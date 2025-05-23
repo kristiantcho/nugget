@@ -65,9 +65,6 @@ pip install -e .
 ## Quick Start
 
 ```python
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
 from nugget import GeoOptimizer
 
 # Create a GeoOptimizer instance
@@ -76,18 +73,17 @@ rbf_optimizer = GeoOptimizer(
     domain_size=2.0,        # Domain size from -1 to 1
     epsilon=30.0,           # RBF kernel parameter
     num_iterations=100,     # Number of optimization iterations
-    visualize_every=50      # Visualization frequency
+    visualize_every=10      # Visualization frequency
 )
 
-# Run optimization for a continuous string geometry with 40 points
+# Run optimization for a dynamic string geometry with 150 points and 30 strings
 results = rbf_optimizer.optimize_geometry(
-    geometry_type="continuous_string",
-    num_points=40,
-    loss_type="rbf_interpolation"
+    geometry_type="dynamic_string",
+    total_points=150,
+    n_strings = 30,
+    loss_type="rbf",
+    even_distribution = True
 )
-
-# Visualize the final optimized geometry
-rbf_optimizer.visualize_results(results)
 ```
 
 ## Examples
