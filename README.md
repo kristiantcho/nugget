@@ -94,9 +94,9 @@ See the `test_optimization.ipynb` notebook for detailed examples of different op
 
 - Python 3.8+
 - PyTorch 1.8+
-- NumPy
-- Matplotlib
-- tqdm
+- SciPy
+- Imagio (for GIF creation)
+- Plotly (for interactive 3D plots)
 
 ## License
 
