@@ -1,54 +1,85 @@
 # *nugget*
 
-*nugget* (NeUtrino experiement Geometry optimization and General Evaluation Tool) is a Python package for optimizing geometric configurations of detectors for astrophysical neutrino experiments.
+*nugget* (NeUtrino experiement Geometry optimization and General Evaluation Tool) is a comprehensive Python package for optimizing geometric configurations of detectors for astrophysical neutrino experiments such as IceCube, P-ONE, and similar deep-field detector arrays.
 
 ## Features
 
-- Multiple geometry optimization strategies (FreePoints, DynamicString, ContinuousString)
-- Various loss functions for optimization (RBF interpolation, Signal-to-Noise Ratio)
-- Built-in visualization tools for 2D and 3D configurations
-- Learning rate schedulers for efficient optimization
-- Surrogate functions for testing optimization strategies on different neutrino signal models
+- **Multiple Geometry Types**: Four different optimization strategies (FreePoints, DynamicString, ContinuousString, EvanescentString)
+- **Advanced Loss Functions**: Five loss functions including RBF interpolation, Signal-to-Noise Ratio (SNR), Weighted SNR, and Likelihood Ratio (LLR) loss
+- **Comprehensive Visualization**: Interactive 2D and 3D plotting with GIF generation for optimization tracking
+- **Flexible Learning Rate Scheduling**: Multiple scheduler types (cosine, exponential, step, linear)
+- **Sophisticated Surrogate Models**: Neural network-based surrogate functions with Fourier features for testing optimization strategies
+- **GPU/CPU Support**: Automatic device detection with PyTorch backend for accelerated computations
+- **Fisher Information Analysis**: Built-in support for parameter estimation and sensitivity analysis
 
 ## Geometry Types
 
-*nugget* implements three different geometry types for optimization:
+*nugget* implements four different geometry types for detector optimization:
 
 ### FreePoints
-Points can be freely positioned in 3D space with no constraints on their arrangement. This provides maximum flexibility but may be less physically realistic for some detector designs.
+Points can be freely positioned in 3D space with no constraints on their arrangement. This provides maximum flexibility for detector configuration exploration and is ideal for initial concept studies or unconstrained optimization problems.
 
 ### DynamicString
-Points are arranged along vertical strings with fixed or free moving XY positions. The number of points on each string can also be optimized, allowing the algorithm to allocate more points to regions of interest (still under development). This geometry type closely resembles the structure of in-ice or underwater neutrino detectors like IceCube or P-ONE.
+Points are arranged along vertical strings with optimizable XY positions. The number of points on each string can be dynamically adjusted during optimization, allowing the algorithm to allocate sensing elements to regions of maximum information gain. This geometry closely resembles the structure of in-ice or underwater neutrino detectors like IceCube or P-ONE.
 
 ### ContinuousString
-Similar to DynamicString, but points are distributed along a continuous path through the detector volume. This allows for smooth, continuous optimization of point positions and is useful for detectors with flexible sensor deployment options.
+Points are distributed along continuous paths through the detector volume with smooth, differentiable string trajectories. This allows for continuous optimization of point positions along string paths and is particularly useful for detectors with flexible sensor deployment options or cable-based installations.
+
+### EvanescentString
+An advanced string geometry where string weights can be optimized, allowing strings to "fade out" (become evanescent) if they don't contribute significantly to the optimization objective. This provides automatic string pruning and optimal resource allocation for large-scale detector arrays.
 
 ## Loss Functions
 
-*nugget* provides two primary loss functions for optimization:
+*nugget* provides five sophisticated loss functions optimized for different neutrino detection scenarios:
 
 ### RBF Interpolation Loss
-This loss function uses Radial Basis Function (RBF) interpolation to reconstruct signal functions from detector points. It optimizes sensor placement to minimize the error between the true signal and the reconstructed signal. Key features:
+Uses Radial Basis Function interpolation to reconstruct signal functions from detector measurements. Optimizes sensor placement to minimize reconstruction error between true signals and detector-interpolated values. Key features:
 
-- Employs Gaussian RBFs with configurable epsilon parameter
-- Includes additional penalties for boundary constraints and point repulsion
-- Supports sampling bias to focus on high-value regions
-- Well-suited for general signal reconstruction problems
+- Gaussian RBF kernels with configurable epsilon parameter
+- Boundary constraints and point repulsion penalties
+- Sampling bias for focusing on high-value regions
+- Ideal for general signal reconstruction and detector sensitivity studies
 
 ### Signal-to-Noise Ratio (SNR) Loss
-This loss function maximizes the signal-to-noise ratio for detecting neutrino events in the presence of background noise. Key features:
+Maximizes the signal-to-noise ratio for neutrino event detection in the presence of background noise. Features:
 
-- Optimizes detector geometry to maximize sensitivity to specific signal types
-- Can operate with or without background functions
-- Configurable signal and background scaling
-- Supports neutrino event specific parameter optimization (up to two parameters)
+- Direct optimization of detector sensitivity to specific signal types
+- Configurable signal and background scaling factors
+- Support for background-free optimization scenarios
+- Optimized for neutrino event parameter estimation
 
-Both loss functions support additional regularization terms including:
-- Boundary constraints to keep points within the domain
-- Repulsion penalties to prevent points from clustering
-- String-specific penalties for the DynamicString and ContinuousString geometries
+### Weighted SNR Loss
+An advanced SNR loss that incorporates Fisher information matrix analysis for optimal parameter estimation. Features:
+
+- Fisher information-based weighting for parameter sensitivity
+- Support for multi-parameter optimization (position, direction, energy)
+- Angular and energy resolution optimization
+- Ideal for precision neutrino parameter reconstruction
+
+### Likelihood Ratio (LLR) Loss
+Optimizes detector geometry for maximum likelihood ratio discrimination between signal and background events. Features:
+
+- Event-by-event likelihood ratio computation
+- ROC curve optimization for event classification
+- Support for realistic neutrino event simulation
+- Ideal for neutrino event identification and background rejection
+
+### Weighted LLR Loss
+Combines likelihood ratio optimization with Fisher information weighting for comprehensive detector optimization.
+
+All loss functions include:
+- Boundary constraints to maintain physical detector domains
+- Repulsion penalties to prevent sensor clustering
+- String-specific penalties for string-based geometries
+- GPU acceleration for large-scale optimizations
 
 ## Installation
+
+### Prerequisites
+- Python 3.8 or higher
+- CUDA-compatible GPU (optional, but recommended for large optimizations)
+
+### Install from source
 
 ```bash
 # Clone the repository
@@ -62,41 +93,162 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+### Dependencies
+The package requires the following core dependencies:
+- **PyTorch** (≥1.8.0): Deep learning backend with GPU support
+- **NumPy** (≥1.19.0): Numerical computing
+- **SciPy** (≥1.5.0): Scientific computing and optimization
+- **Matplotlib** (≥3.3.0): Static plotting and visualization
+- **tqdm** (≥4.45.0): Progress bars during optimization
+- **Jupyter** (≥1.0.0): Interactive notebook support
+
+Optional dependencies for enhanced functionality:
+- **Plotly**: Interactive 3D visualizations
+- **imageio**: GIF generation for optimization animations
+
 ## Quick Start
 
-```python
-from nugget import GeoOptimizer
+The package provides modular components for building custom neutrino detector optimization workflows:
 
-# Create a GeoOptimizer instance
-rbf_optimizer = GeoOptimizer(
-    dim=3,                  # 3D space
-    domain_size=2.0,        # Domain size from -1 to 1
-    epsilon=30.0,           # RBF kernel parameter
-    num_iterations=100,     # Number of optimization iterations
-    visualize_every=10      # Visualization frequency
+### Using Geometry Classes Directly
+
+```python
+from nugget.utils.geometries import DynamicString, FreePoints
+from nugget.utils.losses import RBFInterpolationLoss, SNRloss
+import torch
+
+# Set up device and domain
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+domain_size = 2.0
+
+# Initialize geometry
+geometry = DynamicString(
+    device=device,
+    dim=3,
+    domain_size=domain_size,
+    total_points=150,
+    n_strings=30
 )
 
-# Run optimization for a dynamic string geometry with 150 points and 30 strings
-results = rbf_optimizer.optimize_geometry(
-    geometry_type="dynamic_string",
-    total_points=150,
-    n_strings = 30,
-    loss_type="rbf",
-    even_distribution = True
+# Initialize geometry points
+geom_dict = geometry.initialize_points()
+points = geom_dict['points']
+
+# Set up loss function
+loss_fn = RBFInterpolationLoss(
+    device=device,
+    epsilon=30.0,
+    domain_size=domain_size
 )
 ```
 
-## Examples
+### Using Surrogate Models
 
-See the `test_optimization.ipynb` notebook for detailed examples of different optimization strategies.
+```python
+from nugget.utils.surrogates import SkewedGaussian
 
-## Requirements
+# Create surrogate model for testing
+surrogate = SkewedGaussian(
+    device=device,
+    dim=3,
+    domain_size=domain_size
+)
 
-- Python 3.8+
-- PyTorch 1.8+
-- SciPy
-- Imagio (for GIF creation)
-- Plotly (for interactive 3D plots)
+# Generate test functions
+test_points = torch.rand(2000, 3, device=device) * domain_size - domain_size/2
+surrogate_funcs = surrogate.generate_batch(batch_size=10, test_points=test_points)
+```
+
+## Core Components
+
+The package is organized into modular components that can be used independently or combined:
+
+### Geometry Modules (`utils/geometries.py`)
+- **FreePoints**: Unconstrained 3D point optimization
+- **DynamicString**: Vertical string arrays with optimizable positions
+- **ContinuousString**: Smooth string path optimization  
+- **EvanescentString**: String arrays with learnable weights
+
+### Loss Functions (`utils/losses.py`)
+- **RBFInterpolationLoss**: Signal reconstruction optimization
+- **SNRloss**: Signal-to-noise ratio maximization
+- **WeightedSNRLoss**: Fisher information weighted optimization
+- **WeightedLLRLoss**: Likelihood ratio optimization
+
+### Surrogate Models (`utils/surrogates.py`)
+- Neural network-based function approximation
+- Fourier feature mappings for coordinate encoding
+- Neutrino event simulation and parameter sampling
+
+## Advanced Features
+
+### Learning Rate Scheduling
+Support for multiple learning rate schedulers to improve optimization convergence:
+- **Cosine annealing**: Smooth learning rate decay
+- **Exponential decay**: Traditional exponential scheduling  
+- **Step scheduling**: Piecewise constant learning rates
+- **Linear decay**: Linear learning rate reduction
+
+### Visualization and Analysis
+Comprehensive visualization tools for optimization analysis:
+- **3D Interactive Plots**: Real-time detector geometry visualization
+- **Optimization GIFs**: Animated optimization progress tracking
+- **Loss History**: Detailed loss function evolution
+- **SNR/LLR Analysis**: Signal detection performance metrics
+- **Fisher Information**: Parameter estimation sensitivity maps
+
+### GPU Acceleration
+Full PyTorch backend with GPU support for:
+- Large-scale geometry optimizations (>1000 detector elements)
+- Neural network surrogate model training
+- Batch processing of neutrino event simulations
+- Fisher information matrix computations
+
+## Project Structure
+
+```
+nugget/
+├── __init__.py                 # Main package initialization
+├── pyscripts/
+│   └── GeoOptimizer.py        # Legacy optimization class (deprecated)
+└── utils/
+    ├── geometries.py          # Geometry implementations
+    ├── losses.py              # Loss function implementations  
+    ├── surrogates.py          # Surrogate model implementations
+    ├── schedulers.py          # Learning rate schedulers
+    └── vis_tools.py           # Visualization utilities
+```
+
+### Usage Pattern
+
+The recommended approach is to use the modular components directly rather than the monolithic GeoOptimizer class:
+
+1. **Choose a geometry type** from `utils/geometries.py`
+2. **Select a loss function** from `utils/losses.py`  
+3. **Set up optimization** using PyTorch optimizers
+4. **Add visualization** using tools from `utils/vis_tools.py`
+5. **Test with surrogates** from `utils/surrogates.py`
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Citation
+
+If you use *nugget* in your research, please cite:
+
+```bibtex
+@software{nugget2024,
+  title={nugget: NeUtrino experiement Geometry optimization and General Evaluation Tool},
+  author={[Author Name]},
+  year={2024},
+  url={https://github.com/kristiantcho/nugget}
+}
+```
 
 ## License
 

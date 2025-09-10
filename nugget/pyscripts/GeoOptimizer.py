@@ -13,13 +13,14 @@ This class integrates all the utility modules from NuGeo/utils:
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import copy
 from typing import Dict, List, Tuple, Union, Optional, Callable, Any
 
 # Import all utilities from utils
-from ..utils.geometries import Geometry, FreePoints, DynamicString, ContinuousString
-from ..utils.losses import LossFunction, RBFInterpolationLoss, SNRloss
+from ..utils.geometries import Geometry, FreePoints, DynamicString, ContinuousString, EvanescentString
+from ..utils.losses import LossFunction, RBFInterpolationLoss, SNRloss, WeightedSNRLoss
 from ..utils.surrogates import Surrogate, SkewedGaussian
 from ..utils.schedulers import create_scheduler
 from ..utils.vis_tools import Visualizer
@@ -62,7 +63,12 @@ class GeoOptimizer:
                  signal_scale: float = 1.0,
                  background_scale: float = 10.0,
                  snr_weight: float = 1.0,
-                 no_background: bool = False):
+                 no_background: bool = False,
+                 # Evanescent string parameters
+                 eva_weight: float = 0.001,
+                 n_strings: int = 100,
+                 points_per_string: int = 5,
+                 precompute_snr: bool = False):
         """
         Initialize the GeoOptimizer.
         
@@ -165,6 +171,10 @@ class GeoOptimizer:
         self.background_scale = background_scale
         self.snr_weight = snr_weight
         self.no_background = no_background
+        self.eva_weight = eva_weight
+        self.n_strings = n_strings
+        self.points_per_string = points_per_string
+        self.precompute_snr = precompute_snr
         
         # Initialize components
         self.surrogate_model = SkewedGaussian(device=self.device, dim=self.dim, domain_size=self.domain_size)
@@ -219,6 +229,16 @@ class GeoOptimizer:
                 n_strings=kwargs.get('n_strings', 20),
                 optimize_positions_only=kwargs.get('optimize_positions_only', False)
             )
+        elif geometry_type.lower() == 'evanescent_string':
+            self.geometry = EvanescentString(
+                device=self.device,
+                dim=self.dim,
+                domain_size=self.domain_size,
+                n_strings=kwargs.get('n_strings', self.n_strings),
+                points_per_string=kwargs.get('points_per_string', self.points_per_string),
+                optimize_z=kwargs.get('optimize_z', False),
+                starting_weight=kwargs.get('starting_weight', 0.1),
+            )
         else:
             raise ValueError(f"Unknown geometry type: {geometry_type}")
 
@@ -244,7 +264,7 @@ class GeoOptimizer:
                 z_repulsion_weight=kwargs.get('z_repulsion_weight', self.repulsion_weight),
                 min_dist=kwargs.get('min_dist', 1e-3),
                 sampling_weight=kwargs.get('sampling_weight', self.sampling_weight),
-                domain_size=self.domain_size
+                domain_size=kwargs.get('domain_size', self.domain_size),
             )
         elif loss_type.lower() == 'snr':
             self.loss_function = SNRloss(
@@ -255,7 +275,28 @@ class GeoOptimizer:
                 path_repulsion_weight=kwargs.get('path_repulsion_weight', self.string_repulsion_weight),
                 z_repulsion_weight=kwargs.get('z_repulsion_weight', self.repulsion_weight),
                 min_dist=kwargs.get('min_dist', 1e-3),
-                domain_size=self.domain_size,
+                domain_size=kwargs.get('domain_size', self.domain_size),
+                snr_weight=kwargs.get('snr_weight', self.snr_weight),
+                signal_scale=kwargs.get('signal_scale', self.signal_scale),
+                background_scale=kwargs.get('background_scale', self.background_scale),
+                no_background=kwargs.get('no_background', self.no_background)
+            )
+        elif loss_type.lower() == 'weighted_snr':
+            self.loss_function = WeightedSNRLoss(
+                device=self.device,
+                repulsion_weight=kwargs.get('repulsion_weight', self.repulsion_weight),
+                boundary_weight=kwargs.get('boundary_weight', self.boundary_weight),
+                string_repulsion_weight=kwargs.get('string_repulsion_weight', self.string_repulsion_weight),
+                max_local_rad=kwargs.get('max_local_rad', 0.1),
+                path_repulsion_weight=kwargs.get('path_repulsion_weight', self.string_repulsion_weight),
+                z_repulsion_weight=kwargs.get('z_repulsion_weight', self.repulsion_weight),
+                eva_weight=kwargs.get('eva_weight', self.eva_weight),
+                eva_boundary_weight=kwargs.get('eva_boundary_weight', 100),
+                eva_binary_weight=kwargs.get('eva_binary_weight', 10),
+                eva_string_num_weight=kwargs.get('eva_string_num_weight', 10),
+                eva_min_num_strings= kwargs.get('eva_min_num_strings', 20),
+                min_dist=kwargs.get('min_dist', 1e-3),
+                domain_size=kwargs.get('domain_size', self.domain_size),
                 snr_weight=kwargs.get('snr_weight', self.snr_weight),
                 signal_scale=kwargs.get('signal_scale', self.signal_scale),
                 background_scale=kwargs.get('background_scale', self.background_scale),
@@ -279,9 +320,9 @@ class GeoOptimizer:
         Parameters:
         -----------
         geometry_type : str
-            Type of geometry to use ('free_points', 'dynamic_string', 'continuous_string')
+            Type of geometry to use ('free_points', 'dynamic_string', 'continuous_string', 'evanescent_string')
         loss_type : str
-            Type of loss function to use ('rbf', 'snr')
+            Type of loss function to use ('rbf', 'snr', 'weighted_snr')
         num_iterations : int or None
             Number of optimization iterations. If None, uses the value from initialization.
         visualize_every : int or None
@@ -293,6 +334,7 @@ class GeoOptimizer:
             - For 'free_points': should contain 'points'
             - For 'dynamic_string': should contain 'string_xy', 'z_values', 'string_indices', etc.
             - For 'continuous_string': should contain 'path_positions', 'string_xy', etc.
+            - For 'evanescent_string': should contain 'string_xy', 'z_values', 'string_weights', etc.
         **kwargs : dict
             Additional parameters for the specific geometry and loss types, and for the optimization process
             
@@ -442,13 +484,62 @@ class GeoOptimizer:
                 )
                 if scheduler:
                     schedulers['string_xy'] = scheduler
+                    
+        elif geometry_type.lower() == 'evanescent_string':
+            # For evanescent strings, optimize z-values, string positions, and string weights
+            z_values = geom_dict.get('z_values')
+            string_xy = geom_dict.get('string_xy')
+            string_weights = geom_dict.get('string_weights')
+            
+            # Create optimizers if parameters are available
+            if z_values is not None and kwargs.get('optimize_z', False):
+                print(f"Optimizing z_values with shape {z_values.shape}")
+                z_values.requires_grad_(True)
+                geom_dict['z_values'] = z_values
+                z_optimizer = torch.optim.Adam([z_values], lr=self.learning_rate)
+                optimizers['z_values'] = z_optimizer
+                
+                scheduler = create_scheduler(
+                    z_optimizer, num_iterations,
+                    self.lr_scheduler_type, self.lr_scheduler_params
+                )
+                if scheduler:
+                    schedulers['z_values'] = scheduler
+                    
+            if string_xy is not None and self.optimize_xy:
+                print(f"Optimizing string_xy with shape {string_xy.shape}")
+                string_xy.requires_grad_(True)
+                geom_dict['string_xy'] = string_xy
+                xy_optimizer = torch.optim.Adam([string_xy], lr=self.xy_learning_rate)
+                optimizers['string_xy'] = xy_optimizer
+                
+                scheduler = create_scheduler(
+                    xy_optimizer, num_iterations,
+                    self.xy_lr_scheduler_type, self.xy_lr_scheduler_params
+                )
+                if scheduler:
+                    schedulers['string_xy'] = scheduler
+                    
+            if string_weights is not None:
+                print(f"Optimizing string_weights with shape {string_weights.shape}")
+                string_weights.requires_grad_(True)
+                geom_dict['string_weights'] = string_weights
+                weights_optimizer = torch.optim.Adam([string_weights], lr=kwargs.get('weights_learning_rate', 0.01))
+                optimizers['string_weights'] = weights_optimizer
+                
+                scheduler = create_scheduler(
+                    weights_optimizer, num_iterations,
+                    kwargs.get('weights_lr_scheduler_type'), kwargs.get('weights_lr_scheduler_params')
+                )
+                if scheduler:
+                    schedulers['string_weights'] = scheduler
         
         # Store optimizers and schedulers
         self.optimizers = optimizers
         self.schedulers = schedulers
         
         # Check what kind of surrogate function mode we're in
-        if loss_type.lower() == 'snr':
+        if loss_type.lower() == 'snr' or loss_type.lower() == 'weighted_snr':
             # SNR loss needs both signal and background functions
             num_background_funcs = kwargs.get('num_background_funcs', 1)
             optimize_params = kwargs.get('optimize_params', None)
@@ -473,6 +564,29 @@ class GeoOptimizer:
             keep_param_const = kwargs.get('keep_param_const', None)
             rand_params_in_grid = kwargs.get('rand_params_in_grid', False)
             rand_other_grid = kwargs.get('rand_other_grid', False)
+            
+            # For weighted_snr with precompute_snr option, compute SNR once
+            if loss_type.lower() == 'weighted_snr' and self.precompute_snr:
+                print("Precomputing SNR per string for all signal functions...")
+                all_signal_funcs = []
+                # total_signal_funcs = kwargs.get('total_signal_funcs', 100)
+                for batch_num in range(batch_size):
+                    signal_func = self.surrogate_model.generate_surrogate_functions(
+                        1, 'signal', parameter_ranges, position_ranges, optimize_params,
+                        param_grid_size, batch_num, keep_param_const, rand_params_in_grid, rand_other_grid
+                    )
+                    all_signal_funcs.extend(signal_func)
+                
+                # Store all signal functions for reuse
+                self.all_signal_funcs = all_signal_funcs
+                
+                # Compute SNR per string for all signal functions at once
+                points_per_string_list = geom_dict.get('points_per_string_list', None)
+                self.precomputed_snr_per_string = self.loss_function.compute_snr_per_string(
+                    self.points, all_signal_funcs, self.background_funcs,
+                    self.n_strings, geom_dict.get('string_xy'), points_per_string_list
+                )
+                # print(f"Precomputed SNR shape: {self.precomputed_snr_per_string.shape}")
             
             # Initialize visualization signal functions
             # vis_signal_funcs = self.generate_surrogate_functions(
@@ -514,6 +628,16 @@ class GeoOptimizer:
                     {'path_positions': False, 'string_xy': True},
                     {'path_positions': True, 'string_xy': False}
                 ]
+            elif geometry_type.lower() == 'evanescent_string':
+                # For evanescent strings with alternating optimization
+                phases = []
+                if 'string_weights' in optimizers:
+                    phases.append({'string_weights': True, 'string_xy': False, 'z_values': False})
+                if 'string_xy' in optimizers:
+                    phases.append({'string_weights': False, 'string_xy': True, 'z_values': False})
+                if 'z_values' in optimizers:
+                    phases.append({'string_weights': False, 'string_xy': False, 'z_values': True})
+                training_phases = phases
         
         # Start optimization loop
         print(f"Starting optimization with {num_iterations} iterations...")
@@ -607,6 +731,60 @@ class GeoOptimizer:
                     else:
                         vis_signal_funcs = signal_funcs
             
+            elif loss_type.lower() == 'weighted_snr':
+                # Weighted SNR loss for evanescent strings
+                batch_size = kwargs.get('batch_size', self.batch_size)
+                optimize_params = kwargs.get('optimize_params', None)
+                
+                if self.precompute_snr:
+                    signal_funcs = self.all_signal_funcs
+                    # Use precomputed SNR - just sample from it
+                    # batch_indices = np.random.choice(len(self.all_signal_funcs), batch_size, replace=False)
+                    # signal_funcs = [self.all_signal_funcs[i] for i in batch_indices]
+                    # batch_snr_per_string = self.precomputed_snr_per_string[:, batch_indices]
+                    
+                    # Call the loss function with precomputed SNR
+                    # points_per_string_list = [self.points_per_string] * self.n_strings
+                    loss, avg_snr, snr_per_string = self.loss_function(
+                        points_3d=self.points,
+                        signal_funcs=signal_funcs,
+                        background_funcs=self.background_funcs,
+                        num_strings=self.n_strings,
+                        precomputed_snr_per_string=self.precomputed_snr_per_string,
+                        **geom_dict
+                    )
+                else:
+                    # Generate signal functions for this batch
+                    signal_funcs = []
+                    for batch_num in range(batch_size):
+                        signal_func = self.surrogate_model.generate_surrogate_functions(
+                            1, 'signal', parameter_ranges, position_ranges, optimize_params,
+                            param_grid_size, batch_num, keep_param_const, rand_params_in_grid, rand_other_grid
+                        )
+                        signal_funcs.extend(signal_func)
+                    
+                    # Call the loss function with the current geometry
+          
+                    loss, avg_snr, snr_per_string = self.loss_function(
+                        points_3d=self.points,
+                        signal_funcs=signal_funcs,
+                        background_funcs=self.background_funcs,
+                        num_strings=self.n_strings,
+                        **geom_dict
+                    )
+                
+                # Store loss and SNR history
+                self.loss_history.append(loss.item())
+                self.snr_history.append(avg_snr)
+                
+                # Store signal functions for visualization
+                if iteration == 0 or (visualize_every > 0 and iteration % visualize_every == 0):
+                    if not show_all_signals:
+                        indices = np.random.permutation(len(signal_funcs))[:min(len(signal_funcs), 200)]
+                        vis_signal_funcs = [signal_funcs[i] for i in indices]  # Keep a few for visualization
+                    else:
+                        vis_signal_funcs = signal_funcs
+            
             
             # print(f"\nIteration {iteration} - Parameter gradients:")
             # for param_name, optimizer in optimizers.items():
@@ -637,7 +815,11 @@ class GeoOptimizer:
                 #         print(f"  - {param_name}: No gradients or parameter not found")
             
             # Backpropagate and update
+            # print("string weights:", string_weights)
             loss.backward()
+            # print(string_weights.grad)
+            # print("string weights after backward:", string_weights)
+            # print("string weights" , geom_dict.get('string_weights'))
             
             # Apply optimizer steps based on alternating training
             if alternating_training and training_phases:
@@ -655,9 +837,12 @@ class GeoOptimizer:
                 for scheduler in schedulers.values():
                     scheduler.step()
             
+            # print("string weights:", geom_dict.get('string_weights'))
+            # print("string weights:", string_weights)
             # Update the geometry
             geom_dict = self.geometry.update_points(**geom_dict)
             
+            # Handle tensor replacement for dynamic geometries
             if geom_dict.get('z_values') is not None:
                 if z_values is not None  and 'z_values' in optimizers and "string_logits" in optimizers:
                     # If z_values tensor object was replaced by update_points:
@@ -670,52 +855,81 @@ class GeoOptimizer:
                         if original_z_tensor_in_optimizer.requires_grad:
                             new_z_tensor.requires_grad_(True) # Ensure grad status is maintained
                         optimizers['z_values'].param_groups[0]['params'] = [new_z_tensor]
-              
-
+            
+            # Update points from geometry
             self.points = geom_dict['points']
-            if loss_type.lower() == 'snr':
+            
+            # For evanescent strings with precomputed SNR, update the precomputed values if points changed
+            if (loss_type.lower() == 'weighted_snr' and self.precompute_snr and 
+                geometry_type.lower() == 'evanescent_string'):
+                # Check if we need to recompute SNR due to geometry changes
+                # current_n_points = len(self.points)
+                # expected_n_points = len(geom_dict.get('active_string_indices', [])) * self.points_per_string
+                if iteration != 0 and iteration % kwargs.get('recompute_snr_every', 1000) == 0:
+                    print(f"Recomputing precomputed SNR at iteration {iteration}")
+                    points_per_string_list = [self.points_per_string] * len(geom_dict.get('string_indices', []))
+                    if len(points_per_string_list) > 0:
+                        self.precomputed_snr_per_string = self.loss_function.compute_snr_per_string(
+                            self.points, self.all_signal_funcs, self.background_funcs,
+                            len(points_per_string_list), points_per_string_list
+                        )
+            if loss_type.lower() == 'snr' or loss_type.lower() == 'weighted_snr':
                 self.signal_funcs = signal_funcs
                 self.background_funcs = self.background_funcs
                 self.optimize_params = optimize_params
                 self.param_values = self.surrogate_model.param_values
             self.geom_dict = geom_dict
-            if (visualize_every > 0 and (iteration % visualize_every == 0 or iteration == num_iterations - 1)) or kwargs.get('make_gif', True):
-                vis_kwargs = {}
-                if loss_type.lower() == 'snr':
-                    vis_kwargs.update({
-                        'signal_funcs': vis_signal_funcs,
-                        'background_funcs': self.background_funcs, 
-                        'optimize_params': kwargs.get('optimize_params', None),
-                        'param_values': self.surrogate_model.param_values,
-                        'vis_all_signals': kwargs.get('vis_all_signals', True),
-                        'all_snr': all_snr,
-                        'no_background': self.no_background,
-                        'background_scale': self.background_scale,
-                    })
-                elif loss_type.lower() == 'rbf':
-                    vis_kwargs.update({
-                        'surrogate_funcs': batch_surrogate_funcs,
-                        'surrogate_model': self.surrogate_model,
-                        'compute_rbf_interpolant': self.loss_function.compute_rbf_interpolant if hasattr(self.loss_function, 'compute_rbf_interpolant') else None,
-                        'uw_loss': self.uw_loss_history,
-                        'vis_all_surrogates': kwargs.get('vis_all_surrogates', True),
-                        
-                    })
-                
-                if geom_dict.get('num_strings') is not None:
-                    vis_kwargs.update({
-                        'num_strings': geom_dict['num_strings'],
-                        })
-                vis_kwargs.update({"geometry_type": geometry_type})
-                
-                additional_metrics = {'snr_history': self.snr_history} if loss_type.lower() == 'snr' else None
+            
+            # Update additional metrics for different loss types
+            additional_metrics = {}
+            if loss_type.lower() == 'snr' or loss_type.lower() == 'weighted_snr':
+                additional_metrics['snr_history'] = self.snr_history
+            if loss_type.lower() == 'weighted_snr':
+                # Add string weights to visualization
+                # string_weights = geom_dict.get('string_weights')
+                # print('string_weights:', string_weights)
+                if string_weights is not None:
+                    # print('String weights:', string_weights.detach().cpu().numpy())
+                    additional_metrics['string_weights'] = torch.sigmoid(geom_dict.get('string_weights', None)).detach().cpu().numpy()
+                    additional_metrics['active_strings'] = geom_dict.get('active_string_indices', [])
             
             # Visualize progress
-            if visualize_every > 0 and (iteration % visualize_every == 0 or iteration == num_iterations - 1):
-       
+            
+            vis_kwargs = {}
+            if loss_type.lower() == 'snr' or loss_type.lower() == 'weighted_snr':
+                vis_kwargs.update({
+                    'signal_funcs': vis_signal_funcs,
+                    'background_funcs': self.background_funcs, 
+                    'optimize_params': kwargs.get('optimize_params', None),
+                    'param_values': self.surrogate_model.param_values,
+                    'vis_all_signals': kwargs.get('vis_all_signals', True),
+                    'all_snr': locals().get('all_snr'),
+                    'no_background': self.no_background,
+                    'background_scale': self.background_scale,
+                })
+                if loss_type.lower() == 'weighted_snr':
+                    vis_kwargs.update({
+                        'snr_per_string': locals().get('snr_per_string'),
+                        'string_weights': additional_metrics.get('string_weights'),
+                    })
+            elif loss_type.lower() == 'rbf':
+                vis_kwargs.update({
+                    'surrogate_funcs': batch_surrogate_funcs,
+                    'surrogate_model': self.surrogate_model,
+                    'compute_rbf_interpolant': self.loss_function.compute_rbf_interpolant if hasattr(self.loss_function, 'compute_rbf_interpolant') else None,
+                    'uw_loss': self.uw_loss_history,
+                    'vis_all_surrogates': kwargs.get('vis_all_surrogates', True),
+                })
+            
+            if geom_dict.get('num_strings') is not None:
+                vis_kwargs.update({
+                    'num_strings': geom_dict['num_strings'],
+                })
+            vis_kwargs.update({"geometry_type": geometry_type})
+            if visualize_every > 0 and (iteration % visualize_every == 0 or iteration == num_iterations - 1):                                                                                                                                                       
                 self.visualizer.visualize_progress(
                     iteration=iteration,
-                    points_3d=self.points,
+                    points_3d=geom_dict.get('points', self.points),
                     loss_history=self.loss_history,
                     additional_metrics=additional_metrics,
                     string_indices=geom_dict.get('string_indices'),
@@ -732,7 +946,7 @@ class GeoOptimizer:
             if kwargs.get('make_gif', True):
                 self.visualizer.visualize_progress(
                     iteration=iteration,
-                    points_3d=self.points,
+                    points_3d=geom_dict.get('points', self.points),
                     loss_history=self.loss_history,
                     additional_metrics=additional_metrics,
                     string_indices=geom_dict.get('string_indices'),
@@ -749,6 +963,9 @@ class GeoOptimizer:
                     gif_plot_selection=kwargs.get('gif_plot_selection', ['3d_points']),
                     **vis_kwargs
                 )
+            # if geometry_type.lower() == 'evanescent_string':
+            #     print(f"string_weights: {geom_dict.get('string_weights')}")
+            #     print(f'string_logits: {torch.sigmoid(geom_dict.get("string_weights"))}')
         
         # Return the results
         results = {
@@ -764,6 +981,15 @@ class GeoOptimizer:
             results['snr_history'] = self.snr_history
             results['signal_funcs'] = vis_signal_funcs
             results['background_funcs'] = self.background_funcs
+        elif loss_type.lower() == 'weighted_snr':
+            results['snr_history'] = self.snr_history
+            results['signal_funcs'] = vis_signal_funcs
+            results['background_funcs'] = self.background_funcs
+            results['string_weights'] = geom_dict.get('string_weights')
+            results['active_string_indices'] = geom_dict.get('active_string_indices')
+            results['z_values'] = geom_dict.get('z_values')
+            if hasattr(self, 'precomputed_snr_per_string'):
+                results['precomputed_snr_per_string'] = self.precomputed_snr_per_string
             
         return results
 

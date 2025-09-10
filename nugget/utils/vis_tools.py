@@ -5,9 +5,15 @@ from matplotlib import cm
 from matplotlib.colors import Normalize
 from IPython.display import clear_output, display
 import math
+import re # Added for regex pattern matching in GIF frame sorting
 from typing import List, Dict, Union, Tuple, Optional, Any, Callable
 import io # Added for GIF generation
 import imageio # Added for GIF generation
+from scipy.interpolate import griddata
+import os # Added for file management
+import tempfile # Added for temporary directory management
+import glob # Added for file pattern matching
+import shutil # Added for directory operations
 
 # Try importing plotly for interactive 3D plotting, but don't fail if not available
 try:
@@ -25,6 +31,7 @@ class Visualizer:
     PLOT_LOSS = "loss"
     PLOT_UW_LOSS = "uw_loss"
     PLOT_SNR_HISTORY = "snr_history"
+    PLOT_LLR_HISTORY = "llr_history"
     PLOT_3D_POINTS = "3d_points"
     PLOT_STRING_XY = "string_xy"
     PLOT_Z_DIST = "z_distribution"
@@ -38,8 +45,23 @@ class Visualizer:
     PLOT_INTERP_FUNCTION = "interp_function"
     PLOT_ERROR_FUNCTION = "error_function"
     PLOT_SURROGATE_FUNCTION = "surrogate_function"
+    PLOT_STRING_WEIGHTS_SCATTER = "string_weights_scatter"
+    PLOT_LLR_CONTOUR = "llr_contour"
+    PLOT_SIGNAL_LLR_CONTOUR = "signal_llr_contour"
+    PLOT_BACKGROUND_LLR_CONTOUR = "background_llr_contour"
+    PLOT_LLR_HISTOGRAM = "llr_histogram"
+    PLOT_SNR_CONTOUR = "snr_contour"
+    PLOT_TRUE_SIGNAL_LLR_CONTOUR = "true_signal_llr_contour"
+    PLOT_TRUE_BACKGROUND_LLR_CONTOUR = "true_background_llr_contour"
+    PLOT_SIGNAL_LIGHT_YIELD_CONTOUR = "signal_light_yield_contour"
+    PLOT_FISHER_INFO_LOGDET = "fisher_info_logdet"
+    PLOT_ANGULAR_RESOLUTION = "angular_resolution"
+    PLOT_ENERGY_RESOLUTION = "energy_resolution"
+    PLOT_ANGULAR_RESOLUTION_HISTORY = "angular_resolution_history"
+    PLOT_ENERGY_RESOLUTION_HISTORY = "energy_resolution_history"
+
     
-    def __init__(self, device=None, dim=3, domain_size=2.0):
+    def __init__(self, device=None, dim=3, domain_size=2.0, gif_temp_dir=None):
         """
         Initialize the visualizer.
         
@@ -57,6 +79,98 @@ class Visualizer:
         self.domain_size = domain_size
         self.half_domain = domain_size / 2
         self.gif_frames = [] # Added to store frames for the GIF
+        self.gif_temp_dir = gif_temp_dir# Temporary directory for storing individual images
+        self.gif_image_paths = [] # List to track saved image paths
+    
+    def _standardize_axis_formatting(self, ax, max_ticks=5, label_precision=2, fontsize=8):
+        """
+        Standardize axis formatting for consistent GIF frame sizing.
+        
+        Parameters:
+        -----------
+        ax : matplotlib.axes.Axes
+            The axis to format
+        max_ticks : int
+            Maximum number of ticks on each axis
+        label_precision : int
+            Number of decimal places for tick labels
+        fontsize : int
+            Font size for tick labels
+        """
+        if hasattr(ax, 'xaxis') and hasattr(ax, 'yaxis'):
+            # Limit number of ticks to prevent overcrowding
+            # ax.locator_params(axis='x', nbins=max_ticks)
+            # ax.locator_params(axis='y', nbins=max_ticks)
+            
+            # Format tick labels to consistent precision
+            ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.{label_precision}f}'))
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, p: f'{y:.{label_precision}f}'))
+            
+            # Set consistent tick label size
+            ax.tick_params(axis='both', which='major', labelsize=fontsize)
+            
+            # Ensure tick labels don't extend beyond plot area
+            ax.tick_params(axis='x', rotation=0, pad=2)
+            ax.tick_params(axis='y', rotation=0, pad=2)
+    
+    def _safe_griddata_interpolation(self, points_xy, values, grid_points, resolution, method='linear', fill_value=None):
+        """
+        Safely perform griddata interpolation with proper error handling.
+        
+        Parameters:
+        -----------
+        points_xy : array-like
+            2D array of point coordinates (N, 2)
+        values : array-like
+            Values at each point (N,)
+        grid_points : array-like
+            Grid points for interpolation (M, 2)
+        resolution : int
+            Grid resolution for reshaping
+        method : str
+            Interpolation method ('linear', 'nearest', 'cubic')
+        fill_value : float or None
+            Value to use for points outside the convex hull
+            
+        Returns:
+        --------
+        tuple : (success, grid_values, error_message)
+            success : bool - whether interpolation succeeded
+            grid_values : ndarray or None - interpolated values reshaped to (resolution, resolution)
+            error_message : str or None - error message if failed
+        """
+        # Handle finite values
+        finite_mask = np.isfinite(values)
+        num_finite = np.sum(finite_mask)
+        
+        if num_finite < 3:
+            return False, None, f"Too few finite values ({num_finite}) for triangulation (need ≥3)"
+        
+        # Extract finite data
+        finite_points = points_xy[finite_mask]
+        finite_values = values[finite_mask]
+        
+        # Set fill value if not provided
+        if fill_value is None:
+            fill_value = np.min(finite_values)
+        
+        try:
+            # Perform interpolation
+            interpolated = griddata(
+                finite_points, 
+                finite_values, 
+                grid_points,
+                method=method, 
+                fill_value=fill_value
+            )
+            
+            # Reshape to grid
+            grid_values = interpolated.reshape(resolution, resolution)
+            
+            return True, grid_values, None
+            
+        except Exception as e:
+            return False, None, str(e)
     
     def visualize_progress(self, 
                           iteration: int, 
@@ -74,6 +188,11 @@ class Visualizer:
                           gif_plot_selection: Optional[List[str]] = None, # New: specific plots for GIF
                           gif_filename: str = "optimization_progress.gif", # New: GIF filename
                           gif_fps: int = 2, # New: GIF frames per second
+                          save_individual_images: bool = True, # New: Save images to disk instead of memory
+                          compile_gif_on_iteration: bool = False, # New: Whether to compile GIF on each iteration
+                          gif_fixed_figsize: Optional[tuple] = None, # New: Fixed figure size for consistent GIFs
+                          gif_fixed_rows: int = 4, # New: Fixed number of rows for consistent layout
+                          gif_standardize_ticks: bool = True, # New: Whether to standardize tick formatting
                           geometry_type: Optional[str] = None, # ADDED geometry_type
                           **kwargs) -> None:
         """
@@ -100,7 +219,7 @@ class Visualizer:
         multi_slice : bool
             Whether to use multiple slices for visualization.
         loss_type : str
-            Type of loss function used ('rbf', 'snr', or 'surrogate').
+            Type of loss function used ('rbf', 'snr', 'surrogate', or 'llr').
         plot_types : list of str or None
             List of plot types to display. If None, displays default plots for the loss type.
             Available plot types:
@@ -119,6 +238,16 @@ class Visualizer:
             - 'interp_function': Interpolated function contour
             - 'error_function': Error function contour
             - 'surrogate_function': Surrogate function contour
+            - 'string_weights_scatter': String weights scatter plot with variable alpha
+            - 'llr_contour': Combined LLR contour plot based on per-string values
+            - 'signal_llr_contour': Signal-only LLR contour plot
+            - 'background_llr_contour': Background-only LLR contour plot
+            - 'llr_histogram': LLR density histogram comparing signal and background distributions
+            - 'snr_contour': SNR contour plot based on per-string values
+            - 'signal_light_yield_contour': Signal light yield contour plot based on per-string values
+            - 'fisher_info_logdet': Log determinant of Fisher Information matrix contour plot
+            - 'angular_resolution': Angular resolution from Fisher Information using Cramér-Rao bound
+            - 'energy_resolution': Energy resolution from Fisher Information using Cramér-Rao bound
         make_gif : bool
             Whether to generate and save a GIF of the progress.
         gif_plot_selection : list of str or None
@@ -128,6 +257,21 @@ class Visualizer:
             Filename for the generated GIF.
         gif_fps : int
             Frames per second for the generated GIF.
+        save_individual_images : bool
+            If True, save individual images to disk instead of storing frames in memory.
+            This is more memory efficient and allows for better GIF management.
+        compile_gif_on_iteration : bool
+            If True, compile/update the GIF on each iteration. If False, only save images
+            and require manual compilation via finalize_gif().
+        gif_fixed_figsize : tuple or None
+            Fixed figure size (width, height) for GIF frames to ensure consistent sizing.
+            If None, defaults to (15, 12) for consistent 3x4 layout regardless of plot count.
+        gif_fixed_rows : int
+            Fixed number of rows for GIF layout to ensure consistent sizing.
+            Defaults to 4 rows for a 3x4 grid layout.
+        gif_standardize_ticks : bool
+            Whether to standardize tick formatting across all plots for consistent sizing.
+            Helps prevent layout shifts due to varying tick label lengths.
         geometry_type : str, optional
             The type of geometry being used.
         kwargs : dict
@@ -142,6 +286,11 @@ class Visualizer:
 
         # GIF Generation Logic
         if make_gif:
+            # Initialize temporary directory for saving images if needed
+            if save_individual_images and self.gif_temp_dir is None:
+                self.gif_temp_dir = tempfile.mkdtemp(prefix="gif_frames_")
+                print(f"Created temporary directory for GIF frames: {self.gif_temp_dir}")
+            
             current_gif_plot_types = []
             if gif_plot_selection is not None:
                 current_gif_plot_types = gif_plot_selection
@@ -190,21 +339,67 @@ class Visualizer:
                 for i in range(num_gif_plots, num_gif_rows * num_gif_cols):
                     axes_gif_flat_for_loop[i].axis('off')
                 
-                fig_gif.tight_layout() # ADDED
+                # Apply consistent formatting to all axes to handle tick label length variations
+                if gif_standardize_ticks:
+                    for ax in axes_gif_flat_for_loop:
+                        self._standardize_axis_formatting(ax)
                 
-                img_buf = io.BytesIO()
-                fig_gif.savefig(img_buf, format='png')
-                img_buf.seek(0)
-                self.gif_frames.append(imageio.v3.imread(img_buf))
-                img_buf.close()
+                # Use constrained layout instead of tight_layout for more consistent spacing
+                fig_gif.subplots_adjust(left=0.08, right=0.95, top=0.95, bottom=0.08, 
+                                      wspace=0.3, hspace=0.4)
+                
+                if save_individual_images:
+                    # Save individual image to disk
+                    add_on = 0
+                    if self.gif_temp_dir is not None:
+                        # Ensure the temporary directory exists
+                        if not os.path.exists(self.gif_temp_dir):
+                            os.makedirs(self.gif_temp_dir)
+                        # check if there are existing images
+                        if os.listdir(self.gif_temp_dir):
+                            existing_files = [f for f in os.listdir(self.gif_temp_dir) if f.startswith("frame_") and f.endswith(".png")]
+                            if existing_files:
+                                # Extract numbers from existing filenames and find the highest
+                                numbers = []
+                                for f in existing_files:
+                                    try:
+                                        num = int(f.split("_")[1].split(".")[0])
+                                        numbers.append(num)
+                                    except (ValueError, IndexError):
+                                        continue
+                                add_on = max(numbers) + 1 if numbers else 0
+                            else:
+                                add_on = 0
+                    image_filename = f"frame_{iteration+add_on:04d}.png"
+                    image_path = os.path.join(self.gif_temp_dir, image_filename)
+                    # Use consistent save parameters for identical image sizes
+                    fig_gif.savefig(image_path, format='png', dpi=100, bbox_inches=None, 
+                                   facecolor='white', edgecolor='none', pad_inches=0.1)
+                    self.gif_image_paths.append(image_path)
+                    print(f"Saved GIF frame {len(self.gif_image_paths)} to {image_path}")
+                    
+                    # Compile GIF if requested on each iteration
+                    if compile_gif_on_iteration:
+                        self._compile_gif_from_images(gif_filename, gif_fps)
+                else:
+                    # Original method: store frames in memory
+                    img_buf = io.BytesIO()
+                    # Use consistent save parameters for identical image sizes
+                    fig_gif.savefig(img_buf, format='png', dpi=100, bbox_inches=None,
+                                   facecolor='white', edgecolor='none', pad_inches=0.1)
+                    img_buf.seek(0)
+                    self.gif_frames.append(imageio.v3.imread(img_buf))
+                    img_buf.close()
+                    
+                    # Compile GIF from memory frames
+                    if self.gif_frames and compile_gif_on_iteration:
+                        try:
+                            imageio.mimsave(gif_filename, self.gif_frames, fps=gif_fps)
+                            print(f"GIF '{gif_filename}' updated with {len(self.gif_frames)} frames (Iteration {iteration}).")
+                        except Exception as e:
+                            print(f"Error saving GIF: {e}")
+                
                 plt.close(fig_gif)
-
-                if self.gif_frames:
-                    try:
-                        imageio.mimsave(gif_filename, self.gif_frames, fps=gif_fps)
-                        # print(f"GIF '{gif_filename}' updated with {len(self.gif_frames)} frames (Iteration {iteration}).")
-                    except Exception as e:
-                        print(f"Error saving GIF: {e}")
                         
             return
         
@@ -236,22 +431,40 @@ class Visualizer:
                     self.PLOT_INTERP_FUNCTION,
                     self.PLOT_ERROR_FUNCTION
                 ]
+            elif loss_type == 'llr':
+                plot_types = [
+                    self.PLOT_LOSS,
+                    self.PLOT_LLR_HISTORY if additional_metrics and 'llr_history' in additional_metrics else self.PLOT_LOSS,
+                    self.PLOT_3D_POINTS,
+                    self.PLOT_STRING_XY if string_xy is not None else self.PLOT_XY_PROJECTION,
+                    self.PLOT_LLR_CONTOUR,
+                    self.PLOT_SIGNAL_LLR_CONTOUR,
+                    self.PLOT_BACKGROUND_LLR_CONTOUR,
+                    self.PLOT_LLR_HISTOGRAM
+                ]
         
         # Create figure with proper layout based on number of plots
         num_plots = len(plot_types)
         num_rows = (num_plots + 2) // 3  # Ceiling division to get number of rows needed
-        fig, axes = plt.subplots(num_rows, 3, figsize=(15, 5 * num_rows)) # MODIFIED
-        
+        if num_plots < 3:
+            ncols = num_plots
+        else:
+            ncols = 3
+        fig, axes = plt.subplots(num_rows, ncols, figsize=(5 * ncols, 5 * num_rows)) # MODIFIED
+
         # If only one row, ensure axes is still a 2D array
-        if num_rows == 1:
+        if num_rows == 1 and ncols > 1:
             axes = axes.reshape(1, -1)
         
         # Generate each requested plot
         for i, plot_type in enumerate(plot_types):
-            row_idx = i // 3
-            col_idx = i % 3
-            ax = axes[row_idx, col_idx]
-            
+            if len(plot_types) > 1:
+                row_idx = i // ncols
+                col_idx = i % ncols
+                ax = axes[row_idx, col_idx]
+            else:
+                ax = axes
+
             # Create the specified plot type
             self._create_plot(
                 plot_type=plot_type,
@@ -272,10 +485,11 @@ class Visualizer:
             )
         
         # Hide unused axes
-        for i in range(num_plots, num_rows * 3):
-            row_idx = i // 3
-            col_idx = i % 3
-            axes[row_idx, col_idx].axis('off')
+        if num_plots > 1:
+            for i in range(num_plots, num_rows * 3):
+                row_idx = i // 3
+                col_idx = i % 3
+                axes[row_idx, col_idx].axis('off')
         
         fig.tight_layout() # ADDED
         plt.show()
@@ -340,7 +554,7 @@ class Visualizer:
             ax.set_title(f"Loss (Iteration {iteration})")
             ax.set_xlabel("Iteration")
             ax.set_ylabel("Loss")
-            if loss_type == 'rbf':    
+            if loss_type == 'rbf' or np.all(np.array(loss_history) > 0):    
                 ax.set_yscale('log')
         
         elif plot_type == self.PLOT_UW_LOSS:
@@ -356,9 +570,21 @@ class Visualizer:
             if additional_metrics and 'snr_history' in additional_metrics:
                 snr_history = additional_metrics['snr_history']
                 ax.plot(snr_history)
-                ax.set_title(f"Signal-to-Noise Ratio")
+                ax.set_title(f"Total Signal-to-Noise Ratio")
                 ax.set_xlabel("Iteration")
                 ax.set_ylabel("SNR")
+            else:
+                ax.text(0.5, 0.5, "SNR history not available", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_LLR_HISTORY:
+            # SNR history plot
+            if additional_metrics and 'llr_history' in additional_metrics:
+                llr_history = np.array(additional_metrics['llr_history'])/len(points_3d)
+                ax.plot(llr_history)
+                ax.set_title(f"Mean Log-Likelihood Ratio")
+                ax.set_xlabel("Iteration")
+                ax.set_ylabel("LLR")
             else:
                 ax.text(0.5, 0.5, "SNR history not available", 
                       ha='center', va='center', transform=ax.transAxes)
@@ -368,21 +594,54 @@ class Visualizer:
             fig.delaxes(ax)  # Remove the current axis
             ax = fig.add_subplot(ax.get_subplotspec(), projection='3d')
             
+            # Get string weights for alpha transparency
+            string_weights = kwargs.get('string_weights', None)
+            
             if string_indices is not None:
+                # print("string_indices:", string_indices)
                 # Color by string index for string-based methods
-                unique_strings = len(points_per_string_list)
-                string_colors = plt.cm.rainbow(np.linspace(0, 1, unique_strings))
-                colors = np.array([string_colors[idx] for idx in string_indices])
+                unique_strings = np.unique(string_indices)
+                string_colors = plt.cm.rainbow(np.linspace(0, 1, unique_strings.size))
+                # Map each point to its string's color
+                colors = np.array([string_colors[idx] for idx in unique_strings])
+                
+                # Calculate alpha values based on string weights
+                if string_weights is not None:
+                    
+                    # Convert string weights to point-wise alpha values
+                    alpha_values = np.array([string_weights[idx] for idx in unique_strings])
+                    # Apply sigmoid to convert to [0,1] range if not already
+                    # alpha_values = 1 / (1 + np.exp(-alpha_values)) if np.any(alpha_values < 0) or np.any(alpha_values > 1) else alpha_values
+                    # alpha_values = torch.nn.functional.softplus(torch.tensor(alpha_values)).detach().cpu().numpy()  # Apply softplus for smoothness
+                    # Ensure minimum visibility
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                    
+                full_colors = []
+                full_alphas = []
+                # print("Points per string list:", points_per_string_list)
+                for string_num, num_points in enumerate(points_per_string_list):
+                    full_colors.extend([colors[string_num]] * num_points)
+                    if string_weights is not None:
+                        full_alphas.extend([alpha_values[string_num]] * num_points)
+                    
                 
                 ax.scatter(points_xyz[:, 0], points_xyz[:, 1], points_xyz[:, 2], 
-                          c=colors, s=30, alpha=0.8)
+                          c=full_colors, s=min([30,30*200/len(points_per_string_list)]), alpha=full_alphas if string_weights is not None else 0.8)
                 
                 if string_xy is not None:
-                    # Draw vertical lines for strings
+                    # Draw vertical lines for strings with alpha based on string weights
                     xy_np = string_xy.detach().cpu().numpy()
                     for i, (x, y) in enumerate(xy_np):
+                        line_alpha = string_weights[i] if string_weights is not None else 0.3
+                        # Apply sigmoid if needed
+                        if string_weights is not None:
+                            line_alpha = np.clip(line_alpha, 0.1, 1.0)  # Ensure minimum visibility
+                            # line_alpha = 1 / (1 + np.exp(-line_alpha)) if line_alpha < 0 or line_alpha > 1 else line_alpha
+                            # line_alpha = max(0.1, line_alpha)  # Minimum visibility
                         ax.plot([x, x], [y, y], [-self.half_domain, self.half_domain], 
-                               color=string_colors[i], alpha=0.3, linestyle='--')
+                               color=string_colors[i], alpha=line_alpha, linestyle='--')
             else:
                 # Color by z-coordinate for non-string methods
                 ax.scatter(points_xyz[:, 0], points_xyz[:, 1], points_xyz[:, 2], 
@@ -433,6 +692,7 @@ class Visualizer:
             # String positions in XY plane
             if string_xy is not None:
                 xy_np = string_xy.detach().cpu().numpy()
+                string_weights = kwargs.get('string_weights', None)
                 
                 # Create colormap based on number of points per string
                 if points_per_string_list is not None:
@@ -440,16 +700,32 @@ class Visualizer:
                     norm = Normalize(vmin=min(points_per_string_list), 
                                     vmax=max(points_per_string_list))
                     
-                    # Plot strings with size proportional to number of points
+                    # Calculate alpha values based on string weights
+                    if string_weights is not None:
+                        # Apply sigmoid to convert to [0,1] range if not already
+                        # print("String weights:", string_weights)
+                        alpha_vals = np.array([string_weights[idx] for idx in string_indices])
+                        # if np.any(alpha_vals < 0) or np.any(alpha_vals > 1):
+                        #     alpha_vals = 1 / (1 + np.exp(-alpha_vals))
+                        # alpha_vals = torch.nn.functional.softplus(torch.tensor(alpha_vals)).detach().cpu().numpy()  # Apply softplus for smoothness
+                        # Ensure minimum visibility and filter active strings
+                        alpha_vals = np.clip(alpha_vals, 0.05, 1.0)
+                        # print("Alpha values:", alpha_vals)
+                        # active_mask = np.array(points_per_string_list) > 0
+                        # alpha_vals = alpha_vals[active_mask] if len(alpha_vals) == len(points_per_string_list) else [0.8] * sum(active_mask)
+                    else:
+                        alpha_vals = 0.8
+                    
+                    # Plot strings with size proportional to number of points and alpha based on weights
                     sc = ax.scatter(
                         [xy_np[s, 0] for s in range(len(xy_np)) if points_per_string_list[s] > 0],
                         [xy_np[s, 1] for s in range(len(xy_np)) if points_per_string_list[s] > 0],
-                        s=[20 + 10 * (points_per_string_list[s] / max(points_per_string_list)) 
+                        s=[min([40, 30 * 200 / len(points_per_string_list)]) 
                           for s in range(len(xy_np)) if points_per_string_list[s] > 0],
                         c=[points_per_string_list[s] for s in range(len(xy_np)) 
                           if points_per_string_list[s] > 0],
                         cmap=cmap,
-                        alpha=0.8,
+                        alpha=alpha_vals,
                         norm=norm
                     )
                     
@@ -457,8 +733,17 @@ class Visualizer:
                     cbar = fig.colorbar(sc, ax=ax)
                     cbar.set_label('Number of points on string')
                 else:
-                    # Basic scatter plot if no point count information
-                    ax.scatter(xy_np[:, 0], xy_np[:, 1], s=30, alpha=0.8)
+                    # Basic scatter plot with alpha based on string weights
+                    if string_weights is not None:
+                        alpha_vals = np.array([string_weights[idx] for idx in string_indices])
+                        # if np.any(alpha_vals < 0) or np.any(alpha_vals > 1):
+                        #     alpha_vals = 1 / (1 + np.exp(-alpha_vals))
+                        # alpha_vals = torch.nn.functional.softplus(torch.tensor(alpha_vals)).detach().cpu().numpy()
+                        alpha_vals = np.clip(alpha_vals, 0.05, 1.0)
+                    else:
+                        alpha_vals = 0.8
+                    
+                    ax.scatter(xy_np[:, 0], xy_np[:, 1], s=min([40,30*200/len(xy_np)]), alpha=alpha_vals)
                 
                 ax.set_xlim(-self.half_domain, self.half_domain)
                 ax.set_ylim(-self.half_domain, self.half_domain)
@@ -481,8 +766,22 @@ class Visualizer:
             
         elif plot_type == self.PLOT_XY_PROJECTION:
             # XY projection with points colored by Z
+            string_weights = kwargs.get('string_weights', None)
+            
+            # Calculate alpha values based on string weights
+            if string_weights is not None and string_indices is not None:
+                alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                # Apply sigmoid to convert to [0,1] range if not already
+                # if np.any(alpha_values < 0) or np.any(alpha_values > 1):
+                    # alpha_values = 1 / (1 + np.exp(-alpha_values))
+                # alpha_values = torch.nn.functional.softplus(torch.tensor(alpha_values)).detach().cpu().numpy()  # Apply softplus for smoothness
+                # Ensure minimum visibility
+                alpha_values = np.clip(alpha_values, 0.05, 1.0)
+            else:
+                alpha_values = 0.8
+            
             sc = ax.scatter(points_xyz[:, 0], points_xyz[:, 1], 
-                         c=points_xyz[:, 2], cmap='rainbow', alpha=0.8, s=40)
+                         c=points_xyz[:, 2], cmap='rainbow', alpha=alpha_values, s=40)
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
             ax.set_title('XY Projection (colored by Z)')
@@ -540,8 +839,24 @@ class Visualizer:
                 c1 = ax.contourf(X.cpu().numpy(), Y.cpu().numpy(), signal_values, cmap='viridis', levels=20)
                 fig.colorbar(c1, ax=ax)
                 
-                # Show points near the slice
-                ax.scatter(points_xyz[:, 0], points_xyz[:, 1], c='red', s=30, alpha=0.8, edgecolor='black')
+                # Show points near the slice with alpha based on string weights
+                string_weights = kwargs.get('string_weights', None)
+                if string_weights is not None and string_indices is not None:
+                    # print("Test!")
+                    alpha_values = np.array([string_weights[idx] for idx in range(len(string_weights))])
+                    # Apply sigmoid to convert to [0,1] range if not already
+                    # if np.any(alpha_values < 0) or np.any(alpha_values > 1):
+                        # alpha_values = 1 / (1 + np.exp(-alpha_values))
+                        
+                    # alpha_values = torch.nn.functional.softplus(torch.tensor(alpha_values)).detach().cpu().numpy()  # Apply softplus for smoothness
+                    # Ensure minimum visibility
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                # print("Alpha values:", alpha_values)
+                # alpha_values = [alpha_values[i] if alpha_values[i] > 0.7 else 0.1 for i in range(len(alpha_values))]
+                
+                ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
                 
                 if not vis_all_signals:
                     ax.set_title("Sample Signal Function")
@@ -603,7 +918,22 @@ class Visualizer:
                             cmap='plasma', levels=20)
             fig.colorbar(c2, ax=ax)
             
-            ax.scatter(points_xyz[:, 0], points_xyz[:, 1], c='red', s=30, alpha=0.8, edgecolor='black')
+            # Show points with alpha based on string weights
+            string_weights = kwargs.get('string_weights', None)
+            if string_weights is not None and string_indices is not None:
+                alpha_values = np.array([string_weights[idx] for idx in range(len(string_weights))])
+                # Apply sigmoid to convert to [0,1] range if not already
+                # if np.any(alpha_values < 0) or np.any(alpha_values > 1):
+                    # alpha_values = 1 / (1 + np.exp(-alpha_values))
+                # alpha_values = torch.nn.functional.softplus(torch.tensor(alpha_values)).detach().cpu().numpy()  # Apply softplus for smoothness
+                # Ensure minimum visibility
+                alpha_values = np.clip(alpha_values, 0.05, 1.0)
+            else:
+                alpha_values = 0.8
+            
+            # alpha_values = [alpha_values[i] if alpha_values[i] > 0.7 else 0.1 for i in range(len(alpha_values))]
+                
+            ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
             
             ax.set_title(plot_title)
             ax.set_xlabel("X")
@@ -611,10 +941,6 @@ class Visualizer:
             # Set consistent domain boundaries
             ax.set_xlim(-self.half_domain, self.half_domain)
             ax.set_ylim(-self.half_domain, self.half_domain)
-        # else:
-        #     ax.text(0.5, 0.5, "Background function data not available", 
-        #             ha='center', va='center', transform=ax.transAxes)
-                
         elif plot_type == self.PLOT_PARAM_1D:
             # 1D parameter vs SNR plot
             optimize_params = kwargs.get('optimize_params', [])
@@ -656,7 +982,7 @@ class Visualizer:
                     # Get parameter values
                     param1_vals = param_values[param1].detach().cpu().numpy()
                     param2_vals = param_values[param2].detach().cpu().numpy()
-                    snr_vals = all_snr.detach().cpu().numpy()
+                    snr_vals = all_snr.detach().cpu().numpy();
                     
                     # Create a grid of unique parameter values
                     param1_unique = np.unique(param1_vals)
@@ -688,8 +1014,8 @@ class Visualizer:
             
             if string_logits is not None:
                 # Get probabilities from logits
-                import torch.nn.functional as F
-                probs = F.softmax(string_logits, dim=0).detach().cpu().numpy()
+            
+                probs = torch.nn.functional.softmax(string_logits, dim=0).detach().cpu().numpy()
                 
                 # Generate colors
                 unique_strings = len(probs)
@@ -848,18 +1174,51 @@ class Visualizer:
             
             points_np = points_3d.detach().cpu().numpy()
             title_str = "Surrogate Function"
+            
+            # Get string weights for alpha transparency
+            string_weights = kwargs.get('string_weights', None)
+            string_indices = additional_metrics.get('string_indices') if additional_metrics else None
+            
             if multi_slice:
                 title_str += " (Multi-Slice Avg)"
                 # For multi-slice, show all points projected to XY plane
-                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=30, alpha=0.8, edgecolor='black')
+                if string_weights is not None and string_indices is not None:
+                    alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                    # Apply sigmoid to convert to [0,1] range if not already
+                    # if np.any(alpha_values < 0) or np.any(alpha_values > 1):
+                        # alpha_values = 1 / (1 + np.exp(-alpha_values))
+                    # alpha_values = torch.nn.functional.softplus(torch.tensor(alpha_values)).detach().cpu().numpy()  # Apply softplus for smoothness
+                    # Ensure minimum visibility
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
             else:
                 title_str += " (Z=0)"
                 # For single-slice, show points near the z=0 slice
                 xy_points_z0 = points_np[np.abs(points_np[:, 2] - 0.0) < 0.2] # Check points close to z=0
                 if len(xy_points_z0) > 0:
-                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=30, alpha=0.8, edgecolor='black')
+                    if string_weights is not None and string_indices is not None:
+                        # Filter alpha values for points near z=0
+                        z0_mask = np.abs(points_np[:, 2] - 0.0) < 0.2
+                        alpha_values = np.array([string_weights[string_indices[i]] for i in range(len(string_indices)) if z0_mask[i]])
+                        # if np.any(alpha_values < 0) or np.any(alpha_values > 1):
+                            # alpha_values = 1 / (1 + np.exp(-alpha_values))
+                        # alpha_values = torch.nn.functional.softplus(torch.tensor(alpha_values)).detach().cpu().numpy()
+                        alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                    else:
+                        alpha_values = 0.8
+                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
                 else: # If no points are near z=0, show all points projected
-                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=30, alpha=0.8, edgecolor='black')
+                    if string_weights is not None and string_indices is not None:
+                        alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                        # if np.any(alpha_values < 0) or np.any(alpha_values > 1):
+                        #     alpha_values = 1 / (1 + np.exp(-alpha_values))
+                        # alpha_values = torch.nn.functional.softplus(torch.tensor(alpha_values)).detach().cpu().numpy()  # Apply softplus for smoothness
+                        alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                    else:
+                        alpha_values = 0.8
+                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
 
             # Add detail to title based on what was visualized
             if vis_all_surrogates and len(surrogate_funcs_list) > 1:
@@ -1061,19 +1420,846 @@ class Visualizer:
             c1 = ax.contourf(X_np, Y_np, values_to_plot, cmap=c_map, levels=20)
             fig.colorbar(c1, ax=ax)
 
+            # Calculate alpha values based on string weights
+            string_weights = kwargs.get('string_weights', None)
+            if string_weights is not None and string_indices is not None:
+                alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                # Apply sigmoid to convert to [0,1] range if not already
+                # if np.any(alpha_values < 0) or np.any(alpha_values > 1):
+                #     alpha_values = 1 / (1 + np.exp(-alpha_values))
+                # alpha_values = torch.nn.functional.softplus(torch.tensor(alpha_values)).detach().cpu().numpy()  # Apply softplus for smoothness
+                # Ensure minimum visibility
+                alpha_values = np.clip(alpha_values, 0.05, 1.0)
+            else:
+                alpha_values = 0.8
+
             if multi_slice:
-                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=30, alpha=0.8, edgecolor='black')
+                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
             else: # Single slice (Z=0.0)
                 xy_points_z0 = points_np[np.abs(points_np[:, 2] - 0.0) < 0.2] # Points near Z=0
                 if len(xy_points_z0) > 0:
-                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=30, alpha=0.8, edgecolor='black')
+                    # Get alpha values for points near Z=0
+                    z0_indices = np.where(np.abs(points_np[:, 2] - 0.0) < 0.2)[0]
+                    if isinstance(alpha_values, np.ndarray):
+                        z0_alpha_values = alpha_values[z0_indices]
+                    else:
+                        z0_alpha_values = alpha_values
+                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=z0_alpha_values, edgecolor='black')
                 else: # If no points near Z=0, show all points projected
-                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=30, alpha=0.8, edgecolor='black')
+                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
             
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
             ax.set_xlim(-self.half_domain, self.half_domain)
             ax.set_ylim(-self.half_domain, self.half_domain)
+        
+        elif plot_type == self.PLOT_STRING_WEIGHTS_SCATTER:
+            # String weights scatter plot with variable alpha
+            if string_xy is not None:
+                string_weights = kwargs.get('string_weights', None)
+                
+                if string_weights is not None:
+                    # Convert tensors to numpy arrays
+                    xy_np = string_xy.detach().cpu().numpy()
+                    weights_np = string_weights
+                    
+                    # Create alpha values: 1 if weight > 0.7, else 0.1
+                    alphas = [1 if weights_np[i] > 0.7 else 0.3 for i in range(len(weights_np))]
+                    
+                    # Create scatter plot
+                    scatter = ax.scatter(
+                        xy_np[:, 0], 
+                        xy_np[:, 1], 
+                        c=weights_np,
+                        cmap='viridis',
+                        alpha=alphas,
+                        edgecolors='k',
+                        s=min([40,30*200/len(weights_np)])
+                        )
+                    
+                    # Add colorbar
+                    cbar = fig.colorbar(scatter, ax=ax)
+                    cbar.set_label('String Weight')
+                    
+                    # Set labels and title
+                    ax.set_xlabel('X Coordinate')
+                    ax.set_ylabel('Y Coordinate')
+                    ax.set_title(f'Active strings = {len(weights_np[weights_np > 0.7])}, Total strings = {len(weights_np)}')
+                    ax.set_xlim(-self.half_domain, self.half_domain)
+                    ax.set_ylim(-self.half_domain, self.half_domain)
+                else:
+                    ax.text(0.5, 0.5, "String weights data not available", 
+                          ha='center', va='center', transform=ax.transAxes)
+            else:
+                ax.text(0.5, 0.5, "String XY data not available", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_LLR_CONTOUR:
+            # Combined LLR contour plot based on per-string values
+            llr_per_string = kwargs.get('llr_per_string', None)
+            
+            if llr_per_string is not None and string_xy is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(llr_per_string, 'detach'):
+                    llr_values_np = llr_per_string.detach().cpu().numpy()
+                else:
+                    llr_values_np = np.array(llr_per_string)
+                    
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
+                
+                # Create a grid for interpolation in XY plane
+                resolution = slice_res
+                x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Use string XY positions and their corresponding LLR values
+                string_x = string_positions_np[:, 0]
+                string_y = string_positions_np[:, 1]
+                
+                # Create grid points for interpolation
+                grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
+                
+                # Interpolate LLR values from string positions to grid
+                # Use the minimum value in the data as fill_value to preserve negative values
+                fill_val = np.min(llr_values_np) if len(llr_values_np) > 0 else np.nan
+                llr_grid = griddata(
+                    np.column_stack([string_x, string_y]), 
+                    llr_values_np, 
+                    grid_points,
+                    method='linear', 
+                    fill_value=fill_val
+                ).reshape(resolution, resolution)
+                
+                # Create the contour plot
+                c1 = ax.contourf(X_np, Y_np, llr_grid, cmap='RdYlBu_r', levels=20)
+                cbar = fig.colorbar(c1, ax=ax)
+                cbar.set_label('Log-Likelihood Ratio')
+                
+                # Overlay string positions with their LLR values as color
+                string_weights = kwargs.get('string_weights', None)
+                if string_weights is not None and string_indices is not None:
+                    alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                
+                # Show string positions colored by their LLR values
+                scatter = ax.scatter(string_x, string_y, c=llr_values_np, 
+                                   cmap='RdYlBu_r', s=min([60, 40*200/len(string_indices)]), 
+                                   alpha=alpha_values, edgecolor='black', linewidth=1,
+                                   label='String Positions')
+                
+                ax.set_title(f"Combined LLR per String (n={len(llr_values_np)} strings)")
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_xlim(-self.half_domain, self.half_domain)
+                ax.set_ylim(-self.half_domain, self.half_domain)
+                
+            else:
+                ax.text(0.5, 0.5, "LLR per string data not available\n(Requires 'llr_per_string' and 'string_xy' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_SIGNAL_LLR_CONTOUR:
+            # Signal-only LLR contour plot based on per-string values
+            signal_llr_per_string = kwargs.get('signal_llr_per_string', None)
+            
+            if signal_llr_per_string is not None and string_xy is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(signal_llr_per_string, 'detach'):
+                    signal_llr_values_np = signal_llr_per_string.detach().cpu().numpy()
+                else:
+                    signal_llr_values_np = np.array(signal_llr_per_string)
+                    
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
+                
+                # Create a grid for interpolation in XY plane
+                resolution = slice_res
+                x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Use string XY positions and their corresponding signal LLR values
+                string_x = string_positions_np[:, 0]
+                string_y = string_positions_np[:, 1]
+                
+                # Create grid points for interpolation
+                grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
+                
+                # Interpolate signal LLR values from string positions to grid
+                fill_val = np.min(signal_llr_values_np) if len(signal_llr_values_np) > 0 else np.nan
+                signal_llr_grid = griddata(
+                    np.column_stack([string_x, string_y]), 
+                    signal_llr_values_np, 
+                    grid_points,
+                    method='linear', 
+                    fill_value=fill_val
+                ).reshape(resolution, resolution)
+                
+                # Create the contour plot with signal-appropriate colormap
+                c1 = ax.contourf(X_np, Y_np, signal_llr_grid, cmap='Reds', levels=20)
+                cbar = fig.colorbar(c1, ax=ax)
+                cbar.set_label('Signal Log-Likelihood Ratio')
+                
+                # Overlay string positions with their signal LLR values as color
+                string_weights = kwargs.get('string_weights', None)
+                if string_weights is not None and string_indices is not None:
+                    alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                
+                # Show string positions colored by their signal LLR values
+                scatter = ax.scatter(string_x, string_y, c=signal_llr_values_np, 
+                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]), 
+                                   alpha=alpha_values, edgecolor='black', linewidth=1,
+                                   label='String Positions')
+                
+                ax.set_title(f"Pred. Signal LLR per String")
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_xlim(-self.half_domain, self.half_domain)
+                ax.set_ylim(-self.half_domain, self.half_domain)
+                
+            else:
+                ax.text(0.5, 0.5, "Signal LLR per string data not available\n(Requires 'signal_llr_per_string' and 'string_xy' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_TRUE_SIGNAL_LLR_CONTOUR:
+            # Signal-only LLR contour plot based on per-string values
+            signal_llr_per_string = kwargs.get('true_signal_llr_per_string', None)
+            
+            if signal_llr_per_string is not None and string_xy is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(signal_llr_per_string, 'detach'):
+                    signal_llr_values_np = signal_llr_per_string.detach().cpu().numpy()
+                else:
+                    signal_llr_values_np = np.array(signal_llr_per_string)
+                    
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
+                
+                # Create a grid for interpolation in XY plane
+                resolution = slice_res
+                x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Use string XY positions and their corresponding signal LLR values
+                string_x = string_positions_np[:, 0]
+                string_y = string_positions_np[:, 1]
+                
+                # Create grid points for interpolation
+                grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
+                
+                # Interpolate signal LLR values from string positions to grid
+                fill_val = np.min(signal_llr_values_np) if len(signal_llr_values_np) > 0 else np.nan
+                signal_llr_grid = griddata(
+                    np.column_stack([string_x, string_y]), 
+                    signal_llr_values_np, 
+                    grid_points,
+                    method='linear', 
+                    fill_value=fill_val
+                ).reshape(resolution, resolution)
+                
+                # Create the contour plot with signal-appropriate colormap
+                c1 = ax.contourf(X_np, Y_np, signal_llr_grid, cmap='Reds', levels=20)
+                cbar = fig.colorbar(c1, ax=ax)
+                cbar.set_label('Signal Log-Likelihood Ratio')
+                
+                # Overlay string positions with their signal LLR values as color
+                string_weights = kwargs.get('string_weights', None)
+                if string_weights is not None and string_indices is not None:
+                    alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                
+                # Show string positions colored by their signal LLR values
+                scatter = ax.scatter(string_x, string_y, c=signal_llr_values_np, 
+                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]), 
+                                   alpha=alpha_values, edgecolor='black', linewidth=1,
+                                   label='String Positions')
+                
+                ax.set_title(f"True Signal LLR per String")
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_xlim(-self.half_domain, self.half_domain)
+                ax.set_ylim(-self.half_domain, self.half_domain)
+                
+            else:
+                ax.text(0.5, 0.5, "True Signal LLR per string data not available\n(Requires 'true_signal_llr_per_string' and 'string_xy' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_BACKGROUND_LLR_CONTOUR:
+            # Background-only LLR contour plot based on per-string values
+            background_llr_per_string = kwargs.get('background_llr_per_string', None)
+            
+            if background_llr_per_string is not None and string_xy is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(background_llr_per_string, 'detach'):
+                    background_llr_values_np = background_llr_per_string.detach().cpu().numpy()
+                else:
+                    background_llr_values_np = np.array(background_llr_per_string)
+                    
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
+                
+                # Create a grid for interpolation in XY plane
+                resolution = slice_res
+                x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Use string XY positions and their corresponding background LLR values
+                string_x = string_positions_np[:, 0]
+                string_y = string_positions_np[:, 1]
+                
+                # Create grid points for interpolation
+                grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
+                
+                # Interpolate background LLR values from string positions to grid
+                fill_val = np.min(background_llr_values_np) if len(background_llr_values_np) > 0 else np.nan
+                background_llr_grid = griddata(
+                    np.column_stack([string_x, string_y]), 
+                    background_llr_values_np, 
+                    grid_points,
+                    method='linear', 
+                    fill_value=fill_val
+                ).reshape(resolution, resolution)
+                
+                # Create the contour plot with background-appropriate colormap
+                c1 = ax.contourf(X_np, Y_np, background_llr_grid, cmap='Blues', levels=20)
+                cbar = fig.colorbar(c1, ax=ax)
+                cbar.set_label('Background Log-Likelihood Ratio')
+                
+                # Overlay string positions with their background LLR values as color
+                string_weights = kwargs.get('string_weights', None)
+                if string_weights is not None and string_indices is not None:
+                    alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                
+                # Show string positions colored by their background LLR values
+                scatter = ax.scatter(string_x, string_y, c=background_llr_values_np, 
+                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]), 
+                                   alpha=alpha_values, edgecolor='black', linewidth=1,
+                                   label='String Positions')
+                
+                ax.set_title(f"Pred. Background LLR per String")
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_xlim(-self.half_domain, self.half_domain)
+                ax.set_ylim(-self.half_domain, self.half_domain)
+                
+            else:
+                ax.text(0.5, 0.5, "Background LLR per string data not available\n(Requires 'background_llr_per_string' and 'string_xy' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_TRUE_BACKGROUND_LLR_CONTOUR:
+            # Background-only LLR contour plot based on per-string values
+            background_llr_per_string = kwargs.get('true_background_llr_per_string', None)
+            
+            if background_llr_per_string is not None and string_xy is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(background_llr_per_string, 'detach'):
+                    background_llr_values_np = background_llr_per_string.detach().cpu().numpy()
+                else:
+                    background_llr_values_np = np.array(background_llr_per_string)
+                    
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
+                
+                # Create a grid for interpolation in XY plane
+                resolution = slice_res
+                x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Use string XY positions and their corresponding background LLR values
+                string_x = string_positions_np[:, 0]
+                string_y = string_positions_np[:, 1]
+                
+                # Create grid points for interpolation
+                grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
+                
+                # Interpolate background LLR values from string positions to grid
+                fill_val = np.min(background_llr_values_np) if len(background_llr_values_np) > 0 else np.nan
+                background_llr_grid = griddata(
+                    np.column_stack([string_x, string_y]), 
+                    background_llr_values_np, 
+                    grid_points,
+                    method='linear', 
+                    fill_value=fill_val
+                ).reshape(resolution, resolution)
+                
+                # Create the contour plot with background-appropriate colormap
+                c1 = ax.contourf(X_np, Y_np, background_llr_grid, cmap='Blues', levels=20)
+                cbar = fig.colorbar(c1, ax=ax)
+                cbar.set_label('Background Log-Likelihood Ratio')
+                
+                # Overlay string positions with their background LLR values as color
+                string_weights = kwargs.get('string_weights', None)
+                if string_weights is not None and string_indices is not None:
+                    alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                
+                # Show string positions colored by their background LLR values
+                scatter = ax.scatter(string_x, string_y, c=background_llr_values_np, 
+                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]), 
+                                   alpha=alpha_values, edgecolor='black', linewidth=1,
+                                   label='String Positions')
+                
+                ax.set_title(f"True Background LLR per String")
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_xlim(-self.half_domain, self.half_domain)
+                ax.set_ylim(-self.half_domain, self.half_domain)
+                
+            else:
+                ax.text(0.5, 0.5, "True Background LLR per string data not available\n(Requires 'true_background_llr_per_string' and 'string_xy' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_LLR_HISTOGRAM:
+            # LLR density histogram plot with signal and background distributions
+            signal_llr_per_string = kwargs.get('signal_llr_per_string', None)/kwargs.get('points_per_string', 1)
+            background_llr_per_string = kwargs.get('background_llr_per_string', None)/kwargs.get('points_per_string', 1)
+            string_weights = kwargs.get('string_weights', None)
+            
+            if signal_llr_per_string is not None and background_llr_per_string is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(signal_llr_per_string, 'detach'):
+                    signal_llr_values_np = signal_llr_per_string.detach().cpu().numpy()
+                else:
+                    signal_llr_values_np = np.array(signal_llr_per_string)
+                    
+                if hasattr(background_llr_per_string, 'detach'):
+                    background_llr_values_np = background_llr_per_string.detach().cpu().numpy()
+                else:
+                    background_llr_values_np = np.array(background_llr_per_string)
+                
+                # Apply string weights if available
+                if string_weights is not None:
+                    if hasattr(string_weights, 'detach'):
+                        weights_np = string_weights.detach().cpu().numpy()
+                    else:
+                        weights_np = np.array(string_weights)
+                    
+                    # Ensure weights are the same length as LLR values
+                    if len(weights_np) == len(signal_llr_values_np) == len(background_llr_values_np):
+                        # Apply weights to the LLR values for histogram density
+                        signal_weights = weights_np
+                        background_weights = weights_np
+                    else:
+                        print(f"Warning: String weights length ({len(weights_np)}) doesn't match LLR values length ({len(signal_llr_values_np)}). Using uniform weights.")
+                        signal_weights = np.ones_like(signal_llr_values_np)
+                        background_weights = np.ones_like(background_llr_values_np)
+                else:
+                    signal_weights = np.ones_like(signal_llr_values_np)
+                    background_weights = np.ones_like(background_llr_values_np)
+                
+                # Determine histogram range to include both distributions
+                all_llr_values = np.concatenate([signal_llr_values_np, background_llr_values_np])
+                hist_range = (np.min(all_llr_values) - 0.1 * np.abs(np.min(all_llr_values)), 
+                             np.max(all_llr_values) + 0.1 * np.abs(np.max(all_llr_values)))
+                
+                # Create histograms with weights
+                bins = 30
+                
+                # Signal LLR histogram
+                ax.hist(signal_llr_values_np, bins=bins, range=hist_range, 
+                       weights=signal_weights, alpha=0.7, color='red', 
+                       label=f'Signal LLR (n={len(signal_llr_values_np)})', 
+                       density=True, edgecolor='darkred', linewidth=0.5)
+                
+                # Background LLR histogram
+                ax.hist(background_llr_values_np, bins=bins, range=hist_range, 
+                       weights=background_weights, alpha=0.7, color='blue', 
+                       label=f'Background LLR (n={len(background_llr_values_np)})', 
+                       density=True, edgecolor='darkblue', linewidth=0.5)
+                
+                # Calculate weighted means
+                signal_mean = np.average(signal_llr_values_np, weights=signal_weights)
+                background_mean = np.average(background_llr_values_np, weights=background_weights)
+                
+                # Plot mean lines
+                ax.axvline(signal_mean, color='darkred', linestyle='--', linewidth=2, 
+                        #   label=f'Signal Mean: {signal_mean:.3f}'
+                          )
+                ax.axvline(background_mean, color='darkblue', linestyle='--', linewidth=2, 
+                        #   label=f'Background Mean: {background_mean:.3f}'
+                          )
+                
+                # Calculate separation metrics
+                separation = abs(signal_mean - background_mean)
+                
+                # Set labels and title
+                ax.set_xlabel('Log-Likelihood Ratio')
+                ax.set_ylabel('Density')
+                ax.set_title(f'LLR Distribution Comparison')
+                ax.legend(fontsize='small')
+                ax.grid(True, alpha=0.3)
+                
+                # Add text box with statistics
+                stats_text = f'Signal Strings: {np.sum(signal_weights > 0.1):.0f}/{len(signal_weights)}\n'
+                stats_text += f'Background Strings: {np.sum(background_weights > 0.1):.0f}/{len(background_weights)}\n'
+                if string_weights is not None:
+                    active_strings = np.sum(weights_np > 0.7)
+                    stats_text += f'Active Strings: {active_strings}/{len(weights_np)}'
+                
+                # ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                #        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+                #        fontsize='small')
+                
+            elif signal_llr_per_string is not None or background_llr_per_string is not None:
+                # Only one type of LLR data available
+                available_data = signal_llr_per_string if signal_llr_per_string is not None else background_llr_per_string
+                data_type = "Signal" if signal_llr_per_string is not None else "Background"
+                color = 'red' if signal_llr_per_string is not None else 'blue'
+                
+                # Convert to numpy array
+                if hasattr(available_data, 'detach'):
+                    llr_values_np = available_data.detach().cpu().numpy()
+                else:
+                    llr_values_np = np.array(available_data)
+                
+                # Apply string weights if available
+                if string_weights is not None:
+                    if hasattr(string_weights, 'detach'):
+                        weights_np = string_weights.detach().cpu().numpy()
+                    else:
+                        weights_np = np.array(string_weights)
+                    
+                    if len(weights_np) == len(llr_values_np):
+                        llr_weights = weights_np
+                    else:
+                        llr_weights = np.ones_like(llr_values_np)
+                else:
+                    llr_weights = np.ones_like(llr_values_np)
+                
+                # Create histogram
+                bins = 30
+                ax.hist(llr_values_np, bins=bins, weights=llr_weights, alpha=0.7, color=color, 
+                       label=f'{data_type} LLR (n={len(llr_values_np)})', 
+                       density=True, edgecolor='black', linewidth=0.5)
+                
+                # Calculate and plot weighted mean
+                weighted_mean = np.average(llr_values_np, weights=llr_weights)
+                ax.axvline(weighted_mean, color='black', linestyle='--', linewidth=2, 
+                          label=f'{data_type} Mean: {weighted_mean:.3f}')
+                
+                ax.set_xlabel('Log-Likelihood Ratio')
+                ax.set_ylabel('Density')
+                ax.set_title(f'{data_type} LLR Distribution')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                
+            else:
+                ax.text(0.5, 0.5, "LLR histogram data not available\n(Requires 'signal_llr_per_string' and/or 'background_llr_per_string' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_SIGNAL_LIGHT_YIELD_CONTOUR:
+            # Signal light yield contour plot based on per-string values
+            signal_light_yield_per_string = kwargs.get('signal_light_yield_per_string', None)
+            
+            if signal_light_yield_per_string is not None and string_xy is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(signal_light_yield_per_string, 'detach'):
+                    signal_light_yield_values_np = signal_light_yield_per_string.detach().cpu().numpy()
+                else:
+                    signal_light_yield_values_np = np.array(signal_light_yield_per_string)
+                    
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
+                
+                # Create a grid for interpolation in XY plane
+                resolution = slice_res
+                x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Use string XY positions and their corresponding signal light yield values
+                string_x = string_positions_np[:, 0]
+                string_y = string_positions_np[:, 1]
+                
+                # Create grid points for interpolation
+                grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
+                
+                # Interpolate signal light yield values from string positions to grid
+                fill_val = np.min(signal_light_yield_values_np) if len(signal_light_yield_values_np) > 0 else np.nan
+                signal_light_yield_grid = griddata(
+                    np.column_stack([string_x, string_y]), 
+                    signal_light_yield_values_np, 
+                    grid_points,
+                    method='linear', 
+                    fill_value=fill_val
+                ).reshape(resolution, resolution)
+                
+                # Create the contour plot with signal-appropriate colormap
+                c1 = ax.contourf(X_np, Y_np, signal_light_yield_grid, cmap='Oranges', levels=20)
+                cbar = fig.colorbar(c1, ax=ax)
+                cbar.set_label('Signal Light Yield')
+                
+                # Overlay string positions with their signal light yield values as color
+                string_weights = kwargs.get('string_weights', None)
+                if string_weights is not None and string_indices is not None:
+                    alpha_values = np.array([string_weights[idx] for idx in range(len(string_weights))])
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                
+                # Show string positions colored by their signal light yield values
+                scatter = ax.scatter(string_x, string_y, c=signal_light_yield_values_np, 
+                                   cmap='Oranges', s=min([60, 40*200/len(string_indices)]), 
+                                   alpha=alpha_values, edgecolor='black', linewidth=1,
+                                   label='String Positions')
+                
+                ax.set_title(f"Signal Light Yield per String")
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_xlim(-self.half_domain, self.half_domain)
+                ax.set_ylim(-self.half_domain, self.half_domain)
+                
+            else:
+                ax.text(0.5, 0.5, "Signal light yield per string data not available\n(Requires 'signal_light_yield_per_string' and 'string_xy' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_SNR_CONTOUR:
+            # SNR contour plot based on per-string values
+            snr_per_string = kwargs.get('snr_per_string', None)
+            
+            if snr_per_string is not None and string_xy is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(snr_per_string, 'detach'):
+                    snr_values_np = snr_per_string.detach().cpu().numpy()
+                else:
+                    snr_values_np = np.array(snr_per_string)
+                    
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
+                
+                # Create a grid for interpolation in XY plane
+                resolution = slice_res
+                x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Use string XY positions and their corresponding SNR values
+                string_x = string_positions_np[:, 0]
+                string_y = string_positions_np[:, 1]
+                
+                # Create grid points for interpolation
+                grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
+                
+                # Interpolate SNR values from string positions to grid
+                # Use the minimum value in the data as fill_value to preserve negative values
+                fill_val = np.min(snr_values_np) if len(snr_values_np) > 0 else np.nan
+                snr_grid = griddata(
+                    np.column_stack([string_x, string_y]), 
+                    snr_values_np, 
+                    grid_points,
+                    method='linear', 
+                    fill_value=fill_val
+                ).reshape(resolution, resolution)
+                
+                # Create the contour plot with a colormap suitable for SNR (higher values = better)
+                c1 = ax.contourf(X_np, Y_np, snr_grid, cmap='viridis', levels=20)
+                cbar = fig.colorbar(c1, ax=ax)
+                cbar.set_label('Signal-to-Noise Ratio')
+                
+                # Overlay string positions with their SNR values as color
+                string_weights = kwargs.get('string_weights', None)
+                if string_weights is not None and string_indices is not None:
+                    alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                    alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                else:
+                    alpha_values = 0.8
+                
+                # Show string positions colored by their SNR values
+                scatter = ax.scatter(string_x, string_y, c=snr_values_np, 
+                                   cmap='viridis', s=min([60, 40*200/len(string_indices)]), 
+                                   alpha=alpha_values, edgecolor='black', linewidth=1,
+                                   label='String Positions')
+                
+                ax.set_title(f"SNR per String (n={len(snr_values_np)} strings)")
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_xlim(-self.half_domain, self.half_domain)
+                ax.set_ylim(-self.half_domain, self.half_domain)
+                
+            else:
+                ax.text(0.5, 0.5, "SNR per string data not available\n(Requires 'snr_per_string' and 'string_xy' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_FISHER_INFO_LOGDET:
+            # Log determinant of Fisher Information matrix
+            fisher_info_per_string = kwargs.get('fisher_info_per_string', None)
+            string_weights = kwargs.get('string_weights', None)
+            
+            if fisher_info_per_string is not None and string_xy is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
+                
+                # Compute Fisher Information matrix per string and its log determinant
+                fisher_logdet_values = []
+                for s_idx in range(len(fisher_info_per_string)):
+                    fisher_matrix = fisher_info_per_string[s_idx]
+                    # if hasattr(fisher_matrix, 'detach'):
+                    #     fisher_matrix = fisher_matrix.detach().cpu().numpy()
+                    
+                    # Add regularization for numerical stability
+                    reg_matrix = torch.eye(fisher_matrix.shape[0]) * 1e-6
+                    regularized_fisher = fisher_matrix + reg_matrix
+                    fisher_logdet = torch.logdet(regularized_fisher).detach().cpu().numpy()
+                    fisher_logdet_values.append(fisher_logdet)
+                    # Compute log determinant
+                #     try:
+                #         # Compute eigenvalues to check positive definiteness
+                #         eigenvals = np.linalg.eigvals(regularized_fisher)
+                #         if np.all(eigenvals > 0):
+                #             logdet = np.log(np.linalg.det(regularized_fisher))
+                #         else:
+                #             # Use pseudodeterminant for non-positive definite matrices
+                #             eigenvals_pos = eigenvals[eigenvals > 1e-12]
+                #             logdet = np.sum(np.log(eigenvals_pos)) if len(eigenvals_pos) > 0 else -np.inf
+                #         fisher_logdet_values.append(logdet)
+                #     except:
+                #         fisher_logdet_values.append(-np.inf)
+                
+                fisher_logdet_values = np.array(fisher_logdet_values)
+                
+                # Create a grid for interpolation in XY plane
+                resolution = slice_res
+                x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Use string XY positions and their corresponding Fisher log-det values
+                string_x = string_positions_np[:, 0]
+                string_y = string_positions_np[:, 1]
+                
+                # Create grid points for interpolation
+                grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
+                
+                # Use safe griddata interpolation
+                points_xy = np.column_stack([string_x, string_y])
+                fill_val = np.min(fisher_logdet_values[np.isfinite(fisher_logdet_values)]) if np.any(np.isfinite(fisher_logdet_values)) else np.nan
+                
+                success, fisher_logdet_grid, error_msg = self._safe_griddata_interpolation(
+                    points_xy, fisher_logdet_values, grid_points, resolution, 
+                    method='linear', fill_value=fill_val
+                )
+                
+                if success:
+                    # Create the contour plot
+                    c1 = ax.contourf(X_np, Y_np, fisher_logdet_grid, cmap='plasma', levels=20)
+                    cbar = fig.colorbar(c1, ax=ax)
+                    cbar.set_label('log(det(Fisher Information Matrix))')
+                    
+                    # Overlay string positions
+                    if string_weights is not None:
+                        alpha_values = np.array([string_weights[idx] for idx in range(len(string_weights))])
+                        alpha_values = np.clip(alpha_values, 0.05, 1.0)
+                    else:
+                        alpha_values = 0.8
+                    
+                    scatter = ax.scatter(string_x, string_y, c=fisher_logdet_values, 
+                                       cmap='plasma', s=min([60, 40*200/len(string_x)]), 
+                                       alpha=alpha_values, edgecolor='black', linewidth=1)
+                    
+                    ax.set_title(f"Fisher Info Log-Determinant per String")
+                else:
+                    # Fallback based on error type
+                    finite_mask = np.isfinite(fisher_logdet_values)
+                    num_finite = np.sum(finite_mask)
+                    if num_finite > 0:
+                        ax.scatter(string_x[finite_mask], string_y[finite_mask], 
+                                 c=fisher_logdet_values[finite_mask], cmap='plasma', 
+                                 s=min([60, 40*200/len(string_x)]), alpha=0.8, 
+                                 edgecolor='black', linewidth=1)
+                        ax.set_title(f"Fisher Info Determinant (scatter only, {num_finite} finite values)")
+                        ax.text(0.5, 0.02, f"Interpolation failed: {error_msg}", 
+                              ha='center', va='bottom', transform=ax.transAxes, fontsize=8)
+                    else:
+                        ax.text(0.5, 0.5, "All Fisher Information matrices are singular", 
+                              ha='center', va='center', transform=ax.transAxes)
+                
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_xlim(-self.half_domain, self.half_domain)
+                ax.set_ylim(-self.half_domain, self.half_domain)
+                
+            else:
+                ax.text(0.5, 0.5, "Fisher Information data not available\n(Requires 'fisher_info_per_string' and 'string_xy' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_ANGULAR_RESOLUTION:
+            # Angular resolution history from Fisher Information matrix using Cramér-Rao bound
+            angular_resolution_history = additional_metrics.get('angular_resolution_history', None) if additional_metrics else None
+            
+            if angular_resolution_history is not None:
+                # Plot the history of weighted total angular resolution
+                ax.plot(angular_resolution_history, color='blue', linewidth=2, markersize=4)
+                ax.set_title('Angular Resolution History')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Angular Resolution (degrees)')
+                ax.grid(True, alpha=0.3)
+                
+                # # Add current value annotation
+                # if len(angular_resolution_history) > 0:
+                #     current_val = angular_resolution_history[-1]
+                #     ax.annotate(f'Current: {current_val:.2f}°', 
+                #               xy=(len(angular_resolution_history)-1, current_val),
+                #               xytext=(10, 10), textcoords='offset points',
+                #               fontsize=10, ha='left')
+            else:
+                ax.text(0.5, 0.5, "Angular resolution history not available\n(Requires 'angular_resolution_history' in additional_metrics)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_ENERGY_RESOLUTION:
+            # Energy resolution history from Fisher Information matrix using Cramér-Rao bound
+            energy_resolution_history = additional_metrics.get('energy_resolution_history', None) if additional_metrics else None
+            
+            if energy_resolution_history is not None:
+                # Plot the history of weighted total energy resolution
+                ax.plot(energy_resolution_history, color='red', linewidth=2, markersize=4)
+                ax.set_title('Weighted Total Energy Resolution History')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Energy Resolution (relative uncertainty)')
+                ax.grid(True, alpha=0.3)
+                
+                # Add current value annotation
+                # if len(energy_resolution_history) > 0:
+                #     current_val = energy_resolution_history[-1]
+                #     ax.annotate(f'Current: {current_val:.4f}', 
+                #               xy=(len(energy_resolution_history)-1, current_val),
+                #               xytext=(10, 10), textcoords='offset points',
+                #               fontsize=10, ha='left')
+            else:
+                ax.text(0.5, 0.5, "Energy resolution history not available\n(Requires 'energy_resolution_history' in additional_metrics)", 
+                      ha='center', va='center', transform=ax.transAxes)
         
         else:
             # Unknown plot type
@@ -1148,7 +2334,7 @@ class Visualizer:
         )
     
     def create_interactive_3d_plot(self, points_3d, string_indices=None, 
-                                 points_per_string_list=None, string_xy=None):
+                                 points_per_string_list=None, string_xy=None, string_weights=None):
         """
         Create an interactive 3D plot with Plotly.
         
@@ -1201,9 +2387,17 @@ class Visualizer:
                 # Skip empty strings
                 if points_per_string_list[s] == 0:
                     continue
-                    
+                
                 # Get points for this string
-                mask = np.array(string_indices) == s
+                # mask = np.array(string_indices) == s
+                # if len(mask) != len(points_np):
+                #     full_mask = np.zeros(len(points_np), dtype=bool)
+                #     for k, pps in enumerate(points_per_string_list):
+                #         if pps > 0: # set bool values to the mask value at s
+                #            full_mask[k*pps:(k+1)*pps] = mask[s]
+                              
+                #     mask = full_mask  
+                mask = (points_np[:,0] == string_xy[s][0]) & (points_np[:,1] == string_xy[s][1]) if string_xy is not None else np.array([True]*len(points_np))     
                 string_points = points_np[mask]
                 
                 # Add vertical line for string if string_xy is provided
@@ -1229,24 +2423,26 @@ class Visualizer:
                     hovertext = [f"String {s+1}: {points_per_string_list[s]} points"]
                     
                     # Add string position markers
-                    fig.add_trace(
-                        go.Scatter3d(
-                            x=[x_pos],
-                            y=[y_pos],
-                            z=[-self.half_domain],  # Place at bottom of domain
-                            mode='markers',
-                            marker=dict(
-                                size=8,
-                                color=colormap_hex[s],
-                                symbol='diamond',
-                                opacity=0.8
-                            ),
-                            name=f'String {s} ({points_per_string_list[s]} pts)',
-                            text=hovertext,
-                            hoverinfo='text'
-                        )
-                    )
-                
+                    # fig.add_trace(
+                    #     go.Scatter3d(
+                    #         x=[x_pos],
+                    #         y=[y_pos],
+                    #         z=[-self.half_domain],  # Place at bottom of domain
+                    #         mode='markers',
+                    #         marker=dict(
+                    #             size=8,
+                    #             color=colormap_hex[s],
+                    #             symbol='diamond',
+                    #             opacity=0.8
+                    #         ),
+                    #         name=f'String {s} ({points_per_string_list[s]} pts)',
+                    #         text=hovertext,
+                    #         hoverinfo='text'
+                    #     )
+                    # )
+                if string_weights is not None:
+                    # Use string weights for alpha transparency
+                    alpha_value = 0.9 if string_weights[s] > 0.7 else 0.2
                 # Add points with same colors as in the visualization
                 fig.add_trace(
                     go.Scatter3d(
@@ -1257,7 +2453,7 @@ class Visualizer:
                         marker=dict(
                             size=6,
                             color=colormap_hex[s],
-                            opacity=0.9,
+                            opacity=alpha_value if string_weights is not None else 0.9,
                             symbol='circle'
                         ),
                         name=f'String {s} ({points_per_string_list[s]} pts)'
@@ -1312,3 +2508,121 @@ class Visualizer:
         )
         
         return fig
+    
+    def _compile_gif_from_images(self, gif_filename: str, gif_fps: int = 2) -> bool:
+        """
+        Compile a GIF from saved image files.
+        
+        Parameters:
+        -----------
+        gif_filename : str
+            Output filename for the GIF.
+        gif_fps : int
+            Frames per second for the GIF.
+            
+        Returns:
+        --------
+        bool
+            True if successful, False otherwise.
+        """
+        if not self.gif_image_paths:
+            print("No images available to compile into GIF.")
+            return False
+            
+        try:
+            # Sort image paths numerically by extracting frame numbers
+            def extract_frame_number(path):
+                """Extract frame number from filename for proper numerical sorting."""
+                filename = os.path.basename(path)
+                # Look for pattern like "frame_0001.png" or "frame_1.png"
+                match = re.search(r'frame_(\d+)', filename)
+                if match:
+                    return int(match.group(1))
+                else:
+                    # Fallback to alphabetical sorting if no number found
+                    return float('inf')
+            
+            # Sort paths by frame number
+            sorted_paths = sorted(self.gif_image_paths, key=extract_frame_number)
+            
+            # Load images in order and create GIF
+            images = []
+            for image_path in sorted_paths:
+                if os.path.exists(image_path):
+                    images.append(imageio.v3.imread(image_path))
+                else:
+                    print(f"Warning: Image file not found: {image_path}")
+            
+            if images:
+                imageio.mimsave(gif_filename, images, fps=gif_fps)
+                print(f"Successfully compiled GIF '{gif_filename}' with {len(images)} frames.")
+                return True
+            else:
+                print("No valid images found to compile into GIF.")
+                return False
+                
+        except Exception as e:
+            print(f"Error compiling GIF: {e}")
+            return False
+    
+    def finalize_gif(self, gif_filename: str = "optimization_progress.gif", 
+                     gif_fps: int = 2, cleanup_images: bool = True) -> bool:
+        """
+        Finalize GIF creation by compiling from saved images and optionally cleaning up.
+        
+        Parameters:
+        -----------
+        gif_filename : str
+            Output filename for the GIF.
+        gif_fps : int
+            Frames per second for the GIF.
+        cleanup_images : bool
+            If True, remove temporary image files after creating GIF.
+            
+        Returns:
+        --------
+        bool
+            True if successful, False otherwise.
+        """
+        success = False
+        
+        # Compile GIF from saved images
+        if self.gif_image_paths:
+            success = self._compile_gif_from_images(gif_filename, gif_fps)
+        elif self.gif_frames:
+            # Fallback: compile from memory frames if no saved images
+            try:
+                imageio.mimsave(gif_filename, self.gif_frames, fps=gif_fps)
+                print(f"Successfully compiled GIF '{gif_filename}' from {len(self.gif_frames)} memory frames.")
+                success = True
+            except Exception as e:
+                print(f"Error compiling GIF from memory frames: {e}")
+        else:
+            print("No frames available to create GIF.")
+        
+        # Clean up temporary files if requested
+        if cleanup_images and success:
+            self.cleanup_gif_temp_files()
+            
+        return success
+    
+    def cleanup_gif_temp_files(self) -> None:
+        """
+        Clean up temporary files and directories created for GIF generation.
+        """
+        # Clear image paths list
+        self.gif_image_paths.clear()
+        
+        # Clear memory frames
+        self.gif_frames.clear()
+        
+        # Remove temporary directory and all its contents
+        if self.gif_temp_dir and os.path.exists(self.gif_temp_dir):
+            try:
+                shutil.rmtree(self.gif_temp_dir)
+                print(f"Cleaned up temporary directory: {self.gif_temp_dir}")
+                self.gif_temp_dir = None
+            except Exception as e:
+                print(f"Error cleaning up temporary directory: {e}")
+        
+        print("GIF temporary files cleanup completed.")

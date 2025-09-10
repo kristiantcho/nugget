@@ -44,7 +44,8 @@ class Geometry:
     
     def create_uniform_hexagonal_grid(self, n_points=50):
         """
-        Create a uniform hexagonal lattice of points (for 2D only).
+        Create a uniform hexagonal lattice of points starting from center and building outward.
+        Starts with one point in the center, then adds points in concentric hexagons clockwise.
         
         Parameters:
         -----------
@@ -58,71 +59,110 @@ class Geometry:
         """
         if self.dim != 2:
             raise ValueError("Hexagonal grid is only available for 2D")
+        
+        # Calculate optimal spacing to fit the desired number of points within domain
+        # For a hexagonal grid, the number of points in rings 0 to r is: 1 + 3*r*(r+1)
+        # We need to find the minimum spacing such that all points fit within the domain
+        
+        def calculate_max_rings(spacing):
+            """Calculate how many complete rings can fit within the domain"""
+            max_radius = self.half_domain / spacing
+            return int(max_radius)
+        
+        def points_in_rings(num_rings):
+            """Calculate total points in rings 0 to num_rings-1"""
+            if num_rings <= 0:
+                return 0
+            return 1 + 3 * (num_rings - 1) * num_rings
+        
+        # Binary search to find optimal spacing
+        min_spacing = 0.0
+        max_spacing = self.domain_size - self.domain_size/10
+        
+        # Find the largest spacing that allows at least n_points
+        optimal_spacing = max_spacing
+        for _ in range(100):  # Binary search iterations
+            mid_spacing = (min_spacing + max_spacing) / 2
+            max_rings = calculate_max_rings(mid_spacing)
+            total_possible_points = points_in_rings(max_rings + 1)  # +1 because we can have partial rings
             
-        # Calculate spacing based on number of points
-        area = self.domain_size * self.domain_size
-        area_per_point = area / n_points
-        
-        # Spacing for a regular hexagonal grid
-        horizontal_spacing = np.sqrt(2 * area_per_point / np.sqrt(3))
-        vertical_spacing = horizontal_spacing * np.sqrt(3) / 2
-        
-        # Generate more points than needed to ensure complete coverage
-        x_count = int(np.ceil(self.domain_size / horizontal_spacing)) + 3
-        y_count = int(np.ceil(self.domain_size / vertical_spacing)) + 3
-        
-        # Generate initial grid with hexagonal pattern
-        all_points = []
-        
-        # Calculate center offset to perfectly center the entire grid
-        center_x_offset = (x_count % 2) * horizontal_spacing / 2
-        center_y_offset = (y_count % 2) * vertical_spacing / 2
-        
-        for j in range(-y_count, y_count + 1):
-            # Hexagonal pattern: offset every other row
-            offset = horizontal_spacing / 2 if j % 2 else 0
-            
-            for i in range(-x_count, x_count + 1):
-                x = i * horizontal_spacing + offset - center_x_offset
-                y = j * vertical_spacing - center_y_offset
+            if total_possible_points >= n_points:
+                optimal_spacing = mid_spacing
+                min_spacing = mid_spacing
+            else:
+                max_spacing = mid_spacing
                 
-                # Check if within domain bounds
-                if -self.half_domain <= x <= self.half_domain and -self.half_domain <= y <= self.half_domain:
-                    all_points.append([x, y])
+            if max_spacing - min_spacing < 1e-6:
+                break
         
-        # If we have too many points, select them to ensure uniform distribution
-        if len(all_points) > n_points:
-            # Convert to numpy array for processing
-            points_array = np.array(all_points)
-            
-            # First compute pairwise distances between all candidate points
-            distances = squareform(pdist(points_array))
-            
-            # Start with the point closest to the center
-            center_distances = np.sum(points_array**2, axis=1)
-            selected_indices = [np.argmin(center_distances)]  # Start with center point
-            
-            # Iteratively add the point that is farthest from all previously selected points
-            while len(selected_indices) < n_points:
-                # Calculate minimum distance from each remaining point to any selected point
-                mask = np.ones(len(all_points), dtype=bool)
-                mask[selected_indices] = False
+        # Generate points starting from center
+        points = []
+        spacing = optimal_spacing
+        
+        # Add center point
+        points.append([0.0, 0.0])
+        
+        if n_points == 1:
+            hex_points = torch.tensor(points[:n_points], dtype=torch.float32, device=self.device)
+            return hex_points
+        
+        # Generate concentric hexagonal rings
+        ring = 1
+        while len(points) < n_points:
+            # Check if this ring would fit within domain
+            # For hexagonal lattice, the distance from center to corner is ring * spacing
+            max_distance = ring * spacing - self.half_domain/10
+            if max_distance > self.half_domain:
+                break
                 
-                # For each candidate point, find its minimum distance to any selected point
-                min_distances = np.min(distances[mask][:, selected_indices], axis=1)
-                
-                # Choose the point with the maximum minimum distance (farthest point)
-                next_idx = np.where(mask)[0][np.argmax(min_distances)]
-                selected_indices.append(next_idx)
+            # Generate hexagonal ring points
+            ring_points = []
             
-            # Keep only the selected points
-            final_points = [all_points[i] for i in selected_indices]
+            # For each side of the hexagon
+            for side in range(6):
+                # Number of points on this side (including corners, but avoid duplicates)
+                points_on_side = ring
+                
+                for i in range(points_on_side):
+                    # Calculate position along this side of the hexagon
+                    # Each side goes from one corner to the next
+                    
+                    # Hexagon vertices (corners) in clockwise order starting from rightmost
+                    corners = [
+                        (ring * spacing, 0),  # Right
+                        (ring * spacing * 0.5, ring * spacing * np.sqrt(3) / 2),  # Top-right
+                        (-ring * spacing * 0.5, ring * spacing * np.sqrt(3) / 2),  # Top-left
+                        (-ring * spacing, 0),  # Left
+                        (-ring * spacing * 0.5, -ring * spacing * np.sqrt(3) / 2),  # Bottom-left
+                        (ring * spacing * 0.5, -ring * spacing * np.sqrt(3) / 2),  # Bottom-right
+                    ]
+                    
+                    # Get start and end corners for this side
+                    start_corner = corners[side]
+                    end_corner = corners[(side + 1) % 6]
+                    
+                    # Interpolate along the side (skip the end point to avoid duplicates)
+                    if i < points_on_side:
+                        t = i / points_on_side
+                        x = start_corner[0] + t * (end_corner[0] - start_corner[0])
+                        y = start_corner[1] + t * (end_corner[1] - start_corner[1])
+                        
+                        # Check if point is within domain bounds
+                        if abs(x) <= self.half_domain and abs(y) <= self.half_domain:
+                            ring_points.append([x, y])
+            
+            # Add ring points
+            points.extend(ring_points)
+            ring += 1
+        
+        # If we have more points than needed, take the first n_points
+        if len(points) > n_points:
+            final_points = points[:n_points]
         else:
-            final_points = all_points
-        
-        # If we don't have enough points (unlikely), duplicate the last point
-        while len(final_points) < n_points:
-            final_points.append(final_points[-1])
+            final_points = points
+            # If we don't have enough points, fill with the last point
+            while len(final_points) < n_points:
+                final_points.append(final_points[-1] if final_points else [0.0, 0.0])
         
         # Convert to torch tensor
         hex_points = torch.tensor(final_points[:n_points], dtype=torch.float32, device=self.device)
@@ -259,7 +299,7 @@ class DynamicString(Geometry):
             else:
                 # Generate default z-values based on the number of points per string
                 if 'string_xy' in result:
-                    # Determine total number of points based on total_points parameter
+                    # Determine total number of points based on the total_points parameter
                     n_points = self.total_points
                     
                     # Create initial distribution of points across strings
@@ -446,7 +486,7 @@ class DynamicString(Geometry):
             # points_3d is already torch.zeros(self.total_points, 3, device=self.device)
             current_point_fill_idx = 0
             _z_values_list = []
-            _string_indices_list = [] # This will be assigned to string_indices_final
+            _string_indices_list = []  # This will be assigned to string_indices_final
 
             for s_idx_loop in range(self.n_strings):
                 num_points_on_this_string = points_per_string_counts[s_idx_loop].item()
@@ -746,7 +786,7 @@ class ContinuousString(Geometry):
             # Return updated points using the initial geometry
             return self.update_points(path_positions=path_positions, string_xy=string_xy)
             
-        # Create parameters for a 1D continuous path from 0 to 1
+        # Create parameters for 1D continuous path from 0 to 1
         path_positions = torch.linspace(0, 1, self.total_points, device=self.device)
         
         # Initialize string positions (XY coordinates)
@@ -831,3 +871,214 @@ class ContinuousString(Geometry):
         return points_3d, string_indices.tolist(), points_per_string_list
 
 
+class EvanescentString(Geometry):
+    """Evanescent string geometry optimizer."""
+    
+    def __init__(self, device=None, dim=3, domain_size=2, optimize_z=False, 
+                n_strings=1000, points_per_string=5, starting_weight=1.0):
+        super().__init__(device=device, dim=dim, domain_size=domain_size)
+        self.n_strings = n_strings
+        self.points_per_string = points_per_string
+        self.optimize_z = optimize_z
+        self.starting_weight = starting_weight
+        
+        # Create hexagonal grid for strings
+        original_dim = self.dim
+        self.dim = 2
+        self.hex_grid = self.create_uniform_hexagonal_grid(n_points=self.n_strings)
+        self.dim = original_dim
+        
+        
+        # Half domain size for z-value mapping
+        self.half_domain = domain_size / 2.0
+    
+    def initialize_points(self, initial_geometry=None, **kwargs):
+        """
+        Initialize points in an evanescent string configuration.
+        
+        Parameters:
+        -----------
+        initial_geometry : dict or None
+            Optional dictionary containing pre-trained geometry parameters to use as a starting point.
+            Should contain keys like 'string_xy', 'z_values', etc.
+        
+        Returns:
+        --------
+        dict
+            Dictionary with initialized torch tensors
+        """
+        
+        if initial_geometry is not None:
+            print(f"Using pre-trained evanescent string geometry as starting point")
+            result = {}
+            
+            # Process string_xy if available
+            if 'string_xy' in initial_geometry:
+                string_xy = initial_geometry['string_xy']
+                if not isinstance(string_xy, torch.Tensor):
+                    string_xy = torch.tensor(string_xy, device=self.device, dtype=torch.float32)
+                elif string_xy.device != self.device:
+                    string_xy = string_xy.to(self.device)
+                result['string_xy'] = string_xy
+            else:
+                string_xy = self.hex_grid.clone()
+                result['string_xy'] = string_xy
+            z_values = None
+            not_matched = False
+            if 'z_values' in initial_geometry:
+                z_values = initial_geometry['z_values']
+                # if z_values != len(result['string_xy'])*self.points_per_string:
+                #     print(f"Warning: z_values length {len(z_values)} does not match expected {len(result['string_xy']) * self.points_per_string}.")
+                #     not_matched = True
+                if not isinstance(z_values, torch.Tensor):
+                    z_values = torch.tensor(z_values, device=self.device, dtype=torch.float32)
+                elif z_values.device != self.device:
+                    z_values = z_values.to(self.device)
+                result['z_values'] = z_values
+            if z_values is None or not_matched:
+                z_values = torch.linspace(-self.half_domain, self.half_domain, self.points_per_string, device=self.device)
+                for s_idx in range(self.n_strings):
+                    if s_idx == 0:
+                        result['z_values'] = z_values
+                    else:
+                        result['z_values'] = torch.cat((result['z_values'], z_values), dim=0)
+            if 'string_weights' in initial_geometry:
+                string_weights = initial_geometry['string_weights']
+                if not isinstance(string_weights, torch.Tensor):
+                    string_weights = torch.tensor(string_weights, device=self.device, dtype=torch.float32)
+                elif string_weights.device != self.device:
+                    string_weights = string_weights.to(self.device)
+                result['string_weights'] = string_weights
+            else:
+                # Default to uniform weights if not provided
+                result['string_weights'] = torch.ones(self.n_strings, device=self.device, dtype=torch.float32)*self.starting_weight
+        else:
+            # Create string_xy (hex grid or random based on self.optimize_xy)
+            string_xy = self.hex_grid.clone()
+            
+            # Initialize z_values uniformly along each string
+            z_values = torch.linspace(-self.half_domain, self.half_domain, self.points_per_string, device=self.device)
+            z_values = z_values.repeat(self.n_strings)
+            
+            string_weights = torch.ones(self.n_strings, device=self.device, dtype=torch.float32)*self.starting_weight
+        
+        string_indices = torch.arange(self.n_strings, device=self.device, dtype=torch.long)
+        
+        points_3d = torch.zeros(self.n_strings * self.points_per_string, 3, device=self.device)
+        # Fill points_3d with string_xy and z_values
+        for s_idx in range(self.n_strings):
+            start_idx = s_idx * self.points_per_string
+            end_idx = start_idx + self.points_per_string
+            points_3d[start_idx:end_idx, 0] = string_xy[s_idx, 0]  # x value
+            points_3d[start_idx:end_idx, 1] = string_xy[s_idx, 1]  # y value
+            points_3d[start_idx:end_idx, 2] = z_values[start_idx:end_idx]  # z value
+            
+        return {
+            'points': points_3d,
+            'active_points': points_3d,  # Initially all points are active
+            'string_xy': string_xy,
+            'z_values': z_values,
+            'string_weights': string_weights,
+            'string_indices': string_indices,
+            'active_string_indices': string_indices,  # Initially all strings are active
+            'points_per_string_list': [self.points_per_string] * self.n_strings,  # Each string has points_per_string points
+            }
+    
+    def update_points(self, string_xy, z_values, string_weights, string_indices, **kwargs):
+        """
+        Update the points based on current optimization state.
+        
+        Parameters:
+        -----------
+        string_xy : torch.Tensor
+            XY coordinates for each string (n_strings, 2)
+        z_values : torch.Tensor
+            Z values for all points (n_strings * points_per_string,)
+        string_weights : torch.Tensor
+            Raw weights for each string (n_strings,)
+        string_indices : torch.Tensor
+            Indices for each string (n_strings,)
+            
+        Returns:
+        --------
+        dict
+            Dictionary with updated tensors
+        """
+        # Apply sigmoid to string weights to get probabilities between 0 and 1
+        # string_probs = torch.sigmoid(string_weights)
+        string_probs = string_weights  # Keep original probabilities for later use
+        # Determine which strings to include based on their sigmoid weights
+        # You can adjust this threshold as needed 
+        threshold = kwargs.get('weight_threshold', 0.7)
+        active_strings_mask = string_probs > threshold
+        active_string_indices = torch.where(active_strings_mask)[0]
+        
+        # Count how many strings are active
+        n_active_strings = string_indices[active_strings_mask]
+        
+        # if n_active_strings == 0:
+        #     # If no strings are active, return empty tensors
+        #     empty_points = torch.zeros(0, 3, device=self.device, dtype=torch.float32)
+           
+            
+        #     return {
+        #         'points': empty_points,
+        #         'string_xy': string_xy,  # Keep original string_xy
+        #         'z_values': z_values,
+        #         'string_weights': string_weights,  # Keep original weights
+        #         'string_indices': string_indices,
+        #         'active_string_indices': []
+        #     }
+        
+        # Create new points tensor for only the active strings
+        total_points = len(string_indices) * self.points_per_string
+        new_points_3d = torch.zeros(total_points, 3, device=self.device)
+        total_active_points = len(active_string_indices) * self.points_per_string
+        active_points_3d = torch.zeros(total_active_points, 3, device=self.device)
+        # new_z_values = torch.zeros(total_active_points, device=self.device)
+        # new_string_indices = []
+        
+        # Fill the new points tensor with data from active strings only
+        for new_idx, original_string_idx in enumerate(string_indices):
+            # Calculate indices for the original z_values
+            original_start_idx = new_idx * self.points_per_string
+            original_end_idx = original_start_idx + self.points_per_string
+            
+            # Set XY coordinates from the string position
+            new_points_3d[original_start_idx:original_end_idx, 0] = string_xy[new_idx, 0]  # x
+            new_points_3d[original_start_idx:original_end_idx, 1] = string_xy[new_idx, 1]  # y
+            
+            # Set Z coordinates from the original z_values
+            new_points_3d[original_start_idx:original_end_idx, 2] = z_values[original_start_idx:original_end_idx]
+            # new_z_values[new_start_idx:new_end_idx] = z_values[original_start_idx:original_end_idx]
+            
+            # Update string indices to point to the new string index
+            # new_string_indices.extend([new_idx] * self.points_per_string)
+        
+        for new_idx, original_string_idx in enumerate(active_string_indices):
+            # Calculate indices for the original z_values
+            original_start_idx = original_string_idx * self.points_per_string
+            original_end_idx = original_start_idx + self.points_per_string
+            
+            # Calculate indices for the new points tensor
+            new_start_idx = new_idx * self.points_per_string
+            new_end_idx = new_start_idx + self.points_per_string
+            
+            # Set XY coordinates from the string position
+            active_points_3d[new_start_idx:new_end_idx, 0] = string_xy[original_string_idx, 0]
+            active_points_3d[new_start_idx:new_end_idx, 1] = string_xy[original_string_idx, 1]
+            
+            # Set Z coordinates from the original z_values
+            active_points_3d[new_start_idx:new_end_idx, 2] = z_values[original_start_idx:original_end_idx]
+            
+        
+        return {
+            'points': new_points_3d,
+            'string_xy': string_xy,  # Keep original string_xy (never changes)
+            'z_values': z_values,  # Only z_values for active strings
+            'string_weights': string_weights,  # Keep original weights
+            'string_indices': string_indices,  # Updated indices for active strings only
+            'active_string_indices': active_string_indices,  # Which strings are active
+            'active_points': active_points_3d, # Points for active strings only
+            'points_per_string_list': [self.points_per_string] * len(string_indices)  # Each active string has points_per_string points  
+        }

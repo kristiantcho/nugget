@@ -29,3 +29,8 @@ Thumbs.db
 # Experiment data and logs
 logs/
 data/
+
+# plots and gifs
+*.png
+*.jpg
+*.gif
