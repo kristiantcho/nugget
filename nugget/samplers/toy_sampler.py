@@ -108,7 +108,14 @@ class ToySampler(Sampler):
         return event_params_list        
         
     def sample_detector_points(self, num_points):
-        
+        """Sample points within the detector volume.
+
+        Args:
+            num_points (int): Number of points to sample.
+
+        Returns:
+            torch.Tensor: Sampled points within the detector volume.
+        """
         return torch.rand((self.dim, num_points), device=self.device, dtype=torch.float32) * self.domain_size - self.domain_size/2
         
         

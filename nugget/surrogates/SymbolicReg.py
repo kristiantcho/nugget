@@ -433,3 +433,55 @@ class SymbolicReg(Surrogate):
             return symbolic_reg_function, [test_output]
         else:
             return symbolic_reg_function
+        
+    def light_yield_surrogate(self, **kwargs):
+        """
+        Surrogate function that computes light yield using Symbolic Regression.
+        
+        Parameters:
+        -----------
+        event_params : dict
+            Contains 'position', 'zenith', 'azimuth', 'energy', etc.
+        opt_point : torch.Tensor
+            Optimization point where light yield is evaluated
+            
+        Returns:
+        --------
+        torch.Tensor
+            Light yield value at the optimization point
+        """
+  
+        
+        opt_point = kwargs.get('opt_point', None)
+        event_params = kwargs.get('event_params', None)
+        event_center = event_params.get('position', None)
+        zenith = event_params.get('zenith', None)
+        azimuth = event_params.get('azimuth', None)
+        energy = event_params.get('energy', None)
+        theta = zenith  # polar angle from z-axis
+        phi = azimuth   # azimuthal angle
+
+        
+        # Generate the SkewedGaussian function for this event
+        event_function = self.__call__(
+            amp=energy,
+            position=event_center,
+            phi=phi,
+            theta=theta,
+  
+        )
+        
+        # Evaluate the function at the optimization point
+        # For gradient computation, avoid operations that break gradient flow
+        
+        # Ensure opt_point has the right shape without breaking gradients
+        if opt_point.dim() == 1:
+            opt_point_input = opt_point.unsqueeze(0)
+        else:
+            opt_point_input = opt_point
+        light_yield = event_function(opt_point_input)
+        # Return without squeezing to preserve gradients
+        if light_yield.dim() > 0 and light_yield.numel() == 1:
+            return light_yield.flatten()[0]  # Use flatten and index instead of squeeze
+        else:
+            return light_yield
