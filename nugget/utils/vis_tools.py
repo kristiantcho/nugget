@@ -176,7 +176,6 @@ class Visualizer:
                           iteration: int, 
                           points_3d: torch.Tensor, 
                           loss_history: List[float], 
-                          additional_metrics: Optional[Dict[str, Any]] = None, 
                           string_indices: Optional[List[int]] = None, 
                           points_per_string_list: Optional[List[int]] = None, 
                           string_xy: Optional[torch.Tensor] = None,
@@ -206,8 +205,6 @@ class Visualizer:
             3D points to visualize (shape: n_points x 3).
         loss_history : list
             History of loss values.
-        additional_metrics : dict or None
-            Additional metrics to visualize (e.g., SNR history).
         string_indices : list or None
             String index for each point.
         points_per_string_list : list or None
@@ -325,7 +322,6 @@ class Visualizer:
                         iteration=iteration,
                         points_3d=points_3d,
                         loss_history=loss_history,
-                        additional_metrics=additional_metrics,
                         string_indices=string_indices,
                         points_per_string_list=points_per_string_list,
                         string_xy=string_xy,
@@ -434,7 +430,7 @@ class Visualizer:
             elif loss_type == 'llr':
                 plot_types = [
                     self.PLOT_LOSS,
-                    self.PLOT_LLR_HISTORY if additional_metrics and 'llr_history' in additional_metrics else self.PLOT_LOSS,
+                    self.PLOT_LLR_HISTORY if kwargs.get('llr_history') is not None else self.PLOT_LOSS,
                     self.PLOT_3D_POINTS,
                     self.PLOT_STRING_XY if string_xy is not None else self.PLOT_XY_PROJECTION,
                     self.PLOT_LLR_CONTOUR,
@@ -473,7 +469,6 @@ class Visualizer:
                 iteration=iteration,
                 points_3d=points_3d,
                 loss_history=loss_history,
-                additional_metrics=additional_metrics,
                 string_indices=string_indices,
                 points_per_string_list=points_per_string_list,
                 string_xy=string_xy,
@@ -501,7 +496,6 @@ class Visualizer:
                    iteration: int, 
                    points_3d: torch.Tensor, 
                    loss_history: List[float], 
-                   additional_metrics: Optional[Dict[str, Any]], 
                    string_indices: Optional[List[int]], 
                    points_per_string_list: Optional[List[int]], 
                    string_xy: Optional[torch.Tensor],
@@ -526,8 +520,6 @@ class Visualizer:
             3D points to visualize.
         loss_history : list
             History of loss values.
-        additional_metrics : dict or None
-            Additional metrics to visualize.
         string_indices : list or None
             String index for each point.
         points_per_string_list : list or None
@@ -567,8 +559,8 @@ class Visualizer:
             
         elif plot_type == self.PLOT_SNR_HISTORY:
             # SNR history plot
-            if additional_metrics and 'snr_history' in additional_metrics:
-                snr_history = additional_metrics['snr_history']
+            snr_history = kwargs.get('snr_history', None)
+            if snr_history is not None:
                 ax.plot(snr_history)
                 ax.set_title(f"Total Signal-to-Noise Ratio")
                 ax.set_xlabel("Iteration")
@@ -578,15 +570,16 @@ class Visualizer:
                       ha='center', va='center', transform=ax.transAxes)
         
         elif plot_type == self.PLOT_LLR_HISTORY:
-            # SNR history plot
-            if additional_metrics and 'llr_history' in additional_metrics:
-                llr_history = np.array(additional_metrics['llr_history'])/len(points_3d)
+            # LLR history plot
+            llr_history = kwargs.get('llr_history', None)
+            if llr_history is not None:
+                llr_history = np.array(llr_history)/len(points_3d)
                 ax.plot(llr_history)
                 ax.set_title(f"Mean Log-Likelihood Ratio")
                 ax.set_xlabel("Iteration")
                 ax.set_ylabel("LLR")
             else:
-                ax.text(0.5, 0.5, "SNR history not available", 
+                ax.text(0.5, 0.5, "LLR history not available", 
                       ha='center', va='center', transform=ax.transAxes)
                 
         elif plot_type == self.PLOT_3D_POINTS:
@@ -1177,13 +1170,13 @@ class Visualizer:
             
             # Get string weights for alpha transparency
             string_weights = kwargs.get('string_weights', None)
-            string_indices = additional_metrics.get('string_indices') if additional_metrics else None
+            string_indices_from_kwargs = kwargs.get('string_indices', None)
             
             if multi_slice:
                 title_str += " (Multi-Slice Avg)"
                 # For multi-slice, show all points projected to XY plane
-                if string_weights is not None and string_indices is not None:
-                    alpha_values = np.array([string_weights[idx] for idx in string_indices])
+                if string_weights is not None and string_indices_from_kwargs is not None:
+                    alpha_values = np.array([string_weights[idx] for idx in string_indices_from_kwargs])
                     # Apply sigmoid to convert to [0,1] range if not already
                     # if np.any(alpha_values < 0) or np.any(alpha_values > 1):
                         # alpha_values = 1 / (1 + np.exp(-alpha_values))
@@ -2217,7 +2210,7 @@ class Visualizer:
         
         elif plot_type == self.PLOT_ANGULAR_RESOLUTION:
             # Angular resolution history from Fisher Information matrix using Cramér-Rao bound
-            angular_resolution_history = additional_metrics.get('angular_resolution_history', None) if additional_metrics else None
+            angular_resolution_history = kwargs.get('angular_resolution_history', None)
             
             if angular_resolution_history is not None:
                 # Plot the history of weighted total angular resolution
@@ -2235,12 +2228,12 @@ class Visualizer:
                 #               xytext=(10, 10), textcoords='offset points',
                 #               fontsize=10, ha='left')
             else:
-                ax.text(0.5, 0.5, "Angular resolution history not available\n(Requires 'angular_resolution_history' in additional_metrics)", 
+                ax.text(0.5, 0.5, "Angular resolution history not available\n(Pass 'angular_resolution_history' in kwargs)", 
                       ha='center', va='center', transform=ax.transAxes)
         
         elif plot_type == self.PLOT_ENERGY_RESOLUTION:
             # Energy resolution history from Fisher Information matrix using Cramér-Rao bound
-            energy_resolution_history = additional_metrics.get('energy_resolution_history', None) if additional_metrics else None
+            energy_resolution_history = kwargs.get('energy_resolution_history', None)
             
             if energy_resolution_history is not None:
                 # Plot the history of weighted total energy resolution
@@ -2258,7 +2251,7 @@ class Visualizer:
                 #               xytext=(10, 10), textcoords='offset points',
                 #               fontsize=10, ha='left')
             else:
-                ax.text(0.5, 0.5, "Energy resolution history not available\n(Requires 'energy_resolution_history' in additional_metrics)", 
+                ax.text(0.5, 0.5, "Energy resolution history not available\n(Pass 'energy_resolution_history' in kwargs)", 
                       ha='center', va='center', transform=ax.transAxes)
         
         else:

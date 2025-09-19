@@ -229,29 +229,6 @@ The recommended approach is to use the modular components directly rather than t
 4. **Add visualization** using tools from `utils/vis_tools.py`
 5. **Test with surrogates** from `utils/surrogates.py`
 
-## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Citation
-
-If you use *nugget* in your research, please cite:
-
-```bibtex
-@software{nugget2024,
-  title={nugget: NeUtrino experiement Geometry optimization and General Evaluation Tool},
-  author={[Author Name]},
-  year={2024},
-  url={https://github.com/kristiantcho/nugget}
-}
-```
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 
