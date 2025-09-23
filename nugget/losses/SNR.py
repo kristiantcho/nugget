@@ -78,6 +78,13 @@ class SNRloss(LossFunction):
         signal_event_params = kwargs.get('signal_event_params', None)
         background_surrogate_func = kwargs.get('background_surrogate_func', None)
         background_event_params = kwargs.get('background_event_params', None)
+        signal_sampler = kwargs.get('signal_sampler', None)
+        background_sampler = kwargs.get('background_sampler', None)
+        num_events = kwargs.get('num_events', 100)
+        if signal_event_params is None and signal_sampler is not None:
+            signal_event_params = signal_sampler.sample_events(num_events)
+        if background_event_params is None and background_sampler is not None:
+            background_event_params = background_sampler.sample_events(num_events)
         signal_total = torch.zeros(len(signal_event_params), device=self.device)
 
         # signal_values = torch.zeros(len(signal_funcs), points_3d.shape[0], device=self.device)
@@ -281,6 +288,13 @@ class WeightedSNRLoss(LossFunction):
         string_weights = geom_dict.get('string_weights', None)
         num_strings = geom_dict.get('num_strings', None)
         precomputed_snr_per_string = kwargs.get('precomputed_snr_per_string', None)
+        signal_sampler = kwargs.get('signal_sampler', None)
+        background_sampler = kwargs.get('background_sampler', None)
+        num_events = kwargs.get('num_events', 100)
+        if signal_event_params is None and signal_sampler is not None:
+            signal_event_params = signal_sampler.sample_events(num_events)
+        if background_event_params is None and background_sampler is not None:
+            background_event_params = background_sampler.sample_events(num_events)
         # Determine number of strings
         if num_strings is None:
             if points_per_string_list is not None:

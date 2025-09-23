@@ -1277,7 +1277,7 @@ class LLRnet(Surrogate):
             if is_signal:
                 detector_point = self.signal_sampler.sample_detector_points(1).squeeze()
                 # Generate a signal event
-                event_data = self.signal_sampler.sample_events(1, 'signal')[0]
+                event_data = self.signal_sampler.sample_events(1)[0]
                 event_features = self.llrnet.prepare_data_from_raw(
                     detector_point, event_data, self.signal_surrogate_func, self.event_labels, self.llrnet.signal_noise_scale, self.llrnet.add_relative_pos
                 )
@@ -1285,7 +1285,7 @@ class LLRnet(Surrogate):
             else:
                 detector_point = self.background_sampler.sample_detector_points(1).squeeze()
                 # Generate a background event
-                event_data = self.background_sampler.sample_events(1, 'background')[0]
+                event_data = self.background_sampler.sample_events(1)[0]
                 event_features = self.llrnet.prepare_data_from_raw(
                     detector_point, event_data, self.background_surrogate_func, self.event_labels, self.llrnet.background_noise_scale, self.llrnet.add_relative_pos
                 )

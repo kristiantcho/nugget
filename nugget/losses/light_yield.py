@@ -22,6 +22,10 @@ class LightYieldLoss(LossFunction):
         surrogate_func = kwargs.get('signal_surrogate_func', None)
         event_params = kwargs.get('signal_event_params', None)
         points_3d = geom_dict.get('points_3d', None)
+        signal_sampler = kwargs.get('signal_sampler', None)
+        num_events = kwargs.get('num_events', 100)
+        if event_params is None and signal_sampler is not None:
+            event_params = signal_sampler.sample_events(num_events)
 
         for params in event_params:
             # Compute light yield for each event
@@ -32,7 +36,7 @@ class LightYieldLoss(LossFunction):
             loss += 1/(torch.sum(light_yield)/len(event_params) + 1e-6)  # Add small value to avoid division by zero  
         if self.print_loss:
             print(f"Light yield loss: {loss.item()}")
-        return {'signal_yield_loss': loss, 'total_signal_yield': torch.sum(light_yield)/len(event_params)}
+        return {'signal_yield_loss': loss, 'signal_yield_per_point': light_yield/len(event_params), 'total_signal_yield': torch.sum(light_yield)/len(event_params)}
 
 class WeightedLightYieldLoss(LossFunction):
     
@@ -85,12 +89,16 @@ class WeightedLightYieldLoss(LossFunction):
     
     def __call__(self, geom_dict, **kwargs):
         
-        precomputed_light_yield = kwargs.get('precomputed_light_yield', None)
+        precomputed_light_yield = kwargs.get('precomputed_signal_yield_per_string', None)
         string_weights = geom_dict.get('string_weights', None)
         string_xy = geom_dict.get('string_xy', None)
         points_3d = geom_dict.get('points_3d', None)
         event_params = kwargs.get('signal_event_params', None)
         surrogate_func = kwargs.get('signal_surrogate_func', None)
+        signal_sampler = kwargs.get('signal_sampler', None)
+        num_events = kwargs.get('num_events', 100)
+        if event_params is None and signal_sampler is not None:
+            event_params = signal_sampler.sample_events(num_events)
         
         if precomputed_light_yield is None:
             signal_yield_per_string = self.light_yield_per_string(surrogate_func, event_params, string_xy, points_3d)

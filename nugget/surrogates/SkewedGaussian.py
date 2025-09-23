@@ -48,8 +48,8 @@ class SkewedGaussian(Surrogate):
             Function values
         """
         # Ensure inputs have correct dimensions
-        # if points.dim() == 1:
-        #     points = points.unsqueeze(0)  # Add batch dimension
+        if points.dim() == 1:
+            points = points.unsqueeze(0)  # Add batch dimension
             
         diff = points - center  # (N, dim)
 
@@ -175,9 +175,9 @@ class SkewedGaussian(Surrogate):
         else:
             # Preserve gradients if position is already a tensor with gradients
             if isinstance(position, torch.Tensor):
-                center = position
+                center = position.squeeze()  # Remove batch dimensions to get shape [3]
             else:
-                center = torch.tensor(position, device=self.device)
+                center = torch.tensor(position, device=self.device).squeeze()
         
         # Generate or use provided direction vector
         if self.dim == 2:
@@ -202,12 +202,12 @@ class SkewedGaussian(Surrogate):
             else:
                 # Use provided angles - preserve gradients
                 if isinstance(phi, torch.Tensor):
-                    phi_val = phi
+                    phi_val = phi.squeeze()  # Ensure scalar
                 else:
                     phi_val = torch.tensor(phi, device=self.device)
                 
                 if isinstance(theta, torch.Tensor):
-                    theta_val = theta
+                    theta_val = theta.squeeze()  # Ensure scalar
                 else:
                     theta_val = torch.tensor(theta, device=self.device)
             
@@ -323,14 +323,8 @@ class SkewedGaussian(Surrogate):
         # For gradient computation, avoid operations that break gradient flow
         
         # Ensure opt_point has the right shape without breaking gradients
-        if opt_point.dim() == 1:
-            opt_point_input = opt_point.unsqueeze(0)
-        else:
-            opt_point_input = opt_point
+       
+        opt_point_input = opt_point
         light_yield = event_function(opt_point_input)
-        # Return without squeezing to preserve gradients
-        if light_yield.dim() > 0 and light_yield.numel() == 1:
-            return light_yield.flatten()[0]  # Use flatten and index instead of squeeze
-        else:
-            return light_yield
+        return light_yield
       

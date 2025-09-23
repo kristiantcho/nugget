@@ -118,6 +118,10 @@ class RBFInterpolationLoss(LossFunction):
         surrogate_func = kwargs.get('signal_surrogate_func')
         test_points = kwargs.get('test_points', None)
         event_params = kwargs.get('signal_event_params', None)
+        signal_sampler = kwargs.get('signal_sampler', None)
+        num_events = kwargs.get('num_events', 100)
+        if event_params is None and signal_sampler is not None:
+            event_params = signal_sampler.sample_events(num_events)
         loss_func = kwargs.get('loss_func', F.mse_loss)
         
         

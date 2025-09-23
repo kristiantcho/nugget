@@ -9,6 +9,7 @@ class ToySampler(Sampler):
         """Sampler for toy model."""
         super().__init__(device, dim, domain_size)
         self.kwargs = kwargs
+        self.event_type = kwargs.get('event_type','signal')  # 'signal' or 'background'
     
     def sample_power_law(self, E_min=0.8, E_max=1, gamma=2.7, n_samples=1):
         """
@@ -62,7 +63,7 @@ class ToySampler(Sampler):
         theta = np.arccos(cos_theta)
         return torch.tensor(theta, device=self.device)
     
-    def sample_events(self, num_events, event_type='signal'):
+    def sample_events(self, num_events):
         """
         Sample event parameters for toy model.
         
@@ -81,7 +82,7 @@ class ToySampler(Sampler):
         
         E_min = self.kwargs.get('E_min', 0.8)
         E_max = self.kwargs.get('E_max', 1)
-        if event_type == 'signal':
+        if self.event_type == 'signal':
             gamma = self.kwargs.get('gamma',2.7)
         else:
             gamma = self.kwargs.get('gamma',3.7)
@@ -94,7 +95,7 @@ class ToySampler(Sampler):
         for _ in range(num_events):
             event_params = {}
             event_params['energy'] = self.sample_power_law(n_samples=1, E_min=E_min, E_max=E_max, gamma=gamma)
-            if event_type == 'signal':
+            if self.event_type == 'signal':
                 event_params['zenith'] = torch.rand(1, device=self.device) * np.pi
             else:
                 event_params['zenith'] = self.sample_background_zenith(a, 1)
@@ -116,6 +117,6 @@ class ToySampler(Sampler):
         Returns:
             torch.Tensor: Sampled points within the detector volume.
         """
-        return torch.rand((self.dim, num_points), device=self.device, dtype=torch.float32) * self.domain_size - self.domain_size/2
+        return torch.rand((num_points, self.dim), device=self.device, dtype=torch.float32) * self.domain_size - self.domain_size/2
         
         

@@ -40,13 +40,41 @@ class ContinuousString(Geometry):
             print(f"Using pre-trained continuous string geometry as starting point")
             # Extract components from the initial geometry
             
-            # Process path_positions if available
+            # Handle string weight filtering first
+            active_strings_mask = None
+            weight_threshold = initial_geometry.get('weight_threshold', 0.7)
+            
+            if 'string_weights' in initial_geometry:
+                string_weights = initial_geometry['string_weights']
+                if not isinstance(string_weights, torch.Tensor):
+                    string_weights = torch.tensor(string_weights, device=self.device, dtype=torch.float32)
+                elif string_weights.device != self.device:
+                    string_weights = string_weights.to(self.device)
+                
+                # Apply weight filtering - use same logic as EvanescentString
+                string_probs = torch.sigmoid(string_weights)  # Keep original probabilities
+                active_strings_mask = string_probs > weight_threshold
+                active_string_indices = torch.where(active_strings_mask)[0]
+                print(f"Filtering strings: {len(active_string_indices)} out of {len(string_weights)} strings active")
+            
+            # Process path_positions if available, else convert from z_values
             if 'path_positions' in initial_geometry:
                 path_positions = initial_geometry['path_positions']
                 if not isinstance(path_positions, torch.Tensor):
                     path_positions = torch.tensor(path_positions, device=self.device, dtype=torch.float32)
                 elif path_positions.device != self.device:
                     path_positions = path_positions.to(self.device)
+            elif 'z_values' in initial_geometry and 'string_indices' in initial_geometry:
+                # Convert z_values to path_positions
+                z_values = initial_geometry['z_values']
+                string_indices = initial_geometry['string_indices']
+                if not isinstance(z_values, torch.Tensor):
+                    z_values = torch.tensor(z_values, device=self.device, dtype=torch.float32)
+                elif z_values.device != self.device:
+                    z_values = z_values.to(self.device)
+                
+                path_positions = self.convert_z_values_to_path_positions(z_values, string_indices, active_strings_mask)
+                print(f"Converted z_values to path_positions")
             else:
                 # Fall back to default initialization
                 path_positions = torch.linspace(0, 1, self.total_points, device=self.device)
@@ -58,12 +86,22 @@ class ContinuousString(Geometry):
                     string_xy = torch.tensor(string_xy, device=self.device, dtype=torch.float32)
                 elif string_xy.device != self.device:
                     string_xy = string_xy.to(self.device)
+                
+                # Apply string filtering if weight mask is available
+                if active_strings_mask is not None:
+                    string_xy = string_xy[active_strings_mask]
+                    # Update n_strings to reflect filtered strings
+                    self.n_strings = len(string_xy)
+                    print(f"Filtered string_xy to {self.n_strings} strings")
             else:
                 # Fall back to default initialization
                 if self.optimize_xy:
                     string_xy = torch.rand(self.n_strings, 2, device=self.device) * self.domain_size - self.half_domain
                 else:
                     string_xy = self.hex_grid.clone()
+                    if active_strings_mask is not None:
+                        string_xy = string_xy[active_strings_mask]
+                        self.n_strings = len(string_xy)
             
             # Return updated points using the initial geometry
             return self.update_points(path_positions=path_positions, string_xy=string_xy)
@@ -100,7 +138,7 @@ class ContinuousString(Geometry):
         points_3d, string_indices, points_per_string_list = self.map_path_to_3d(path_positions, string_xy)
         
         return {
-            "points": points_3d,
+            "points_3d": points_3d,
             "path_positions": path_positions, 
             "string_xy": string_xy, 
             "string_indices": string_indices, 
@@ -151,3 +189,58 @@ class ContinuousString(Geometry):
             points_per_string_list.append(int(count))
         
         return points_3d, string_indices.tolist(), points_per_string_list
+    
+    def convert_z_values_to_path_positions(self, z_values, string_indices, active_strings_mask=None):
+        """
+        Convert z_values and string_indices to continuous path_positions.
+        
+        Parameters:
+        -----------
+        z_values : torch.Tensor
+            Z coordinates for all points
+        string_indices : list or torch.Tensor
+            String index for each point
+        active_strings_mask : torch.Tensor or None
+            Boolean mask indicating which strings are active
+            
+        Returns:
+        --------
+        torch.Tensor
+            Path positions from 0 to 1
+        """
+        if not isinstance(string_indices, torch.Tensor):
+            string_indices = torch.tensor(string_indices, device=self.device, dtype=torch.long)
+        elif string_indices.device != self.device:
+            string_indices = string_indices.to(self.device)
+            
+        # If we have active strings filtering, we need to remap the string indices
+        if active_strings_mask is not None:
+            active_string_indices = torch.where(active_strings_mask)[0]
+            # Create a mapping from old indices to new indices
+            old_to_new_mapping = torch.full((active_strings_mask.size(0),), -1, device=self.device, dtype=torch.long)
+            old_to_new_mapping[active_string_indices] = torch.arange(len(active_string_indices), device=self.device)
+            
+            # Filter points to only include those from active strings
+            active_points_mask = torch.isin(string_indices, active_string_indices)
+            z_values = z_values[active_points_mask]
+            string_indices = string_indices[active_points_mask]
+            
+            # Remap string indices to new numbering
+            string_indices = old_to_new_mapping[string_indices]
+            
+            # Update total_points and n_strings to reflect filtering
+            self.total_points = len(z_values)
+            effective_n_strings = len(active_string_indices)
+        else:
+            effective_n_strings = self.n_strings
+            
+        # Convert z_values back to relative position within each string (0 to 1)
+        # z_values range from -half_domain to half_domain, map to 0 to 1
+        relative_position = (z_values + self.half_domain) / (2 * self.half_domain)
+        relative_position = torch.clamp(relative_position, 0, 1)  # Ensure valid range
+        
+        # Convert to path_positions: each string occupies 1/n_strings of the path
+        segment_width = 1.0 / effective_n_strings
+        path_positions = string_indices.float() * segment_width + relative_position * segment_width
+        
+        return path_positions

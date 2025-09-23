@@ -7,12 +7,11 @@ import torch.nn.functional as F
 class EvanescentString(Geometry):
     """Evanescent string geometry optimizer."""
     
-    def __init__(self, device=None, dim=3, domain_size=2, optimize_z=False, 
+    def __init__(self, device=None, dim=3, domain_size=2,
                 n_strings=1000, points_per_string=5, starting_weight=1.0):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         self.n_strings = n_strings
         self.points_per_string = points_per_string
-        self.optimize_z = optimize_z
         self.starting_weight = starting_weight
         
         # Create hexagonal grid for strings
@@ -107,7 +106,7 @@ class EvanescentString(Geometry):
             points_3d[start_idx:end_idx, 2] = z_values[start_idx:end_idx]  # z value
             
         return {
-            'points': points_3d,
+            'points_3d': points_3d,
             'active_points': points_3d,  # Initially all points are active
             'string_xy': string_xy,
             'z_values': z_values,
@@ -155,7 +154,7 @@ class EvanescentString(Geometry):
            
             
         #     return {
-        #         'points': empty_points,
+        #         'points_3d': empty_points,
         #         'string_xy': string_xy,  # Keep original string_xy
         #         'z_values': z_values,
         #         'string_weights': string_weights,  # Keep original weights
@@ -206,12 +205,14 @@ class EvanescentString(Geometry):
             
         
         return {
-            'points': new_points_3d,
+            'points_3d': new_points_3d,
             'string_xy': string_xy,  # Keep original string_xy (never changes)
             'z_values': z_values,  # Only z_values for active strings
             'string_weights': string_weights,  # Keep original weights
             'string_indices': string_indices,  # Updated indices for active strings only
             'active_string_indices': active_string_indices,  # Which strings are active
             'active_points': active_points_3d, # Points for active strings only
-            'points_per_string_list': [self.points_per_string] * len(string_indices)  # Each active string has points_per_string points  
+            'points_per_string_list': [self.points_per_string] * len(string_indices),  # Each active string has points_per_string points  
+            'weight_threshold': threshold
         }
+        
