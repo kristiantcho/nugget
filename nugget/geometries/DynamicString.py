@@ -651,21 +651,28 @@ class DynamicString(Geometry):
         #     }
         
         # Original hard allocation logic (if the above condition is not met)
-        # Create new points_3d with updated distribution
-        new_points_3d = torch.zeros(self.total_points, 3, device=self.device)
+        # Create new points_3d with updated distribution while preserving gradients
+        points_list = []
         current_idx = 0
         for s in range(self.n_strings):
             n_pts = int(points_per_string_list[s])
             if n_pts > 0:  # Skip empty strings
-         
-                new_points_3d[current_idx:current_idx+n_pts, 0] = string_xy[s, 0]  # x value
-                new_points_3d[current_idx:current_idx+n_pts, 1] = string_xy[s, 1]  # y value
-             
-                new_points_3d[current_idx:current_idx+n_pts, 2] = z_values[current_idx:current_idx+n_pts]  # z value
+                # Create points for this string, preserving gradients
+                x_coords = string_xy[s, 0].repeat(n_pts)  # Repeat x coordinate
+                y_coords = string_xy[s, 1].repeat(n_pts)  # Repeat y coordinate
+                z_coords = z_values[current_idx:current_idx+n_pts]  # Use corresponding z values
+                
+                # Stack coordinates to create 3D points
+                string_points = torch.stack([x_coords, y_coords, z_coords], dim=1)
+                points_list.append(string_points)
                 current_idx += n_pts
         
-        # Update the variables
-        points_3d = new_points_3d
+        # Concatenate all points while preserving gradients
+        if points_list:
+            points_3d = torch.cat(points_list, dim=0)
+        else:
+            # Fallback if no points are assigned
+            points_3d = torch.zeros(0, 3, device=self.device)
         
         return {
             "points_3d": points_3d, 

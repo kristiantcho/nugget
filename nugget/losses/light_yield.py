@@ -2,7 +2,7 @@ from nugget.losses.base_loss import LossFunction
 import torch
 
 class LightYieldLoss(LossFunction):
-    def __init__(self, device=None, print_loss=False, noise_scale=0.0):
+    def __init__(self, device=None, print_loss=False, ):
         """
         Initialize the light yield loss function.
         
@@ -15,7 +15,7 @@ class LightYieldLoss(LossFunction):
         """
         super().__init__(device)
         self.print_loss = print_loss
-        self.noise_scale = noise_scale
+
 
     def __call__(self, geom_dict, **kwargs):
         loss = torch.tensor(0.0, device=self.device)
@@ -24,6 +24,7 @@ class LightYieldLoss(LossFunction):
         points_3d = geom_dict.get('points_3d', None)
         signal_sampler = kwargs.get('signal_sampler', None)
         num_events = kwargs.get('num_events', 100)
+        noise_scale = kwargs.get('signal_noise_scale', 0.0)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
 
@@ -31,8 +32,8 @@ class LightYieldLoss(LossFunction):
             # Compute light yield for each event
             light_yield = surrogate_func(opt_point=points_3d, event_params=params)  # Shape (num_points,)
             # We want to maximize light yield
-            if self.noise_scale > 0.0:
-                light_yield = light_yield + light_yield*torch.randn(size=light_yield.shape, device=self.device) * self.noise_scale
+            if noise_scale > 0.0:
+                light_yield = light_yield + light_yield*torch.randn(size=light_yield.shape, device=self.device) * noise_scale
             loss += 1/(torch.sum(light_yield)/len(event_params) + 1e-6)  # Add small value to avoid division by zero  
         if self.print_loss:
             print(f"Light yield loss: {loss.item()}")
@@ -40,7 +41,7 @@ class LightYieldLoss(LossFunction):
 
 class WeightedLightYieldLoss(LossFunction):
     
-    def __init__(self, device=None, print_loss=False, noise_scale=0.0):
+    def __init__(self, device=None, print_loss=False):
         """
         Initialize the light yield loss function.
         
@@ -53,9 +54,9 @@ class WeightedLightYieldLoss(LossFunction):
         """
         super().__init__(device)
         self.print_loss = print_loss
-        self.noise_scale = noise_scale
+    
 
-    def light_yield_per_string(self, surrogate_func, event_params, string_xy, points_3d):
+    def light_yield_per_string(self, surrogate_func, event_params, string_xy, points_3d, noise_scale=0.0):
         
         signal_yield_per_string = torch.zeros(len(string_xy), device=self.device)
         n_strings = len(string_xy)
@@ -72,8 +73,8 @@ class WeightedLightYieldLoss(LossFunction):
                 signal_yields = []
                 for params in event_params:
                     signal_yield = surrogate_func(opt_point=point, event_params=params)  # Shape (num_points,)
-                    if self.noise_scale > 0.0:
-                        signal_yield = signal_yield + signal_yield*torch.randn(size=signal_yield.shape, device=self.device) * self.noise_scale
+                    if noise_scale > 0.0:
+                        signal_yield = signal_yield + signal_yield*torch.randn(size=signal_yield.shape, device=self.device) * noise_scale
                     
                     signal_yields.append(signal_yield)
                 
@@ -97,11 +98,12 @@ class WeightedLightYieldLoss(LossFunction):
         surrogate_func = kwargs.get('signal_surrogate_func', None)
         signal_sampler = kwargs.get('signal_sampler', None)
         num_events = kwargs.get('num_events', 100)
+        noise_scale = kwargs.get('signal_noise_scale', 0.0)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
         
         if precomputed_light_yield is None:
-            signal_yield_per_string = self.light_yield_per_string(surrogate_func, event_params, string_xy, points_3d)
+            signal_yield_per_string = self.light_yield_per_string(surrogate_func, event_params, string_xy, points_3d, noise_scale)
         else:
             signal_yield_per_string = precomputed_light_yield
         if string_weights is None:

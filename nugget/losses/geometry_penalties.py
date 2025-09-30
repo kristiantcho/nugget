@@ -32,8 +32,45 @@ class BoundaryPenalty(LossFunction):
             The boundary penalty value (weighted).
         """
         points_3d = geom_dict.get('points_3d', None)
-        domain_size = kwargs.get('domain_size', 2.0)
+        domain_size = kwargs.get('boundary_range', 2.0)
         return {'boundary_penalty': torch.mean(torch.clamp(torch.abs(points_3d) - domain_size/2, min=0.0) ** 2)}
+    
+class StringBoundaryPenalty(LossFunction):
+    """Loss function for boundary penalties."""
+    def __init__(self, device=None):
+        """
+        Initialize the boundary penalties loss function.
+        
+        Parameters:
+        -----------
+        device : torch.device or None
+            Device to use for computations. If None, uses cuda if available, else cpu.
+        domain_size : float
+            Size of the domain.
+        """
+        super().__init__(device)
+
+    def __call__(self, geom_dict, **kwargs):
+        """
+        Compute boundary penalty to keep points in domain.
+        
+        Parameters:
+        -----------
+        points_3d : torch.Tensor
+            The 3D points to compute the penalty for.
+            
+        Returns:
+        --------
+        torch.Tensor
+            The boundary penalty value (weighted).
+        """
+        string_xy = geom_dict.get('string_xy', None)
+        domain_size = kwargs.get('boundary_range', 2.0)
+        string_weights = geom_dict.get('string_weights', None)
+        string_probs = torch.sigmoid(string_weights) if string_weights is not None else 1.0
+        clamped_string_xy = torch.clamp(torch.abs(string_xy) - domain_size/2, min=0.0)** 2
+        clamped_string_xy = torch.sum(clamped_string_xy, dim=1)
+        return {'string_boundary_penalty': torch.mean(clamped_string_xy * string_probs)}
 
 class RepulsionPenalty(LossFunction):
     """Loss function for repulsion penalties to keep points apart."""
@@ -166,34 +203,33 @@ class StringRepulsionPenalty(LossFunction):
         Returns:
         --------
         torch.Tensor
-            The string repulsion penalty value (weighted).
+            The local string repulsion penalty value (weighted).
         """
         string_xy = geom_dict.get('string_xy', None)
         string_weights = geom_dict.get('string_weights', None)
-        if string_weights is None:
-            string_probs = None
-        else:
-            string_probs = torch.sigmoid(string_weights)
         min_dist = kwargs.get('min_dist', 1e-3)
         
-        # Return zero penalty if string_xy is None
         if string_xy is None:
             return torch.tensor(0.0)
-            
-        string_repulsion = 0.0
-        total_strings = len(string_xy)
-      
-        for i in range(total_strings):
-            for j in range(i + 1, total_strings):
-                if string_probs is None:
-                    dist_sq = torch.sum((string_xy[i] - string_xy[j]) ** 2)
-                    string_repulsion += 1.0/ (dist_sq + min_dist)
-                else:
-                    dist_sq = torch.sum(((string_xy[i] - string_xy[j]) ** 2))
-                    string_repulsion += string_probs[i] * string_probs[j] / (dist_sq + min_dist)
-                
-        
-        return {'string_repulsion_penalty':string_repulsion/total_strings}
+        n = string_xy.shape[0]
+        # Compute pairwise squared distances
+        diff = string_xy.unsqueeze(1) - string_xy.unsqueeze(0)  # (n, n, 2)
+        dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
+        # Mask: ignore self-pairs
+        mask = (dist_sq > 0)
+        repulsion = 0.0
+        if string_weights is not None:
+            string_probs = torch.sigmoid(string_weights)
+            # Outer product for all pairs
+            weight_matrix = string_probs.unsqueeze(1) * string_probs.unsqueeze(0)  # (n, n)
+            repulsion_matrix = torch.zeros_like(dist_sq)
+            repulsion_matrix[mask] = weight_matrix[mask] / (dist_sq[mask] + min_dist)
+            repulsion = torch.sum(repulsion_matrix) / n
+        else:
+            repulsion_matrix = torch.zeros_like(dist_sq)
+            repulsion_matrix[mask] = 1.0 / (dist_sq[mask] + min_dist)
+            repulsion = torch.sum(repulsion_matrix) / n
+        return {'string_repulsion_penalty': repulsion}
 
 class LocalStringRepulsionPenalty(LossFunction):
     """Loss function for local string repulsion penalties."""
@@ -298,7 +334,7 @@ class PathRepulsionPenalty(LossFunction):
         return {'path_repulsion_penalty': path_penalty}
 
 
-class ZDistPenalty(LossFunction):
+class ZDistRepulsionPenalty(LossFunction):
     """Loss function for z distance penalty to keep points apart along the same string."""
     def __init__(self, device=None):
         """
@@ -315,10 +351,13 @@ class ZDistPenalty(LossFunction):
         """
         Compute z distance penalty to keep points apart along the same string.
         
+        Uses z_values and points_per_string_list if available for efficient computation,
+        otherwise falls back to points_3d-based computation.
+        
         Parameters:
         -----------
         geom_dict : dict
-            Geometry dictionary containing 'points_3d' key.
+            Geometry dictionary containing 'z_values', 'points_per_string_list', or 'points_3d' keys.
         **kwargs
             Additional keyword arguments including 'min_dist'.
             
@@ -327,19 +366,41 @@ class ZDistPenalty(LossFunction):
         torch.Tensor
             The z distance penalty value (weighted).
         """
+        z_values = geom_dict.get('z_values', None)
+        points_per_string_list = geom_dict.get('points_per_string_list', None)
         points_3d = geom_dict.get('points_3d', None)
         min_dist = kwargs.get('min_dist', 1e-3)
         
-        z_dist_penalty = 0.0
-        total_points = len(points_3d)
-        for k in range(total_points):
-            for j in range(k + 1, total_points):
-                if points_3d[k][2] == points_3d[j][2]:
-                    # Use distance in path space
-                    dist_sq = torch.sum((points_3d[k] - points_3d[j]) ** 2)
-                    z_dist_penalty += 1.0 / (dist_sq + min_dist)
+        z_dist_penalty = torch.tensor(0.0, device=self.device)
         
-        return {'z_dist_penalty': z_dist_penalty}
+        # Use z_values and points_per_string_list if available (more efficient)
+        if z_values is not None and points_per_string_list is not None:
+            current_idx = 0
+            for string_idx, num_points in enumerate(points_per_string_list):
+                if num_points > 1:  # Only compute repulsion if string has multiple points
+                    # Get z values for this string
+                    string_z_values = z_values[current_idx:current_idx + num_points]
+                    
+                    # Compute pairwise repulsion within this string
+                    for i in range(num_points):
+                        for j in range(i + 1, num_points):
+                            z_dist_sq = (string_z_values[i] - string_z_values[j]) ** 2
+                            z_dist_penalty += 1.0 / (z_dist_sq + min_dist)
+                
+                current_idx += num_points
+        
+        # Fallback to points_3d-based computation if z_values/points_per_string_list not available
+        elif points_3d is not None:
+            total_points = len(points_3d)
+            for k in range(total_points):
+                for j in range(k + 1, total_points):
+                    # Check if points are on the same string (same x,y coordinates)
+                    if torch.allclose(points_3d[k][:2], points_3d[j][:2], atol=1e-6):
+                        # Compute z distance only
+                        z_dist_sq = (points_3d[k][2] - points_3d[j][2]) ** 2
+                        z_dist_penalty += 1.0 / (z_dist_sq + min_dist)
+        
+        return {'z_dist_repulsion_penalty': z_dist_penalty}
 
 
 class LocalZDistRepulsionPenalty(LossFunction):
@@ -357,13 +418,15 @@ class LocalZDistRepulsionPenalty(LossFunction):
 
     def __call__(self, geom_dict, **kwargs):
         """
-        Compute repulsion penalty between points on the same string (same z-coordinate), 
-        but only for pairs within a given radius.
+        Compute repulsion penalty between points on the same string within a given z-distance radius.
+        
+        Uses z_values and points_per_string_list if available for efficient computation,
+        otherwise falls back to points_3d-based computation.
         
         Parameters:
         -----------
         geom_dict : dict
-            Geometry dictionary containing 'points_3d' key.
+            Geometry dictionary containing 'z_values', 'points_per_string_list', or 'points_3d' keys.
         **kwargs
             Additional keyword arguments including 'max_radius' and 'min_dist'.
             
@@ -372,39 +435,74 @@ class LocalZDistRepulsionPenalty(LossFunction):
         torch.Tensor
             The local z distance repulsion penalty value (weighted).
         """
+        z_values = geom_dict.get('z_values', None)
+        points_per_string_list = geom_dict.get('points_per_string_list', None)
         points_3d = geom_dict.get('points_3d', None)
         max_radius = kwargs.get('max_radius', 0.1)
         min_dist = kwargs.get('min_dist', 1e-3)
         
-        if points_3d is None:
-            return torch.tensor(0.0)
-            
-        n = len(points_3d)
-        if n == 0:
-            return torch.tensor(0.0)
-            
-        # Stack points for efficient computation
-        points_tensor = points_3d  # (n, 3)
+        repulsion = torch.tensor(0.0, device=self.device)
+        total_valid_pairs = 0
         
-        # Compute pairwise squared distances
-        diff = points_tensor.unsqueeze(1) - points_tensor.unsqueeze(0)  # (n, n, 3)
-        dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
+        # Use z_values and points_per_string_list if available (more efficient)
+        if z_values is not None and points_per_string_list is not None:
+            current_idx = 0
+            for string_idx, num_points in enumerate(points_per_string_list):
+                if num_points > 1:  # Only compute repulsion if string has multiple points
+                    # Get z values for this string
+                    string_z_values = z_values[current_idx:current_idx + num_points]
+                    
+                    # Compute pairwise repulsion within this string, within radius
+                    for i in range(num_points):
+                        for j in range(i + 1, num_points):
+                            z_dist_sq = (string_z_values[i] - string_z_values[j]) ** 2
+                            z_dist = torch.sqrt(z_dist_sq + 1e-10)  # Add small epsilon for numerical stability
+                            
+                            if z_dist < max_radius:
+                                repulsion += 1.0 / (z_dist_sq + min_dist)
+                                total_valid_pairs += 1
+                
+                current_idx += num_points
         
-        # Get z-coordinates for comparison
-        z_coords = points_tensor[:, 2]  # (n,)
-        z_diff = z_coords.unsqueeze(1) - z_coords.unsqueeze(0)  # (n, n)
+        # Fallback to points_3d-based computation if z_values/points_per_string_list not available
+        elif points_3d is not None:
+            n = len(points_3d)
+            if n > 0:
+                # Stack points for efficient computation
+                points_tensor = points_3d  # (n, 3)
+                
+                # Compute pairwise squared distances
+                diff = points_tensor.unsqueeze(1) - points_tensor.unsqueeze(0)  # (n, n, 3)
+                dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
+                
+                # Check for same string (same x,y coordinates)
+                xy_coords = points_tensor[:, :2]  # (n, 2)
+                xy_diff = xy_coords.unsqueeze(1) - xy_coords.unsqueeze(0)  # (n, n, 2)
+                xy_dist_sq = torch.sum(xy_diff ** 2, dim=-1)  # (n, n)
+                
+                # Get z-coordinates for distance computation
+                z_coords = points_tensor[:, 2]  # (n,)
+                z_diff = z_coords.unsqueeze(1) - z_coords.unsqueeze(0)  # (n, n)
+                z_dist_sq = z_diff ** 2
+                
+                # Mask: same string (same x,y), ignore self-pairs, and within z-radius
+                same_string_mask = xy_dist_sq < 1e-6  # Same x,y coordinates (same string)
+                self_mask = torch.eye(n, dtype=torch.bool, device=points_tensor.device)
+                radius_mask = torch.sqrt(z_dist_sq + 1e-10) < max_radius
+                
+                mask = same_string_mask & (~self_mask) & radius_mask
+                
+                # Compute repulsion for valid pairs
+                repulsion_matrix = torch.zeros_like(dist_sq)
+                repulsion_matrix[mask] = 1.0 / (z_dist_sq[mask] + min_dist)
+                repulsion = torch.sum(repulsion_matrix)
+                total_valid_pairs = torch.sum(mask.float()).item()
         
-        # Mask: same z-coordinate (same string), ignore self-pairs, and within radius
-        same_z_mask = torch.abs(z_diff) < 1e-6  # Same z-coordinate
-        self_mask = torch.eye(n, dtype=torch.bool, device=points_tensor.device)
-        radius_mask = dist_sq < max_radius ** 2
-        
-        mask = same_z_mask & (~self_mask) & radius_mask
-        
-        # Compute repulsion for valid pairs
-        repulsion_matrix = torch.zeros_like(dist_sq)
-        repulsion_matrix[mask] = 1.0 / (dist_sq[mask] + min_dist)
-        repulsion = torch.sum(repulsion_matrix) / n if n > 0 else torch.tensor(0.0)
+        # Normalize by number of valid pairs or total points
+        if total_valid_pairs > 0:
+            repulsion = repulsion / total_valid_pairs
+        elif points_3d is not None:
+            repulsion = repulsion / len(points_3d) if len(points_3d) > 0 else repulsion
         
         return {'local_z_dist_repulsion_penalty': repulsion}
 
@@ -546,3 +644,85 @@ class WeightBinarizationPenalty(LossFunction):
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
         string_probs_cut = torch.clamp(string_probs, min=0.0, max=1.0)
         return {'weight_binarization_penalty': torch.sum(-string_probs_cut * torch.log(string_probs_cut + 1e-10) - (1 - string_probs_cut) * torch.log(1 - string_probs_cut + 1e-10))}
+    
+    
+class ROVPenalty(LossFunction):
+    """Loss function for ROV penalty to maintain ROV capability for each string."""
+    def __init__(self, device=None, rov_rec_width=0.3, rov_height=0.16, rov_tri_length=0.08):
+        """
+        Initialize the string number penalty loss function.
+        
+        Parameters:
+        -----------
+        device : torch.device or None
+            Device to use for computations. If None, uses cuda if available, else cpu.
+        """
+        super().__init__(device)
+        self.rov_rec_width = rov_rec_width
+        self.rov_height = rov_height
+        self.rov_tri_length = rov_tri_length
+        
+   
+
+    def inside_safe_space(self, points, theta):
+        """
+        points: (N, 2) tensor of 2D points relative to candidate ROV position
+        theta: scalar angle in radians (rotation of safe space)
+        returns: (N,) tensor ~ soft indicator if points are inside region
+        """
+
+        # Rotation matrix
+        c, s = torch.cos(theta), torch.sin(theta)
+        R = torch.tensor([[c, -s], [s, c]], device=points.device)
+        rot_points = points @ R.T  # rotate into canonical frame
+
+        # Canonical safe space dimensions (from diagram)
+        L_rect = self.rov_rec_width
+        W_rect = self.rov_height
+        L_tri = self.rov_tri_length
+        W_tri = self.rov_tri_length
+
+        x, y = rot_points[:, 0], rot_points[:, 1].abs()
+
+        # Inside rectangular part
+        inside_rect = (x >= 0) & (x <= L_rect) & (y <= W_rect / 2)
+
+        # Inside triangular part (slope check)
+        slope = W_tri / L_tri  # 80/80 = 1.0
+        inside_tri = (x >= L_rect) & (x <= L_rect + L_tri) & (y <= slope * (L_rect + L_tri - x))
+
+        inside = inside_rect | inside_tri
+        return inside.float()
+
+    def __call__(self, geom_dict, **kwargs):
+        """
+        points: (N, 2) tensor of 2D points
+        Returns: scalar penalty loss
+        """
+        points = geom_dict.get('string_xy', None)
+        num_angles = kwargs.get('num_angles', 36)
+        string_weights = geom_dict.get('string_weights', None)
+        string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
+
+        N = points.shape[0]
+        loss = 0.0
+
+        for i in range(N):
+            others = torch.cat([points[:i], points[i+1:]], dim=0) - points[i]  # relative coords
+
+            ok = []
+            for k in range(num_angles):
+                theta = torch.tensor(2 * torch.pi * k / num_angles)
+                inside = self.inside_safe_space(others, theta)
+                ok.append(inside.any().float())  # 1 if blocked, 0 if free
+
+            # If all orientations blocked -> penalty = 1
+            penalty = torch.stack(ok).min()  # min over orientations
+            if string_probs is not None:
+                penalty *= string_probs[i]
+            loss += penalty
+
+        return {'rov_penalty': loss/N}
+
+            
+        

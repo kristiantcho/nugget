@@ -5,7 +5,7 @@ import torch.nn.functional as F
 class WeightedLLRLoss(LossFunction):
     """Loss function for log-likelihood ratio (LLR) maximization."""
     
-    def __init__(self, device=None, llr_net = None, noise_scale=0.0, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth']):
+    def __init__(self, device=None, llr_net = None, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth'], no_grad=True):
         """
         Initialize the LLR loss function.
         
@@ -21,10 +21,10 @@ class WeightedLLRLoss(LossFunction):
         super().__init__(device)
         self.llr_net = llr_net
         self.print_loss = print_loss
-        self.noise_scale = noise_scale
         self.event_labels = event_labels
+        self.no_grad = no_grad
     
-    def compute_LLR_per_string(self, string_xy, points_3d, event_params, surrogate_func):
+    def compute_LLR_per_string(self, string_xy, points_3d, event_params, surrogate_func, noise_scale=0):
         """
         Compute the LLR for each string.
         
@@ -44,7 +44,7 @@ class WeightedLLRLoss(LossFunction):
         torch.Tensor
             Tensor of shape (n_strings,) with the computed LLR for each string.
         """
-        llr_per_string = torch.zeros(len(string_xy), device=self.device)
+        llr_values = []
         for s_idx in range(len(string_xy)):
             # Create optimization points for this string
             # Sample points along the string (assuming strings extend in z-direction)
@@ -55,11 +55,19 @@ class WeightedLLRLoss(LossFunction):
             for point in string_points:
                 # Compute surrogate response for each event
                 for params in event_params:
-                    features.append(torch.tensor(self.llr_net.prepare_data_from_raw(point, params, surrogate_func, self.event_labels, self.noise_scale), device=self.device))
+                    features.append(self.llr_net.prepare_data_from_raw(point, params, surrogate_func, self.event_labels, noise_scale, self.llr_net.add_relative_pos))
                 #     avg_llr += self.llr_net.predict_log_likelihood_ratio(features)
                 # avg_llr /= len(event_params)
-            avg_llr = torch.sum(self.llr_net.predict_log_likelihood_ratio(torch.stack(features))) / len(event_params)
-            llr_per_string[s_idx] += avg_llr
+            if features:  # Only compute if we have features
+                if self.no_grad:
+                    with torch.no_grad():    
+                        avg_llr = torch.sum(self.llr_net.predict_log_likelihood_ratio(torch.stack(features))) / len(event_params)
+                else:    
+                    avg_llr = torch.sum(self.llr_net.predict_log_likelihood_ratio(torch.stack(features))) / len(event_params)           
+            llr_values.append(avg_llr)
+        
+        # Stack to preserve gradients
+        llr_per_string = torch.stack(llr_values) if llr_values else torch.tensor([], device=self.device)
         return llr_per_string
     
     def __call__(self, geom_dict, **kwargs):
@@ -72,19 +80,20 @@ class WeightedLLRLoss(LossFunction):
         surrogate_func = kwargs.get('signal_surrogate_func', None)
         signal_sampler = kwargs.get('signal_sampler', None)
         num_events = kwargs.get('num_events', 100)
+        noise_scale = kwargs.get('signal_noise_scale', 0.0)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
 
         if precomputed_llr_per_string is not None:
             llr_per_string = precomputed_llr_per_string
         else:
-            llr_per_string = self.compute_LLR_per_string(string_xy, points_3d, event_params, surrogate_func)
+            llr_per_string = self.compute_LLR_per_string(string_xy, points_3d, event_params, surrogate_func, noise_scale)
 
         if string_weights is None:
             total_llr = torch.sum(llr_per_string)  # Sum over strings
         else:
             string_probs = torch.sigmoid(string_weights)
-            total_llr = torch.sum(llr_per_string * string_probs)  # Weighted sum
+            total_llr = torch.sum(llr_per_string * string_probs) / len(string_probs)  # Weighted sum
         
         llr_loss = 1/(total_llr + 1e-6)  # Add small value for numerical stability
         
@@ -94,7 +103,7 @@ class WeightedLLRLoss(LossFunction):
 class WeightedMeanDifLLRLoss(WeightedLLRLoss):
     """Loss function for mean difference in log-likelihood ratio (LLR) maximization."""
     
-    def __init__(self, device=None, llr_net = None, noise_scale=0.0, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth']):
+    def __init__(self, device=None, llr_net = None, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth'], no_grad=True):
         """
         Initialize the mean difference LLR loss function.
         
@@ -107,7 +116,7 @@ class WeightedMeanDifLLRLoss(WeightedLLRLoss):
         noise_scale : float
             Scale of noise to add to surrogate response.
         """
-        super().__init__(device, llr_net, noise_scale, print_loss, event_labels)
+        super().__init__(device, llr_net, print_loss, event_labels, no_grad)
     
     def __call__(self, geom_dict, **kwargs):
         
@@ -123,6 +132,8 @@ class WeightedMeanDifLLRLoss(WeightedLLRLoss):
         signal_sampler = kwargs.get('signal_sampler', None)
         background_sampler = kwargs.get('background_sampler', None)
         num_events = kwargs.get('num_events', 100)
+        signal_noise_scale = kwargs.get('signal_noise_scale', 0.0)
+        background_noise_scale = kwargs.get('background_noise_scale', 0.0)
         if signal_event_params is None and signal_sampler is not None:
             signal_event_params = signal_sampler.sample_events(num_events)
         if background_event_params is None and background_sampler is not None:
@@ -131,11 +142,11 @@ class WeightedMeanDifLLRLoss(WeightedLLRLoss):
         if precomputed_signal_llr_per_string is not None:
             signal_llr_per_string = precomputed_signal_llr_per_string
         else:
-            signal_llr_per_string = self.compute_LLR_per_string(string_xy, points_3d, signal_event_params, signal_surrogate_func)
+            signal_llr_per_string = self.compute_LLR_per_string(string_xy, points_3d, signal_event_params, signal_surrogate_func, signal_noise_scale)
         if precomputed_background_llr_per_string is not None:
             background_llr_per_string = precomputed_background_llr_per_string
         else:
-            background_llr_per_string = self.compute_LLR_per_string(string_xy, points_3d, background_event_params, background_surrogate_func)
+            background_llr_per_string = self.compute_LLR_per_string(string_xy, points_3d, background_event_params, background_surrogate_func, background_noise_scale)
 
         if string_weights is None:
             signal_total_llr = torch.mean(signal_llr_per_string)  # Mean over strings
@@ -143,8 +154,8 @@ class WeightedMeanDifLLRLoss(WeightedLLRLoss):
             llr_diff = torch.abs(signal_total_llr - background_total_llr)
         else:
             string_probs = torch.sigmoid(string_weights)
-            signal_total_llr = torch.sum(signal_llr_per_string * string_probs) / (torch.sum(string_probs) + 1e-6)  # Weighted mean
-            background_total_llr = torch.sum(background_llr_per_string * string_probs) / (torch.sum(string_probs) + 1e-6)  # Weighted mean
+            signal_total_llr = torch.sum(signal_llr_per_string * string_probs) / len(string_probs)  # Weighted mean
+            background_total_llr = torch.sum(background_llr_per_string * string_probs) / len(string_probs)  # Weighted mean
             llr_diff = torch.abs(signal_total_llr - background_total_llr)
         
         llr_loss = 1/(llr_diff + 1e-6)  # Add small value for numerical stability
@@ -154,7 +165,7 @@ class WeightedMeanDifLLRLoss(WeightedLLRLoss):
 class LLRLoss(LossFunction):
     """Loss function for log-likelihood ratio (LLR) maximization."""
     
-    def __init__(self, device=None, llr_net = None, noise_scale=0.0, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth']):
+    def __init__(self, device=None, llr_net = None, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth']):
         """
         Initialize the LLR loss function.
         
@@ -170,10 +181,9 @@ class LLRLoss(LossFunction):
         super().__init__(device)
         self.llr_net = llr_net
         self.print_loss = print_loss
-        self.noise_scale = noise_scale
         self.event_labels = event_labels
     
-    def compute_LLR_per_point(self, points_3d, event_params, surrogate_func):
+    def compute_LLR_per_point(self, points_3d, event_params, surrogate_func, noise_scale=0):
         """
         Compute the LLR for each string.
         
@@ -194,15 +204,19 @@ class LLRLoss(LossFunction):
             Tensor of shape (n_strings,) with the computed LLR for each string.
         """
           
-        llr_per_point = torch.zeros(len(points_3d), device=self.device)
-        features = []           
+        llr_values = []         
         for ip, point in enumerate(points_3d):
             # Compute surrogate response for each event
+            features = []
             for params in event_params:
-                features.append(torch.tensor(self.llr_net.prepare_data_from_raw(point, params, surrogate_func, self.event_labels, self.noise_scale), device=self.device))
+                features.append(self.llr_net.prepare_data_from_raw(point, params, surrogate_func, self.event_labels, noise_scale, self.llr_net.add_relative_pos))
             #     avg_llr += self.llr_net.predict_log_likelihood_ratio(features)
             # avg_llr /= len(event_params)
-            llr_per_point[ip] += torch.sum(self.llr_net.predict_log_likelihood_ratio(torch.stack(features))) / len(event_params)
+            avg_llr = torch.sum(self.llr_net.predict_log_likelihood_ratio(torch.stack(features))) / len(event_params)
+            llr_values.append(avg_llr)
+        
+        # Stack to preserve gradients
+        llr_per_point = torch.stack(llr_values) if llr_values else torch.tensor([], device=self.device)
         return llr_per_point
     
     def __call__(self, geom_dict, **kwargs):
@@ -211,11 +225,12 @@ class LLRLoss(LossFunction):
         surrogate_func = kwargs.get('signal_surrogate_func', None)
         signal_sampler = kwargs.get('signal_sampler', None)
         num_events = kwargs.get('num_events', 100)
+        noise_scale = kwargs.get('signal_noise_scale', 0.0)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
 
         
-        llr_per_point = self.compute_LLR_per_point(points_3d, event_params, surrogate_func)
+        llr_per_point = self.compute_LLR_per_point(points_3d, event_params, surrogate_func, noise_scale)
         total_llr = torch.sum(llr_per_point)  # Sum over points
         
         llr_loss = 1/(total_llr + 1e-6)  # Add small value for numerical stability
@@ -226,7 +241,7 @@ class LLRLoss(LossFunction):
 class MeanDifLLRLoss(LLRLoss):
     """Loss function for mean difference in log-likelihood ratio (LLR) maximization."""
     
-    def __init__(self, device=None, llr_net = None, noise_scale=0.0, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth']):
+    def __init__(self, device=None, llr_net = None, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth']):
         """
         Initialize the mean difference LLR loss function.
         
@@ -239,7 +254,7 @@ class MeanDifLLRLoss(LLRLoss):
         noise_scale : float
             Scale of noise to add to surrogate response.
         """
-        super().__init__(device, llr_net, noise_scale, print_loss, event_labels)
+        super().__init__(device, llr_net, print_loss, event_labels)
     
     def __call__(self, geom_dict, **kwargs):
         
@@ -251,13 +266,15 @@ class MeanDifLLRLoss(LLRLoss):
         signal_sampler = kwargs.get('signal_sampler', None)
         background_sampler = kwargs.get('background_sampler', None)
         num_events = kwargs.get('num_events', 100)
+        signal_noise_scale = kwargs.get('signal_noise_scale', 0.0)
+        background_noise_scale = kwargs.get('background_noise_scale', 0.0)
         if signal_event_params is None and signal_sampler is not None:
             signal_event_params = signal_sampler.sample_events(num_events)
         if background_event_params is None and background_sampler is not None:
             background_event_params = background_sampler.sample_events(num_events)
 
-        signal_llr_per_point = self.compute_LLR_per_point(points_3d, signal_event_params, signal_surrogate_func)
-        background_llr_per_point = self.compute_LLR_per_point(points_3d, background_event_params, background_surrogate_func)
+        signal_llr_per_point = self.compute_LLR_per_point(points_3d, signal_event_params, signal_surrogate_func, signal_noise_scale)
+        background_llr_per_point = self.compute_LLR_per_point(points_3d, background_event_params, background_surrogate_func, background_noise_scale)
         signal_total_llr = torch.sum(signal_llr_per_point)  # Mean over points
         background_total_llr = torch.sum(background_llr_per_point)  # Mean over points
         llr_diff = torch.abs(signal_total_llr - background_total_llr)/len(points_3d)

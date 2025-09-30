@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 
 
-def compute_fisher_info_single(fisher_info_params, point, event_params, surrogate_func):
+def compute_fisher_info_single(fisher_info_params, point, event_params, surrogate_func, llr_net=None, signal_noise_scale=None, add_relative_pos=False):
     """
     Compute the Fisher information matrix for a single point and event parameters.
     
@@ -37,8 +37,14 @@ def compute_fisher_info_single(fisher_info_params, point, event_params, surrogat
     
 
     # Compute light yield mean (λ) using the signal surrogate function with gradients
-    light_yield_mean = surrogate_func(opt_point=point, event_params=grad_event_params)  # Shape (1,)
-        
+    if llr_net is None:
+        light_yield_mean = surrogate_func(opt_point=point, event_params=grad_event_params)  # Shape (1,)
+        if signal_noise_scale is not None:
+            light_yield_mean = torch.normal(0, signal_noise_scale)*light_yield_mean + light_yield_mean
+    
+    else:
+        features = llr_net.prepare_data_from_raw(point, grad_event_params, surrogate_func, noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos)
+        light_yield_mean = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-9)
     param_gradients = []
     
     for param_name in fisher_info_params:
@@ -70,7 +76,10 @@ def compute_fisher_info_single(fisher_info_params, point, event_params, surrogat
                 grad_j = param_gradients[j_param]
                 
                 # Fisher Information element: (∂λ/∂θ_i)(∂λ/∂θ_j)/λ
-                fisher_element = (grad_i * grad_j) / light_yield_mean
+                if llr_net is None:    
+                    fisher_element = (grad_i * grad_j) / light_yield_mean
+                else: 
+                    fisher_element = grad_i * grad_j
                 fisher_matrix[i_param, j_param] += fisher_element.item()
             
     return fisher_matrix
@@ -287,7 +296,8 @@ class FisherInfoLoss(LossFunction):
         event_params = kwargs.get('signal_event_params', None)
         surrogate_func = kwargs.get('signal_surrogate_func', None)
         signal_sampler = kwargs.get('signal_sampler', None)
-        num_events = kwargs.get('num_events', 100)
+        num_events = kwargs.get('num_events', 1)
+        
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
         
@@ -318,6 +328,10 @@ class FisherInfoLoss(LossFunction):
         surrogate_func = kwargs.get('signal_surrogate_func', None)
         signal_sampler = kwargs.get('signal_sampler', None)
         num_events = kwargs.get('num_events', 100)
+        llr_net = kwargs.get('fisher_info_llr_net', None)
+        llr_iterations = kwargs.get('fisher_info_llr_iterations', 100)
+        signal_noise_scale = kwargs.get('signal_noise_scale', None)
+        add_relative_pos = kwargs.get('add_relative_pos', False)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
         n_params = len(self.fisher_info_params)
@@ -326,8 +340,9 @@ class FisherInfoLoss(LossFunction):
         for i, point in enumerate(points_3d):
             fisher_matrix = torch.zeros(n_params, n_params, device=self.device)
             for params in event_params:
-                fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, params, surrogate_func)/len(event_params)
-            total_fisher_info += fisher_matrix
+                for _ in range(llr_iterations):
+                    fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, params, surrogate_func, llr_net, signal_noise_scale, add_relative_pos=add_relative_pos)/len(event_params)
+            total_fisher_info += fisher_matrix/llr_iterations
             fisher_info_per_point[i] += fisher_matrix
             
         fisher_loss = 1/(torch.det(total_fisher_info) + 1e-6)  # Add small value to diagonal for numerical stability
@@ -417,7 +432,7 @@ class WeightedFisherInfoLoss(LossFunction):
             
         return fisher_info_per_string
         
-    def compute_fisher_info_per_string(self, string_xy, points_3d, signal_event_params, signal_surrogate_func):
+    def compute_fisher_info_per_string(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False):
         """
         Legacy method - kept for backward compatibility and testing.
         Compute the Fisher information for each string using the original single-event approach.
@@ -432,8 +447,9 @@ class WeightedFisherInfoLoss(LossFunction):
             fisher_matrix = torch.zeros(n_params, n_params, device=self.device)
             for point in string_points:  
                 for signal_params in signal_event_params:
-                    fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, event_params=signal_params, surrogate_func=signal_surrogate_func)/len(signal_event_params)
-            fisher_info_per_string[s_idx] += fisher_matrix
+                    for _ in range(llr_iterations):    
+                        fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos)/len(signal_event_params)
+            fisher_info_per_string[s_idx] += fisher_matrix/llr_iterations
             
         return fisher_info_per_string
     
@@ -469,12 +485,16 @@ class WeightedFisherInfoLoss(LossFunction):
         signal_surrogate_func = kwargs.get('signal_surrogate_func', None)
         signal_sampler = kwargs.get('signal_sampler', None)
         num_events = kwargs.get('num_events', 100)
+        llr_net = kwargs.get('fisher_info_llr_net', None)
+        llr_iterations = kwargs.get('fisher_info_llr_iterations', 100)
+        signal_noise_scale = kwargs.get('signal_noise_scale', None)
+        add_relative_pos = kwargs.get('add_relative_pos', False)
         # background_event_params = kwargs.get('background_event_params', None)
         # background_surrogate_func = kwargs.get('background_surrogate_func', None)
         if signal_event_params is None and signal_sampler is not None:
             signal_event_params = signal_sampler.sample_events(num_events)
         if precomputed_fisher_info_per_string is None:
-            fisher_info_per_string = self.compute_fisher_info_per_string(string_xy, points_3d, signal_event_params, signal_surrogate_func)
+            fisher_info_per_string = self.compute_fisher_info_per_string(string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net, signal_noise_scale, llr_iterations, add_relative_pos)
         else:
             fisher_info_per_string = precomputed_fisher_info_per_string
         if string_weights is None:
@@ -488,3 +508,202 @@ class WeightedFisherInfoLoss(LossFunction):
         
         # return fisher_loss, fisher_info_per_string, total_fisher_info
         return {'fisher_loss': fisher_loss, 'fisher_info_per_string': fisher_info_per_string, 'total_fisher_info': total_fisher_info}
+    
+class WeightedResolutionLoss(WeightedFisherInfoLoss):
+    def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith'], resolution_type='angular'):
+        """
+        Initialize the weighted LLR loss function.
+        
+        Parameters:
+        -----------
+        device : torch.device or None
+            Device to use for computations.
+        print_loss : bool
+            Whether to print loss components during computation.
+        signal_surrogate_func : callable or None
+            Function that computes signal light yield from event parameters.
+        background_surrogate_func : callable or None
+            Function that computes background light yield from event parameters.
+        signal_event_params : dict or None
+            Dictionary containing signal event parameters.
+        background_event_params : dict or None
+            Dictionary containing background event parameters.
+        batch_size_per_string : int
+            Number of samples to generate per string for LLR computation.
+        random_seed : int or None
+            Random seed for reproducibility.
+        fisher_info_params : list of str
+            List of event parameters to compute Fisher information for.
+        resolution_type : str
+            Type of resolution to compute ('angular' or 'energy').
+        """
+        super().__init__(device, print_loss, random_seed, fisher_info_params)
+        
+        self.resolution_type = resolution_type # 'angular' or 'energy'
+    
+    def __call__(self, geom_dict, **kwargs):
+        """
+        Compute the total Fisher information loss = 1/det(WeightedFisherInfo).
+        
+        Parameters:
+        -----------
+        string_xy : list of torch.Tensor or None
+            The 2D points of the strings to compute the penalty for.
+        points_3d : torch.Tensor
+            The 3D points to evaluate the loss at.
+        signal_event_params : list of dict
+            List of dictionaries containing signal event parameters.
+        signal_surrogate_func : callable
+            Function that computes signal light yield from event parameters.
+        background_event_params : list of dict or None
+            List of dictionaries containing background event parameters.
+        background_surrogate_func : callable or None
+            Function that computes background light yield from event parameters.
+            
+        Returns:
+        --------
+        torch.Tensor
+            The total Fisher information loss value.
+        """
+        precomputed_fisher_info_per_string = kwargs.get('precomputed_fisher_info_per_string', None)
+        string_weights = geom_dict.get('string_weights', None)
+        string_xy = geom_dict.get('string_xy', None)
+        points_3d = geom_dict.get('points_3d', None)
+        signal_event_params = kwargs.get('signal_event_params', None)
+        signal_surrogate_func = kwargs.get('signal_surrogate_func', None)
+        signal_sampler = kwargs.get('signal_sampler', None)
+        num_events = kwargs.get('num_events', 100)
+        llr_net = kwargs.get('fisher_info_llr_net', None)
+        llr_iterations = kwargs.get('fisher_info_llr_iterations', 100)
+        signal_noise_scale = kwargs.get('signal_noise_scale', None)
+        add_relative_pos = kwargs.get('add_relative_pos', False)
+        # background_event_params = kwargs.get('background_event_params', None)
+        # background_surrogate_func = kwargs.get('background_surrogate_func', None)
+        if signal_event_params is None and signal_sampler is not None:
+            signal_event_params = signal_sampler.sample_events(num_events)
+        if precomputed_fisher_info_per_string is None:
+            fisher_info_per_string = self.compute_fisher_info_per_string(string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net, signal_noise_scale, llr_iterations, add_relative_pos)
+        else:
+            fisher_info_per_string = precomputed_fisher_info_per_string
+        if string_weights is None:
+            total_fisher_info = torch.sum(fisher_info_per_string, dim=0)  # Sum over strings, keep matrix form
+        else:
+            string_probs = torch.sigmoid(string_weights)
+            total_fisher_info = torch.sum(string_probs.unsqueeze(1).unsqueeze(2) * fisher_info_per_string, dim=0)
+            
+        if self.resolution_type == 'angular':
+            azimuth_idx = self.fisher_info_params.index('azimuth')
+            zenith_idx = self.fisher_info_params.index('zenith')
+            cov_matrix = torch.inverse(total_fisher_info)
+    
+            # Angular resolution: sqrt(var_azimuth + var_zenith)
+            var_azimuth = cov_matrix[azimuth_idx, azimuth_idx]
+            var_zenith = cov_matrix[zenith_idx, zenith_idx]
+            angular_resolution_rad = torch.sqrt(var_azimuth + var_zenith)
+            
+            return {'angular_resolution_loss': angular_resolution_rad, 'total_fisher_info': total_fisher_info, 'fisher_info_per_string': fisher_info_per_string}
+        elif self.resolution_type == 'energy':
+            energy_idx = self.fisher_info_params.index('energy')
+            cov_matrix = torch.inverse(total_fisher_info)
+    
+            # Energy resolution: sqrt(var_energy)/energy
+            var_energy = cov_matrix[energy_idx, energy_idx]
+            mean_energy = torch.mean(torch.tensor([params['energy'] for params in signal_event_params], device=self.device))
+            energy_resolution = torch.sqrt(var_energy)/mean_energy
+
+            return {'energy_resolution_loss': energy_resolution, 'total_fisher_info': total_fisher_info, 'fisher_info_per_string': fisher_info_per_string}
+        
+class ResolutionLoss(FisherInfoLoss):
+    def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith'], resolution_type='angular'):
+        """
+        Initialize the weighted LLR loss function.
+        
+        Parameters:
+        -----------
+        device : torch.device or None
+            Device to use for computations.
+        print_loss : bool
+            Whether to print loss components during computation.
+        signal_surrogate_func : callable or None
+            Function that computes signal light yield from event parameters.
+        background_surrogate_func : callable or None
+            Function that computes background light yield from event parameters.
+        signal_event_params : dict or None
+            Dictionary containing signal event parameters.
+        background_event_params : dict or None
+            Dictionary containing background event parameters.
+        batch_size_per_string : int
+            Number of samples to generate per string for LLR computation.
+        random_seed : int or None
+            Random seed for reproducibility.
+        fisher_info_params : list of str
+            List of event parameters to compute Fisher information for.
+        resolution_type : str
+            Type of resolution to compute ('angular' or 'energy').
+        """
+        super().__init__(device, print_loss, random_seed, fisher_info_params)
+        
+        self.resolution_type = resolution_type # 'angular' or 'energy'
+    
+    def __call__(self, geom_dict, **kwargs):
+        """
+        Compute the total Fisher information loss = 1/det(FisherInfo).
+        
+        Parameters:
+        -----------
+        points_3d : torch.Tensor
+            The 3D points to evaluate the loss at.
+        event_params : list of dict
+            List of dictionaries containing event parameters.
+        surrogate_func : callable
+            Function that computes light yield from event parameters.
+            
+        Returns:
+        --------
+        torch.Tensor
+            The total Fisher information loss value.
+        """
+        points_3d = geom_dict.get('points_3d', None)
+        event_params = kwargs.get('signal_event_params', None)
+        surrogate_func = kwargs.get('signal_surrogate_func', None)
+        signal_sampler = kwargs.get('signal_sampler', None)
+        num_events = kwargs.get('num_events', 100)
+        llr_net = kwargs.get('fisher_info_llr_net', None)
+        llr_iterations = kwargs.get('fisher_info_llr_iterations', 100)
+        signal_noise_scale = kwargs.get('signal_noise_scale', None)
+        add_relative_pos = kwargs.get('add_relative_pos', False)
+        if event_params is None and signal_sampler is not None:
+            event_params = signal_sampler.sample_events(num_events)
+        n_params = len(self.fisher_info_params)
+        total_fisher_info = torch.zeros(n_params, n_params, device=self.device)
+        fisher_info_per_point = torch.zeros((len(points_3d), n_params, n_params), device=self.device)
+        for i, point in enumerate(points_3d):
+            fisher_matrix = torch.zeros(n_params, n_params, device=self.device)
+            for params in event_params:
+                for _ in range(llr_iterations):
+                    fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, params, surrogate_func, llr_net, signal_noise_scale, add_relative_pos=add_relative_pos)/len(event_params)
+            total_fisher_info += fisher_matrix/llr_iterations
+            fisher_info_per_point[i] += fisher_matrix
+        
+        if self.resolution_type == 'angular':
+            azimuth_idx = self.fisher_info_params.index('azimuth')
+            zenith_idx = self.fisher_info_params.index('zenith')
+            cov_matrix = torch.inverse(total_fisher_info)
+    
+            # Angular resolution: sqrt(var_azimuth + var_zenith)
+            var_azimuth = cov_matrix[azimuth_idx, azimuth_idx]
+            var_zenith = cov_matrix[zenith_idx, zenith_idx]
+            angular_resolution_rad = torch.sqrt(var_azimuth + var_zenith)
+            
+            return {'angular_resolution_loss': angular_resolution_rad, 'total_fisher_info': total_fisher_info, 'fisher_info_per_point': fisher_info_per_point}
+        elif self.resolution_type == 'energy':
+            energy_idx = self.fisher_info_params.index('energy')
+            cov_matrix = torch.inverse(total_fisher_info)
+    
+            # Energy resolution: sqrt(var_energy)/energy
+            var_energy = cov_matrix[energy_idx, energy_idx]
+            mean_energy = torch.mean(torch.tensor([params['energy'] for params in event_params], device=self.device))
+            energy_resolution = torch.sqrt(var_energy)/mean_energy
+
+            return {'energy_resolution_loss': energy_resolution, 'total_fisher_info': total_fisher_info, 'fisher_info_per_point': fisher_info_per_point}
+            

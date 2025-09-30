@@ -1,15 +1,18 @@
 import torch
 import numpy as np
 from conflictfree.grad_operator import ConFIG_update
+from conflictfree.weight_model import WeightModel, EqualWeight
+from typing import Optional, Sequence, Union
 
 class Optimizer():
     
-    def __init__(self, device=None, geometry=None, visualizer=None, conflict_free=False):
+    def __init__(self, device=None, geometry=None, visualizer=None, conflict_free=False, use_custom_cf_weight=True):
         
         self.device=device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.geometry = geometry
         self.visualizer = visualizer
         self.conflict_free = conflict_free
+        self.use_custom_cf_weight = use_custom_cf_weight
 
     def init_geometry(self, opt_list=[('string_xy', 0.01)], schedule_creator=None, schedule_params=None, geom_dict=None):
         
@@ -28,7 +31,7 @@ class Optimizer():
                     params = schedule_params[geo_aspect_name]
                     geo_scheduler = schedule_creator(geo_optimizer, **params)
                     self.schedulers[geo_aspect_name] = geo_scheduler
-    
+            self.geom_dict = self.geometry.update_points(**self.geom_dict)
     def loss_update_step(self):
         
   
@@ -46,7 +49,9 @@ class Optimizer():
                 optimizer.zero_grad()
                 grads = []              
                 # Compute gradients for each loss component separately
-                for loss_fn in self.loss_dict.values():
+                for loss_name, loss_fn in self.loss_dict.items():
+                    if self.loss_weights_dict.get(loss_name) == 0.0:
+                        continue
                     if count == 1:    
                         total_loss += loss_fn[-1].item()
                     
@@ -63,7 +68,11 @@ class Optimizer():
 
                 # Calculate conflict-free gradient direction
                 if len(grads) > 0:
-                    g_config = ConFIG_update(grads)
+                    if self.use_custom_cf_weight:
+                        weight_model = CustomWeight(self.loss_dict, self.loss_weights_dict)
+                    else:
+                        weight_model = EqualWeight()
+                    g_config = ConFIG_update(grads, weight_model=weight_model)
                     
                     # Apply conflict-free gradients to string_weights manually
                     geo_aspect.grad = g_config.view_as(self.geom_dict[geo_aspect_name])
@@ -73,9 +82,10 @@ class Optimizer():
                         continue
                 self.optimizers[key].step()
         else:
-            for loss_fn in self.loss_dict.values():
-                total_loss += loss_fn[-1]
-                total_loss.backward(retain_graph=True)
+            for loss_name, loss_fn in self.loss_dict.items():
+                if self.loss_weights_dict.get(loss_name) != 0.0:
+                    total_loss += loss_fn[-1]
+                    total_loss.backward(retain_graph=True)
                 
             # Update parameters
             for key in self.optimizers.keys():
@@ -94,6 +104,8 @@ class Optimizer():
         self.vis_loss_dict = kwargs.get('vis_loss_dict', {})
         self.vis_uw_loss_dict = kwargs.get('vis_uw_loss_dict', {})
         self.alternate_freq = kwargs.get('alternate_freq', None)
+        self.loss_weights_dict = loss_weights_dict
+        self.cf_loss_weights_dict = kwargs.get('cf_loss_weights_dict', self.loss_weights_dict)
         for key in loss_func_dict:
             if key not in self.loss_dict:
                 self.loss_dict[key] = []
@@ -139,16 +151,18 @@ class Optimizer():
                     loss_value = loss_stuff
                     vis_kwargs.update({loss_name: loss_stuff})
                 if loss_value is not None:
-                    weight = loss_weights_dict.get(loss_name, 1.0)
+                    weight = self.loss_weights_dict.get(loss_name, 1.0)
                     weighted_loss = weight * loss_value
-                    self.loss_dict[loss_name].append(weighted_loss)
-                    self.uw_loss_dict[loss_name].append(loss_value)
+                    if weight != 0.0:
+                        self.loss_dict[loss_name].append(weighted_loss)
+                        self.uw_loss_dict[loss_name].append(loss_value)
                     self.vis_loss_dict[loss_name].append(weighted_loss.item())
                     self.vis_uw_loss_dict[loss_name].append(loss_value.item())
                 else:
                     print(f"Warning: {loss_name} did not return a valid loss value.")
                 vis_kwargs['loss_dict'] = self.vis_loss_dict
                 vis_kwargs['uw_loss_dict'] = self.vis_uw_loss_dict
+                vis_kwargs['loss_weights_dict'] = self.loss_weights_dict
             self.total_loss.append(self.loss_update_step())
             
             # Step the schedulers
@@ -163,7 +177,7 @@ class Optimizer():
             vis_kwargs.update(self.geom_dict)
             if it % print_freq == 0 or it == n_iter - 1:
                 # print('string weights:', self.geom_dict.get('string_weights'))
-                loss_str = ' | '.join([f'{key}: {loss_fn[-1]:.4f}' for key, loss_fn in self.loss_dict.items()])
+                loss_str = ' | '.join([f'{key}: {loss_fn[-1]:.4f}' if self.loss_weights_dict.get(key) != 0.0 else '' for key, loss_fn in self.loss_dict.items()])
                 print(f'Iter {it+1}/{n_iter}, Total Loss: {self.total_loss[-1]:.4f} | {loss_str}')
             
             if self.visualizer is not None and vis_freq is not None:
@@ -176,3 +190,40 @@ class Optimizer():
                     self.visualizer.visualize_progress(**vis_kwargs)
         
         return self.geom_dict
+    
+class CustomWeight(WeightModel):
+    """
+    A weight model that assigns equal weights to all gradients.
+    """
+
+    def __init__(self,
+                 losses_dict: Optional[dict] = None,
+                 weights_dict: Optional[dict] = None):
+        super().__init__()
+        self.losses_dict = losses_dict
+        self.weights_dict = weights_dict
+
+    def get_weights(
+        self,
+        gradients: torch.Tensor,
+        losses: Optional[Sequence] = None,
+        device: Optional[Union[torch.device, str]] = None,
+    ) -> torch.Tensor:
+        """
+        Apply weights for the Configfree method.
+
+        Parameters:
+        -----------
+        weights_dict : dict
+            Dictionary of weights for each loss component.
+        losses_dict : dict
+            Dictionary of loss values for each loss component.
+        device : torch.device or str
+            Device to use for computations.
+        """
+        weights_tensor = torch.ones(len(self.losses_dict), device=device)
+        for i, key in enumerate(self.losses_dict):
+            if self.weights_dict is not None and key in self.weights_dict:
+                weights_tensor[i] *= self.weights_dict[key]
+            
+        return weights_tensor

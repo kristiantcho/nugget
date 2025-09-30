@@ -423,7 +423,7 @@ class LLRnet(Surrogate):
         
     
     
-    def prepare_data_from_raw(self, point, event_data, surrogate_func, event_labels = ['position', 'energy', 'zenith', 'azimuth'], noise_scale=0.0, add_relative_pos=True):
+    def prepare_data_from_raw(self, point, event_data, surrogate_func, event_labels = ['position', 'energy', 'zenith', 'azimuth'], noise_scale=0.0, add_relative_pos=True, signal_event_data=None, output_true_light_yield=False):
         """
         Prepare training data from raw neutrino event data.
         
@@ -445,6 +445,8 @@ class LLRnet(Surrogate):
         torch.Tensor
             features: torch.Tensor of shape (feature_dim,) for single event
         """
+        if signal_event_data is None:
+            signal_event_data = event_data
         if isinstance(event_data, dict):
             # Extract features from dictionary
             feature_list = []
@@ -457,8 +459,8 @@ class LLRnet(Surrogate):
             
             # Flatten point coordinates to 1D
             feature_list.append(point_tensor.flatten())
-            if add_relative_pos and 'position' in event_data:
-                event_pos = event_data['position']
+            if add_relative_pos and 'position' in signal_event_data:
+                event_pos = signal_event_data['position']
                 if isinstance(event_pos, np.ndarray):
                     event_pos_tensor = torch.tensor(event_pos, device=self.device, dtype=torch.float32)
                 else:
@@ -468,8 +470,8 @@ class LLRnet(Surrogate):
             
             # Add event parameters
             for key in event_labels:
-                if key in event_data:
-                    feature = event_data[key]
+                if key in signal_event_data:
+                    feature = signal_event_data[key]
                     if isinstance(feature, np.ndarray):
                         feature = torch.tensor(feature, device=self.device, dtype=torch.float32)
                     elif not isinstance(feature, torch.Tensor):
@@ -482,9 +484,11 @@ class LLRnet(Surrogate):
                     
             # Calculate detector response
             detector_response = surrogate_func(opt_point=point_tensor, event_params=event_data)
+            if output_true_light_yield:
+                true_light_yield = detector_response.clone()
             if noise_scale > 0.0:
-                noise = np.random.normal(0, noise_scale, size=detector_response.shape)
-                detector_response += torch.tensor(noise, device=self.device, dtype=torch.float32) * detector_response
+                noise = torch.normal(0, noise_scale, size=detector_response.shape, device=self.device, dtype=torch.float32)
+                detector_response += noise * detector_response
             if isinstance(detector_response, np.ndarray):
                 detector_response = torch.tensor(detector_response, device=self.device, dtype=torch.float32)
             elif not isinstance(detector_response, torch.Tensor):
@@ -497,7 +501,10 @@ class LLRnet(Surrogate):
             # Combine all features into a single 1D tensor
             features = torch.cat(feature_list, dim=0)
         
-        return features
+            if output_true_light_yield:
+                return features, true_light_yield
+            else:
+                return features
     
     # def train(self, features, labels, epochs=100, batch_size=256, validation_split=0.2, 
     #           verbose=True, early_stopping_patience=10):
@@ -640,11 +647,12 @@ class LLRnet(Surrogate):
     def train_with_dataloader(self, train_dataloader, val_dataloader=None, epochs=100,
                              verbose=True, early_stopping_patience=10):
         """
-        Train the LLR network using PyTorch DataLoader.
+        Train the LLR network using PyTorch DataLoader with balanced signal/background events.
         
         This method is designed to work with EventDataset that dynamically generates
-        events from different detector points. Each batch from the DataLoader contains
-        events from a single detector point.
+        balanced signal and background events. The dataset ensures that for every signal
+        event there is a corresponding background event with the same detector point and
+        shared parameters, differing only in detector response.
         
         Parameters:
         -----------
@@ -668,7 +676,7 @@ class LLRnet(Surrogate):
         if self.mlp_branches is None and self.shared_branch_mlp is None:
             sample_batch = next(iter(train_dataloader))
             sample_features, _ = sample_batch
-            # Features are now (batch_size, feature_dim) since each sample is a single event
+            # Features are now (batch_size, feature_dim) since each sample is an individual event
             feature_dim = sample_features.shape[1]
             self._build_network(feature_dim)
         
@@ -691,9 +699,11 @@ class LLRnet(Surrogate):
             train_loss = 0.0
             n_batches = 0
             
-            # Iterate through batches of single events
+            # Iterate through batches of individual events
             for batch_features, batch_labels in train_dataloader:
-                # Move to device (no need to flatten since each sample is already a single event)
+                # Each sample is now an individual event
+                # batch_features shape: (batch_size, feature_dim)
+                # batch_labels shape: (batch_size,)
                 batch_features = batch_features.to(self.device)
                 batch_labels = batch_labels.to(self.device)
                 
@@ -725,7 +735,9 @@ class LLRnet(Surrogate):
                 n_val_batches = 0
                 with torch.no_grad():
                     for batch_features, batch_labels in val_dataloader:
-                        # Move to device (no need to flatten since each sample is already a single event)
+                        # Each sample is now an individual event
+                        # batch_features shape: (batch_size, feature_dim)
+                        # batch_labels shape: (batch_size,)
                         batch_features = batch_features.to(self.device)
                         batch_labels = batch_labels.to(self.device)
                         
@@ -880,16 +892,16 @@ class LLRnet(Surrogate):
             for fourier_layer in self.fourier_features_list:
                 fourier_layer.eval()
             
-        with torch.no_grad():
-            probabilities = self._forward_pass(points)
-            
-            if return_probabilities:
-                return probabilities
-            else:
-                # Convert probabilities to LLR: log(p/(1-p))
-                epsilon = 1e-7  # Small value to prevent log(0)
-                prob_clamped = torch.clamp(probabilities, epsilon, 1 - epsilon)
-                return torch.log(prob_clamped / (1 - prob_clamped))
+      
+        probabilities = self._forward_pass(points)
+        
+        if return_probabilities:
+            return probabilities
+        else:
+            # Convert probabilities to LLR: log(p/(1-p))
+            epsilon = 1e-7  # Small value to prevent log(0)
+            prob_clamped = torch.clamp(probabilities, epsilon, 1 - epsilon)
+            return torch.log(prob_clamped / (1 - prob_clamped))
 
     def predict_log_likelihood_ratio(self, features, epsilon=1e-7):
         """
@@ -922,16 +934,16 @@ class LLRnet(Surrogate):
             for fourier_layer in self.fourier_features_list:
                 fourier_layer.eval()
             
-        with torch.no_grad():
-            # Get probabilities from the network (already has sigmoid)
-            probabilities = self._forward_pass(features)
-            
-            # Compute LLR: log(p/(1-p))
-            # epsilon = 1e-7  # Small value to prevent log(0)
-            prob_clamped = torch.clamp(probabilities, epsilon, 1 - epsilon)
-            llr = torch.log(prob_clamped / (1 - prob_clamped))
-            # llr = torch.log(probabilities + 1e-10) - torch.log(1 - (probabilities + 1e-10))
-            return llr
+        
+        # Get probabilities from the network (already has sigmoid)
+        probabilities = self._forward_pass(features)
+        
+        # Compute LLR: log(p/(1-p))
+        # epsilon = 1e-7  # Small value to prevent log(0)
+        prob_clamped = torch.clamp(probabilities, epsilon, 1 - epsilon)
+        llr = torch.log(prob_clamped / (1 - prob_clamped))
+        # llr = torch.log(probabilities + 1e-10) - torch.log(1 - (probabilities + 1e-10))
+        return llr
     
     def predict_likelihood_ratio(self, features):
         """
@@ -1201,35 +1213,40 @@ class LLRnet(Surrogate):
 
     class EventDataset(Dataset):
         """
-        Simplified PyTorch Dataset for sampling background and signal events for LLR training.
+        Balanced PyTorch Dataset for signal/background events for LLR training.
         
-        This dataset dynamically generates single events using a ToySampler, calculates light yield
-        using surrogate functions, and provides proper labels for training. Each sample 
-        represents a single event with a randomly sampled detector point.
+        This dataset dynamically generates balanced signal and background events
+        using ToySamplers and surrogate functions. It generates events on-demand
+        while maintaining proper pairing for balanced training using a deterministic
+        approach based on the sample index.
         
         This inner class has access to the parent LLRnet's prepare_data_from_raw method.
         """
 
         def __init__(self, llrnet_instance, signal_sampler, background_sampler, signal_surrogate_func, background_surrogate_func,
-                     num_samples_per_epoch=1000, signal_fraction=0.5,
+                     num_samples_per_epoch=1000, output_true_light_yield=False,
                      event_labels=['position', 'energy', 'zenith', 'azimuth']):
             """
-            Initialize the EventDataset.
+            Initialize the EventDataset for balanced signal/background training.
+            
+            This dataset generates balanced pairs of signal and background events on-demand.
+            Each pair uses the same detector point and shared event parameters,
+            differing only in the detector response calculated by different surrogate functions.
             
             Parameters:
             -----------
             llrnet_instance : LLRnet
                 Reference to the parent LLRnet instance to access prepare_data_from_raw
-            sampler : ToySampler
-                Sampler instance for generating event parameters
+            signal_sampler : ToySampler
+                Sampler instance for generating signal event parameters
+            background_sampler : ToySampler
+                Sampler instance for generating background event parameters
             signal_surrogate_func : callable
                 Function to calculate light yield for signal events
             background_surrogate_func : callable  
                 Function to calculate light yield for background events
             num_samples_per_epoch : int
-                Total number of samples (events) to generate per epoch
-            signal_fraction : float
-                Fraction of events that should be signal (rest are background)
+                Total number of signal/background pairs to generate per epoch
             event_labels : list
                 List of event parameter keys to include as features
             """
@@ -1240,85 +1257,169 @@ class LLRnet(Surrogate):
             self.signal_surrogate_func = signal_surrogate_func
             self.background_surrogate_func = background_surrogate_func
             self.num_samples_per_epoch = num_samples_per_epoch
-            self.signal_fraction = signal_fraction
             self.event_labels = event_labels
-              # Fixed noise scale for signal
+            self.output_true_light_yield = output_true_light_yield
             
-            # Calculate number of signal and background samples
-            self.num_signal_samples = int(num_samples_per_epoch * signal_fraction)
-            self.num_background_samples = num_samples_per_epoch - self.num_signal_samples
+            # Cache for the current epoch's generated pairs
+            self.epoch_cache = {}
+            # Track which events from each pair have been accessed
+            self.pair_access_tracker = {}
+            self.current_epoch_id = 0
             
+        def _generate_pair_data(self, pair_idx):
+            """
+            Generate signal/background pair data for a specific pair index.
+            
+            This method generates both signal and background events for a given pair
+            using the same detector point and event parameters.
+            
+            Parameters:
+            -----------
+            pair_idx : int
+                The index of the pair to generate
+                
+            Returns:
+            --------
+            tuple : (signal_data, background_data)
+                signal_data: (features, label) for signal event
+                background_data: (features, label) for background event
+            """
+            # Use deterministic seeding based on pair index and epoch
+            # This ensures reproducibility within an epoch while varying across epochs
+          
+        
+    
+            # Sample a random detector point for this event pair
+            detector_point = self.signal_sampler.sample_detector_points(1).squeeze()
+            
+            # Generate signal event parameters (shared between signal and background)
+            signal_event_data = self.signal_sampler.sample_events(1)[0]
+            
+            # Generate background event parameters
+            background_event_data = self.background_sampler.sample_events(1)[0]
+            
+            # Create signal features using signal surrogate function
+            if not self.output_true_light_yield:
+                signal_features = self.llrnet.prepare_data_from_raw(
+                    detector_point, signal_event_data, self.signal_surrogate_func, 
+                    self.event_labels, self.llrnet.signal_noise_scale, self.llrnet.add_relative_pos
+                )
+                # Create background features using background surrogate function 
+                # but with the signal event data (for balanced training)
+                background_features = self.llrnet.prepare_data_from_raw(
+                    detector_point, background_event_data, self.background_surrogate_func, 
+                    self.event_labels, self.llrnet.background_noise_scale, self.llrnet.add_relative_pos, 
+                    signal_event_data
+                )
+            else:
+                signal_features, true_signal_light_yield = self.llrnet.prepare_data_from_raw(
+                    detector_point, signal_event_data, self.signal_surrogate_func, 
+                    self.event_labels, self.llrnet.signal_noise_scale, self.llrnet.add_relative_pos,
+                    output_true_light_yield=True
+                )
+                # Create background features using background surrogate function 
+                # but with the signal event data (for balanced training)
+                background_features, true_background_light_yield = self.llrnet.prepare_data_from_raw(
+                    detector_point, background_event_data, self.background_surrogate_func, 
+                    self.event_labels, self.llrnet.background_noise_scale, self.llrnet.add_relative_pos, 
+                    signal_event_data, output_true_light_yield=True
+                )
+            
+            signal_label = torch.tensor(1.0, device=self.llrnet.device)
+            background_label = torch.tensor(0.0, device=self.llrnet.device)
+            if not self.output_true_light_yield:
+                return (signal_features, signal_label), (background_features, background_label)
+            else:
+                return (signal_features, signal_label, true_signal_light_yield), (background_features, background_label, true_background_light_yield)
+
         def __len__(self):
-            """Return the number of samples per epoch."""
-            return self.num_samples_per_epoch
+            """Return the number of individual events per epoch (2 * num_samples_per_epoch)."""
+            return self.num_samples_per_epoch * 2
         
         def __getitem__(self, idx):
             """
-            Generate a single event with a randomly sampled detector point.
+            Get individual signal or background event for balanced training.
+            
+            This method generates pairs on-demand and caches them for the current epoch.
+            It uses deterministic seeding to ensure consistency within epochs while
+            allowing variation across epochs.
             
             Parameters:
             -----------
             idx : int
-                Sample index (used to determine if this should be signal or background)
+                Sample index (even indices = signal, odd indices = background)
             
             Returns:
             --------
             tuple : (features, label)
-                features: torch.Tensor of shape (feature_dim,) for single event
-                label: torch.Tensor scalar (0 for background, 1 for signal)
+                features: torch.Tensor of shape (feature_dim,) for individual event
+                label: torch.Tensor scalar (1.0 for signal, 0.0 for background)
             """
-            # Sample a random detector point for this event
+            # Detect new epoch when idx resets to 0
+            if idx == 0:
+                self.current_epoch_id += 1
+                self.epoch_cache.clear()
+                self.pair_access_tracker.clear()
             
+            # Determine which pair this event belongs to and whether it's signal or background
+            pair_idx = idx // 2
+            is_signal = (idx % 2 == 0)
             
-            # Determine if this should be a signal or background event
-            # Use deterministic assignment based on index to ensure exact signal_fraction
-            is_signal = idx < self.num_signal_samples
+            # Check if we already have this pair cached
+            if pair_idx not in self.epoch_cache:
+                # Generate the pair data
+                signal_data, background_data = self._generate_pair_data(pair_idx)
+                self.epoch_cache[pair_idx] = (signal_data, background_data)
+                # Initialize access tracker for this pair
+                self.pair_access_tracker[pair_idx] = {'signal_accessed': False, 'background_accessed': False}
             
+            # Get the appropriate event from the cached pair
             if is_signal:
-                detector_point = self.signal_sampler.sample_detector_points(1).squeeze()
-                # Generate a signal event
-                event_data = self.signal_sampler.sample_events(1)[0]
-                event_features = self.llrnet.prepare_data_from_raw(
-                    detector_point, event_data, self.signal_surrogate_func, self.event_labels, self.llrnet.signal_noise_scale, self.llrnet.add_relative_pos
-                )
-                label = torch.tensor(1.0, device=self.llrnet.device)
+                result = self.epoch_cache[pair_idx][0]  # signal data
+                self.pair_access_tracker[pair_idx]['signal_accessed'] = True
             else:
-                detector_point = self.background_sampler.sample_detector_points(1).squeeze()
-                # Generate a background event
-                event_data = self.background_sampler.sample_events(1)[0]
-                event_features = self.llrnet.prepare_data_from_raw(
-                    detector_point, event_data, self.background_surrogate_func, self.event_labels, self.llrnet.background_noise_scale, self.llrnet.add_relative_pos
-                )
-                label = torch.tensor(0.0, device=self.llrnet.device)
+                result = self.epoch_cache[pair_idx][1]  # background data
+                self.pair_access_tracker[pair_idx]['background_accessed'] = True
             
-            return event_features, label
+            # Check if both signal and background have been accessed for this pair
+            if (self.pair_access_tracker[pair_idx]['signal_accessed'] and 
+                self.pair_access_tracker[pair_idx]['background_accessed']):
+                # Both events accessed, clear from cache to free memory
+                del self.epoch_cache[pair_idx]
+                del self.pair_access_tracker[pair_idx]
+            
+            return result
+        
 
     def create_event_dataloader(self, signal_sampler, background_sampler, signal_surrogate_func, background_surrogate_func,
-                               num_samples_per_epoch=1000, signal_fraction=0.5, batch_size=32, 
-                               shuffle=True, num_workers=0,
+                               num_samples_per_epoch=1000, batch_size=32, 
+                               shuffle=True, num_workers=0, output_true_light_yield=False,
                                event_labels=['position', 'energy', 'zenith', 'azimuth']):
         """
-        Create a DataLoader for event-based training using the simplified inner EventDataset class.
+        Create a DataLoader for balanced signal/background training using the EventDataset class.
         
-        This method creates an EventDataset that generates single events with randomly
-        sampled detector points, making the training process much simpler.
+        This method creates an EventDataset that generates balanced signal and background
+        events with shared detector points and event parameters, ensuring perfectly balanced
+        training with matched features except for detector response. The dataset internally
+        generates pairs but returns individual events to the DataLoader.
         
         Parameters:
         -----------
-        sampler : ToySampler
-            Sampler instance for generating event parameters
+        signal_sampler : ToySampler
+            Sampler instance for generating signal event parameters
+        background_sampler : ToySampler
+            Sampler instance for generating background event parameters
         signal_surrogate_func : callable
             Function to calculate light yield for signal events  
         background_surrogate_func : callable
             Function to calculate light yield for background events
         num_samples_per_epoch : int
-            Total number of samples (events) to generate per epoch
-        signal_fraction : float
-            Fraction of events that should be signal (rest are background)
+            Total number of signal/background pairs to generate per epoch
+            (will result in 2 * num_samples_per_epoch individual events)
         batch_size : int
-            Number of events per batch (now can be larger since each sample is a single event)
+            Number of individual events per batch 
         shuffle : bool
-            Whether to shuffle the events
+            Whether to shuffle the individual events
         num_workers : int
             Number of worker processes for data loading
         event_labels : list
@@ -1327,22 +1428,23 @@ class LLRnet(Surrogate):
         Returns:
         --------
         torch.utils.data.DataLoader
-            Configured DataLoader for training
+            Configured DataLoader for balanced training
             
         Example:
         --------
-        >>> # Create model and sampler
+        >>> # Create model and samplers
         >>> model = LLRnet(dim=3, domain_size=2, device=device)
-        >>> sampler = ToySampler(device=device, dim=3, domain_size=2)
+        >>> signal_sampler = ToySampler(device=device, dim=3, domain_size=2)
+        >>> background_sampler = ToySampler(device=device, dim=3, domain_size=2)
         >>> 
-        >>> # Create DataLoader using simplified method
+        >>> # Create DataLoader for balanced training
         >>> train_loader = model.create_event_dataloader(
-        ...     sampler=sampler,
+        ...     signal_sampler=signal_sampler,
+        ...     background_sampler=background_sampler,
         ...     signal_surrogate_func=signal_func,
         ...     background_surrogate_func=background_func,
-        ...     num_samples_per_epoch=5000,  # 5000 events per epoch
-        ...     signal_fraction=0.6,         # 60% signal, 40% background
-        ...     batch_size=64                # 64 events per batch
+        ...     num_samples_per_epoch=2500,  # 2500 pairs = 5000 total events per epoch
+        ...     batch_size=64                # 64 individual events per batch
         ... )
         >>>
         >>> # Train model
@@ -1355,8 +1457,7 @@ class LLRnet(Surrogate):
             signal_surrogate_func=signal_surrogate_func,
             background_surrogate_func=background_surrogate_func,
             num_samples_per_epoch=num_samples_per_epoch,
-            signal_fraction=signal_fraction,
-            event_labels=event_labels
+            event_labels=event_labels, output_true_light_yield=output_true_light_yield
         )
         
         dataloader = DataLoader(

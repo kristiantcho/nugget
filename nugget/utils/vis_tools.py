@@ -85,6 +85,7 @@ class Visualizer:
     PLOT_TRUE_SIGNAL_LLR_CONTOUR = "true_signal_llr_contour"
     PLOT_TRUE_BACKGROUND_LLR_CONTOUR = "true_background_llr_contour"
     PLOT_SIGNAL_LIGHT_YIELD_CONTOUR = "signal_light_yield_contour"
+    PLOT_SIGNAL_LIGHT_YIELD_CONTOUR_POINTS = "signal_light_yield_contour_points"
     PLOT_FISHER_INFO_LOGDET = "fisher_info_logdet"
     PLOT_ANGULAR_RESOLUTION = "angular_resolution"
     PLOT_ENERGY_RESOLUTION = "energy_resolution"
@@ -292,6 +293,7 @@ class Visualizer:
             - 'llr_histogram_points': LLR density histogram comparing signal and background distributions per point
             - 'snr_contour': SNR contour plot based on per-string values
             - 'signal_light_yield_contour': Signal light yield contour plot based on per-string values
+            - 'signal_light_yield_contour_points': Signal light yield contour plot based on per-point values
             - 'fisher_info_logdet': Log determinant of Fisher Information matrix contour plot
             - 'angular_resolution': Angular resolution from Fisher Information using Cramér-Rao bound
             - 'energy_resolution': Energy resolution from Fisher Information using Cramér-Rao bound
@@ -608,13 +610,14 @@ class Visualizer:
         # Safely handle torch tensor inputs by cloning and detaching them
         points = self._safe_tensor_convert(points_3d)
         string_xy = self._safe_tensor_convert(string_xy)
-        kwargs['string_weights'] = torch.sigmoid(kwargs['string_weights'].clone())
+        if kwargs.get('string_weights') is not None:    
+            kwargs['string_weights'] = torch.sigmoid(kwargs['string_weights'].clone())
         # Handle potential torch tensors in common kwargs
         tensor_kwargs = ['string_weights', 'signal_funcs', 'background_funcs', 'test_points', 
                         'llr_per_string', 'signal_llr_per_string', 'background_llr_per_string',
                         'signal_yield_per_string', 'snr_per_string', 'fisher_info_per_string']
         for key in tensor_kwargs:
-            if key in kwargs and kwargs[key] is not None:
+            if key in kwargs and kwargs.get(key) is not None:
                 kwargs[key] = self._safe_tensor_convert(kwargs[key])
         
         # Convert points to numpy for plotting
@@ -2391,6 +2394,65 @@ class Visualizer:
                 ax.text(0.5, 0.5, "Signal light yield per string data not available\n(Requires 'signal_light_yield_per_string' and 'string_xy' in kwargs)", 
                       ha='center', va='center', transform=ax.transAxes)
         
+        elif plot_type == self.PLOT_SIGNAL_LIGHT_YIELD_CONTOUR_POINTS:
+            # Signal light yield contour plot based on per-point values
+            signal_light_yield_per_points = kwargs.get('signal_yield_per_point', None)
+            
+            if signal_light_yield_per_points is not None and points is not None:
+                # Convert to numpy arrays if they're tensors
+                if hasattr(signal_light_yield_per_points, 'detach'):
+                    signal_light_yield_values_np = signal_light_yield_per_points.detach().cpu().numpy()
+                else:
+                    signal_light_yield_values_np = np.array(signal_light_yield_per_points)
+                
+                points_np = points.detach().cpu().numpy()
+                
+                # Create a grid for interpolation in XY plane
+                resolution = slice_res
+                x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Use point XY positions and their corresponding signal light yield values
+                points_x = points_np[:, 0]
+                points_y = points_np[:, 1]
+                
+                # Create grid points for interpolation
+                grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
+                
+                # Use the safe interpolation method
+                success, signal_light_yield_grid, error_msg = self._safe_griddata_interpolation(
+                    np.column_stack([points_x, points_y]),
+                    signal_light_yield_values_np,
+                    grid_points,
+                    resolution,
+                    method='linear'
+                )
+                
+                if success:
+                    # Create the contour plot with signal light yield-appropriate colormap
+                    c1 = ax.contourf(X_np, Y_np, signal_light_yield_grid, cmap='Oranges', levels=20)
+                    cbar = fig.colorbar(c1, ax=ax)
+                    cbar.set_label('Signal Light Yield (per Point)')
+                    
+                    # Show point positions colored by their signal light yield values
+                    scatter = ax.scatter(points_x, points_y, c=signal_light_yield_values_np, 
+                                       cmap='Oranges', s=10, alpha=0.6, edgecolor='black', linewidth=0.2,
+                                       label='Point Positions')
+                    
+                    ax.set_title(f"Signal Light Yield per Point")
+                    ax.set_xlabel('X')
+                    ax.set_ylabel('Y')
+                    ax.set_xlim(-self.half_domain, self.half_domain)
+                    ax.set_ylim(-self.half_domain, self.half_domain)
+                else:
+                    ax.text(0.5, 0.5, f"Signal light yield interpolation failed:\n{error_msg}", 
+                          ha='center', va='center', transform=ax.transAxes)
+                
+            else:
+                ax.text(0.5, 0.5, "Signal light yield per point data not available\n(Requires 'signal_yield_per_points' and 'points' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+        
         elif plot_type == self.PLOT_SNR_CONTOUR:
             # SNR contour plot based on per-string values
             snr_per_string = kwargs.get('snr_per_string', None)
@@ -2567,9 +2629,13 @@ class Visualizer:
         
         elif plot_type == self.PLOT_ANGULAR_RESOLUTION:
             # Angular resolution history from Fisher Information matrix using Cramér-Rao bound
-            angular_resolution_history = kwargs.get('angular_resolution_history', None)
+            loss_dict = kwargs.get('uw_loss_dict', None)
             
+            if loss_dict is not None:
+                angular_resolution_history = loss_dict.get('angular_resolution_loss', None)
+
             if angular_resolution_history is not None:
+                angular_resolution_history = np.array(angular_resolution_history) * (180.0/np.pi)  # Convert to degrees
                 # Plot the history of weighted total angular resolution
                 ax.plot(angular_resolution_history, color='blue', linewidth=2, markersize=4)
                 ax.set_title('Angular Resolution History')
@@ -2590,14 +2656,19 @@ class Visualizer:
         
         elif plot_type == self.PLOT_ENERGY_RESOLUTION:
             # Energy resolution history from Fisher Information matrix using Cramér-Rao bound
-            energy_resolution_history = kwargs.get('energy_resolution_history', None)
-            
+            loss_dict = kwargs.get('uw_loss_dict', None)
+
+            if loss_dict is not None:
+                energy_resolution_history = loss_dict.get('energy_resolution_loss', None)
+
             if energy_resolution_history is not None:
+                energy_resolution_history = np.array(energy_resolution_history)
+                
                 # Plot the history of weighted total energy resolution
                 ax.plot(energy_resolution_history, color='red', linewidth=2, markersize=4)
-                ax.set_title('Weighted Total Energy Resolution History')
+                ax.set_title('Energy Resolution History')
                 ax.set_xlabel('Iteration')
-                ax.set_ylabel('Energy Resolution (relative uncertainty)')
+                ax.set_ylabel('Energy Resolution [GeV]')
                 ax.grid(True, alpha=0.3)
                 
                 # Add current value annotation
@@ -2614,10 +2685,12 @@ class Visualizer:
         elif plot_type == self.PLOT_LOSS_COMPONENTS:
             # Loss components plot from loss dictionary
             loss_dict = kwargs.get('loss_dict', None)
-            
+            loss_filter_list = kwargs.get('loss_filter', None)
             if loss_dict is not None and isinstance(loss_dict, dict) and loss_dict:
                 # Plot each loss component
                 for loss_name, loss_history in loss_dict.items():
+                    if loss_name in loss_filter_list:
+                        continue
                     if loss_history and len(loss_history) > 0:
                         ax.plot(loss_history, label=loss_name, alpha=0.8, linewidth=2)
                 
@@ -2629,7 +2702,9 @@ class Visualizer:
                 total_loss = []
                 for i in range(max_length):
                     iteration_total = 0.0
-                    for loss_history in loss_dict.values():
+                    for loss_name, loss_history in loss_dict.items():
+                        if loss_name in loss_filter_list:
+                            continue
                         if loss_history and i < len(loss_history):
                             iteration_total += loss_history[i]
                     total_loss.append(iteration_total)
@@ -2638,7 +2713,7 @@ class Visualizer:
                 ax.plot(total_loss, label='Total Loss', color='black', 
                        linewidth=3, linestyle='--', alpha=0.9)
                 
-                ax.set_title(f"Loss Components (Iteration {iteration})")
+                ax.set_title(f"Loss Components")
                 ax.set_xlabel("Iteration")
                 ax.set_ylabel("Loss Value")
                 ax.legend(loc='best', fontsize='small')
@@ -2656,12 +2731,13 @@ class Visualizer:
         elif plot_type == self.PLOT_UW_LOSS_COMPONENTS:
             # Unweighted loss components plot from unweighted loss dictionary
             uw_loss_dict = kwargs.get('uw_loss_dict', None)
+            loss_weights_dict = kwargs.get('loss_weights_dict', None)
             
             if uw_loss_dict is not None and isinstance(uw_loss_dict, dict) and uw_loss_dict:
                 # Plot each unweighted loss component
                 for loss_name, loss_history in uw_loss_dict.items():
                     if loss_history and len(loss_history) > 0:
-                        ax.plot(loss_history, label=f"UW {loss_name}", alpha=0.8, linewidth=2)
+                        ax.plot(np.array(loss_history)/max(loss_history), label=f"UW {loss_name}", alpha=0.8, linewidth=2)
                 
                 # Calculate and plot total unweighted loss (sum of all components)
                 # Find the maximum length of all loss histories
@@ -2677,10 +2753,10 @@ class Visualizer:
                     total_uw_loss.append(iteration_total)
                 
                 # Plot total unweighted loss with a distinct style
-                ax.plot(total_uw_loss, label='Total UW Loss', color='black', 
-                       linewidth=3, linestyle='--', alpha=0.9)
+                # ax.plot(total_uw_loss, label='Total UW Loss', color='black', 
+                #        linewidth=3, linestyle='--', alpha=0.9)
                 
-                ax.set_title(f"Unweighted Loss Components (Iteration {iteration})")
+                ax.set_title(f"Unweighted Loss Components")
                 ax.set_xlabel("Iteration")
                 ax.set_ylabel("Unweighted Loss Value")
                 ax.legend(loc='best', fontsize='small')
