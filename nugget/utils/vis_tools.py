@@ -137,9 +137,11 @@ class Visualizer:
             # ax.locator_params(axis='x', nbins=max_ticks)
             # ax.locator_params(axis='y', nbins=max_ticks)
             
-            # Format tick labels to consistent precision
-            ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.{label_precision}f}'))
-            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, p: f'{y:.{label_precision}f}'))
+            # Format tick labels to consistent precision only if not log scaled
+            if ax.get_xscale() != 'log':
+                ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.{label_precision}f}'))
+            if ax.get_yscale() != 'log':
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, p: f'{y:.{label_precision}f}'))
             
             # Set consistent tick label size
             ax.tick_params(axis='both', which='major', labelsize=fontsize)
@@ -378,7 +380,7 @@ class Visualizer:
                 num_gif_cols = 3  # Or a different layout, e.g., 2 for smaller GIF frames
                 num_gif_rows = (num_gif_plots + num_gif_cols - 1) // num_gif_cols
                 
-                gif_fig_size = (12, 4 * num_gif_rows) 
+                gif_fig_size = (12, 3.5 * num_gif_rows) 
 
                 fig_gif, axes_gif_array = plt.subplots(num_gif_rows, num_gif_cols, 
                                                        figsize=gif_fig_size, squeeze=False,
@@ -518,7 +520,7 @@ class Visualizer:
             ncols = num_plots
         else:
             ncols = 3
-        fig, axes = plt.subplots(num_rows, ncols, figsize=(5 * ncols, 5 * num_rows)) # MODIFIED
+        fig, axes = plt.subplots(num_rows, ncols, figsize=(5 * ncols, 4.5 * num_rows)) # MODIFIED
 
         # If only one row, ensure axes is still a 2D array
         if num_rows == 1 and ncols > 1:
@@ -2686,11 +2688,16 @@ class Visualizer:
             # Loss components plot from loss dictionary
             loss_dict = kwargs.get('loss_dict', None)
             loss_filter_list = kwargs.get('loss_filter', None)
+            loss_weights_dict = kwargs.get('loss_weights_dict', None)
             if loss_dict is not None and isinstance(loss_dict, dict) and loss_dict:
                 # Plot each loss component
                 for loss_name, loss_history in loss_dict.items():
                     if loss_name in loss_filter_list:
                         continue
+                    if loss_weights_dict is not None and loss_name in loss_weights_dict:
+                        weight = loss_weights_dict[loss_name]
+                        if weight == 0.0:
+                            continue
                     if loss_history and len(loss_history) > 0:
                         ax.plot(loss_history, label=loss_name, alpha=0.8, linewidth=2)
                 
@@ -2705,6 +2712,10 @@ class Visualizer:
                     for loss_name, loss_history in loss_dict.items():
                         if loss_name in loss_filter_list:
                             continue
+                        if loss_weights_dict is not None and loss_name in loss_weights_dict:
+                            weight = loss_weights_dict[loss_name]
+                            if weight == 0.0:
+                                continue
                         if loss_history and i < len(loss_history):
                             iteration_total += loss_history[i]
                     total_loss.append(iteration_total)
@@ -2720,7 +2731,7 @@ class Visualizer:
                 ax.grid(True, alpha=0.3)
                 
                 # Use log scale if all values are positive
-                all_values = [val for history in loss_dict.values() for val in history if val is not None]
+                all_values = [val for history in loss_dict.values() for val in history if val is not None and val != 0]
                 all_values.extend(total_loss)
                 if all_values and all(val > 0 for val in all_values):
                     ax.set_yscale('log')
@@ -2737,11 +2748,18 @@ class Visualizer:
                 # Plot each unweighted loss component
                 for loss_name, loss_history in uw_loss_dict.items():
                     if loss_history and len(loss_history) > 0:
-                        ax.plot(np.array(loss_history)/max(loss_history), label=f"UW {loss_name}", alpha=0.8, linewidth=2)
-                
+                        # Normalize each component to [1e-2, 1] range for better visibility
+                        loss_array = np.array(loss_history)
+                        if len(loss_array) > 0 and np.max(loss_array) > 0:
+                            normalized_loss = (loss_array / np.max(loss_array)) * (1 - 1e-2) + 1e-2
+                        else:
+                            normalized_loss = loss_array
+                        ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
+
                 # Calculate and plot total unweighted loss (sum of all components)
                 # Find the maximum length of all loss histories
                 max_length = max(len(history) for history in uw_loss_dict.values() if history)
+               
                 
                 # Calculate total unweighted loss at each iteration
                 total_uw_loss = []
@@ -2763,7 +2781,7 @@ class Visualizer:
                 ax.grid(True, alpha=0.3)
                 
                 # Use log scale if all values are positive
-                all_values = [val for history in uw_loss_dict.values() for val in history if val is not None]
+                all_values = [val for history in uw_loss_dict.values() for val in history if val is not None and val != 0]
                 all_values.extend(total_uw_loss)
                 if all_values and all(val > 0 for val in all_values):
                     ax.set_yscale('log')
@@ -2847,7 +2865,7 @@ class Visualizer:
             **kwargs
         )
     
-    def create_interactive_3d_plot(self, points_3d, string_indices=None, 
+    def create_interactive_3d_plot(self, points_3d, weight_threshold=None,
                                  points_per_string_list=None, string_xy=None, string_weights=None):
         """
         Create an interactive 3D plot with Plotly.
@@ -2891,7 +2909,7 @@ class Visualizer:
             subplot_titles=["Interactive 3D Visualization"]
         )
         
-        if string_indices is not None and points_per_string_list is not None:
+        if points_per_string_list is not None:
             # Color by string for string-based methods
             n_strings = len(points_per_string_list)
             
@@ -2906,6 +2924,10 @@ class Visualizer:
                 # Skip empty strings
                 if points_per_string_list[s] == 0:
                     continue
+                if string_weights is not None and weight_threshold is not None:
+                    string_probs = torch.sigmoid(string_weights).detach().cpu().numpy()
+                    if string_probs[s] < weight_threshold:
+                        continue
                 
                 # Get points for this string
                 # mask = np.array(string_indices) == s
@@ -2960,8 +2982,9 @@ class Visualizer:
                     #     )
                     # )
                 if string_weights is not None:
+                    string_probs = torch.sigmoid(string_weights).detach().cpu().numpy()
                     # Use string weights for alpha transparency
-                    alpha_value = 0.9 if string_weights[s] > 0.7 else 0.2
+                    alpha_value = 0.9 if string_probs[s] > 0.7 else 0.2
                 # Add points with same colors as in the visualization
                 fig.add_trace(
                     go.Scatter3d(
