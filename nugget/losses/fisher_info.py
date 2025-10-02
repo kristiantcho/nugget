@@ -59,7 +59,7 @@ def compute_fisher_info_single(fisher_info_params, point, event_params, surrogat
                 inputs=param_tensor,
                 grad_outputs=grad_outputs,
                 create_graph=False,
-                retain_graph=True,
+                retain_graph=False,
                 only_inputs=True,
                 allow_unused=True
             )[0]
@@ -344,9 +344,9 @@ class FisherInfoLoss(LossFunction):
                     fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, params, surrogate_func, llr_net, signal_noise_scale, add_relative_pos=add_relative_pos)/len(event_params)
             total_fisher_info += fisher_matrix/llr_iterations
             fisher_info_per_point[i] += fisher_matrix
-            
-        fisher_loss = 1/(torch.det(total_fisher_info) + 1e-6)  # Add small value to diagonal for numerical stability
-        
+
+        fisher_loss = torch.trace(torch.inverse(total_fisher_info + 1e-6 * torch.eye(total_fisher_info.shape[0], device=total_fisher_info.device)))  # Add small value to diagonal for numerical stability
+
         if self.print_loss:
             print(f"Fisher Info Loss: {fisher_loss.item()}")
         
@@ -389,6 +389,24 @@ class WeightedFisherInfoLoss(LossFunction):
         # self.signal_event_params = signal_event_params
         # self.background_event_params = background_event_params
         self.fisher_info_params = fisher_info_params # Default parameters for Fisher Info
+
+    def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False):
+        n_strings = len(string_xy)
+        n_params = len(self.fisher_info_params)
+        fisher_per_string_per_event = torch.zeros(len(signal_event_params), n_strings, n_params, n_params, device=self.device)
+        
+        for i, signal_params in enumerate(signal_event_params):
+            for s_idx in range(n_strings):
+                mask = (points_3d[:, 1] == string_xy[s_idx][1]) & (points_3d[:, 0] == string_xy[s_idx][0])
+                string_points = points_3d[mask]
+                fisher_matrix = torch.zeros(n_params, n_params, device=self.device)
+                for point in string_points: 
+                    for _ in range(llr_iterations):    
+                        fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos)/len(signal_event_params)
+                    fisher_matrix += fisher_matrix/llr_iterations
+                fisher_per_string_per_event[i, s_idx] += fisher_matrix
+
+        return fisher_per_string_per_event
 
     def compute_fisher_info_per_string_experimental(self, string_xy, points_3d, signal_event_params, signal_surrogate_func):
         """
@@ -477,7 +495,8 @@ class WeightedFisherInfoLoss(LossFunction):
         torch.Tensor
             The total Fisher information loss value.
         """
-        precomputed_fisher_info_per_string = kwargs.get('precomputed_fisher_info_per_string', None)
+        # precomputed_fisher_info_per_string = kwargs.get('precomputed_fisher_info_per_string', None)
+        precomputed_fisher_info_per_string_per_event = kwargs.get('precomputed_fisher_info_per_string_per_event', None)
         string_weights = geom_dict.get('string_weights', None)
         string_xy = geom_dict.get('string_xy', None)
         points_3d = geom_dict.get('points_3d', None)
@@ -493,22 +512,32 @@ class WeightedFisherInfoLoss(LossFunction):
         # background_surrogate_func = kwargs.get('background_surrogate_func', None)
         if signal_event_params is None and signal_sampler is not None:
             signal_event_params = signal_sampler.sample_events(num_events)
-        if precomputed_fisher_info_per_string is None:
-            fisher_info_per_string = self.compute_fisher_info_per_string(string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net, signal_noise_scale, llr_iterations, add_relative_pos)
+        # if precomputed_fisher_info_per_string is None:
+        #     fisher_info_per_string = self.compute_fisher_info_per_string(string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net, signal_noise_scale, llr_iterations, add_relative_pos)
+        if precomputed_fisher_info_per_string_per_event is None:
+            fisher_info_per_string_per_event = self.compute_fisher_info_per_string_per_event(string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net, signal_noise_scale, llr_iterations, add_relative_pos) 
+        # else:
+        #     fisher_info_per_string = precomputed_fisher_info_per_string
         else:
-            fisher_info_per_string = precomputed_fisher_info_per_string
+            fisher_info_per_string_per_event = precomputed_fisher_info_per_string_per_event
+        # if string_weights is None:
+        #     total_fisher_info = torch.sum(fisher_info_per_string, dim=0)  # Sum over strings, keep matrix form
+        # else:
+        #     string_probs = torch.sigmoid(string_weights)
+        #     total_fisher_info = torch.sum(string_probs.unsqueeze(1).unsqueeze(2) * fisher_info_per_string, dim=0)  # Weighted sum
+        # fisher_loss = torch.det(torch.inverse(total_fisher_info + 1e-6 * torch.eye(total_fisher_info.shape[0], device=total_fisher_info.device)))  # Add small value to diagonal for numerical stability
         if string_weights is None:
-            total_fisher_info = torch.sum(fisher_info_per_string, dim=0)  # Sum over strings, keep matrix form
+            total_fisher_info_per_event = torch.sum(fisher_info_per_string_per_event, dim=1)  # Sum over strings, keep matrix form
         else:
             string_probs = torch.sigmoid(string_weights)
-            total_fisher_info = torch.sum(string_probs.unsqueeze(1).unsqueeze(2) * fisher_info_per_string, dim=0)  # Weighted sum
-
-        fisher_loss = 1/(torch.det(total_fisher_info) + 1e-6)  # Add small value to diagonal for numerical stability
+            total_fisher_info_per_event = torch.sum(string_probs.unsqueeze(1).unsqueeze(2) * fisher_info_per_string_per_event, dim=1)
+        mean_fisher_inv_trace = 0
+        for i in range(total_fisher_info_per_event.shape[0]):
+            mean_fisher_inv_trace += torch.trace(torch.inverse(total_fisher_info_per_event[i] + 1e-6 * torch.eye(total_fisher_info_per_event.shape[1], device=total_fisher_info_per_event.device)))/total_fisher_info_per_event.shape[0]  # Add small value to diagonal for numerical stability
+        fisher_loss = mean_fisher_inv_trace
         
-        
-        # return fisher_loss, fisher_info_per_string, total_fisher_info
-        return {'fisher_loss': fisher_loss, 'fisher_info_per_string': fisher_info_per_string, 'total_fisher_info': total_fisher_info}
-    
+        # return {'fisher_loss': fisher_loss, 'fisher_info_per_string': fisher_info_per_string, 'total_fisher_info': total_fisher_info}
+        return {'fisher_loss': fisher_loss, 'fisher_info_per_string_per_event': fisher_info_per_string_per_event, 'total_fisher_info_per_event': total_fisher_info_per_event, 'fisher_signal_params': signal_event_params}
 class WeightedResolutionLoss(WeightedFisherInfoLoss):
     def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith'], resolution_type='angular'):
         """
@@ -540,48 +569,6 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         super().__init__(device, print_loss, random_seed, fisher_info_params)
         
         self.resolution_type = resolution_type # 'angular' or 'energy'
-    
-    def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False):
-        """
-
-        """
-        n_strings = len(string_xy)
-        n_params = len(self.fisher_info_params)
-        fisher_per_string_per_event = torch.zeros(len(signal_event_params), n_strings, n_params, n_params, device=self.device)
-        
-        for i, signal_params in enumerate(signal_event_params):
-            for s_idx in range(n_strings):
-                mask = (points_3d[:, 1] == string_xy[s_idx][1]) & (points_3d[:, 0] == string_xy[s_idx][0])
-                string_points = points_3d[mask]
-                fisher_matrix = torch.zeros(n_params, n_params, device=self.device)
-                for point in string_points: 
-                    for _ in range(llr_iterations):    
-                        fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos)/len(signal_event_params)
-                    fisher_matrix += fisher_matrix/llr_iterations
-                fisher_per_string_per_event[i, s_idx] += fisher_matrix
-                    # if self.resolution_type == 'angular':
-                    #     azimuth_idx = self.fisher_info_params.index('azimuth')
-                    #     zenith_idx = self.fisher_info_params.index('zenith')
-                    #     zenith = signal_params.get('zenith')
-                    #     cov_matrix = torch.inverse(fisher_matrix)
-        
-                    #     # Angular resolution: sqrt(var_azimuth + var_zenith)
-                    #     var_azimuth = cov_matrix[azimuth_idx, azimuth_idx]
-                    #     var_zenith = cov_matrix[zenith_idx, zenith_idx]
-                    #     covar_zenith_azimuth = cov_matrix[zenith_idx, azimuth_idx]
-                    #     angular_resolution_rad = torch.sqrt(var_zenith + torch.sin(zenith)*var_azimuth + 2*torch.sin(zenith)*torch.cos(zenith)*covar_zenith_azimuth)
-                    #     resolution_per_string[s_idx] += angular_resolution_rad
-                    # elif self.resolution_type == 'energy':
-                    #     energy_idx = self.fisher_info_params.index('energy')
-                    #     cov_matrix = torch.inverse(fisher_matrix)
-        
-                    #     var_energy = cov_matrix[energy_idx, energy_idx]
-                    #     energy_resolution = torch.sqrt(var_energy)
-
-                    #     resolution_per_string[s_idx] += energy_resolution
-
-        return fisher_per_string_per_event
-
 
     def __call__(self, geom_dict, **kwargs):
         """

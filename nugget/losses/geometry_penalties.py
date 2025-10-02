@@ -700,7 +700,7 @@ class ROVPenalty(LossFunction):
         Returns: scalar penalty loss
         """
         points = geom_dict.get('string_xy', None)
-        num_angles = kwargs.get('num_angles', 36)
+        num_angles = kwargs.get('num_angles', 6)
         string_weights = geom_dict.get('string_weights', None)
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
 

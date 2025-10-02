@@ -86,7 +86,7 @@ class Visualizer:
     PLOT_TRUE_BACKGROUND_LLR_CONTOUR = "true_background_llr_contour"
     PLOT_SIGNAL_LIGHT_YIELD_CONTOUR = "signal_light_yield_contour"
     PLOT_SIGNAL_LIGHT_YIELD_CONTOUR_POINTS = "signal_light_yield_contour_points"
-    PLOT_FISHER_INFO_LOGDET = "fisher_info_logdet"
+    PLOT_FISHER_INFO_CONTOUR = "fisher_info_contour"
     PLOT_ANGULAR_RESOLUTION = "angular_resolution"
     PLOT_ENERGY_RESOLUTION = "energy_resolution"
     PLOT_ANGULAR_RESOLUTION_HISTORY = "angular_resolution_history"
@@ -150,6 +150,68 @@ class Visualizer:
             ax.tick_params(axis='x', rotation=0, pad=2)
             ax.tick_params(axis='y', rotation=0, pad=2)
     
+    def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=0.2):
+        """
+        Draw ROV safe space shape on the given axes.
+        
+        Parameters:
+        -----------
+        ax : matplotlib.axes.Axes
+            The axis to draw on
+        rov_penalty : ROVPenalty object or None
+            ROV penalty object to get dimensions from
+        position : str
+            Where to place the ROV shape ('bottom_left', 'bottom_right', etc.)
+        scale_factor : float
+            Scale factor for the ROV shape relative to plot domain
+        """
+        if rov_penalty is None:
+            return
+            
+        # Get ROV dimensions
+        rov_rec_width = getattr(rov_penalty, 'rov_rec_width', 0.3)
+        rov_height = getattr(rov_penalty, 'rov_height', 0.16) 
+        rov_tri_length = getattr(rov_penalty, 'rov_tri_length', 0.08)
+        
+        # Scale dimensions to fit in corner of plot
+        scale = scale_factor * self.domain_size
+        rec_width = rov_rec_width * scale
+        rec_height = rov_height * scale
+        tri_length = rov_tri_length * scale
+        
+        # Position in bottom left corner
+        if position == 'bottom_left':
+            x_offset = -self.half_domain + 0.1 * self.domain_size
+            y_offset = -self.half_domain + 0.1 * self.domain_size
+        elif position == 'bottom_right':
+            x_offset = self.half_domain - (rec_width + tri_length) - 0.1 * self.domain_size
+            y_offset = -self.half_domain + 0.1 * self.domain_size
+        else:  # default to bottom_left
+            x_offset = -self.half_domain + 0.1 * self.domain_size
+            y_offset = -self.half_domain + 0.1 * self.domain_size
+        
+        # Draw rectangular part
+        rect_x = [x_offset, x_offset + rec_width, x_offset + rec_width, x_offset, x_offset]
+        rect_y = [y_offset - rec_height/2, y_offset - rec_height/2, y_offset + rec_height/2, y_offset + rec_height/2, y_offset - rec_height/2]
+        ax.plot(rect_x, rect_y, 'r-', linewidth=2, alpha=0.7, label='ROV Safe Space')
+        
+        # Draw triangular part
+        tri_x = [x_offset + rec_width, x_offset + rec_width + tri_length, x_offset + rec_width, x_offset + rec_width]
+        tri_y = [y_offset - rec_height/2, y_offset, y_offset + rec_height/2, y_offset - rec_height/2]
+        ax.plot(tri_x, tri_y, 'r-', linewidth=2, alpha=0.7)
+        
+        # Fill the shape with semi-transparent red
+        # Combine rectangle and triangle vertices for filling
+        fill_x = [x_offset, x_offset + rec_width, x_offset + rec_width + tri_length, x_offset + rec_width, x_offset]
+        fill_y = [y_offset - rec_height/2, y_offset - rec_height/2, y_offset, y_offset + rec_height/2, y_offset + rec_height/2]
+        ax.fill(fill_x, fill_y, 'red', alpha=0.2)
+        
+        # Add "ROV" text inside the rectangular part of the safe space
+        text_x = x_offset + rec_width/2  # Center of rectangle
+        text_y = y_offset  # Center vertically
+        ax.text(text_x, text_y, 'ROV', fontsize=8, fontweight='bold', 
+                ha='center', va='center', color='darkred', alpha=0.8)
+
     def _safe_griddata_interpolation(self, points_xy, values, grid_points, resolution, method='linear', fill_value=None):
         """
         Safely perform griddata interpolation with proper error handling.
@@ -340,6 +402,7 @@ class Visualizer:
             - signal_event_params: Event parameters dict for signal surrogate function
             - background_surrogate_func: Surrogate function for background
             - background_event_params: Event parameters dict for background surrogate function
+            - rov_penalty: ROVPenalty object for displaying ROV safe space on string_xy and string_weights_scatter plots
         """
         # Safely handle torch tensor inputs by cloning and detaching them
         points = self._safe_tensor_convert(points)
@@ -830,6 +893,12 @@ class Visualizer:
                 ax.set_title('String Positions in XY Plane')
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
+                
+                # Add ROV safe space visualization if ROV penalty is available
+
+                rov_penalty = kwargs.get('rov_penalty', None)
+                if rov_penalty is not None:
+                    self._draw_rov_safe_space(ax, rov_penalty)
             else:
                 ax.text(0.5, 0.5, "String XY data not available", 
                       ha='center', va='center', transform=ax.transAxes)
@@ -1625,6 +1694,11 @@ class Visualizer:
                     ax.set_title(f'Active strings = {len(weights_np[weights_np > 0.7])}, Total strings = {len(weights_np)}')
                     ax.set_xlim(-self.half_domain, self.half_domain)
                     ax.set_ylim(-self.half_domain, self.half_domain)
+                    
+                    # Add ROV safe space visualization if ROV penalty is available
+                    rov_penalty = kwargs.get('rov_penalty', None)
+                    if rov_penalty is not None:
+                        self._draw_rov_safe_space(ax, rov_penalty)
                 else:
                     ax.text(0.5, 0.5, "String weights data not available", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -2524,30 +2598,30 @@ class Visualizer:
                 ax.text(0.5, 0.5, "SNR per string data not available\n(Requires 'snr_per_string' and 'string_xy' in kwargs)", 
                       ha='center', va='center', transform=ax.transAxes)
         
-        elif plot_type == self.PLOT_FISHER_INFO_LOGDET:
+        elif plot_type == self.PLOT_FISHER_INFO_CONTOUR:
             # Log determinant of Fisher Information matrix
-            fisher_info_per_string = kwargs.get('fisher_info_per_string', None)
-            string_weights = kwargs.get('string_weights', None)
+            # fisher_info_per_string = kwargs.get('fisher_info_per_string', None)
+            # string_weights = kwargs.get('string_weights', None)
             
-            if fisher_info_per_string is not None and string_xy is not None:
-                # Convert to numpy arrays if they're tensors
-                if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
-                else:
-                    string_positions_np = np.array(string_xy)
+            # if fisher_info_per_string is not None and string_xy is not None:
+            #     # Convert to numpy arrays if they're tensors
+            #     if hasattr(string_xy, 'detach'):
+            #         string_positions_np = string_xy.detach().cpu().numpy()
+            #     else:
+            #         string_positions_np = np.array(string_xy)
                 
-                # Compute Fisher Information matrix per string and its log determinant
-                fisher_logdet_values = []
-                for s_idx in range(len(fisher_info_per_string)):
-                    fisher_matrix = fisher_info_per_string[s_idx]
-                    # if hasattr(fisher_matrix, 'detach'):
-                    #     fisher_matrix = fisher_matrix.detach().cpu().numpy()
+            #     # Compute Fisher Information matrix per string and its log determinant
+            #     fisher_logdet_values = []
+            #     for s_idx in range(len(fisher_info_per_string)):
+            #         fisher_matrix = fisher_info_per_string[s_idx]
+            #         # if hasattr(fisher_matrix, 'detach'):
+            #         #     fisher_matrix = fisher_matrix.detach().cpu().numpy()
                     
-                    # Add regularization for numerical stability
-                    reg_matrix = torch.eye(fisher_matrix.shape[0]) * 1e-6
-                    regularized_fisher = fisher_matrix + reg_matrix
-                    fisher_logdet = torch.logdet(regularized_fisher).detach().cpu().numpy()
-                    fisher_logdet_values.append(fisher_logdet)
+            #         # Add regularization for numerical stability
+            #         reg_matrix = torch.eye(fisher_matrix.shape[0]) * 1e-6
+            #         regularized_fisher = fisher_matrix + reg_matrix
+            #         fisher_logdet = torch.logdet(regularized_fisher).detach().cpu().numpy()
+            #         fisher_logdet_values.append(fisher_logdet)
                     # Compute log determinant
                 #     try:
                 #         # Compute eigenvalues to check positive definiteness
@@ -2561,9 +2635,23 @@ class Visualizer:
                 #         fisher_logdet_values.append(logdet)
                 #     except:
                 #         fisher_logdet_values.append(-np.inf)
+                # fisher_logdet_values = np.array(fisher_logdet_values)
+            fisher_info_per_string_per_event = kwargs.get('fisher_info_per_string_per_event', None)
+            string_weights = kwargs.get('string_weights', None)
+            trace_fisher_info_per_string_per_event = np.zeros((fisher_info_per_string_per_event.shape[0], len(string_xy)))
+            if fisher_info_per_string_per_event is not None:
+                fisher_info_per_string_per_event = np.array(fisher_info_per_string_per_event)
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
                 
-                fisher_logdet_values = np.array(fisher_logdet_values)
+                for event_idx in range(fisher_info_per_string_per_event.shape[0]):
+                    for s_idx in range(len(string_positions_np)):
+                        trace_fisher_info_per_string_per_event[event_idx, s_idx] = np.trace(np.linalg.inv(fisher_info_per_string_per_event[event_idx, s_idx] + np.eye(fisher_info_per_string_per_event.shape[-1])*1e-6))
+                fisher_logdet_values = np.mean(trace_fisher_info_per_string_per_event, axis=0)
                 
+
                 # Create a grid for interpolation in XY plane
                 resolution = slice_res
                 x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
@@ -2590,7 +2678,7 @@ class Visualizer:
                     # Create the contour plot
                     c1 = ax.contourf(X_np, Y_np, fisher_logdet_grid, cmap='plasma', levels=20)
                     cbar = fig.colorbar(c1, ax=ax)
-                    cbar.set_label('log(det(Fisher Information Matrix))')
+                    cbar.set_label(r'tr(I$_F^{-1}$)')
                     
                     # Overlay string positions
                     if string_weights is not None:
@@ -2603,7 +2691,7 @@ class Visualizer:
                                        cmap='plasma', s=min([60, 40*200/len(string_x)]), 
                                        alpha=alpha_values, edgecolor='black', linewidth=1)
                     
-                    ax.set_title(f"Fisher Info Log-Determinant per String")
+                    ax.set_title(f"Fisher Info Inv. Trace per String")
                 else:
                     # Fallback based on error type
                     finite_mask = np.isfinite(fisher_logdet_values)
@@ -2613,7 +2701,7 @@ class Visualizer:
                                  c=fisher_logdet_values[finite_mask], cmap='plasma', 
                                  s=min([60, 40*200/len(string_x)]), alpha=0.8, 
                                  edgecolor='black', linewidth=1)
-                        ax.set_title(f"Fisher Info Determinant (scatter only, {num_finite} finite values)")
+                        ax.set_title(f"Fisher Info Inv. Trace per String")
                         ax.text(0.5, 0.02, f"Interpolation failed: {error_msg}", 
                               ha='center', va='bottom', transform=ax.transAxes, fontsize=8)
                     else:
@@ -2689,6 +2777,7 @@ class Visualizer:
             loss_dict = kwargs.get('loss_dict', None)
             loss_filter_list = kwargs.get('loss_filter', None)
             loss_weights_dict = kwargs.get('loss_weights_dict', None)
+            loss_iterations_dict = kwargs.get('loss_iterations_dict', None)
             if loss_dict is not None and isinstance(loss_dict, dict) and loss_dict:
                 # Plot each loss component
                 for loss_name, loss_history in loss_dict.items():
@@ -2697,6 +2786,27 @@ class Visualizer:
                     if loss_weights_dict is not None and loss_name in loss_weights_dict:
                         weight = loss_weights_dict[loss_name]
                         if weight == 0.0:
+                            continue
+                    if loss_iterations_dict is not None:
+                        iterations = loss_iterations_dict.get(loss_name, None)
+                        if iterations is not None and len(iterations) == len(loss_history):
+                            # If iterations have gaps, we need to handle missing iterations
+                            # Create a full range from 0 to max iteration
+                            max_iter = max(iterations)
+                            full_range = list(range(max_iter + 1))
+                            
+                            # Create loss values array with None for missing iterations
+                            full_loss_history = []
+                            iter_idx = 0
+                            for i in full_range:
+                                if iter_idx < len(iterations) and iterations[iter_idx] == i:
+                                    full_loss_history.append(loss_history[iter_idx])
+                                    iter_idx += 1
+                                else:
+                                    full_loss_history.append(None)
+                            
+                            # Plot with gaps handled
+                            ax.plot(full_range, full_loss_history, label=loss_name, alpha=0.8, linewidth=2)
                             continue
                     if loss_history and len(loss_history) > 0:
                         ax.plot(loss_history, label=loss_name, alpha=0.8, linewidth=2)
@@ -2743,7 +2853,7 @@ class Visualizer:
             # Unweighted loss components plot from unweighted loss dictionary
             uw_loss_dict = kwargs.get('uw_loss_dict', None)
             loss_weights_dict = kwargs.get('loss_weights_dict', None)
-            
+            loss_iterations_dict = kwargs.get('loss_iterations_dict', None)
             if uw_loss_dict is not None and isinstance(uw_loss_dict, dict) and uw_loss_dict:
                 # Plot each unweighted loss component
                 for loss_name, loss_history in uw_loss_dict.items():
@@ -2754,7 +2864,30 @@ class Visualizer:
                             normalized_loss = (loss_array / np.max(loss_array)) * (1 - 1e-2) + 1e-2
                         else:
                             normalized_loss = loss_array
-                        ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
+                        if loss_iterations_dict is None:    
+                            ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
+                        else:
+                            iterations = loss_iterations_dict.get(loss_name, None)
+                            if iterations is not None:
+                                # If iterations have gaps, we need to handle missing iterations
+                                # Create a full range from 0 to max iteration
+                                max_iter = max(iterations)
+                                full_range = list(range(max_iter + 1))
+                                
+                                # Create loss values array with None for missing iterations
+                                full_loss_history = []
+                                iter_idx = 0
+                                for i in full_range:
+                                    if iter_idx < len(iterations) and iterations[iter_idx] == i:
+                                        full_loss_history.append(normalized_loss[iter_idx])
+                                        iter_idx += 1
+                                    else:
+                                        full_loss_history.append(None)
+                                
+                                # Plot with gaps handled
+                                ax.plot(full_range, full_loss_history, label=f"{loss_name}", alpha=0.8, linewidth=2)
+                            else:
+                                ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
 
                 # Calculate and plot total unweighted loss (sum of all components)
                 # Find the maximum length of all loss histories
@@ -2762,13 +2895,13 @@ class Visualizer:
                
                 
                 # Calculate total unweighted loss at each iteration
-                total_uw_loss = []
-                for i in range(max_length):
-                    iteration_total = 0.0
-                    for loss_history in uw_loss_dict.values():
-                        if loss_history and i < len(loss_history):
-                            iteration_total += loss_history[i]
-                    total_uw_loss.append(iteration_total)
+                # total_uw_loss = []
+                # for i in range(max_length):
+                #     iteration_total = 0.0
+                #     for loss_history in uw_loss_dict.values():
+                #         if loss_history and i < len(loss_history):
+                #             iteration_total += loss_history[i]
+                #     total_uw_loss.append(iteration_total)
                 
                 # Plot total unweighted loss with a distinct style
                 # ax.plot(total_uw_loss, label='Total UW Loss', color='black', 
@@ -2782,7 +2915,7 @@ class Visualizer:
                 
                 # Use log scale if all values are positive
                 all_values = [val for history in uw_loss_dict.values() for val in history if val is not None and val != 0]
-                all_values.extend(total_uw_loss)
+                # all_values.extend(total_uw_loss)
                 if all_values and all(val > 0 for val in all_values):
                     ax.set_yscale('log')
             else:

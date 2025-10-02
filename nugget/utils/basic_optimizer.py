@@ -106,6 +106,7 @@ class Optimizer():
         self.alternate_freq = kwargs.get('alternate_freq', None)
         self.loss_weights_dict = loss_weights_dict
         self.cf_loss_weights_dict = kwargs.get('cf_loss_weights_dict', self.loss_weights_dict)
+        self.loss_iterations_dict = kwargs.get('loss_iterations_dict', {})
         for key in loss_func_dict:
             if key not in self.loss_dict:
                 self.loss_dict[key] = []
@@ -115,6 +116,8 @@ class Optimizer():
                 self.uw_loss_dict[key] = []
             if key not in self.vis_uw_loss_dict:
                 self.vis_uw_loss_dict[key] = []
+            if key not in self.loss_iterations_dict:
+                self.loss_iterations_dict[key] = []
         self.total_loss = []
         if self.alternate_freq is not None:
             self.optimizer_phases = {}
@@ -123,6 +126,8 @@ class Optimizer():
                 
         for it in range(n_iter):
             vis_kwargs.update({'iteration': it})
+            for key in self.loss_iterations_dict:
+                self.loss_iterations_dict[key].append(it)
             if self.alternate_freq is not None:
                 for ik, key in enumerate(self.optimizers):
                     if ik == 0 and it == 0:
@@ -163,6 +168,8 @@ class Optimizer():
                 vis_kwargs['loss_dict'] = self.vis_loss_dict
                 vis_kwargs['uw_loss_dict'] = self.vis_uw_loss_dict
                 vis_kwargs['loss_weights_dict'] = self.loss_weights_dict
+                vis_kwargs['loss_func_dict'] = loss_func_dict
+                vis_kwargs['loss_iterations_dict'] = self.loss_iterations_dict
             self.total_loss.append(self.loss_update_step())
             
             # Step the schedulers

@@ -32,7 +32,7 @@ data/
 gifs/
 nn_test_outputs/
 old_notebooks/
-
+gif_temp/
 # plots and gifs
 *.png
 *.jpg
