@@ -123,8 +123,9 @@ class Optimizer():
             self.optimizer_phases = {}
             for key in self.optimizers:
                 self.optimizer_phases[key] = False
-                
-        for it in range(n_iter):
+        
+        max_iter = max([len(v) for v in self.loss_iterations_dict.values()]) if len(self.loss_iterations_dict) > 0 else 0     
+        for it in range(max_iter, max_iter+n_iter):
             vis_kwargs.update({'iteration': it})
             for key in self.loss_iterations_dict:
                 self.loss_iterations_dict[key].append(it)

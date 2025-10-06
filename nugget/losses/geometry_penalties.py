@@ -69,7 +69,7 @@ class StringBoundaryPenalty(LossFunction):
         string_weights = geom_dict.get('string_weights', None)
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else 1.0
         clamped_string_xy = torch.clamp(torch.abs(string_xy) - domain_size/2, min=0.0)** 2
-        clamped_string_xy = torch.sum(clamped_string_xy, dim=1)
+        clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy, dim=1))
         return {'string_boundary_penalty': torch.mean(clamped_string_xy * string_probs)}
 
 class RepulsionPenalty(LossFunction):
@@ -271,19 +271,22 @@ class LocalStringRepulsionPenalty(LossFunction):
         # Compute pairwise squared distances
         diff = string_xy.unsqueeze(1) - string_xy.unsqueeze(0)  # (n, n, 2)
         dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
-        # Mask: ignore self-pairs and pairs outside radius
-        mask = (dist_sq > 0) & (dist_sq < max_radius ** 2)
+        dist = torch.sqrt(dist_sq + 1e-10)  # Add small epsilon for numerical stability
+        
+        # Soft mask using sigmoid - smoother transition at radius boundary
+        self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
+        radius_weight = torch.sigmoid((max_radius - dist) * 10)  # Sharp transition around max_radius
+        radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
+        
         repulsion = 0.0
         if string_weights is not None:
             string_probs = torch.sigmoid(string_weights)
             # Outer product for all pairs
             weight_matrix = string_probs.unsqueeze(1) * string_probs.unsqueeze(0)  # (n, n)
-            repulsion_matrix = torch.zeros_like(dist_sq)
-            repulsion_matrix[mask] = weight_matrix[mask] / (dist_sq[mask] + min_dist)
+            repulsion_matrix = weight_matrix * radius_weight / (dist_sq + min_dist)
             repulsion = torch.sum(repulsion_matrix) / n
         else:
-            repulsion_matrix = torch.zeros_like(dist_sq)
-            repulsion_matrix[mask] = 1.0 / (dist_sq[mask] + min_dist)
+            repulsion_matrix = radius_weight / (dist_sq + min_dist)
             repulsion = torch.sum(repulsion_matrix) / n
         return {'local_string_repulsion_penalty': repulsion}
     

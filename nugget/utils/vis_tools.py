@@ -1669,18 +1669,17 @@ class Visualizer:
                     # Convert tensors to numpy arrays
                     xy_np = string_xy.detach().cpu().numpy()
                     weights_np = string_weights
-                    
-                    # Create alpha values: 1 if weight > 0.7, else 0.1
-                    alphas = [1 if weights_np[i] > 0.7 else 0.3 for i in range(len(weights_np))]
-                    
+                    # Create alpha values: 1 if weight > 0.7, else 0.5
+                    alphas = [1 if weights_np[i] > 0.7 else 0.5 for i in range(len(weights_np))]
+                    edge_colors=['k' if weights_np[i] > 0.7 else 'none' for i in range(len(weights_np))]
                     # Create scatter plot
                     scatter = ax.scatter(
                         xy_np[:, 0], 
                         xy_np[:, 1], 
                         c=weights_np,
-                        cmap='viridis',
+                        cmap='Greens',
                         alpha=alphas,
-                        edgecolors='k',
+                        edgecolors=edge_colors,
                         s=min([40,30*200/len(weights_np)])
                         )
                     

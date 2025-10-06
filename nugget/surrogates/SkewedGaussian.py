@@ -4,7 +4,7 @@ import numpy as np
 
 class SkewedGaussian(Surrogate):
     
-    def __init__(self, device=None, dim=3, domain_size=2, background=False):
+    def __init__(self, device=None, dim=3, domain_size=2, background=False, **kwargs):
         """
         Initialize the Skewed Gaussian surrogate model.
         
@@ -19,6 +19,7 @@ class SkewedGaussian(Surrogate):
         """
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         self.background = background    
+        self.kwargs = kwargs
     
     
     def skewed_anisotropic_gaussian(self, points, center, motion_dir, sigma_front, sigma_back, sigma_perp, amp):
@@ -313,7 +314,7 @@ class SkewedGaussian(Surrogate):
             position=event_center,
             phi=phi,
             theta=theta,
-            sigma_factor=10
+            sigma_factor=self.kwargs.get('sigma_factor', 10)
             # sigma_front=sigma_front,
             # sigma_back=sigma_back,
             # sigma_perp=sigma_perp

@@ -95,7 +95,7 @@ class WeightedLLRLoss(LossFunction):
             string_probs = torch.sigmoid(string_weights)
             total_llr = torch.sum(llr_per_string * string_probs) / len(string_probs)  # Weighted sum
         
-        llr_loss = 1/(total_llr + 1e-6)  # Add small value for numerical stability
+        llr_loss = 1/total_llr  # Add small value for numerical stability
         
         return {'signal_llr_loss': llr_loss, 'signal_llr_per_string': llr_per_string, 'signal_total_llr': total_llr}
     

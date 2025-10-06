@@ -59,7 +59,7 @@ def compute_fisher_info_single(fisher_info_params, point, event_params, surrogat
                 inputs=param_tensor,
                 grad_outputs=grad_outputs,
                 create_graph=False,
-                retain_graph=False,
+                retain_graph=True,
                 only_inputs=True,
                 allow_unused=True
             )[0]
