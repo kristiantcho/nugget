@@ -13,6 +13,7 @@ setup(
         "matplotlib>=3.3.0",
         "scipy>=1.5.0",
         "tqdm>=4.45.0",
+        "conflictfree>=0.1.8",
     ],
     python_requires=">=3.8",
 )
