@@ -42,7 +42,7 @@ pip install -r requirements.txt
 
 For a comprehensive example of NUGGET's capabilities, see the Jupyter notebook:
 
-- **`nugget/examples/modular_surrogate_notebook.ipynb`**: Demonstrates the complete workflow including:
+- **`nugget/examples/example_notebook.ipynb`**: Demonstrates the complete workflow including:
   - Training neural network surrogates for log-likelihood ratio estimation
   - Setting up geometry optimization with evanescent and dynamic string configurations
   - Using various loss functions (Fisher information, light yield, LLR-based losses)
