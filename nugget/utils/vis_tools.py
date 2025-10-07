@@ -2784,7 +2784,7 @@ class Visualizer:
         elif plot_type == self.PLOT_LOSS_COMPONENTS:
             # Loss components plot from loss dictionary
             loss_dict = kwargs.get('loss_dict', None)
-            loss_filter_list = kwargs.get('loss_filter', None)
+            loss_filter_list = kwargs.get('loss_filter', [])
             loss_weights_dict = kwargs.get('loss_weights_dict', None)
             loss_iterations_dict = kwargs.get('loss_iterations_dict', None)
             if loss_dict is not None and isinstance(loss_dict, dict) and loss_dict:
