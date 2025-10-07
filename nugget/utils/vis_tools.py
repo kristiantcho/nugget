@@ -150,7 +150,7 @@ class Visualizer:
             ax.tick_params(axis='x', rotation=0, pad=2)
             ax.tick_params(axis='y', rotation=0, pad=2)
     
-    def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=0.2):
+    def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=1):
         """
         Draw ROV safe space shape on the given axes.
         
@@ -174,21 +174,21 @@ class Visualizer:
         rov_tri_length = getattr(rov_penalty, 'rov_tri_length', 0.08)
         
         # Scale dimensions to fit in corner of plot
-        scale = scale_factor * self.domain_size
+        scale = scale_factor #* self.domain_size
         rec_width = rov_rec_width * scale
         rec_height = rov_height * scale
         tri_length = rov_tri_length * scale
         
         # Position in bottom left corner
         if position == 'bottom_left':
-            x_offset = -self.half_domain + 0.1 * self.domain_size
-            y_offset = -self.half_domain + 0.1 * self.domain_size
+            x_offset = -self.half_domain + 0.05 * self.domain_size
+            y_offset = -self.half_domain + 0.05 * self.domain_size
         elif position == 'bottom_right':
-            x_offset = self.half_domain - (rec_width + tri_length) - 0.1 * self.domain_size
-            y_offset = -self.half_domain + 0.1 * self.domain_size
+            x_offset = self.half_domain - (rec_width + tri_length) - 0.05 * self.domain_size
+            y_offset = -self.half_domain + 0.05 * self.domain_size
         else:  # default to bottom_left
-            x_offset = -self.half_domain + 0.1 * self.domain_size
-            y_offset = -self.half_domain + 0.1 * self.domain_size
+            x_offset = -self.half_domain + 0.05 * self.domain_size
+            y_offset = -self.half_domain + 0.05 * self.domain_size
         
         # Draw rectangular part
         rect_x = [x_offset, x_offset + rec_width, x_offset + rec_width, x_offset, x_offset]
@@ -209,7 +209,7 @@ class Visualizer:
         # Add "ROV" text inside the rectangular part of the safe space
         text_x = x_offset + rec_width/2  # Center of rectangle
         text_y = y_offset  # Center vertically
-        ax.text(text_x, text_y, 'ROV', fontsize=8, fontweight='bold', 
+        ax.text(text_x, text_y, 'ROV', fontsize=21*rec_width, fontweight='bold', 
                 ha='center', va='center', color='darkred', alpha=0.8)
 
     def _safe_griddata_interpolation(self, points_xy, values, grid_points, resolution, method='linear', fill_value=None):
@@ -836,6 +836,7 @@ class Visualizer:
             if string_xy is not None:
                 xy_np = string_xy.detach().cpu().numpy()
                 string_weights = kwargs.get('string_weights', None)
+                weight_threshold = kwargs.get('weight_threshold', 0.7)
                 
                 # Create colormap based on number of points per string
                 if points_per_string_list is not None:
@@ -856,25 +857,30 @@ class Visualizer:
                         # print("Alpha values:", alpha_vals)
                         # active_mask = np.array(points_per_string_list) > 0
                         # alpha_vals = alpha_vals[active_mask] if len(alpha_vals) == len(points_per_string_list) else [0.8] * sum(active_mask)
+                        weight_mask = np.array([string_weights[idx] >= weight_threshold for idx in string_indices])
                     else:
                         alpha_vals = 0.8
+                        weight_mask = np.array([True]*len(xy_np))
+                    
+                    
                     
                     # Plot strings with size proportional to number of points and alpha based on weights
-                    sc = ax.scatter(
-                        [xy_np[s, 0] for s in range(len(xy_np)) if points_per_string_list[s] > 0],
-                        [xy_np[s, 1] for s in range(len(xy_np)) if points_per_string_list[s] > 0],
-                        s=[min([40, 30 * 200 / len(points_per_string_list)]) 
-                          for s in range(len(xy_np)) if points_per_string_list[s] > 0],
-                        c=[points_per_string_list[s] for s in range(len(xy_np)) 
-                          if points_per_string_list[s] > 0],
-                        cmap=cmap,
-                        alpha=alpha_vals,
-                        norm=norm
-                    )
+                    if np.any(weight_mask):    
+                        sc = ax.scatter(
+                            np.array([xy_np[s, 0] for s in range(len(xy_np)) if points_per_string_list[s] > 0])[weight_mask],
+                            np.array([xy_np[s, 1] for s in range(len(xy_np)) if points_per_string_list[s] > 0])[weight_mask],
+                            s=[min([40, 30 * 200 / len(xy_np[weight_mask])]) 
+                            for s in range(len(xy_np[weight_mask])) if np.array(points_per_string_list)[weight_mask][s] > 0],
+                            c=[np.array(points_per_string_list)[weight_mask][s] for s in range(len(xy_np[weight_mask])) 
+                            if np.array(points_per_string_list)[weight_mask][s] > 0],
+                            cmap=cmap,
+                            alpha=alpha_vals,
+                            norm=norm
+                        )
                     
-                    # Add a colorbar to show the mapping from color to number of points
-                    cbar = fig.colorbar(sc, ax=ax)
-                    cbar.set_label('Number of points on string')
+                        # Add a colorbar to show the mapping from color to number of points
+                        cbar = fig.colorbar(sc, ax=ax)
+                        cbar.set_label('Number of points on string')
                 else:
                     # Basic scatter plot with alpha based on string weights
                     if string_weights is not None:
@@ -883,11 +889,14 @@ class Visualizer:
                         #     alpha_vals = 1 / (1 + np.exp(-alpha_vals))
                         # alpha_vals = torch.nn.functional.softplus(torch.tensor(alpha_vals)).detach().cpu().numpy()
                         alpha_vals = np.clip(alpha_vals, 0.05, 1.0)
+                        weight_mask = np.array([string_weights[idx] >= weight_threshold for idx in string_indices])
                     else:
                         alpha_vals = 0.8
-                    
-                    ax.scatter(xy_np[:, 0], xy_np[:, 1], s=min([40,30*200/len(xy_np)]), alpha=alpha_vals)
-                
+                        weight_mask = np.array([True]*len(xy_np))
+
+                    if np.any(weight_mask):    
+                        ax.scatter(xy_np[:, 0][weight_mask], xy_np[:, 1][weight_mask], s=min([40,30*200/len(xy_np[weight_mask])]), alpha=alpha_vals[weight_mask])
+
                 ax.set_xlim(-self.half_domain, self.half_domain)
                 ax.set_ylim(-self.half_domain, self.half_domain)
                 ax.set_title('String Positions in XY Plane')
@@ -1664,6 +1673,7 @@ class Visualizer:
             # String weights scatter plot with variable alpha
             if string_xy is not None:
                 string_weights = kwargs.get('string_weights', None)
+                weight_threshold = kwargs.get('weight_threshold', 0.7)
                 
                 if string_weights is not None:
                     # Convert tensors to numpy arrays
@@ -2857,12 +2867,16 @@ class Visualizer:
                 # Plot each unweighted loss component
                 for loss_name, loss_history in uw_loss_dict.items():
                     if loss_history and len(loss_history) > 0:
-                        # Normalize each component to [1e-2, 1] range for better visibility
-                        loss_array = np.array(loss_history)
-                        if len(loss_array) > 0 and np.max(loss_array) > 0:
-                            normalized_loss = (loss_array / np.max(loss_array)) * (1 - 1e-2) + 1e-2
+                        # transform each component to [1, 0] range for better visibility (min at 0, max at 1)
+                        loss_array = np.log10(loss_history)
+                        if len(loss_array) > 0 and np.max(loss_array) > np.min(loss_array):
+                            # Normalize to [0, 1] first, then scale to [1e-2, 1]
+                            normalized_loss = (loss_array - np.min(loss_array)) / (np.max(loss_array) - np.min(loss_array))
+                            # normalized_loss = normalized_loss * (1 - 0.01) + 0.01
                         else:
-                            normalized_loss = loss_array
+                            # If all values are the same, set them to middle of range
+                            normalized_loss = np.full_like(loss_array, 0.5)
+                        
                         if loss_iterations_dict is None:    
                             ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
                         else:
@@ -2882,7 +2896,6 @@ class Visualizer:
                                         iter_idx += 1
                                     else:
                                         full_loss_history.append(None)
-                                
                                 # Plot with gaps handled
                                 ax.plot(full_range, full_loss_history, label=f"{loss_name}", alpha=0.8, linewidth=2)
                             else:
@@ -2908,15 +2921,15 @@ class Visualizer:
                 
                 ax.set_title(f"Unweighted Loss Components")
                 ax.set_xlabel("Iteration")
-                ax.set_ylabel("Unweighted Loss Value")
+                ax.set_ylabel("Normalized Loss Value (log scale)")
                 ax.legend(loc='best', fontsize='small')
                 ax.grid(True, alpha=0.3)
                 
                 # Use log scale if all values are positive
-                all_values = [val for history in uw_loss_dict.values() for val in history if val is not None and val != 0]
-                # all_values.extend(total_uw_loss)
-                if all_values and all(val > 0 for val in all_values):
-                    ax.set_yscale('log')
+                # all_values = [val for history in uw_loss_dict.values() for val in history if val is not None and val != 0]
+                # # all_values.extend(total_uw_loss)
+                # if all_values and all(val > 0 for val in all_values):
+                #     ax.set_yscale('log')
             else:
                 ax.text(0.5, 0.5, "Unweighted loss dictionary not available or empty\n(Pass 'uw_loss_dict' in kwargs)", 
                       ha='center', va='center', transform=ax.transAxes)
@@ -3277,8 +3290,6 @@ class Visualizer:
         # Clean up temporary files if requested
         if cleanup_images and success:
             self.cleanup_gif_temp_files()
-            
-        return success
     
     def cleanup_gif_temp_files(self) -> None:
         """

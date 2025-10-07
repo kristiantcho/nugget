@@ -3,6 +3,7 @@ import numpy as np
 from conflictfree.grad_operator import ConFIG_update
 from conflictfree.weight_model import WeightModel, EqualWeight
 from typing import Optional, Sequence, Union
+import pickle
 
 class Optimizer():
     
@@ -107,6 +108,8 @@ class Optimizer():
         self.loss_weights_dict = loss_weights_dict
         self.cf_loss_weights_dict = kwargs.get('cf_loss_weights_dict', self.loss_weights_dict)
         self.loss_iterations_dict = kwargs.get('loss_iterations_dict', {})
+        self.save_best_geom_file = kwargs.get('save_best_geom_file', None)
+        self.save_last_geom = kwargs.get('save_last_geom', False)
         for key in loss_func_dict:
             if key not in self.loss_dict:
                 self.loss_dict[key] = []
@@ -173,6 +176,7 @@ class Optimizer():
                 vis_kwargs['loss_iterations_dict'] = self.loss_iterations_dict
             self.total_loss.append(self.loss_update_step())
             
+
             # Step the schedulers
             if len(self.schedulers) > 0:
                 for key in self.schedulers.keys():
@@ -181,6 +185,9 @@ class Optimizer():
                             continue
                     self.schedulers[key].step()
             self.geom_dict = self.geometry.update_points(**self.geom_dict)
+            if self.save_best_geom_file is not None and (self.total_loss[-1] == min(self.total_loss) or self.save_last_geom):
+                with open(self.save_best_geom_file, 'wb') as f:
+                    pickle.dump(self.geom_dict, f)
             # print(self.geom_dict['string_weights'])
             vis_kwargs.update(self.geom_dict)
             if it % print_freq == 0 or it == n_iter - 1:
