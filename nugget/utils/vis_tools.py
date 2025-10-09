@@ -2441,17 +2441,24 @@ class Visualizer:
                 grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
                 
                 # Interpolate signal light yield values from string positions to grid
-                fill_val = np.min(signal_light_yield_values_np) if len(signal_light_yield_values_np) > 0 else np.nan
-                signal_light_yield_grid = griddata(
-                    np.column_stack([string_x, string_y]), 
-                    signal_light_yield_values_np, 
-                    grid_points,
-                    method='linear', 
-                    fill_value=fill_val
-                ).reshape(resolution, resolution)
-                
-                # Create the contour plot with signal-appropriate colormap
-                c1 = ax.contourf(X_np, Y_np, signal_light_yield_grid, cmap='Oranges', levels=20)
+                if np.all(signal_light_yield_values_np != signal_light_yield_values_np[0]):
+                    fill_val = np.min(signal_light_yield_values_np) if len(signal_light_yield_values_np) > 0 else np.nan
+                    signal_light_yield_grid = griddata(
+                        np.column_stack([string_x, string_y]), 
+                        signal_light_yield_values_np, 
+                        grid_points,
+                        method='linear', 
+                        fill_value=fill_val
+                    ).reshape(resolution, resolution)
+                    
+                    # Create the contour plot with signal-appropriate colormap
+                    c1 = ax.contourf(X_np, Y_np, signal_light_yield_grid, cmap='Oranges', levels=20)
+                else:
+                    # If all values are identical, create a uniform grid
+                    signal_light_yield_grid = np.full((resolution, resolution), signal_light_yield_values_np[0])
+                    c1 = ax.contourf(X_np, Y_np, signal_light_yield_grid, cmap='Oranges', levels=1)
+                    # force colorbar to just show that single value
+                    c1.set_clim(signal_light_yield_values_np[0]-0.5, signal_light_yield_values_np[0]+0.5)
                 cbar = fig.colorbar(c1, ax=ax)
                 cbar.set_label('Signal Light Yield')
                 

@@ -101,7 +101,7 @@ class ToySampler(Sampler):
                 event_params['zenith'] = self.sample_background_zenith(a, 1)
             # event_params['lepton'] = None
             event_params['azimuth'] = torch.rand(1, device=self.device) * 2 * np.pi
-            event_params['position'] = torch.randn(1, 3, device=self.device) * self.half_domain
+            event_params['position'] = torch.rand(1, 3, device=self.device) * self.domain_size*1.5 - self.domain_size*1.5/2
             
             event_params['position'] += torch.tensor([x_bias, y_bias, z_bias])*self.domain_size
             event_params_list.append(event_params)
