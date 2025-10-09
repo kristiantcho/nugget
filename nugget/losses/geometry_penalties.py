@@ -275,7 +275,7 @@ class LocalStringRepulsionPenalty(LossFunction):
         
         # Soft mask using sigmoid - smoother transition at radius boundary
         self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
-        radius_weight = torch.sigmoid((max_radius - dist) * 10)  # Sharp transition around max_radius
+        radius_weight = torch.sigmoid((max_radius - dist) * 100)  # Sharp transition around max_radius
         radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
         
         repulsion = 0.0
@@ -645,8 +645,8 @@ class WeightBinarizationPenalty(LossFunction):
         """
         string_weights = geom_dict.get('string_weights', None)
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
-        string_probs_cut = torch.clamp(string_probs, min=0.0, max=1.0)
-        return {'weight_binarization_penalty': torch.sum(-string_probs_cut * torch.log(string_probs_cut + 1e-10) - (1 - string_probs_cut) * torch.log(1 - string_probs_cut + 1e-10))}
+        # string_probs_cut = torch.clamp(string_probs, min=0.0, max=1.0)
+        return {'weight_binarization_penalty': torch.sum(-string_probs * torch.log(string_probs + 1e-10) - (1 - string_probs) * torch.log(1 - string_probs + 1e-10))}
     
     
 class ROVPenalty(LossFunction):
@@ -667,7 +667,7 @@ class ROVPenalty(LossFunction):
         
    
 
-    def inside_safe_space(self, points, theta):
+    def inside_safe_space(self, points, theta, weights=None):
         """
         points: (N, 2) tensor of 2D points relative to candidate ROV position
         theta: scalar angle in radians (rotation of safe space)
@@ -695,7 +695,12 @@ class ROVPenalty(LossFunction):
         inside_tri = (x >= L_rect) & (x <= L_rect + L_tri) & (y <= slope * (L_rect + L_tri - x))
 
         inside = inside_rect | inside_tri
-        return inside.float()
+        if weights is not None:
+            inside_weights = weights[inside]
+            indicator = inside.any().to(weights.dtype)
+            return indicator * torch.sum(inside_weights)
+        else:
+            return inside.any().to(points.dtype)
 
     def __call__(self, geom_dict, **kwargs):
         """
@@ -712,17 +717,19 @@ class ROVPenalty(LossFunction):
 
         for i in range(N):
             others = torch.cat([points[:i], points[i+1:]], dim=0) - points[i]  # relative coords
-
+            other_string_probs = None
+            if string_probs is not None:
+                other_string_probs = torch.cat([string_probs[:i], string_probs[i+1:]], dim=0)
             ok = []
             for k in range(num_angles):
                 theta = torch.tensor(2 * torch.pi * k / num_angles)
-                inside = self.inside_safe_space(others, theta)
-                ok.append(inside.any().float())  # 1 if blocked, 0 if free
+                inside = self.inside_safe_space(others, theta, other_string_probs)
+                ok.append(inside)  # 1 if blocked, 0 if free
 
             # If all orientations blocked -> penalty = 1
             penalty = torch.stack(ok).min()  # min over orientations
             if string_probs is not None:
-                penalty *= string_probs[i]
+                penalty = penalty * string_probs[i]
             loss += penalty
 
         return {'rov_penalty': loss/N}

@@ -402,7 +402,7 @@ class WeightedFisherInfoLoss(LossFunction):
                 fisher_matrix = torch.zeros(n_params, n_params, device=self.device)
                 for point in string_points: 
                     for _ in range(llr_iterations):    
-                        fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos)/len(signal_event_params)
+                        fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos)
                     fisher_matrix += fisher_matrix/llr_iterations
                 fisher_per_string_per_event[i, s_idx] += fisher_matrix
 
