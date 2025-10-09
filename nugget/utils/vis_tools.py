@@ -2441,7 +2441,7 @@ class Visualizer:
                 grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
                 
                 # Interpolate signal light yield values from string positions to grid
-                if np.all(signal_light_yield_values_np != signal_light_yield_values_np[0]):
+                if np.any(signal_light_yield_values_np != signal_light_yield_values_np[0]):
                     fill_val = np.min(signal_light_yield_values_np) if len(signal_light_yield_values_np) > 0 else np.nan
                     signal_light_yield_grid = griddata(
                         np.column_stack([string_x, string_y]), 

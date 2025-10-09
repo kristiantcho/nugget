@@ -264,6 +264,7 @@ class LocalStringRepulsionPenalty(LossFunction):
         string_weights = geom_dict.get('string_weights', None)
         max_radius = kwargs.get('max_radius', 0.1)
         min_dist = kwargs.get('min_dist', 1e-3)
+        sharpness = kwargs.get('local_sharpness', 100.0)  # Controls steepness of sigmoid transition
         
         if string_xy is None:
             return torch.tensor(0.0)
@@ -275,7 +276,7 @@ class LocalStringRepulsionPenalty(LossFunction):
         
         # Soft mask using sigmoid - smoother transition at radius boundary
         self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
-        radius_weight = torch.sigmoid((max_radius - dist) * 100)  # Sharp transition around max_radius
+        radius_weight = torch.sigmoid((max_radius - dist) * sharpness)  # Sharp transition around max_radius
         radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
         
         repulsion = 0.0
