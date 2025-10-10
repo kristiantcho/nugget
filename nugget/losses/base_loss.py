@@ -29,7 +29,7 @@ class LossFunction:
         domain : float
             Size of the domain.
         """
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device if device is not None else torch.device('cpu')
   
     
     def __call__(self, geom_dict, **kwargs):

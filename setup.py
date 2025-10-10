@@ -14,6 +14,7 @@ setup(
         "scipy>=1.5.0",
         "tqdm>=4.45.0",
         "conflictfree>=0.1.8",
+        "imageio>=2.37.0",
     ],
     python_requires=">=3.8",
 )

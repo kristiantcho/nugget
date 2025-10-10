@@ -109,7 +109,7 @@ class Visualizer:
         domain_size : float
             Size of the domain from -domain_size/2 to domain_size/2 in each dimension.
         """
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device if device is not None else torch.device('cpu')
         self.dim = dim
         self.domain_size = domain_size
         self.half_domain = domain_size / 2
@@ -403,6 +403,8 @@ class Visualizer:
             - background_surrogate_func: Surrogate function for background
             - background_event_params: Event parameters dict for background surrogate function
             - rov_penalty: ROVPenalty object for displaying ROV safe space on string_xy and string_weights_scatter plots
+            - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range] 
+              instead of the default domain boundaries [-half_domain, half_domain]
         """
         # Safely handle torch tensor inputs by cloning and detaching them
         points = self._safe_tensor_convert(points)
@@ -410,7 +412,7 @@ class Visualizer:
         
         
         # Handle potential torch tensors in kwargs
-        for key in ['test_points', 'string_weights', 'signal_funcs', 'background_funcs']:
+        for key in ['test_points', 'string_weights', 'signal_funcs', 'background_funcs', 'string_spacing']:
             if key in kwargs:
                 kwargs[key] = self._safe_tensor_convert(kwargs[key])
         
@@ -689,6 +691,18 @@ class Visualizer:
         points_xyz = points.detach().cpu().numpy()
         geometry_type = kwargs.get('geometry_type', None) # Get geometry_type from kwargs
         
+        # Extract zoom_range parameter for contour plots
+        zoom_range = kwargs.get('zoom_range', None)
+        
+        # Helper function to set axis limits based on zoom_range or default domain
+        def set_axis_limits(ax_obj):
+            if zoom_range is not None:
+                ax_obj.set_xlim(-zoom_range, zoom_range)
+                ax_obj.set_ylim(-zoom_range, zoom_range)
+            else:
+                ax_obj.set_xlim(-self.half_domain, self.half_domain)
+                ax_obj.set_ylim(-self.half_domain, self.half_domain)
+        
         # Create the requested plot type
         if plot_type == self.PLOT_LOSS:
             # Loss history plot
@@ -897,8 +911,7 @@ class Visualizer:
                     if np.any(weight_mask):    
                         ax.scatter(xy_np[:, 0][weight_mask], xy_np[:, 1][weight_mask], s=min([40,30*200/len(xy_np[weight_mask])]), alpha=alpha_vals[weight_mask])
 
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 ax.set_title('String Positions in XY Plane')
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
@@ -943,8 +956,7 @@ class Visualizer:
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
             ax.set_title('XY Projection (colored by Z)')
-            ax.set_xlim(-self.half_domain, self.half_domain)
-            ax.set_ylim(-self.half_domain, self.half_domain)
+            set_axis_limits(ax)
             fig.colorbar(sc, ax=ax, label='Z Position')
             
         elif plot_type == self.PLOT_SIGNAL_CONTOUR:
@@ -1054,8 +1066,7 @@ class Visualizer:
                 ax.set_xlabel("X")
                 ax.set_ylabel("Y")
                 # Set consistent domain boundaries
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
             else:
                 ax.text(0.5, 0.5, "Signal function data not available\n(Pass 'signal_funcs' or 'signal_surrogate_func' + 'signal_event_params')", 
                       ha='center', va='center', transform=ax.transAxes)
@@ -1155,8 +1166,7 @@ class Visualizer:
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
             # Set consistent domain boundaries
-            ax.set_xlim(-self.half_domain, self.half_domain)
-            ax.set_ylim(-self.half_domain, self.half_domain)
+            set_axis_limits(ax)
         elif plot_type == self.PLOT_PARAM_1D:
             # 1D parameter vs SNR plot
             optimize_params = kwargs.get('optimize_params', [])
@@ -1450,8 +1460,7 @@ class Visualizer:
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
             # Set consistent domain boundaries
-            ax.set_xlim(-self.half_domain, self.half_domain)
-            ax.set_ylim(-self.half_domain, self.half_domain)
+            set_axis_limits(ax)
             
         elif plot_type in [self.PLOT_TRUE_FUNCTION, self.PLOT_INTERP_FUNCTION, self.PLOT_ERROR_FUNCTION]:
             # Retrieve necessary parameters from kwargs
@@ -1666,8 +1675,7 @@ class Visualizer:
             
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
-            ax.set_xlim(-self.half_domain, self.half_domain)
-            ax.set_ylim(-self.half_domain, self.half_domain)
+            set_axis_limits(ax)
         
         elif plot_type == self.PLOT_STRING_WEIGHTS_SCATTER:
             # String weights scatter plot with variable alpha
@@ -1701,8 +1709,7 @@ class Visualizer:
                     ax.set_xlabel('X Coordinate')
                     ax.set_ylabel('Y Coordinate')
                     ax.set_title(f'Active strings = {len(weights_np[weights_np > 0.7])}, Total strings = {len(weights_np)}')
-                    ax.set_xlim(-self.half_domain, self.half_domain)
-                    ax.set_ylim(-self.half_domain, self.half_domain)
+                    set_axis_limits(ax)
                     
                     # Add ROV safe space visualization if ROV penalty is available
                     rov_penalty = kwargs.get('rov_penalty', None)
@@ -1777,8 +1784,7 @@ class Visualizer:
                 ax.set_title(f"Combined LLR per String (n={len(llr_values_np)} strings)")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "LLR per string data not available\n(Requires 'llr_per_string' and 'string_xy' in kwargs)", 
@@ -1845,8 +1851,7 @@ class Visualizer:
                 ax.set_title(f"Pred. Signal LLR per String")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "Signal LLR per string data not available\n(Requires 'signal_llr_per_string' and 'string_xy' in kwargs)", 
@@ -1913,8 +1918,7 @@ class Visualizer:
                 ax.set_title(f"True Signal LLR per String")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "True Signal LLR per string data not available\n(Requires 'true_signal_llr_per_string' and 'string_xy' in kwargs)", 
@@ -1969,8 +1973,7 @@ class Visualizer:
                     ax.set_title(f"Signal LLR per Point")
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
-                    ax.set_xlim(-self.half_domain, self.half_domain)
-                    ax.set_ylim(-self.half_domain, self.half_domain)
+                    set_axis_limits(ax)
                 else:
                     ax.text(0.5, 0.5, f"Signal LLR interpolation failed:\n{error_msg}", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -2040,8 +2043,7 @@ class Visualizer:
                 ax.set_title(f"Pred. Background LLR per String")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "Background LLR per string data not available\n(Requires 'background_llr_per_string' and 'string_xy' in kwargs)", 
@@ -2108,8 +2110,7 @@ class Visualizer:
                 ax.set_title(f"True Background LLR per String")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "True Background LLR per string data not available\n(Requires 'true_background_llr_per_string' and 'string_xy' in kwargs)", 
@@ -2164,8 +2165,7 @@ class Visualizer:
                     ax.set_title(f"Background LLR per Point")
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
-                    ax.set_xlim(-self.half_domain, self.half_domain)
-                    ax.set_ylim(-self.half_domain, self.half_domain)
+                    set_axis_limits(ax)
                 else:
                     ax.text(0.5, 0.5, f"Background LLR interpolation failed:\n{error_msg}", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -2469,18 +2469,21 @@ class Visualizer:
                     alpha_values = np.clip(alpha_values, 0.05, 1.0)
                 else:
                     alpha_values = 0.8
+                if kwargs.get('string_spacing', None) is not None:
+                    size_factor = kwargs['string_spacing']/2
+                else:
+                    size_factor = 1.0
                 
                 # Show string positions colored by their signal light yield values
                 scatter = ax.scatter(string_x, string_y, c=signal_light_yield_values_np, 
-                                   cmap='Oranges', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='Oranges', s=min([60, 40*200*size_factor/len(string_indices)]), 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
                 ax.set_title(f"Signal Light Yield per String")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "Signal light yield per string data not available\n(Requires 'signal_light_yield_per_string' and 'string_xy' in kwargs)", 
@@ -2535,8 +2538,7 @@ class Visualizer:
                     ax.set_title(f"Signal Light Yield per Point")
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
-                    ax.set_xlim(-self.half_domain, self.half_domain)
-                    ax.set_ylim(-self.half_domain, self.half_domain)
+                    set_axis_limits(ax)
                 else:
                     ax.text(0.5, 0.5, f"Signal light yield interpolation failed:\n{error_msg}", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -2607,8 +2609,7 @@ class Visualizer:
                 ax.set_title(f"SNR per String (n={len(snr_values_np)} strings)")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "SNR per string data not available\n(Requires 'snr_per_string' and 'string_xy' in kwargs)", 
@@ -2726,8 +2727,7 @@ class Visualizer:
                 
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "Fisher Information data not available\n(Requires 'fisher_info_per_string' and 'string_xy' in kwargs)", 

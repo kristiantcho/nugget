@@ -107,11 +107,11 @@ class WeightedLightYieldLoss(LossFunction):
         else:
             signal_yield_per_string = precomputed_light_yield
         if string_weights is None:
-            total_light_yield = torch.sum(signal_yield_per_string)  # Sum over strings
+            total_light_yield = torch.sum(signal_yield_per_string / torch.mean(signal_yield_per_string))  # Sum over strings
         else:
             string_probs = torch.sigmoid(string_weights)
             total_light_yield = torch.sum(signal_yield_per_string * string_probs)  # Weighted sum
-        light_yield_loss = 1/total_light_yield  # Add small value to avoid division by zero
+        light_yield_loss = 1 / total_light_yield  # Add small value to avoid division by zero
         if self.print_loss:
             print(f"Weighted light yield loss: {light_yield_loss.item()}")
         
