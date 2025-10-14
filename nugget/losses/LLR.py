@@ -5,7 +5,7 @@ import torch.nn.functional as F
 class WeightedLLRLoss(LossFunction):
     """Loss function for log-likelihood ratio (LLR) maximization."""
     
-    def __init__(self, device=None, llr_net = None, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth'], no_grad=True):
+    def __init__(self, device=None, llr_net = None, event_labels=['position', 'energy', 'zenith', 'azimuth'], no_grad=True, sharpness=1.0):
         """
         Initialize the LLR loss function.
         
@@ -20,7 +20,7 @@ class WeightedLLRLoss(LossFunction):
         """
         super().__init__(device)
         self.llr_net = llr_net
-        self.print_loss = print_loss
+        self.sharpness = sharpness
         self.event_labels = event_labels
         self.no_grad = no_grad
     
@@ -93,10 +93,10 @@ class WeightedLLRLoss(LossFunction):
             total_llr = torch.sum(llr_per_string)  # Sum over strings
         else:
             string_probs = torch.sigmoid(string_weights)
-            total_llr = torch.sum(llr_per_string * string_probs) / len(string_probs)  # Weighted sum
-        
-        llr_loss = 1/total_llr  # Add small value for numerical stability
-        
+            total_llr = torch.sum(llr_per_string * string_probs)  # Weighted sum
+
+        llr_loss = torch.sigmoid(-total_llr * self.sharpness/len(points_3d))  # Add small value for numerical stability
+
         return {'signal_llr_loss': llr_loss, 'signal_llr_per_string': llr_per_string, 'signal_total_llr': total_llr}
     
 
@@ -165,7 +165,7 @@ class WeightedMeanDifLLRLoss(WeightedLLRLoss):
 class LLRLoss(LossFunction):
     """Loss function for log-likelihood ratio (LLR) maximization."""
     
-    def __init__(self, device=None, llr_net = None, print_loss=False, event_labels=['position', 'energy', 'zenith', 'azimuth']):
+    def __init__(self, device=None, llr_net = None, event_labels=['position', 'energy', 'zenith', 'azimuth'], sharpeness=1.0):
         """
         Initialize the LLR loss function.
         
@@ -180,7 +180,7 @@ class LLRLoss(LossFunction):
         """
         super().__init__(device)
         self.llr_net = llr_net
-        self.print_loss = print_loss
+        self.sharpness = sharpeness
         self.event_labels = event_labels
     
     def compute_LLR_per_point(self, points_3d, event_params, surrogate_func, noise_scale=0):
@@ -232,9 +232,9 @@ class LLRLoss(LossFunction):
         
         llr_per_point = self.compute_LLR_per_point(points_3d, event_params, surrogate_func, noise_scale)
         total_llr = torch.sum(llr_per_point)  # Sum over points
-        
-        llr_loss = 1/(total_llr + 1e-6)  # Add small value for numerical stability
-        
+
+        llr_loss = torch.sigmoid(-total_llr * self.sharpness/len(points_3d))  # Add small value for numerical stability
+
         return {'signal_llr_loss': llr_loss, 'signal_total_llr': total_llr, 'signal_llr_per_point': llr_per_point}
     
 

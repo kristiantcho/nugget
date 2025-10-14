@@ -332,6 +332,8 @@ class FisherInfoLoss(LossFunction):
         llr_iterations = kwargs.get('fisher_info_llr_iterations', 100)
         signal_noise_scale = kwargs.get('signal_noise_scale', None)
         add_relative_pos = kwargs.get('add_relative_pos', False)
+        max_energy_resolution = kwargs.get('max_energy_resolution', 1)
+        max_angular_resolution = kwargs.get('max_angular_resolution', torch.pi)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
         n_params = len(self.fisher_info_params)
@@ -346,7 +348,13 @@ class FisherInfoLoss(LossFunction):
             fisher_info_per_point[i] += fisher_matrix
 
         fisher_loss = torch.trace(torch.inverse(total_fisher_info + 1e-6 * torch.eye(total_fisher_info.shape[0], device=total_fisher_info.device)))  # Add small value to diagonal for numerical stability
-
+        if 'energy' in self.fisher_info_params and ('azimuth' in self.fisher_info_params or 'zenith' in self.fisher_info_params):
+            fisher_loss = fisher_loss/(max_angular_resolution + max_energy_resolution)
+        elif 'energy' in self.fisher_info_params:
+            fisher_loss = fisher_loss/max_energy_resolution
+        elif 'azimuth' in self.fisher_info_params or 'zenith' in self.fisher_info_params:
+            fisher_loss = fisher_loss/max_angular_resolution
+        
         if self.print_loss:
             print(f"Fisher Info Loss: {fisher_loss.item()}")
         
@@ -508,6 +516,8 @@ class WeightedFisherInfoLoss(LossFunction):
         llr_iterations = kwargs.get('fisher_info_llr_iterations', 100)
         signal_noise_scale = kwargs.get('signal_noise_scale', None)
         add_relative_pos = kwargs.get('add_relative_pos', False)
+        max_energy_resolution = kwargs.get('max_energy_resolution', 1)
+        max_angular_resolution = kwargs.get('max_angular_resolution', torch.pi)
         # background_event_params = kwargs.get('background_event_params', None)
         # background_surrogate_func = kwargs.get('background_surrogate_func', None)
         if signal_event_params is None and signal_sampler is not None:
@@ -535,7 +545,12 @@ class WeightedFisherInfoLoss(LossFunction):
         for i in range(total_fisher_info_per_event.shape[0]):
             mean_fisher_inv_trace += torch.trace(torch.inverse(total_fisher_info_per_event[i] + 1e-6 * torch.eye(total_fisher_info_per_event.shape[1], device=total_fisher_info_per_event.device)))/total_fisher_info_per_event.shape[0]  # Add small value to diagonal for numerical stability
         fisher_loss = mean_fisher_inv_trace
-        
+        if 'energy' in self.fisher_info_params and ('azimuth' in self.fisher_info_params or 'zenith' in self.fisher_info_params):
+            fisher_loss = fisher_loss/(max_angular_resolution + max_energy_resolution)
+        elif 'energy' in self.fisher_info_params:
+            fisher_loss = fisher_loss/max_energy_resolution
+        elif 'azimuth' in self.fisher_info_params or 'zenith' in self.fisher_info_params:
+            fisher_loss = fisher_loss/max_angular_resolution
         # return {'fisher_loss': fisher_loss, 'fisher_info_per_string': fisher_info_per_string, 'total_fisher_info': total_fisher_info}
         return {'fisher_loss': fisher_loss, 'fisher_info_per_string_per_event': fisher_info_per_string_per_event, 'total_fisher_info_per_event': total_fisher_info_per_event, 'fisher_signal_params': signal_event_params}
 class WeightedResolutionLoss(WeightedFisherInfoLoss):
@@ -606,6 +621,8 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         llr_iterations = kwargs.get('fisher_info_llr_iterations', 100)
         signal_noise_scale = kwargs.get('signal_noise_scale', None)
         add_relative_pos = kwargs.get('add_relative_pos', False)
+        max_angular_resolution = kwargs.get('max_angular_resolution', torch.pi) # radians
+        max_energy_resolution = kwargs.get('max_energy_resolution', 1.0) # fraction
         # background_event_params = kwargs.get('background_event_params', None)
         # background_surrogate_func = kwargs.get('background_surrogate_func', None)
         if signal_event_params is None and signal_sampler is not None:
@@ -648,6 +665,10 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
             resolution_per_event.append(energy_resolution)
             resolution_per_event = torch.stack(resolution_per_event)
             total_resolution = torch.mean(resolution_per_event)
+            if self.resolution_type == 'angular':
+                total_resolution = total_resolution/max_angular_resolution
+            if self.resolution_type == 'energy':
+                total_resolution = total_resolution/max_energy_resolution
 
             return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
 
@@ -710,6 +731,8 @@ class ResolutionLoss(FisherInfoLoss):
         llr_iterations = kwargs.get('fisher_info_llr_iterations', 100)
         signal_noise_scale = kwargs.get('signal_noise_scale', None)
         add_relative_pos = kwargs.get('add_relative_pos', False)
+        max_energy_resolution = kwargs.get('max_energy_resolution', 1.0)
+        max_angular_resolution = kwargs.get('max_angular_resolution', torch.pi)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
         n_params = len(self.fisher_info_params)
@@ -735,7 +758,7 @@ class ResolutionLoss(FisherInfoLoss):
                 covar_zenith_azimuth = cov_matrix[zenith_idx, azimuth_idx]
                 angular_resolution_rad = torch.sqrt(var_azimuth + torch.sin(zenith)*var_azimuth + 2*torch.sin(zenith)*torch.cos(zenith)*covar_zenith_azimuth)
 
-                resolution_per_event.append(angular_resolution_rad)
+                resolution_per_event.append(angular_resolution_rad)  # Convert to degrees
 
             elif self.resolution_type == 'energy':
                 energy_idx = self.fisher_info_params.index('energy')
@@ -748,6 +771,10 @@ class ResolutionLoss(FisherInfoLoss):
                 resolution_per_event.append(energy_resolution)
         resolution_per_event = torch.stack(resolution_per_event)
         total_resolution = torch.mean(resolution_per_event)
+        if self.resolution_type == 'angular':
+            total_resolution = total_resolution/max_angular_resolution 
+        if self.resolution_type == 'energy':
+            total_resolution = total_resolution/max_energy_resolution
         if self.resolution_type == 'energy':
             return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}
         elif self.resolution_type == 'angular':

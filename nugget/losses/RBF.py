@@ -5,7 +5,7 @@ import torch.nn.functional as F
 class RBFInterpolationLoss(LossFunction):
     """Loss function for RBF interpolation."""
     
-    def __init__(self, device=None, epsilon=30.0):
+    def __init__(self, device=None, epsilon=30.0, domain_size=2, loss_func=F.mse_loss):
         """
         Initialize the RBF interpolation loss function.
         
@@ -31,8 +31,9 @@ class RBFInterpolationLoss(LossFunction):
         """
         super().__init__(device)
         self.epsilon = epsilon
-    
-    
+        self.domain_size = domain_size
+        self.loss_func = loss_func
+        
     def compute_rbf_interpolant(self, x_points, f_values, test_points):
         """
         Compute RBF interpolant weights and kernel matrix.
@@ -122,7 +123,7 @@ class RBFInterpolationLoss(LossFunction):
         num_events = kwargs.get('num_events', 100)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
-        loss_func = kwargs.get('loss_func', F.mse_loss)
+        
         
         
         if test_points is None:
@@ -145,7 +146,7 @@ class RBFInterpolationLoss(LossFunction):
         s_tests = torch.stack(s_tests)
         f_value_sets = torch.stack(f_value_sets)
         
-        loss = loss_func(f_tests, s_tests)
+        loss = self.loss_func(f_tests, s_tests)
     
         
         # return loss,  f_tests, s_tests, f_value_sets

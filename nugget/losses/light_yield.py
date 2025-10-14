@@ -2,7 +2,7 @@ from nugget.losses.base_loss import LossFunction
 import torch
 
 class LightYieldLoss(LossFunction):
-    def __init__(self, device=None, print_loss=False, ):
+    def __init__(self, device=None, sharpness=1.0):
         """
         Initialize the light yield loss function.
         
@@ -14,7 +14,8 @@ class LightYieldLoss(LossFunction):
             Whether to print loss components during computation.
         """
         super().__init__(device)
-        self.print_loss = print_loss
+        self.sharpness = sharpness
+
 
 
     def __call__(self, geom_dict, **kwargs):
@@ -34,14 +35,13 @@ class LightYieldLoss(LossFunction):
             # We want to maximize light yield
             if noise_scale > 0.0:
                 light_yield = light_yield + light_yield*torch.randn(size=light_yield.shape, device=self.device) * noise_scale
-            loss += 1/(torch.sum(light_yield)/len(event_params) + 1e-6)  # Add small value to avoid division by zero  
-        if self.print_loss:
-            print(f"Light yield loss: {loss.item()}")
+            loss += torch.sigmoid(-torch.sum(light_yield)*self.sharpness/(len(points_3d)*len(event_params)))  
+
         return {'signal_yield_loss': loss, 'signal_yield_per_point': light_yield/len(event_params), 'total_signal_yield': torch.sum(light_yield)/len(event_params)}
 
 class WeightedLightYieldLoss(LossFunction):
     
-    def __init__(self, device=None, print_loss=False):
+    def __init__(self, device=None, sharpness=1.0):
         """
         Initialize the light yield loss function.
         
@@ -53,7 +53,8 @@ class WeightedLightYieldLoss(LossFunction):
             Whether to print loss components during computation.
         """
         super().__init__(device)
-        self.print_loss = print_loss
+ 
+        self.sharpness = sharpness
     
 
     def light_yield_per_string(self, surrogate_func, event_params, string_xy, points_3d, noise_scale=0.0):
@@ -107,16 +108,14 @@ class WeightedLightYieldLoss(LossFunction):
         else:
             signal_yield_per_string = precomputed_light_yield
         if string_weights is None:
-            total_light_yield = torch.sum(signal_yield_per_string / torch.mean(signal_yield_per_string))  # Sum over strings
+            total_light_yield = torch.sum(signal_yield_per_string)  # Sum over strings
         else:
             string_probs = torch.sigmoid(string_weights)
-            total_light_yield = torch.sum(signal_yield_per_string * string_probs)  # Weighted sum
-        light_yield_loss = 1 / total_light_yield  # Add small value to avoid division by zero
-        if self.print_loss:
-            print(f"Weighted light yield loss: {light_yield_loss.item()}")
+            total_light_yield = torch.sum(signal_yield_per_string * string_probs) # Weighted sum
+        light_yield_loss =  torch.sigmoid(-total_light_yield*self.sharpness/len(points_3d))  # Add small value to avoid division by zero
         
         # return light_yield_loss, signal_yield_per_string, total_light_yield
-        return {'signal_yield_loss': light_yield_loss, 'signal_yield_per_string': signal_yield_per_string, 'total_signal_yield': total_light_yield}
+        return {'signal_yield_loss': light_yield_loss, 'signal_yield_per_string': signal_yield_per_string, 'total_signal_yield': total_light_yield, 'signal_event_params': event_params}
 
         
 
