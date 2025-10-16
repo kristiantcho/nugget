@@ -28,16 +28,17 @@ class LightYieldLoss(LossFunction):
         noise_scale = kwargs.get('signal_noise_scale', 0.0)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
-
+        total_light_yield = torch.tensor(0.0, device=self.device)
         for params in event_params:
             # Compute light yield for each event
             light_yield = surrogate_func(opt_point=points_3d, event_params=params)  # Shape (num_points,)
             # We want to maximize light yield
             if noise_scale > 0.0:
                 light_yield = light_yield + light_yield*torch.randn(size=light_yield.shape, device=self.device) * noise_scale
-            loss += torch.sigmoid(-torch.sum(light_yield)*self.sharpness/(len(points_3d)*len(event_params)))  
+            total_light_yield += torch.sum(light_yield)
+        loss += torch.sigmoid(-total_light_yield*self.sharpness/(len(points_3d)*len(event_params)))
 
-        return {'signal_yield_loss': loss, 'signal_yield_per_point': light_yield/len(event_params), 'total_signal_yield': torch.sum(light_yield)/len(event_params)}
+        return {'signal_yield_loss': loss, 'signal_yield_per_point': light_yield/len(event_params), 'total_signal_yield': total_light_yield/len(event_params)}
 
 class WeightedLightYieldLoss(LossFunction):
     

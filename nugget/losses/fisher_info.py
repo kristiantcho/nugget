@@ -622,7 +622,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         signal_noise_scale = kwargs.get('signal_noise_scale', None)
         add_relative_pos = kwargs.get('add_relative_pos', False)
         max_angular_resolution = kwargs.get('max_angular_resolution', torch.pi) # radians
-        max_energy_resolution = kwargs.get('max_energy_resolution', 1.0) # fraction
+        max_energy_resolution = kwargs.get('max_energy_resolution', 1) # fraction
         # background_event_params = kwargs.get('background_event_params', None)
         # background_surrogate_func = kwargs.get('background_surrogate_func', None)
         if signal_event_params is None and signal_sampler is not None:
@@ -657,17 +657,15 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         elif self.resolution_type == 'energy':
             for i, params in enumerate(signal_event_params):
                 energy_idx = self.fisher_info_params.index('energy')
-                cov_matrix = torch.inverse(total_fisher_info)
-        
-                # Energy resolution: sqrt(var_energy)/energy
+                cov_matrix = torch.inverse(total_fisher_info[i])
                 var_energy = cov_matrix[energy_idx, energy_idx]
                 energy_resolution = torch.sqrt(var_energy)
-            resolution_per_event.append(energy_resolution)
+                resolution_per_event.append(energy_resolution)
             resolution_per_event = torch.stack(resolution_per_event)
             total_resolution = torch.mean(resolution_per_event)
             if self.resolution_type == 'angular':
                 total_resolution = total_resolution/max_angular_resolution
-            if self.resolution_type == 'energy':
+            elif self.resolution_type == 'energy':
                 total_resolution = total_resolution/max_energy_resolution
 
             return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
@@ -766,8 +764,8 @@ class ResolutionLoss(FisherInfoLoss):
         
                 # Energy resolution: sqrt(var_energy)/energy
                 var_energy = cov_matrix[energy_idx, energy_idx]
-                mean_energy = torch.mean(torch.tensor([params['energy'] for params in event_params], device=self.device))
-                energy_resolution = torch.sqrt(var_energy)/mean_energy
+                # mean_energy = torch.mean(torch.tensor([params['energy'] for params in event_params], device=self.device))
+                energy_resolution = torch.sqrt(var_energy)
                 resolution_per_event.append(energy_resolution)
         resolution_per_event = torch.stack(resolution_per_event)
         total_resolution = torch.mean(resolution_per_event)
