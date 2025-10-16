@@ -5,7 +5,7 @@ import torch.nn.functional as F
 class SNRloss(LossFunction):
     """Loss function for SNR (Signal-to-Noise Ratio) optimization."""
     
-    def __init__(self, device=None, signal_scale=1.0, background_scale=1.0, no_background=False):
+    def __init__(self, device=None, signal_scale=1.0, background_scale=1.0, no_background=False, sharpness=1.0):
         """
         Initialize the SNR loss function.
         
@@ -39,8 +39,8 @@ class SNRloss(LossFunction):
         self.signal_scale = signal_scale
         self.background_scale = background_scale
         self.no_background = no_background
-        
-    
+        self.sharpness = sharpness
+
     def __call__(self, geom_dict, **kwargs):
         """
         Compute the SNR loss.
@@ -86,23 +86,23 @@ class SNRloss(LossFunction):
         if background_event_params is None and background_sampler is not None:
             background_event_params = background_sampler.sample_events(num_events)
         signal_total = torch.zeros(len(signal_event_params), device=self.device)
-
+        background_total = torch.zeros(len(background_event_params), device=self.device)
         # signal_values = torch.zeros(len(signal_funcs), points_3d.shape[0], device=self.device)
         for i, params in enumerate(signal_event_params):
-            signal_total[i] = torch.sum(signal_surrogate_func(opt_point=points_3d, event_params=params)) * self.signal_scale
+            signal_total[i] += torch.sum(signal_surrogate_func(opt_point=points_3d, event_params=params)) * self.signal_scale
         
         # signal_total = torch.sum(signal_values, dim=1)  # Sum across all points for each function
         
         # Compute background light yield (sum of background function values)
         background_total = torch.zeros(len(background_event_params), device=self.device)
         for i, params in enumerate(background_event_params):
-            background_total[i] = torch.sum(background_surrogate_func(opt_point=points_3d, event_params=params)) * self.background_scale
+            background_total[i] += torch.sum(background_surrogate_func(opt_point=points_3d, event_params=params)) * self.background_scale
         
         # background_total = torch.sum(background_values, dim=1)  # Sum across all points for each function
         
         # Compute SNR for each signal function against the average background
-        avg_background = torch.mean(background_total)
-        
+        avg_background = background_total / len(background_event_params)
+        avg_signal = signal_total / len(signal_event_params)
         # Fix for no_background=True: Create a consistent background value that doesn't change between batches
         if self.no_background:
             # Use a constant value of 1 instead of a newly created tensor to ensure consistency across batches
@@ -110,37 +110,37 @@ class SNRloss(LossFunction):
             
         # Compute SNR with a small epsilon to avoid division by zero
         epsilon = 1e-10 if not self.no_background else 0
-        snr = signal_total / torch.sqrt(avg_background + epsilon)
+        snr = avg_signal / torch.sqrt(avg_background + epsilon)
         
         # Average SNR across all signal functions
-        avg_snr = torch.mean(snr)
+        total_snr = torch.sum(snr)
         
         # SNR loss (negative since we want to maximize SNR)
-        snr_loss = 1/avg_snr
+        snr_loss = torch.sigmoid(-total_snr * self.sharpness/len(points_3d))
         
         # Initialize total loss with SNR loss
         # total_loss = snr_loss
         
-        optimize_params = kwargs.get('optimize_params', None)
-        grid_size = kwargs.get('grid_size', None)
+        # optimize_params = kwargs.get('optimize_params', None)
+        # grid_size = kwargs.get('grid_size', None)
         
-        if len(optimize_params) == 2:
-            # Reshape for 2D grid visualization
-            all_snr = torch.zeros(grid_size, grid_size, device=self.device)
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    all_snr[i, j] = snr[i * grid_size + j]
-        elif len(optimize_params) == 1:
-            all_snr = snr.detach()
+        # if len(optimize_params) == 2:
+        #     # Reshape for 2D grid visualization
+        #     all_snr = torch.zeros(grid_size, grid_size, device=self.device)
+        #     for i in range(grid_size):
+        #         for j in range(grid_size):
+        #             all_snr[i, j] = snr[i * grid_size + j]
+        # elif len(optimize_params) == 1:
+        #     all_snr = snr.detach()
         
         # return snr_loss, avg_snr.item(), all_snr
-        return {'snr_loss': snr_loss, 'avg_snr': avg_snr.item(), 'all_snr': all_snr}
+        return {'snr_loss': snr_loss, 'total_snr': total_snr.item()}
     
     
 class WeightedSNRLoss(LossFunction):
     """Loss function for weighted SNR optimization per string."""
-    
-    def __init__(self, device=None, signal_scale=1.0, background_scale=10.0, no_background=False, print_loss=False, num_bkg_samples=100, num_signal_samples=100):
+
+    def __init__(self, device=None, signal_scale=1.0, background_scale=10.0, no_background=False, sharpness=1.0):
         """
         Initialize the weighted SNR loss function.
         
@@ -178,9 +178,8 @@ class WeightedSNRLoss(LossFunction):
         self.signal_scale = signal_scale
         self.background_scale = background_scale
         self.no_background = no_background
-        self.print_loss = print_loss
-        self.num_bkg_samples = num_bkg_samples
-        self.num_signal_samples = num_signal_samples
+        self.sharpness = sharpness
+
     
     def compute_snr_per_string(self, points_3d, signal_surrogate_func, background_surrogate_func, signal_event_params, background_event_params, string_xy):
         """
@@ -236,8 +235,8 @@ class WeightedSNRLoss(LossFunction):
                 for params in signal_event_params:
                     signal_sum += signal_surrogate_func(point, *params) * self.signal_scale
         
-            background_sum /= len(background_event_params)
-            signal_sum /= len(signal_event_params)
+            background_sum = background_sum/len(background_event_params)
+            signal_sum = signal_sum/len(signal_event_params)
             epsilon = 1e-10 if not self.no_background else 0
             snr_per_string[s_idx] += torch.sum(signal_sum / torch.sqrt(background_sum + epsilon))
         
@@ -313,27 +312,14 @@ class WeightedSNRLoss(LossFunction):
         # print(f"SNR per string: {snr_per_string}")
         # Apply string weights if provided
         if string_weights is not None:
-            # Apply sigmoid to get probabilities
-            # string_probs = torch.sigmoid(string_weights)
-            string_probs = string_weights
-            clamped_string_probs = torch.sigmoid(string_probs)  # Apply clamp to string weights
-            # Normalize weights to sum to 1
-            # snr_per_string: (n_strings, n_signal_funcs)
-            # normalized_weights: (n_strings,)
-            no_norm_weighted_snr_per_string = torch.sum(snr_per_string * clamped_string_probs, dim=0)#/torch.mean(snr_per_string, dim=0, keepdim=True)  # (n_signal_funcs,)
-            # print(snr_per_string*clamped_string_probs)
+            string_probs = torch.sigmoid(string_probs) 
+            total_snr = torch.sum(snr_per_string * string_probs)
         else:
-            # If no weights provided, use simple average
-            
-            # weighted_snr_per_func = torch.mean(snr_per_string/torch.mean(snr_per_string, dim=0, keepdim=True))  # (n_signal_funcs,)
-            no_norm_weighted_snr_per_string = torch.mean(snr_per_string, dim=0)  # (n_signal_funcs,)
-        # Average across all signal functions
-        # weighted_avg_snr = torch.mean(weighted_snr_per_func)
-        no_norm_weighted_avg_snr = torch.mean(no_norm_weighted_snr_per_string)
-        
+            total_snr = torch.sum(snr_per_string)
+
         # SNR loss (negative since we want to maximize SNR)
-        
-        snr_loss =  1 / (no_norm_weighted_avg_snr + 1e-10)
-        
+
+        snr_loss =  torch.sigmoid(-total_snr * self.sharpness/len(points_3d))
+
         # return snr_loss, no_norm_weighted_avg_snr.item(), snr_per_string
-        return {'snr_loss': snr_loss, 'avg_snr': no_norm_weighted_avg_snr.item(), 'snr_per_string': snr_per_string}
+        return {'snr_loss': snr_loss, 'total_snr': total_snr.item(), 'snr_per_string': snr_per_string}

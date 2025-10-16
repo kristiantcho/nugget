@@ -9,7 +9,7 @@ class Optimizer():
     
     def __init__(self, device=None, geometry=None, visualizer=None, conflict_free=False, use_custom_cf_weight=True):
         
-        self.device=device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device=device if device is not None else torch.device('cpu')
         self.geometry = geometry
         self.visualizer = visualizer
         self.conflict_free = conflict_free
@@ -27,7 +27,7 @@ class Optimizer():
             self.geom_dict[geo_aspect_name] = geo_aspect
             geo_optimizer = torch.optim.Adam([geo_aspect], lr=lr)
             self.optimizers[geo_aspect_name] = geo_optimizer
-            if schedule_creator is not None:
+            if schedule_creator is not None and schedule_params is not None:
                 if geo_aspect_name in schedule_params:
                     params = schedule_params[geo_aspect_name]
                     geo_scheduler = schedule_creator(geo_optimizer, **params)
@@ -110,6 +110,7 @@ class Optimizer():
         self.loss_iterations_dict = kwargs.get('loss_iterations_dict', {})
         self.save_best_geom_file = kwargs.get('save_best_geom_file', None)
         self.save_last_geom = kwargs.get('save_last_geom', False)
+        self.sample_every = loss_params_dict.get('sample_every', None)
         for key in loss_func_dict:
             if key not in self.loss_dict:
                 self.loss_dict[key] = []
@@ -130,6 +131,12 @@ class Optimizer():
         max_iter = max([len(v) for v in self.loss_iterations_dict.values()]) if len(self.loss_iterations_dict) > 0 else 0     
         for it in range(max_iter, max_iter+n_iter):
             vis_kwargs.update({'iteration': it})
+            if self.sample_every is not None:
+                if loss_params_dict.get('signal_sampler', None) is not None and it % self.sample_every == 0:
+                    loss_params_dict['signal_event_params'] = loss_params_dict['signal_sampler'].sample_events(loss_params_dict.get('num_events', 100))
+                    # print(f"Resampled events at iteration {it}")
+                    if loss_params_dict.get('background_sampler', None) is not None:
+                        loss_params_dict['background_event_params'] = loss_params_dict['background_sampler'].sample_events(loss_params_dict.get('num_events', 100))
             for key in self.loss_iterations_dict:
                 self.loss_iterations_dict[key].append(it)
             if self.alternate_freq is not None:

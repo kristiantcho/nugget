@@ -231,7 +231,7 @@ class SkewedGaussian(Surrogate):
                 sigma_front_val = torch.tensor(sigma_front, device=self.device)
         
         if sigma_back is None:
-            sigma_back_val = sigma_factor / amps / 5
+            sigma_back_val = sigma_factor / amps / 10
         else:
             # Preserve gradients if sigma_back is already a tensor with gradients
             if isinstance(sigma_back, torch.Tensor):
@@ -240,7 +240,7 @@ class SkewedGaussian(Surrogate):
                 sigma_back_val = torch.tensor(sigma_back, device=self.device)
         
         if sigma_perp is None:
-            sigma_perp_val = sigma_factor / amps / 3
+            sigma_perp_val = sigma_factor / amps / 7
         else:
             # Preserve gradients if sigma_perp is already a tensor with gradients
             if isinstance(sigma_perp, torch.Tensor):

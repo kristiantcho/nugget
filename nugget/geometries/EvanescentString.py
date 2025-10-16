@@ -8,16 +8,24 @@ class EvanescentString(Geometry):
     """Evanescent string geometry optimizer."""
     
     def __init__(self, device=None, dim=3, domain_size=2,
-                n_strings=1000, points_per_string=5, starting_weight=1.0):
+                n_strings=1000, points_per_string=5, starting_weight=1.0, custom_string_spacing=None, hex_type='hexagonal'):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         self.n_strings = n_strings
         self.points_per_string = points_per_string
         self.starting_weight = starting_weight
-        
+        self.custom_string_spacing = custom_string_spacing
+        if hex_type == 'hexagonal':
+            self.hex_func = self.create_uniform_hexagonal_grid
+        elif hex_type == 'circular':
+            self.hex_func = self.create_circular_hexagonal_grid
+        elif hex_type == 'sunflower':
+            self.hex_func = self.create_sunflower_grid
+        else:
+            self.hex_func = self.create_uniform_hexagonal_grid
         # Create hexagonal grid for strings
         original_dim = self.dim
         self.dim = 2
-        self.hex_grid = self.create_uniform_hexagonal_grid(n_points=self.n_strings)
+        self.hex_grid = self.hex_func(n_points=self.n_strings, optimal_spacing=self.custom_string_spacing)
         self.dim = original_dim
         
         

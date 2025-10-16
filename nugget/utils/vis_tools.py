@@ -109,7 +109,7 @@ class Visualizer:
         domain_size : float
             Size of the domain from -domain_size/2 to domain_size/2 in each dimension.
         """
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device if device is not None else torch.device('cpu')
         self.dim = dim
         self.domain_size = domain_size
         self.half_domain = domain_size / 2
@@ -403,6 +403,15 @@ class Visualizer:
             - background_surrogate_func: Surrogate function for background
             - background_event_params: Event parameters dict for background surrogate function
             - rov_penalty: ROVPenalty object for displaying ROV safe space on string_xy and string_weights_scatter plots
+            - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range] 
+              instead of the default domain boundaries [-half_domain, half_domain]
+            - plot_with_surrogate: bool, optional. If True and 'light_surrogate_func' and 'surrogate_event_params' 
+              are provided, will generate full domain contour plot using the surrogate function for 'signal_light_yield_contour'
+            - light_surrogate_func: callable, optional. Surrogate function to evaluate light yield across the full domain.
+              Expected to accept 'opt_point' and 'event_params' keyword arguments and return light yield values.
+            - surrogate_event_params: dict or list of dicts, optional. Event parameters to pass to the surrogate function.
+              Can be a single dict containing 'position', 'zenith', 'azimuth', 'energy', etc., or a list of such dicts.
+              If a list is provided, the light yield will be averaged over all events in the list.
         """
         # Safely handle torch tensor inputs by cloning and detaching them
         points = self._safe_tensor_convert(points)
@@ -410,7 +419,7 @@ class Visualizer:
         
         
         # Handle potential torch tensors in kwargs
-        for key in ['test_points', 'string_weights', 'signal_funcs', 'background_funcs']:
+        for key in ['test_points', 'string_weights', 'signal_funcs', 'background_funcs', 'string_spacing']:
             if key in kwargs:
                 kwargs[key] = self._safe_tensor_convert(kwargs[key])
         
@@ -689,6 +698,18 @@ class Visualizer:
         points_xyz = points.detach().cpu().numpy()
         geometry_type = kwargs.get('geometry_type', None) # Get geometry_type from kwargs
         
+        # Extract zoom_range parameter for contour plots
+        zoom_range = kwargs.get('zoom_range', None)
+        
+        # Helper function to set axis limits based on zoom_range or default domain
+        def set_axis_limits(ax_obj):
+            if zoom_range is not None:
+                ax_obj.set_xlim(-zoom_range, zoom_range)
+                ax_obj.set_ylim(-zoom_range, zoom_range)
+            else:
+                ax_obj.set_xlim(-self.half_domain, self.half_domain)
+                ax_obj.set_ylim(-self.half_domain, self.half_domain)
+        
         # Create the requested plot type
         if plot_type == self.PLOT_LOSS:
             # Loss history plot
@@ -897,8 +918,7 @@ class Visualizer:
                     if np.any(weight_mask):    
                         ax.scatter(xy_np[:, 0][weight_mask], xy_np[:, 1][weight_mask], s=min([40,30*200/len(xy_np[weight_mask])]), alpha=alpha_vals[weight_mask])
 
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 ax.set_title('String Positions in XY Plane')
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
@@ -943,8 +963,7 @@ class Visualizer:
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
             ax.set_title('XY Projection (colored by Z)')
-            ax.set_xlim(-self.half_domain, self.half_domain)
-            ax.set_ylim(-self.half_domain, self.half_domain)
+            set_axis_limits(ax)
             fig.colorbar(sc, ax=ax, label='Z Position')
             
         elif plot_type == self.PLOT_SIGNAL_CONTOUR:
@@ -1054,8 +1073,7 @@ class Visualizer:
                 ax.set_xlabel("X")
                 ax.set_ylabel("Y")
                 # Set consistent domain boundaries
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
             else:
                 ax.text(0.5, 0.5, "Signal function data not available\n(Pass 'signal_funcs' or 'signal_surrogate_func' + 'signal_event_params')", 
                       ha='center', va='center', transform=ax.transAxes)
@@ -1155,8 +1173,7 @@ class Visualizer:
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
             # Set consistent domain boundaries
-            ax.set_xlim(-self.half_domain, self.half_domain)
-            ax.set_ylim(-self.half_domain, self.half_domain)
+            set_axis_limits(ax)
         elif plot_type == self.PLOT_PARAM_1D:
             # 1D parameter vs SNR plot
             optimize_params = kwargs.get('optimize_params', [])
@@ -1450,8 +1467,7 @@ class Visualizer:
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
             # Set consistent domain boundaries
-            ax.set_xlim(-self.half_domain, self.half_domain)
-            ax.set_ylim(-self.half_domain, self.half_domain)
+            set_axis_limits(ax)
             
         elif plot_type in [self.PLOT_TRUE_FUNCTION, self.PLOT_INTERP_FUNCTION, self.PLOT_ERROR_FUNCTION]:
             # Retrieve necessary parameters from kwargs
@@ -1666,8 +1682,7 @@ class Visualizer:
             
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
-            ax.set_xlim(-self.half_domain, self.half_domain)
-            ax.set_ylim(-self.half_domain, self.half_domain)
+            set_axis_limits(ax)
         
         elif plot_type == self.PLOT_STRING_WEIGHTS_SCATTER:
             # String weights scatter plot with variable alpha
@@ -1701,8 +1716,7 @@ class Visualizer:
                     ax.set_xlabel('X Coordinate')
                     ax.set_ylabel('Y Coordinate')
                     ax.set_title(f'Active strings = {len(weights_np[weights_np > 0.7])}, Total strings = {len(weights_np)}')
-                    ax.set_xlim(-self.half_domain, self.half_domain)
-                    ax.set_ylim(-self.half_domain, self.half_domain)
+                    set_axis_limits(ax)
                     
                     # Add ROV safe space visualization if ROV penalty is available
                     rov_penalty = kwargs.get('rov_penalty', None)
@@ -1777,8 +1791,7 @@ class Visualizer:
                 ax.set_title(f"Combined LLR per String (n={len(llr_values_np)} strings)")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "LLR per string data not available\n(Requires 'llr_per_string' and 'string_xy' in kwargs)", 
@@ -1845,8 +1858,7 @@ class Visualizer:
                 ax.set_title(f"Pred. Signal LLR per String")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "Signal LLR per string data not available\n(Requires 'signal_llr_per_string' and 'string_xy' in kwargs)", 
@@ -1913,8 +1925,7 @@ class Visualizer:
                 ax.set_title(f"True Signal LLR per String")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "True Signal LLR per string data not available\n(Requires 'true_signal_llr_per_string' and 'string_xy' in kwargs)", 
@@ -1969,8 +1980,7 @@ class Visualizer:
                     ax.set_title(f"Signal LLR per Point")
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
-                    ax.set_xlim(-self.half_domain, self.half_domain)
-                    ax.set_ylim(-self.half_domain, self.half_domain)
+                    set_axis_limits(ax)
                 else:
                     ax.text(0.5, 0.5, f"Signal LLR interpolation failed:\n{error_msg}", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -2040,8 +2050,7 @@ class Visualizer:
                 ax.set_title(f"Pred. Background LLR per String")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "Background LLR per string data not available\n(Requires 'background_llr_per_string' and 'string_xy' in kwargs)", 
@@ -2108,8 +2117,7 @@ class Visualizer:
                 ax.set_title(f"True Background LLR per String")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "True Background LLR per string data not available\n(Requires 'true_background_llr_per_string' and 'string_xy' in kwargs)", 
@@ -2164,8 +2172,7 @@ class Visualizer:
                     ax.set_title(f"Background LLR per Point")
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
-                    ax.set_xlim(-self.half_domain, self.half_domain)
-                    ax.set_ylim(-self.half_domain, self.half_domain)
+                    set_axis_limits(ax)
                 else:
                     ax.text(0.5, 0.5, f"Background LLR interpolation failed:\n{error_msg}", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -2414,8 +2421,94 @@ class Visualizer:
         elif plot_type == self.PLOT_SIGNAL_LIGHT_YIELD_CONTOUR:
             # Signal light yield contour plot based on per-string values
             signal_light_yield_per_string = kwargs.get('signal_yield_per_string', None)
+            plot_with_surrogate = kwargs.get('plot_with_surrogate', False)
+            light_surrogate_func = kwargs.get('signal_surrogate_func', None)
+            surrogate_event_params = kwargs.get('signal_event_params', None)
             
-            if signal_light_yield_per_string is not None and string_xy is not None:
+            # Check if we should use surrogate function for full domain contour
+            if plot_with_surrogate and light_surrogate_func is not None and surrogate_event_params is not None:
+                # Handle multiple sets of event parameters
+                if isinstance(surrogate_event_params, list):
+                    event_params_list = surrogate_event_params
+                    num_events = len(event_params_list)
+                else:
+                    event_params_list = [surrogate_event_params]
+                    num_events = 1
+                
+                # Create a dense grid for surrogate function evaluation
+                resolution = slice_res
+                if kwargs.get('zoom_range', None) is None:
+                    x_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                    y_grid = np.linspace(-self.half_domain, self.half_domain, resolution)
+                else:
+                    zoom_num = kwargs['zoom_range']
+                    x_grid = np.linspace(-zoom_num, zoom_num, resolution)
+                    y_grid = np.linspace(-zoom_num, zoom_num, resolution)
+                X_np, Y_np = np.meshgrid(x_grid, y_grid)
+                
+                # Initialize grid to accumulate averages over events
+                signal_light_yield_grid = np.zeros((resolution, resolution))
+                
+                # Loop over each event parameter set
+                for event_idx, event_params in enumerate(event_params_list):
+                    if multi_slice:
+                        # For multi-slice, generate points across different z values and average
+                        z_slices = np.linspace(-self.half_domain, self.half_domain, slice_res)  # 5 z slices
+                        event_grid = np.zeros((resolution, resolution))
+                        
+                        for z_val in z_slices:
+                            # Create 3D points for this z slice
+                            Z_np = np.full_like(X_np, z_val)
+                            grid_points_3d = np.column_stack([X_np.flatten(), Y_np.flatten(), Z_np.flatten()])
+                            grid_points_tensor = torch.tensor(grid_points_3d, dtype=torch.float32, device=self.device)
+                            
+                            # Evaluate surrogate function at all grid points for this slice
+                            slice_values = []
+                            for i in range(grid_points_tensor.shape[0]):
+                                opt_point = grid_points_tensor[i:i+1]  # Keep batch dimension
+                                light_yield_val = light_surrogate_func(
+                                    opt_point=opt_point,
+                                    event_params=event_params
+                                )
+                                slice_values.append(light_yield_val.detach().cpu().numpy().item())
+                            
+                            # Reshape and add to z-slice average for this event
+                            slice_grid = np.array(slice_values).reshape(resolution, resolution)
+                            event_grid += slice_grid / len(z_slices)
+                        
+                        # Add this event's contribution to the overall average
+                        signal_light_yield_grid += event_grid / num_events
+                        
+                    else:
+                        # For single slice, use z=0 plane
+                        Z_np = np.zeros_like(X_np)
+                        grid_points_3d = np.column_stack([X_np.flatten(), Y_np.flatten(), Z_np.flatten()])
+                        grid_points_tensor = torch.tensor(grid_points_3d, dtype=torch.float32, device=self.device)
+                        
+                        # Evaluate surrogate function at all grid points for this event
+                        grid_values = []
+                        for i in range(grid_points_tensor.shape[0]):
+                            opt_point = grid_points_tensor[i:i+1]  # Keep batch dimension
+                            light_yield_val = light_surrogate_func(
+                                opt_point=opt_point,
+                                event_params=event_params
+                            )
+                            grid_values.append(light_yield_val.detach().cpu().numpy().item())
+                        
+                        # Reshape to grid and add to average
+                        event_grid = np.array(grid_values).reshape(resolution, resolution)
+                        signal_light_yield_grid += event_grid / num_events
+                
+                # Create the contour plot with surrogate-based values
+                c1 = ax.contourf(X_np, Y_np, signal_light_yield_grid, cmap='Oranges', levels=20)
+                cbar = fig.colorbar(c1, ax=ax)
+                cbar.set_label('Light Yield')
+                
+                title_text = f"Signal Yield Contour"
+                ax.set_title(title_text)
+                
+            elif signal_light_yield_per_string is not None and string_xy is not None:
+                # Original implementation using per-string values
                 # Convert to numpy arrays if they're tensors
                 if hasattr(signal_light_yield_per_string, 'detach'):
                     signal_light_yield_values_np = signal_light_yield_per_string.detach().cpu().numpy()
@@ -2441,7 +2534,7 @@ class Visualizer:
                 grid_points = np.column_stack([X_np.flatten(), Y_np.flatten()])
                 
                 # Interpolate signal light yield values from string positions to grid
-                if np.all(signal_light_yield_values_np != signal_light_yield_values_np[0]):
+                if np.any(signal_light_yield_values_np != signal_light_yield_values_np[0]):
                     fill_val = np.min(signal_light_yield_values_np) if len(signal_light_yield_values_np) > 0 else np.nan
                     signal_light_yield_grid = griddata(
                         np.column_stack([string_x, string_y]), 
@@ -2460,31 +2553,63 @@ class Visualizer:
                     # force colorbar to just show that single value
                     c1.set_clim(signal_light_yield_values_np[0]-0.5, signal_light_yield_values_np[0]+0.5)
                 cbar = fig.colorbar(c1, ax=ax)
-                cbar.set_label('Signal Light Yield')
+                cbar.set_label('Light Yield')
                 
-                # Overlay string positions with their signal light yield values as color
+                ax.set_title(f"Signal Light Yield per String")
+                
+            else:
+                ax.text(0.5, 0.5, "Signal light yield data not available\n(Requires either surrogate function setup or 'signal_light_yield_per_string' and 'string_xy' in kwargs)", 
+                      ha='center', va='center', transform=ax.transAxes)
+                ax.set_title("Signal Light Yield - No Data")
+                
+            # Always overlay string positions if available (regardless of method used)
+            if string_xy is not None:
+                if hasattr(string_xy, 'detach'):
+                    string_positions_np = string_xy.detach().cpu().numpy()
+                else:
+                    string_positions_np = np.array(string_xy)
+                    
+                string_x = string_positions_np[:, 0]
+                string_y = string_positions_np[:, 1]
+                
+                # Get string weights and spacing for visualization
                 string_weights = kwargs.get('string_weights', None)
                 if string_weights is not None and string_indices is not None:
                     alpha_values = np.array([string_weights[idx] for idx in range(len(string_weights))])
                     alpha_values = np.clip(alpha_values, 0.05, 1.0)
                 else:
                     alpha_values = 0.8
+                    
+                if kwargs.get('string_spacing', None) is not None:
+                    size_factor = kwargs['string_spacing']/2
+                else:
+                    size_factor = 1.0
+                # if kwargs.get('zoom_range', None) is not None:
+                #     size_factor *= (self.domain_size/kwargs['zoom_range'])
+                # else:
+                #     size_factor *= self.domain_size
                 
-                # Show string positions colored by their signal light yield values
-                scatter = ax.scatter(string_x, string_y, c=signal_light_yield_values_np, 
-                                   cmap='Oranges', s=min([60, 40*200/len(string_indices)]), 
-                                   alpha=alpha_values, edgecolor='black', linewidth=1,
-                                   label='String Positions')
+                # Color string positions by their per-string light yield if available
+                if signal_light_yield_per_string is not None:
+                    if hasattr(signal_light_yield_per_string, 'detach'):
+                        signal_light_yield_values_np = signal_light_yield_per_string.detach().cpu().numpy()
+                    else:
+                        signal_light_yield_values_np = np.array(signal_light_yield_per_string)
+                        
+                    scatter = ax.scatter(string_x, string_y, c=signal_light_yield_values_np, 
+                                       cmap='Oranges', s=min([60, 40*200*size_factor/len(string_indices)]), 
+                                       alpha=alpha_values, edgecolor='black', linewidth=1,
+                                       label='String Positions')
+                else:
+                    # Just show string positions without color coding
+                    scatter = ax.scatter(string_x, string_y, c='red', 
+                                       s=min([60, 40*200*size_factor/len(string_indices)]) if string_indices else 60, 
+                                       alpha=alpha_values, edgecolor='black', linewidth=1,
+                                       label='String Positions')
                 
-                ax.set_title(f"Signal Light Yield per String")
-                ax.set_xlabel('X')
-                ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
-                
-            else:
-                ax.text(0.5, 0.5, "Signal light yield per string data not available\n(Requires 'signal_light_yield_per_string' and 'string_xy' in kwargs)", 
-                      ha='center', va='center', transform=ax.transAxes)
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            set_axis_limits(ax)
         
         elif plot_type == self.PLOT_SIGNAL_LIGHT_YIELD_CONTOUR_POINTS:
             # Signal light yield contour plot based on per-point values
@@ -2535,8 +2660,7 @@ class Visualizer:
                     ax.set_title(f"Signal Light Yield per Point")
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
-                    ax.set_xlim(-self.half_domain, self.half_domain)
-                    ax.set_ylim(-self.half_domain, self.half_domain)
+                    set_axis_limits(ax)
                 else:
                     ax.text(0.5, 0.5, f"Signal light yield interpolation failed:\n{error_msg}", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -2607,8 +2731,7 @@ class Visualizer:
                 ax.set_title(f"SNR per String (n={len(snr_values_np)} strings)")
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "SNR per string data not available\n(Requires 'snr_per_string' and 'string_xy' in kwargs)", 
@@ -2726,8 +2849,7 @@ class Visualizer:
                 
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
-                ax.set_xlim(-self.half_domain, self.half_domain)
-                ax.set_ylim(-self.half_domain, self.half_domain)
+                set_axis_limits(ax)
                 
             else:
                 ax.text(0.5, 0.5, "Fisher Information data not available\n(Requires 'fisher_info_per_string' and 'string_xy' in kwargs)", 
@@ -2741,7 +2863,7 @@ class Visualizer:
                 angular_resolution_history = loss_dict.get('angular_resolution_loss', None)
 
             if angular_resolution_history is not None:
-                angular_resolution_history = np.array(angular_resolution_history) * (180.0/np.pi)  # Convert to degrees
+                angular_resolution_history = np.array(angular_resolution_history) * 180.0  # Convert to degrees
                 # Plot the history of weighted total angular resolution
                 ax.plot(angular_resolution_history, color='blue', linewidth=2, markersize=4)
                 ax.set_title('Angular Resolution History')
