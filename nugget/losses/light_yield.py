@@ -36,7 +36,8 @@ class LightYieldLoss(LossFunction):
             if noise_scale > 0.0:
                 light_yield = light_yield + light_yield*torch.randn(size=light_yield.shape, device=self.device) * noise_scale
             total_light_yield += torch.sum(light_yield)
-        loss += torch.sigmoid(-total_light_yield*self.sharpness/(len(points_3d)*len(event_params)))
+        # loss += torch.sigmoid(-total_light_yield*self.sharpness/(len(points_3d)*len(event_params)))
+        loss += len(event_params)*len(points_3d)/total_light_yield
 
         return {'signal_yield_loss': loss, 'signal_yield_per_point': light_yield/len(event_params), 'total_signal_yield': total_light_yield/len(event_params)}
 
@@ -113,8 +114,8 @@ class WeightedLightYieldLoss(LossFunction):
         else:
             string_probs = torch.sigmoid(string_weights)
             total_light_yield = torch.sum(signal_yield_per_string * string_probs) # Weighted sum
-        light_yield_loss =  torch.sigmoid(-total_light_yield*self.sharpness/len(points_3d))  # Add small value to avoid division by zero
-        
+        # light_yield_loss =  torch.sigmoid(-total_light_yield*self.sharpness/len(points_3d))  # Add small value to avoid division by zero
+        light_yield_loss =  len(points_3d)/(total_light_yield + 1e-8)  # Add small value to avoid division by zero
         # return light_yield_loss, signal_yield_per_string, total_light_yield
         return {'signal_yield_loss': light_yield_loss, 'signal_yield_per_string': signal_yield_per_string, 'total_signal_yield': total_light_yield, 'signal_event_params': event_params}
 

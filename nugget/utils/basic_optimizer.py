@@ -7,13 +7,27 @@ import pickle
 
 class Optimizer():
     
-    def __init__(self, device=None, geometry=None, visualizer=None, conflict_free=False, use_custom_cf_weight=True):
+    def __init__(self, device=None, geometry=None, visualizer=None, conflict_free=False, use_custom_cf_weight=True, use_alm=False, alm_params=None):
         
         self.device=device if device is not None else torch.device('cpu')
         self.geometry = geometry
         self.visualizer = visualizer
         self.conflict_free = conflict_free
         self.use_custom_cf_weight = use_custom_cf_weight
+        self.use_alm = use_alm
+        
+        # ALM parameters based on the algorithm in the image
+        if alm_params is None:
+            alm_params = {}
+        self.alm_gamma = alm_params.get('gamma', 1e-2)  # global learning rate
+        self.alm_alpha = alm_params.get('alpha', 0.9)   # discounting factor (default from RMSprop)
+        self.alm_epsilon = alm_params.get('epsilon', 1e-8)  # numerical stability constant
+        
+        # ALM state variables (initialized when constraints are set)
+        self.alm_lambdas = {}  # Lagrange multipliers for each constraint
+        self.alm_mus = {}      # penalty parameters for each constraint
+        self.alm_v_lambda = {}  # weighted moving average for lambda gradients
+        self.alm_v_mu = {}      # weighted moving average for mu gradients
 
     def init_geometry(self, opt_list=[('string_xy', 0.01)], schedule_creator=None, schedule_params=None, geom_dict=None):
         
@@ -33,9 +47,39 @@ class Optimizer():
                     geo_scheduler = schedule_creator(geo_optimizer, **params)
                     self.schedulers[geo_aspect_name] = geo_scheduler
             self.geom_dict = self.geometry.update_points(**self.geom_dict)
+    
+    def _initialize_alm_parameters(self):
+        """Initialize ALM parameters for constraint loss components"""
+        for constraint_name in self.constraints_list:
+            # Initialize Lagrange multipliers (λ) 
+            self.alm_lambdas[constraint_name] = torch.tensor(0.0, device=self.device, requires_grad=False)
+            # Initialize penalty parameters (μ) 
+            self.alm_mus[constraint_name] = torch.tensor(1.0, device=self.device, requires_grad=False)
+            # Initialize weighted moving averages for gradients
+            self.alm_v_lambda[constraint_name] = torch.tensor(0.0, device=self.device)
+            self.alm_v_mu[constraint_name] = torch.tensor(0.0, device=self.device)
+    
+    def _update_alm_parameters(self):
+        """Update ALM parameters according to the algorithm"""
+        for constraint_name in self.constraints_list:
+            if constraint_name in self.loss_dict and len(self.loss_dict[constraint_name]) > 0:
+                # Get the latest constraint value C_i(θ)
+                constraint_value = self.loss_dict[constraint_name][-1].item()
+                # Update weighted moving average for lambda gradient 
+                lambda_grad_squared = constraint_value ** 2
+                self.alm_v_lambda[constraint_name] = (self.alm_alpha * self.alm_v_lambda[constraint_name] + 
+                                                    (1 - self.alm_alpha) * lambda_grad_squared)
+                
+                # Update μ 
+                denominator = torch.sqrt(self.alm_v_lambda[constraint_name]) + self.alm_epsilon
+                self.alm_mus[constraint_name] = self.alm_gamma / denominator
+                
+                # Update λ 
+                self.alm_lambdas[constraint_name] = (self.alm_lambdas[constraint_name] + 
+                                                   self.alm_mus[constraint_name] * constraint_value)
+    
     def loss_update_step(self):
         
-  
         total_loss = torch.tensor(0.0, device=self.device)
         if self.conflict_free:
             
@@ -53,11 +97,21 @@ class Optimizer():
                 for loss_name, loss_fn in self.loss_dict.items():
                     if self.loss_weights_dict.get(loss_name) == 0.0:
                         continue
-                    if count == 1:    
-                        total_loss += loss_fn[-1].item()
                     
-                    # Compute gradients for this loss component
-                    loss_fn[-1].backward(retain_graph=True)
+                    loss_value = loss_fn[-1]
+                    if count == 1:    
+                        total_loss += loss_value.item()
+                    
+                    # Apply ALM formulation for constraints or regular loss
+                    # if self.use_alm and loss_name in self.constraints_list:
+                    #     # Compute ALM loss: λC(θ) + (1/2)μC²(θ)
+                    #     constraint_value = self.uw_loss_dict[loss_name][-1]
+                    #     augmented_loss = (self.alm_lambdas[loss_name] * constraint_value + 
+                    #                     0.5 * self.alm_mus[loss_name] * constraint_value ** 2)
+                    #     augmented_loss.backward(retain_graph=True)
+                    # else:
+                    #     # Regular loss handling
+                    loss_value.backward(retain_graph=True)
             
                         # Extract gradients manually for string_weights
                     if geo_aspect.grad is not None:
@@ -82,18 +136,39 @@ class Optimizer():
                     if not self.optimizer_phases[key]:
                         continue
                 self.optimizers[key].step()
+            
+            # Update ALM parameters after parameter update (conflict-free case)
+            if self.use_alm:
+                self._update_alm_parameters()
         else:
+            # Handle ALM and regular losses
             for loss_name, loss_fn in self.loss_dict.items():
                 if self.loss_weights_dict.get(loss_name) != 0.0:
-                    total_loss += loss_fn[-1]
-                    total_loss.backward(retain_graph=True)
-                
+                    loss_value = loss_fn[-1]
+                    
+                    if self.use_alm and loss_name in self.constraints_list:
+                        # Apply ALM formulation for constraint: λC(θ) + (1/2)μC²(θ)
+                        constraint_value = self.uw_loss_dict[loss_name][-1]
+                        augmented_loss = (self.alm_lambdas[loss_name] * constraint_value + 
+                                        0.5 * self.alm_mus[loss_name] * constraint_value ** 2)
+                        total_loss += augmented_loss
+                        augmented_loss.backward(retain_graph=True)
+                    else:
+                        # Regular loss handling
+                        total_loss += loss_value
+                        loss_value.backward(retain_graph=True)
+            # total_loss.backward()
             # Update parameters
             for key in self.optimizers.keys():
                 if self.alternate_freq is not None:
                     if not self.optimizer_phases[key]:
                         continue
                 self.optimizers[key].step()
+            
+            # Update ALM parameters after parameter update
+            if self.use_alm:
+                self._update_alm_parameters()
+                
             total_loss = total_loss.item()
 
         return total_loss
@@ -111,6 +186,11 @@ class Optimizer():
         self.save_best_geom_file = kwargs.get('save_best_geom_file', None)
         self.save_last_geom = kwargs.get('save_last_geom', False)
         self.sample_every = loss_params_dict.get('sample_every', None)
+        self.constraints_list = kwargs.get('constraints_list', [])
+        
+        # Initialize ALM parameters for constraints
+        if self.use_alm:
+            self._initialize_alm_parameters()
         for key in loss_func_dict:
             if key not in self.loss_dict:
                 self.loss_dict[key] = []

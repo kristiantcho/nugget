@@ -637,13 +637,17 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
             string_probs = torch.sigmoid(string_weights)
             total_fisher_info = torch.sum(string_probs.unsqueeze(1).unsqueeze(2) * fisher_info_per_string_per_event, dim=1)
         resolution_per_event = []
+        try:
+            cov_matrix = torch.inverse(total_fisher_info+1e-6 * torch.eye(total_fisher_info.shape[1]))
+        except Exception as e:  
+            cov_matrix = torch.pinverse(total_fisher_info+1e-6 * torch.eye(total_fisher_info.shape[1]))
         if self.resolution_type == 'angular':
             for i, params in enumerate(signal_event_params):
                 zenith = params['zenith']
                 # azimuth = params['azimuth']
                 azimuth_idx = self.fisher_info_params.index('azimuth')
                 zenith_idx = self.fisher_info_params.index('zenith')
-                cov_matrix = torch.inverse(total_fisher_info[i])
+                
         
                 # Angular resolution: sqrt(var_azimuth + var_zenith)
                 var_azimuth = cov_matrix[azimuth_idx, azimuth_idx]
@@ -657,7 +661,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         elif self.resolution_type == 'energy':
             for i, params in enumerate(signal_event_params):
                 energy_idx = self.fisher_info_params.index('energy')
-                cov_matrix = torch.inverse(total_fisher_info[i])
+                
                 var_energy = cov_matrix[energy_idx, energy_idx]
                 energy_resolution = torch.sqrt(var_energy)
                 resolution_per_event.append(energy_resolution)
@@ -742,13 +746,16 @@ class ResolutionLoss(FisherInfoLoss):
                 for _ in range(llr_iterations):
                     fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, params, surrogate_func, llr_net, signal_noise_scale, add_relative_pos=add_relative_pos)/len(event_params)
                 total_fisher_info += fisher_matrix/llr_iterations
-                
+            try:    
+                cov_matrix = torch.inverse(total_fisher_info)
+            except Exception as e:  
+                cov_matrix = torch.pinverse(total_fisher_info) 
             if self.resolution_type == 'angular':
                 zenith = params['zenith']
                 # azimuth = params['azimuth']
                 azimuth_idx = self.fisher_info_params.index('azimuth')
                 zenith_idx = self.fisher_info_params.index('zenith')
-                cov_matrix = torch.inverse(total_fisher_info)
+                
         
                 # Angular resolution: sqrt(var_azimuth + var_zenith)
                 var_azimuth = cov_matrix[azimuth_idx, azimuth_idx]
@@ -760,8 +767,6 @@ class ResolutionLoss(FisherInfoLoss):
 
             elif self.resolution_type == 'energy':
                 energy_idx = self.fisher_info_params.index('energy')
-                cov_matrix = torch.inverse(total_fisher_info)
-        
                 # Energy resolution: sqrt(var_energy)/energy
                 var_energy = cov_matrix[energy_idx, energy_idx]
                 # mean_energy = torch.mean(torch.tensor([params['energy'] for params in event_params], device=self.device))

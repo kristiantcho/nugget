@@ -94,6 +94,7 @@ class Visualizer:
     PLOT_LOSS_COMPONENTS = "loss_components"
     PLOT_UW_LOSS_COMPONENTS = "uw_loss_components"
     PLOT_LLR_HISTOGRAM_POINTS = "llr_histogram_points"
+    PLOT_STRING_XY_ROV_PENALTY = "string_xy_rov_penalty"
 
     
     def __init__(self, device=None, dim=3, domain_size=2.0, gif_temp_dir=None):
@@ -150,7 +151,7 @@ class Visualizer:
             ax.tick_params(axis='x', rotation=0, pad=2)
             ax.tick_params(axis='y', rotation=0, pad=2)
     
-    def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=1):
+    def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=1, zoom_range=None):
         """
         Draw ROV safe space shape on the given axes.
         
@@ -172,6 +173,10 @@ class Visualizer:
         rov_rec_width = getattr(rov_penalty, 'rov_rec_width', 0.3)
         rov_height = getattr(rov_penalty, 'rov_height', 0.16) 
         rov_tri_length = getattr(rov_penalty, 'rov_tri_length', 0.08)
+        if zoom_range is not None:
+            ax_lims = zoom_range*2
+        else:
+            ax_lims = self.domain_size
         
         # Scale dimensions to fit in corner of plot
         scale = scale_factor #* self.domain_size
@@ -181,15 +186,15 @@ class Visualizer:
         
         # Position in bottom left corner
         if position == 'bottom_left':
-            x_offset = -self.half_domain + 0.05 * self.domain_size
-            y_offset = -self.half_domain + 0.05 * self.domain_size
+            x_offset = -ax_lims/2 + 0.05 * ax_lims
+            y_offset = -ax_lims/2 + 0.05 * ax_lims
         elif position == 'bottom_right':
-            x_offset = self.half_domain - (rec_width + tri_length) - 0.05 * self.domain_size
-            y_offset = -self.half_domain + 0.05 * self.domain_size
+            x_offset = ax_lims/2 - (rec_width + tri_length) - 0.05 * ax_lims
+            y_offset = -ax_lims/2 + 0.05 * ax_lims
         else:  # default to bottom_left
-            x_offset = -self.half_domain + 0.05 * self.domain_size
-            y_offset = -self.half_domain + 0.05 * self.domain_size
-        
+            x_offset = -ax_lims/2 + 0.05 * ax_lims
+            y_offset = -ax_lims/2 + 0.05 * ax_lims
+
         # Draw rectangular part
         rect_x = [x_offset, x_offset + rec_width, x_offset + rec_width, x_offset, x_offset]
         rect_y = [y_offset - rec_height/2, y_offset - rec_height/2, y_offset + rec_height/2, y_offset + rec_height/2, y_offset - rec_height/2]
@@ -878,7 +883,8 @@ class Visualizer:
                         # print("Alpha values:", alpha_vals)
                         # active_mask = np.array(points_per_string_list) > 0
                         # alpha_vals = alpha_vals[active_mask] if len(alpha_vals) == len(points_per_string_list) else [0.8] * sum(active_mask)
-                        weight_mask = np.array([string_weights[idx] >= weight_threshold for idx in string_indices])
+                        # weight_mask = np.array([string_weights[idx] >= weight_threshold for idx in string_indices])
+                        weight_mask = np.array([True]*len(xy_np))
                     else:
                         alpha_vals = 0.8
                         weight_mask = np.array([True]*len(xy_np))
@@ -928,6 +934,68 @@ class Visualizer:
                 rov_penalty = kwargs.get('rov_penalty', None)
                 if rov_penalty is not None:
                     self._draw_rov_safe_space(ax, rov_penalty)
+            else:
+                ax.text(0.5, 0.5, "String XY data not available", 
+                      ha='center', va='center', transform=ax.transAxes)
+                
+        elif plot_type == self.PLOT_STRING_XY_ROV_PENALTY:
+            # String positions in XY plane colored by ROV penalty per string
+            if string_xy is not None:
+                xy_np = string_xy.detach().cpu().numpy()
+                rov_penalty_per_string = kwargs.get('rov_penalty_per_string', None)
+                string_weights = kwargs.get('string_weights', None)
+                
+                if rov_penalty_per_string is not None:
+                    # Convert ROV penalty per string to numpy
+                    if torch.is_tensor(rov_penalty_per_string):
+                        rov_penalty_np = rov_penalty_per_string.detach().cpu().numpy()
+                    else:
+                        rov_penalty_np = np.array(rov_penalty_per_string)
+                    
+                    # Use string weights for alpha transparency (no threshold filtering)
+                    if string_weights is not None:
+                        alpha_vals = np.array([string_weights[idx] for idx in string_indices])
+                        # Clip to ensure minimum visibility and maximum opacity
+                        alpha_vals = np.clip(alpha_vals, 0.05, 1.0)
+                    else:
+                        alpha_vals = 0.8
+                    
+                    # Create colormap for ROV penalty
+                    cmap = plt.cm.RdYlGn_r  # Red for high penalty, green for low penalty
+                    
+                    # Normalize penalties for colormap
+                    vmin = np.min(rov_penalty_np)
+                    vmax = np.max(rov_penalty_np)
+                    norm = Normalize(vmin=vmin, vmax=vmax)
+                    
+                    # Plot strings colored by ROV penalty with alpha based on weights
+                    sc = ax.scatter(
+                        xy_np[:, 0],
+                        xy_np[:, 1],
+                        s=min([100, 50 * 200 / len(xy_np)]),
+                        c=rov_penalty_np,
+                        cmap=cmap,
+                        norm=norm,
+                        alpha=alpha_vals if isinstance(alpha_vals, np.ndarray) else alpha_vals,
+                        edgecolors='black',
+                        linewidths=0.5
+                    )
+                    
+                    # Add colorbar
+                    cbar = fig.colorbar(sc, ax=ax)
+                    cbar.set_label('ROV Penalty')
+                    
+                    rov_penalty = kwargs.get('rov_penalty', None)
+                    if rov_penalty is not None:
+                        self._draw_rov_safe_space(ax, rov_penalty, zoom_range=zoom_range)
+                    
+                    set_axis_limits(ax)
+                    ax.set_title('ROV Penalty per String')
+                    ax.set_xlabel('X')
+                    ax.set_ylabel('Y')
+                else:
+                    ax.text(0.5, 0.5, "ROV penalty per string data not available", 
+                          ha='center', va='center', transform=ax.transAxes)
             else:
                 ax.text(0.5, 0.5, "String XY data not available", 
                       ha='center', va='center', transform=ax.transAxes)
@@ -1695,8 +1763,8 @@ class Visualizer:
                     xy_np = string_xy.detach().cpu().numpy()
                     weights_np = string_weights
                     # Create alpha values: 1 if weight > 0.7, else 0.5
-                    alphas = [1 if weights_np[i] > 0.7 else 0.5 for i in range(len(weights_np))]
-                    edge_colors=['k' if weights_np[i] > 0.7 else 'none' for i in range(len(weights_np))]
+                    alphas = [1 if weights_np[i] > 0.7 else 0.6 for i in range(len(weights_np))]
+                    # edge_colors=['k' if weights_np[i] > 0.7 else 'none' for i in range(len(weights_np))]
                     # Create scatter plot
                     scatter = ax.scatter(
                         xy_np[:, 0], 
@@ -1704,7 +1772,7 @@ class Visualizer:
                         c=weights_np,
                         cmap='Greens',
                         alpha=alphas,
-                        edgecolors=edge_colors,
+                        edgecolors=None,
                         s=min([40,30*200/len(weights_np)])
                         )
                     
@@ -1719,9 +1787,9 @@ class Visualizer:
                     set_axis_limits(ax)
                     
                     # Add ROV safe space visualization if ROV penalty is available
-                    rov_penalty = kwargs.get('rov_penalty', None)
-                    if rov_penalty is not None:
-                        self._draw_rov_safe_space(ax, rov_penalty)
+                    # rov_penalty = kwargs.get('rov_penalty', None)
+                    # if rov_penalty is not None:
+                    #     self._draw_rov_safe_space(ax, rov_penalty, zoom_range=zoom_range)
                 else:
                     ax.text(0.5, 0.5, "String weights data not available", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -2426,7 +2494,7 @@ class Visualizer:
             surrogate_event_params = kwargs.get('signal_event_params', None)
             
             # Check if we should use surrogate function for full domain contour
-            if plot_with_surrogate and light_surrogate_func is not None and surrogate_event_params is not None:
+            if plot_with_surrogate and (light_surrogate_func is not None) and (surrogate_event_params is not None):
                 # Handle multiple sets of event parameters
                 if isinstance(surrogate_event_params, list):
                     event_params_list = surrogate_event_params
@@ -3435,7 +3503,7 @@ class Visualizer:
             try:
                 shutil.rmtree(self.gif_temp_dir)
                 print(f"Cleaned up temporary directory: {self.gif_temp_dir}")
-                self.gif_temp_dir = None
+                # self.gif_temp_dir = None
             except Exception as e:
                 print(f"Error cleaning up temporary directory: {e}")
         print("GIF temporary files cleanup completed.")

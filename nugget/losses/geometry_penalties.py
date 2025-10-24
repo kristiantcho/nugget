@@ -641,41 +641,6 @@ class ROVPenalty(LossFunction):
         
    
 
-    def inside_safe_space(self, points, theta, weights=None):
-        """
-        points: (N, 2) tensor of 2D points relative to candidate ROV position
-        theta: scalar angle in radians (rotation of safe space)
-        returns: (N,) tensor ~ soft indicator if points are inside region
-        """
-
-        # Rotation matrix
-        c, s = torch.cos(theta), torch.sin(theta)
-        R = torch.tensor([[c, -s], [s, c]], device=points.device)
-        rot_points = points @ R.T  # rotate into canonical frame
-
-        # Canonical safe space dimensions (from diagram)
-        L_rect = self.rov_rec_width
-        W_rect = self.rov_height
-        L_tri = self.rov_tri_length
-        W_tri = self.rov_tri_length
-
-        x, y = rot_points[:, 0], rot_points[:, 1].abs()
-
-        # Inside rectangular part
-        inside_rect = (x >= 0) & (x <= L_rect) & (y <= W_rect / 2)
-
-        # Inside triangular part (slope check)
-        slope = W_tri / L_tri  # 80/80 = 1.0
-        inside_tri = (x >= L_rect) & (x <= L_rect + L_tri) & (y <= slope * (L_rect + L_tri - x))
-
-        inside = inside_rect | inside_tri
-        if weights is not None:
-            inside_weights = weights[inside]
-            indicator = inside.any().to(weights.dtype)
-            return indicator * torch.sum(inside_weights)
-        else:
-            return inside.any().to(points.dtype)
-
     def __call__(self, geom_dict, **kwargs):
         """
         points: (N, 2) tensor of 2D points
@@ -687,26 +652,60 @@ class ROVPenalty(LossFunction):
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
 
         N = points.shape[0]
-        loss = 0.0
-
-        for i in range(N):
-            others = torch.cat([points[:i], points[i+1:]], dim=0) - points[i]  # relative coords
-            other_string_probs = None
-            if string_probs is not None:
-                other_string_probs = torch.cat([string_probs[:i], string_probs[i+1:]], dim=0)
-            ok = []
-            for k in range(num_angles):
-                theta = torch.tensor(2 * torch.pi * k / num_angles)
-                inside = self.inside_safe_space(others, theta, other_string_probs)
-                ok.append(inside)  # 1 if blocked, 0 if free
-
-            # If all orientations blocked -> penalty = 1
-            penalty = torch.stack(ok).min()  # min over orientations
-            if string_probs is not None:
-                penalty = penalty * string_probs[i]
-            loss += penalty
-
-        return {'rov_penalty': loss/N}
+        
+        # Vectorized computation
+        # Compute all relative positions at once
+        mask = ~torch.eye(N, dtype=torch.bool, device=points.device)
+        all_relative = points.unsqueeze(0) - points.unsqueeze(1)  # (N, N, 2)
+        all_relative = all_relative[mask].reshape(N, N-1, 2)  # (N, N-1, 2)
+        
+        # Prepare angles
+        angles = torch.linspace(0, 2 * torch.pi * (num_angles - 1) / num_angles, 
+                            num_angles, device=points.device)
+        c = torch.cos(angles)
+        s = torch.sin(angles)
+        
+        # Apply rotation for all angles at once: (N, N-1, num_angles, 2)
+        rel_expanded = all_relative.unsqueeze(2)  # (N, N-1, 1, 2)
+        x_rot = rel_expanded[..., 0] * c - rel_expanded[..., 1] * s
+        y_rot_abs = (rel_expanded[..., 0] * s + rel_expanded[..., 1] * c).abs()
+        
+        # Geometry checks
+        L_rect = self.rov_rec_width
+        W_rect = self.rov_height
+        L_tri = self.rov_tri_length
+        W_tri = self.rov_tri_length
+        slope = W_tri / L_tri
+        
+        inside_rect = (x_rot >= 0) & (x_rot <= L_rect) & (y_rot_abs <= W_rect / 2)
+        inside_tri = (x_rot >= L_rect) & (x_rot <= L_rect + L_tri) & \
+                    (y_rot_abs <= slope * (L_rect + L_tri - x_rot))
+        inside = inside_rect | inside_tri  # (N, N-1, num_angles)
+        
+        if string_probs is not None:
+            # Get weights of other strings for each position
+            other_probs = string_probs.unsqueeze(0).expand(N, N)[mask].reshape(N, N-1)
+            
+            # For each angle, sum weights of strings inside safe space
+            # (N, num_angles) = sum over other strings
+            blockage_per_angle = (inside.float() * other_probs.unsqueeze(-1)).sum(dim=1)
+            
+            # For each string: minimum blockage across all angles
+            penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
+            
+            # Weight by string probability and sum
+            loss = (penalty_per_string * string_probs).sum()
+        else:
+            # Count number of strings inside for each angle
+            # (N, num_angles) = count of other strings inside
+            count_per_angle = inside.float().sum(dim=1)  # (N, num_angles)
+            
+            # For each string: minimum count across all angles
+            penalty_per_string = count_per_angle.min(dim=1)[0]  # (N,)
+            
+            loss = penalty_per_string.sum()
+        
+        return {'rov_penalty': loss / N, 'rov_penalty_per_string': penalty_per_string/N}
 
             
         
