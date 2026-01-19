@@ -280,7 +280,7 @@ class Optimizer():
             if it % print_freq == 0 or it == n_iter - 1:
                 # print('string weights:', self.geom_dict.get('string_weights'))
                 loss_str = ' | '.join([f'{key}: {loss_fn[-1]:.4f}' if self.loss_weights_dict.get(key) != 0.0 else '' for key, loss_fn in self.loss_dict.items()])
-                print(f'Iter {it+1}/{n_iter}, Total Loss: {self.total_loss[-1]:.4f} | {loss_str}')
+                print(f'Iter {it+1}/{n_iter}, Total Loss: {self.total_loss[-1]:.4f} | {loss_str}', flush=True)
             
             if self.visualizer is not None and vis_freq is not None:
                 if (it % vis_freq == 0 or it == n_iter - 1):

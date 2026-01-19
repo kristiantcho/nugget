@@ -46,7 +46,8 @@ def compute_fisher_info_single(fisher_info_params, point, event_params, surrogat
         features = llr_net.prepare_data_from_raw(point, grad_event_params, surrogate_func, noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos)
         light_yield_mean = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-9)
     param_gradients = []
-    
+    # grad_outputs = torch.ones_like(light_yield_mean)
+    # light_yield_mean.backward(gradient=grad_outputs, retain_graph=True) 
     for param_name in fisher_info_params:
         if param_name in grad_event_params:
             param_tensor = grad_event_params[param_name]
@@ -58,13 +59,13 @@ def compute_fisher_info_single(fisher_info_params, point, event_params, surrogat
                 outputs=light_yield_mean,
                 inputs=param_tensor,
                 grad_outputs=grad_outputs,
-                create_graph=False,
+                create_graph=True,
                 retain_graph=True,
                 only_inputs=True,
                 allow_unused=True
             )[0]
-            # print(f'Param: {param_name}, Value: {param_tensor}, Grad: {param_grad}')
-            
+            # # print(f'Param: {param_name}, Value: {param_tensor}, Grad: {param_grad}')
+            # param_grad = param_tensor.grad
             param_gradients.append(param_grad)
 
     # Compute Fisher Information matrix: I(θ_i, θ_j) = E[(∂λ/∂θ_i)(∂λ/∂θ_j)/λ]
@@ -80,7 +81,7 @@ def compute_fisher_info_single(fisher_info_params, point, event_params, surrogat
                     fisher_element = (grad_i * grad_j) / light_yield_mean
                 else: 
                     fisher_element = grad_i * grad_j
-                fisher_matrix[i_param, j_param] += fisher_element.item()
+                fisher_matrix[i_param, j_param] += fisher_element.sum()
             
     return fisher_matrix
 
@@ -178,12 +179,12 @@ def compute_fisher_info_batch_events(fisher_info_params, point, event_params_lis
     if len(param_gradients) == n_params:
         for i_param in range(n_params):
             for j_param in range(n_params):
-                grad_i = param_gradients[i_param]  # Shape: (n_events,)
-                grad_j = param_gradients[j_param]  # Shape: (n_events,)
-                
+                grad_i = param_gradients[i_param]  # Shape: (n_events, n_points)
+                grad_j = param_gradients[j_param]  # Shape: (n_events, n_points)
+
                 # Fisher Information elements for all events: (∂λ/∂θ_i)(∂λ/∂θ_j)/λ
-                fisher_elements = (grad_i * grad_j) / light_yields  # Shape: (n_events,)
-                
+                fisher_elements = (grad_i * grad_j) / light_yields.unsqueeze(1)  # Shape: (n_events, n_points)
+
                 # Average across events
                 fisher_matrix[i_param, j_param] = fisher_elements.mean()
     
@@ -408,10 +409,10 @@ class WeightedFisherInfoLoss(LossFunction):
                 mask = (points_3d[:, 1] == string_xy[s_idx][1]) & (points_3d[:, 0] == string_xy[s_idx][0])
                 string_points = points_3d[mask]
                 fisher_matrix = torch.zeros(n_params, n_params, device=self.device)
-                for point in string_points: 
-                    for _ in range(llr_iterations):    
-                        fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos)
-                    fisher_matrix += fisher_matrix/llr_iterations
+                # for point in string_points: 
+                for _ in range(llr_iterations):    
+                    fisher_matrix += compute_fisher_info_single(self.fisher_info_params, string_points, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos)
+                fisher_matrix += fisher_matrix/llr_iterations
                 fisher_per_string_per_event[i, s_idx] += fisher_matrix
 
         return fisher_per_string_per_event
@@ -553,6 +554,7 @@ class WeightedFisherInfoLoss(LossFunction):
             fisher_loss = fisher_loss/max_angular_resolution
         # return {'fisher_loss': fisher_loss, 'fisher_info_per_string': fisher_info_per_string, 'total_fisher_info': total_fisher_info}
         return {'fisher_loss': fisher_loss, 'fisher_info_per_string_per_event': fisher_info_per_string_per_event, 'total_fisher_info_per_event': total_fisher_info_per_event, 'fisher_signal_params': signal_event_params}
+
 class WeightedResolutionLoss(WeightedFisherInfoLoss):
     def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith'], resolution_type='angular'):
         """
@@ -623,6 +625,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         add_relative_pos = kwargs.get('add_relative_pos', False)
         max_angular_resolution = kwargs.get('max_angular_resolution', torch.pi) # radians
         max_energy_resolution = kwargs.get('max_energy_resolution', 1) # fraction
+        use_relative_energy = kwargs.get('use_relative_energy', False)
         # background_event_params = kwargs.get('background_event_params', None)
         # background_surrogate_func = kwargs.get('background_surrogate_func', None)
         if signal_event_params is None and signal_sampler is not None:
@@ -631,46 +634,49 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
             fisher_info_per_string_per_event = self.compute_fisher_info_per_string_per_event(string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net, signal_noise_scale, llr_iterations, add_relative_pos)
         else:
             fisher_info_per_string_per_event = precomputed_fisher_info_per_string_per_event
+        #sum over strings with weights but keep per event
         if string_weights is None:
             total_fisher_info = torch.sum(fisher_info_per_string_per_event, dim=1)  # Sum over strings, keep matrix form
         else:
             string_probs = torch.sigmoid(string_weights)
             total_fisher_info = torch.sum(string_probs.unsqueeze(1).unsqueeze(2) * fisher_info_per_string_per_event, dim=1)
         resolution_per_event = []
-        try:
-            cov_matrix = torch.inverse(total_fisher_info+1e-6 * torch.eye(total_fisher_info.shape[1]))
-        except Exception as e:  
-            cov_matrix = torch.pinverse(total_fisher_info+1e-6 * torch.eye(total_fisher_info.shape[1]))
+        cov_matrix = []
+        
+        for i in range(len(signal_event_params)):
+            try:
+                cov_matrix.append(torch.inverse(total_fisher_info[i]+ 1e-6*torch.eye(total_fisher_info[i].shape[0])))
+            except Exception as e:  
+                # print(f"Matrix inversion failed with error: {e}. Using pseudo-inverse instead.")
+                cov_matrix.append(torch.pinverse(total_fisher_info[i]+ 1e-6*torch.eye(total_fisher_info[i].shape[0])))
+        cov_matrix = torch.stack(cov_matrix)
         if self.resolution_type == 'angular':
             for i, params in enumerate(signal_event_params):
                 zenith = params['zenith']
                 # azimuth = params['azimuth']
                 azimuth_idx = self.fisher_info_params.index('azimuth')
                 zenith_idx = self.fisher_info_params.index('zenith')
-                
-        
                 # Angular resolution: sqrt(var_azimuth + var_zenith)
-                var_azimuth = cov_matrix[azimuth_idx, azimuth_idx]
-                var_zenith = cov_matrix[zenith_idx, zenith_idx]
-                covar_zenith_azimuth = cov_matrix[zenith_idx, azimuth_idx]
+                var_azimuth = cov_matrix[i][azimuth_idx, azimuth_idx]
+                var_zenith = cov_matrix[i][zenith_idx, zenith_idx]
+                covar_zenith_azimuth = cov_matrix[i][zenith_idx, azimuth_idx]
                 angular_resolution_rad = torch.sqrt(var_zenith + torch.sin(zenith)*var_azimuth + 2*torch.sin(zenith)*torch.cos(zenith)*covar_zenith_azimuth)
                 resolution_per_event.append(angular_resolution_rad)
             resolution_per_event = torch.stack(resolution_per_event)
-            total_resolution = torch.mean(resolution_per_event)
+            total_resolution = torch.mean(resolution_per_event[torch.isfinite(resolution_per_event)])
+            total_resolution = total_resolution/max_angular_resolution
             return {'angular_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
         elif self.resolution_type == 'energy':
             for i, params in enumerate(signal_event_params):
                 energy_idx = self.fisher_info_params.index('energy')
-                
-                var_energy = cov_matrix[energy_idx, energy_idx]
+                var_energy = cov_matrix[i][energy_idx, energy_idx]
                 energy_resolution = torch.sqrt(var_energy)
+                if use_relative_energy:
+                    energy_resolution = energy_resolution/params['energy']
                 resolution_per_event.append(energy_resolution)
             resolution_per_event = torch.stack(resolution_per_event)
-            total_resolution = torch.mean(resolution_per_event)
-            if self.resolution_type == 'angular':
-                total_resolution = total_resolution/max_angular_resolution
-            elif self.resolution_type == 'energy':
-                total_resolution = total_resolution/max_energy_resolution
+            total_resolution = torch.mean(resolution_per_event[torch.isfinite(resolution_per_event)])
+            total_resolution = total_resolution/max_energy_resolution
 
             return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
 
@@ -706,6 +712,17 @@ class ResolutionLoss(FisherInfoLoss):
         
         self.resolution_type = resolution_type # 'angular' or 'energy'
     
+    def compute_fisher_info_per_event(self, points_3d, event_params, surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False):
+        n_params = len(self.fisher_info_params)
+        total_fisher_info = []
+        for params in event_params:
+            fisher_matrix = torch.zeros(n_params, n_params, device=self.device)
+            for _ in range(llr_iterations):
+                fisher_matrix += compute_fisher_info_single(self.fisher_info_params, points_3d, params, surrogate_func, llr_net, signal_noise_scale, add_relative_pos=add_relative_pos)
+            total_fisher_info.append(fisher_matrix/llr_iterations)
+        total_fisher_info = torch.stack(total_fisher_info)
+        return total_fisher_info
+    
     def __call__(self, geom_dict, **kwargs):
         """
         Compute the total Fisher information loss = 1/det(FisherInfo).
@@ -735,50 +752,51 @@ class ResolutionLoss(FisherInfoLoss):
         add_relative_pos = kwargs.get('add_relative_pos', False)
         max_energy_resolution = kwargs.get('max_energy_resolution', 1.0)
         max_angular_resolution = kwargs.get('max_angular_resolution', torch.pi)
+        precalculated_fisher_info = kwargs.get('precomputed_fisher_info_per_event', None)
+        use_relative_energy = kwargs.get('use_relative_energy', False)
         if event_params is None and signal_sampler is not None:
             event_params = signal_sampler.sample_events(num_events)
-        n_params = len(self.fisher_info_params)
         resolution_per_event = []
-        for params in event_params:
-            total_fisher_info = torch.zeros(n_params, n_params, device=self.device)
-            for i, point in enumerate(points_3d):
-                fisher_matrix = torch.zeros(n_params, n_params, device=self.device)
-                for _ in range(llr_iterations):
-                    fisher_matrix += compute_fisher_info_single(self.fisher_info_params, point, params, surrogate_func, llr_net, signal_noise_scale, add_relative_pos=add_relative_pos)/len(event_params)
-                total_fisher_info += fisher_matrix/llr_iterations
-            try:    
-                cov_matrix = torch.inverse(total_fisher_info)
+        if precalculated_fisher_info is not None:
+            total_fisher_info = precalculated_fisher_info
+        else:
+            total_fisher_info = self.compute_fisher_info_per_event(points_3d, event_params, surrogate_func, llr_net, signal_noise_scale, llr_iterations, add_relative_pos)
+        resolution_per_event = []
+        cov_matrix = []
+        
+        for i in range(len(event_params)):
+            try:
+                cov_matrix.append(torch.inverse(total_fisher_info[i]+ 1e-6*torch.eye(total_fisher_info[i].shape[0])))
             except Exception as e:  
-                cov_matrix = torch.pinverse(total_fisher_info) 
-            if self.resolution_type == 'angular':
+                # print(f"Matrix inversion failed with error: {e}. Using pseudo-inverse instead.")
+                cov_matrix.append(torch.pinverse(total_fisher_info[i]+ 1e-6*torch.eye(total_fisher_info[i].shape[0])))
+        cov_matrix = torch.stack(cov_matrix)
+        if self.resolution_type == 'angular':
+            for i, params in enumerate(event_params):
                 zenith = params['zenith']
                 # azimuth = params['azimuth']
                 azimuth_idx = self.fisher_info_params.index('azimuth')
                 zenith_idx = self.fisher_info_params.index('zenith')
-                
-        
                 # Angular resolution: sqrt(var_azimuth + var_zenith)
-                var_azimuth = cov_matrix[azimuth_idx, azimuth_idx]
-                var_zenith = cov_matrix[zenith_idx, zenith_idx]
-                covar_zenith_azimuth = cov_matrix[zenith_idx, azimuth_idx]
-                angular_resolution_rad = torch.sqrt(var_azimuth + torch.sin(zenith)*var_azimuth + 2*torch.sin(zenith)*torch.cos(zenith)*covar_zenith_azimuth)
-
-                resolution_per_event.append(angular_resolution_rad)  # Convert to degrees
-
-            elif self.resolution_type == 'energy':
-                energy_idx = self.fisher_info_params.index('energy')
-                # Energy resolution: sqrt(var_energy)/energy
-                var_energy = cov_matrix[energy_idx, energy_idx]
-                # mean_energy = torch.mean(torch.tensor([params['energy'] for params in event_params], device=self.device))
-                energy_resolution = torch.sqrt(var_energy)
-                resolution_per_event.append(energy_resolution)
-        resolution_per_event = torch.stack(resolution_per_event)
-        total_resolution = torch.mean(resolution_per_event)
-        if self.resolution_type == 'angular':
-            total_resolution = total_resolution/max_angular_resolution 
-        if self.resolution_type == 'energy':
-            total_resolution = total_resolution/max_energy_resolution
-        if self.resolution_type == 'energy':
-            return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}
-        elif self.resolution_type == 'angular':
+                var_azimuth = cov_matrix[i][azimuth_idx, azimuth_idx]
+                var_zenith = cov_matrix[i][zenith_idx, zenith_idx]
+                covar_zenith_azimuth = cov_matrix[i][zenith_idx, azimuth_idx]
+                angular_resolution_rad = torch.sqrt(var_zenith + torch.sin(zenith)*var_azimuth + 2*torch.sin(zenith)*torch.cos(zenith)*covar_zenith_azimuth)
+                resolution_per_event.append(angular_resolution_rad)
+            resolution_per_event = torch.stack(resolution_per_event)
+            total_resolution = torch.mean(resolution_per_event[torch.isfinite(resolution_per_event)])
+            total_resolution = total_resolution/max_angular_resolution
             return {'angular_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}
+        elif self.resolution_type == 'energy':
+            for i, params in enumerate(event_params):
+                energy_idx = self.fisher_info_params.index('energy')
+                var_energy = cov_matrix[i][energy_idx, energy_idx]
+                energy_resolution = torch.sqrt(var_energy)
+                if use_relative_energy:
+                    energy_resolution = energy_resolution/params['energy']
+                resolution_per_event.append(energy_resolution)
+            resolution_per_event = torch.stack(resolution_per_event)
+            total_resolution = torch.mean(resolution_per_event[torch.isfinite(resolution_per_event)])
+            total_resolution = total_resolution/max_energy_resolution
+
+            return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}

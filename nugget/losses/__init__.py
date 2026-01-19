@@ -5,3 +5,5 @@ from . import RBF
 from . import fisher_info
 from . import geometry_penalties
 from . import light_yield
+from . import trigger
+from . import effective_area

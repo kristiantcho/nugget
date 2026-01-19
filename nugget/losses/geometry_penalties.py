@@ -147,6 +147,7 @@ class LocalRepulsionPenalty(LossFunction):
         points_3d = geom_dict.get('points_3d', None)
         max_radius = kwargs.get('max_radius', 0.1)
         min_dist = kwargs.get('min_dist', 1e-3)
+        ignore_border = kwargs.get('ignore_border', False)
         
         if points_3d is None:
             return {'local_repulsion_penalty': torch.tensor(0.0)}
@@ -155,20 +156,24 @@ class LocalRepulsionPenalty(LossFunction):
         if n == 0:
             return {'local_repulsion_penalty': torch.tensor(0.0)}
 
-        sharpness = kwargs.get('local_sharpness', 100.0)  # Controls steepness of sigmoid transition
+        sharpness = kwargs.get('local_sharpness', 10.0)  # Controls steepness of sigmoid transition
         
       
         # Compute pairwise squared distances
         diff = points_3d.unsqueeze(1) - points_3d.unsqueeze(0)  # (n, n, 3)
         dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
-        dist = torch.sqrt(dist_sq + 1e-10)  # Add small epsilon for numerical stability
+        dist = torch.sqrt(dist_sq)  
+        # print(f"Min distance between points: {torch.min(dist[dist>0])}")
         
         # Soft mask using sigmoid - smoother transition at radius boundary
         self_mask = torch.eye(n, dtype=torch.bool, device=points_3d.device)
         radius_weight = torch.sigmoid((max_radius - dist) * sharpness)  # Sharp transition around max_radius
+        # radius_mask  = (dist < max_radius) & (~self_mask)
+        # radius_weight = radius_mask.int()
         radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
-
+        # print(f"total radius weight: {torch.sum(radius_weight)}")
         repulsion_matrix = radius_weight / (dist_sq + min_dist)
+        # print(f"Max repulsion value: {torch.max(repulsion_matrix)}")
         repulsion = torch.sum(repulsion_matrix) / n
         
         return {'local_repulsion_penalty': repulsion}
@@ -206,6 +211,7 @@ class StringRepulsionPenalty(LossFunction):
         string_xy = geom_dict.get('string_xy', None)
         string_weights = geom_dict.get('string_weights', None)
         min_dist = kwargs.get('min_dist', 1e-3)
+        ignore_border = kwargs.get('ignore_border', False)
         
         if string_xy is None:
             return torch.tensor(0.0)
@@ -262,7 +268,9 @@ class LocalStringRepulsionPenalty(LossFunction):
         string_weights = geom_dict.get('string_weights', None)
         max_radius = kwargs.get('max_radius', 0.1)
         min_dist = kwargs.get('min_dist', 1e-3)
-        sharpness = kwargs.get('local_sharpness', 100.0)  # Controls steepness of sigmoid transition
+        sharpness = kwargs.get('local_sharpness', 10.0)  # Controls steepness of sigmoid transition
+        ignore_border = kwargs.get('ignore_border', False)
+        domain_size = kwargs.get('boundary_range', 2.0)
         
         if string_xy is None:
             return {'local_string_repulsion_penalty': torch.tensor(0.0)}
@@ -277,8 +285,16 @@ class LocalStringRepulsionPenalty(LossFunction):
         # Soft mask using sigmoid - smoother transition at radius boundary
         self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
         radius_weight = torch.sigmoid((max_radius - dist) * sharpness)  # Sharp transition around max_radius
+        # radius_weight = torch.ones_like(dist)
+        # radius_mask = dist < max_radius
+        # radius_weight = radius_weight * radius_mask.float()
         radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
         
+        if ignore_border:
+            clamped_string_xy = torch.clamp(torch.abs(string_xy) - domain_size/2, min=0.0)** 2
+            clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy, dim=1))
+            border_mask = (clamped_string_xy < 1e-3).unsqueeze(1) | (clamped_string_xy < 1e-3).unsqueeze(0)
+            radius_weight = radius_weight * (~border_mask).float()
         repulsion = 0.0
         if string_weights is not None:
             string_probs = torch.sigmoid(string_weights)

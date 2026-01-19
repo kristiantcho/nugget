@@ -7,7 +7,7 @@ import torch.nn.functional as F
 class SpaceString(Geometry):
     """Hexagonal string geometry optimizer."""
     
-    def __init__(self, device=None, dim=3, domain_size=2,
+    def __init__(self, device=None, dim=3, domain_size=2, hybrid_mix_init=0.5, make_hybrid_iter=True, hybrid_iter_step = 0.01,
                 n_strings=1000, points_per_string=5, starting_spacing=0.1, hex_type='hexagonal', starting_z_spacing=None, optimize_z=False):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         self.n_strings = n_strings
@@ -19,18 +19,24 @@ class SpaceString(Geometry):
             self.hex_func = self.create_circular_hexagonal_grid
         elif hex_type == 'sunflower':
             self.hex_func = self.create_sunflower_grid
+        elif hex_type == 'hybrid':
+            self.hex_func = self.create_hybrid_hex_sunflower_grid
         else:
             self.hex_func = self.create_uniform_hexagonal_grid
         # Create hexagonal grid for strings
         original_dim = self.dim
         self.dim = 2
-        self.hex_grid = self.hex_func(n_points=self.n_strings, optimal_spacing=self.starting_spacing)
+        
         self.dim = original_dim
         self.starting_z_spacing = starting_z_spacing
         self.optimize_z = optimize_z
-        
+        self.hybrid_mix_init = hybrid_mix_init
+        self.make_hybrid_iter = make_hybrid_iter
+        self.hybrid_iter_step = hybrid_iter_step
         # Half domain size for z-value mapping
         self.half_domain = domain_size / 2.0
+        self.hex_grid = self.hex_func(n_points=self.n_strings, optimal_spacing=self.starting_spacing, hybrid_mix=hybrid_mix_init, 
+                                      iterative_hungarian=self.make_hybrid_iter, iter_step=self.hybrid_iter_step)
     
     def initialize_points(self, initial_geometry=None, **kwargs):
         """
@@ -161,6 +167,7 @@ class SpaceString(Geometry):
             'string_indices': string_indices,
             'points_per_string_list': points_per_string_list,  # Each string has points_per_string points
             'z_spacing': z_spacing,
+            'hybrid_mix': self.hybrid_mix_init,
             }
 
     def update_points(self, string_xy, z_values, string_indices, string_spacing, z_spacing, points_per_string_list, **kwargs):
@@ -185,12 +192,13 @@ class SpaceString(Geometry):
         """
         # Apply sigmoid to string weights to get probabilities between 0 and 1
     
-        
+        hybrid_mix = kwargs.get('hybrid_mix', self.hybrid_mix)
         total_points = torch.sum(torch.tensor(points_per_string_list, device=self.device)).item()
         new_points_3d = torch.zeros(total_points, 3, device=self.device)
         original_dim = self.dim
         self.dim = 2  # Temporarily set dim to 2 for hex grid generation
-        string_xy = self.hex_func(n_points=len(string_indices), optimal_spacing=string_spacing)
+        string_xy = self.hex_func(n_points=len(string_indices), optimal_spacing=string_spacing, hybrid_mix=hybrid_mix, 
+                                 iterative_hungarian=self.make_hybrid_iter, iter_step=self.hybrid_iter_step)
         self.dim = original_dim
         
 

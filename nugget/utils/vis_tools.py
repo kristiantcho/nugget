@@ -23,6 +23,20 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
+def sph_to_cart(theta, phi):
+    """Converts spherical coordinates (zenith, azimuth) to a 3D Cartesian vector."""
+    st, ct = torch.sin(theta), torch.cos(theta)
+    sp, cp = torch.sin(phi), torch.cos(phi)
+    return torch.stack([st * cp, st * sp, ct], dim=-1)
+
+def cart_to_sph(vec):
+    """Converts a 3D Cartesian vector to spherical coordinates (zenith, azimuth)."""
+    vec = vec.squeeze()
+    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
+    theta = torch.acos(torch.clamp(z, -1.0, 1.0))  # Zenith
+    phi = torch.atan2(y, x)  # Azimuth
+    return theta, phi
+
 
 class Visualizer:
     """Base class for visualization tools in geometry optimization."""
@@ -170,9 +184,10 @@ class Visualizer:
             return
             
         # Get ROV dimensions
-        rov_rec_width = getattr(rov_penalty, 'rov_rec_width', 0.3)
-        rov_height = getattr(rov_penalty, 'rov_height', 0.16) 
-        rov_tri_length = getattr(rov_penalty, 'rov_tri_length', 0.08)
+        # rov_rec_width = rov_penalty.rov_rec_width
+        rov_rec_width = rov_penalty.rov_tri_length*3
+        rov_height = rov_penalty.rov_height
+        rov_tri_length = rov_penalty.rov_tri_length
         if zoom_range is not None:
             ax_lims = zoom_range*2
         else:
@@ -931,7 +946,7 @@ class Visualizer:
                 
                 # Add ROV safe space visualization if ROV penalty is available
 
-                rov_penalty = kwargs.get('rov_penalty', None)
+                rov_penalty = kwargs.get('rov_penalty_func', None)
                 if rov_penalty is not None:
                     self._draw_rov_safe_space(ax, rov_penalty)
             else:
@@ -951,6 +966,7 @@ class Visualizer:
                         rov_penalty_np = rov_penalty_per_string.detach().cpu().numpy()
                     else:
                         rov_penalty_np = np.array(rov_penalty_per_string)
+                    rov_penalty_np*= len(xy_np)
                     
                     # Use string weights for alpha transparency (no threshold filtering)
                     if string_weights is not None:
@@ -977,7 +993,7 @@ class Visualizer:
                         cmap=cmap,
                         norm=norm,
                         alpha=alpha_vals if isinstance(alpha_vals, np.ndarray) else alpha_vals,
-                        edgecolors='black',
+                        # edgecolors='black',
                         linewidths=0.5
                     )
                     
@@ -985,7 +1001,7 @@ class Visualizer:
                     cbar = fig.colorbar(sc, ax=ax)
                     cbar.set_label('ROV Penalty')
                     
-                    rov_penalty = kwargs.get('rov_penalty', None)
+                    rov_penalty = kwargs.get('rov_penalty_func', None)
                     if rov_penalty is not None:
                         self._draw_rov_safe_space(ax, rov_penalty, zoom_range=zoom_range)
                     
@@ -3507,3 +3523,1153 @@ class Visualizer:
             except Exception as e:
                 print(f"Error cleaning up temporary directory: {e}")
         print("GIF temporary files cleanup completed.")
+
+def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func, 
+                       param_names=None, param_ranges=None, n_points=50,
+                       event_labels=['position', 'energy', 'zenith', 'azimuth'],
+                       true_event=None, detector_point=None, figsize=(10, 8),
+                       contour_levels=[0, 1, 4, 9], cmap='viridis',
+                       use_mollweide=False, skip_zero_response=False):
+    """
+    Plot negative log-likelihood landscape for a trained signal-only LLRnet.
+    
+    This function visualizes how the predicted negative log-likelihood changes when
+    varying one or two event parameters while keeping the detector response fixed
+    to that of a true event. This helps assess whether the network has learned
+    the correct relationship between event parameters and detector response.
+    
+    The predicted log-likelihood is normalized such that the true event parameters
+    have NLL = 0, allowing interpretation of contours as confidence levels
+    (NLL = 1, 4, 9 correspond to 1σ, 2σ, 3σ for chi-squared with 1-2 DOF).
+    
+    When multiple detector points are provided, the log-likelihoods are summed
+    across all points to produce a combined likelihood landscape.
+    
+    Parameters:
+    -----------
+    llrnet : LLRnet
+        Trained LLRnet instance (must be trained with signal-only approach)
+    signal_sampler : ToySampler
+        Sampler instance for generating signal event parameters and detector points
+    signal_surrogate_func : callable
+        Function to calculate light yield for signal events
+    param_names : list of str, optional
+        Names of 1 or 2 parameters to vary. Must be keys in event_labels.
+        If None, defaults to ['energy', 'zenith'] for 2D or ['energy'] for 1D.
+        Examples: ['energy'], ['zenith', 'azimuth'], ['energy', 'zenith']
+    param_ranges : dict, optional
+        Dictionary mapping parameter names to (min, max) tuples.
+        If None, uses sampler's default ranges.
+        Example: {'energy': (1.0, 10.0), 'zenith': (0, np.pi)}
+    n_points : int
+        Number of points to sample along each parameter axis
+    event_labels : list
+        List of event parameter keys to include as features
+    true_event : dict, optional
+        True event parameters. If None, samples a new event from signal_sampler.
+    detector_point : torch.Tensor or list of torch.Tensor, optional
+        Detector point coordinates. Can be a single point or a list/tensor of multiple points.
+        If None, samples a new point. If multiple points, log-likelihoods are summed.
+    figsize : tuple
+        Figure size (width, height)
+    contour_levels : list
+        NLL contour levels to plot (default: [0, 1, 4, 9])
+    cmap : str
+        Colormap for the plot
+    use_mollweide : bool
+        If True and param_names are ['zenith', 'azimuth'] or ['azimuth', 'zenith'],
+        use Mollweide projection for plotting (default: False)
+    skip_zero_response : bool
+        If True, skip detector points with zero response when calculating total LLR
+        (effectively adds zero to the sum for those points). This can be useful when
+        some detector points have zero expected response for certain parameter values.
+        (default: False)
+        
+   """
+
+    
+    if not llrnet.is_trained:
+        raise RuntimeError("LLRnet must be trained before plotting NLL landscape")
+    
+    # Default parameter names
+    if param_names is None:
+        param_names = ['energy', 'zenith']
+    
+    if len(param_names) > 2:
+        raise ValueError("Can only vary up to 2 parameters")
+    
+    # Validate parameter names
+    # for param_name in param_names:
+    #     if param_name not in event_labels and param_name not in ['position', 'x', 'y', 'z']:
+    #         raise ValueError(f"Parameter '{param_name}' not in event_labels or position coordinates: {event_labels}")
+    
+    # Sample true event and detector point if not provided
+    if true_event is None:
+        true_event = signal_sampler.sample_events(1)[0]
+    
+    if detector_point is None:
+        detector_point = signal_sampler.sample_detector_points(1).squeeze()
+    
+    # Handle multiple detector points
+    if isinstance(detector_point, list):
+        detector_points = [p.to(llrnet.device) if isinstance(p, torch.Tensor) else torch.tensor(p, device=llrnet.device) for p in detector_point]
+    elif isinstance(detector_point, torch.Tensor):
+        if detector_point.ndim == 1:
+            detector_points = [detector_point.to(llrnet.device)]
+        else:
+            detector_points = [p.to(llrnet.device) for p in detector_point]
+    else:
+        detector_points = [torch.tensor(detector_point, device=llrnet.device)]
+    
+    num_detector_points = len(detector_points)
+    
+    if true_event.get('azimuth') is not None:
+        if true_event['azimuth'] < 0:
+            true_event['azimuth'] += 2 * np.pi
+    # Get default parameter ranges from sampler if not provided
+    if param_ranges is None:
+        param_ranges = {}
+        for param_name in param_names:
+            if param_name == 'energy':
+                param_ranges['energy'] = (0.8, 1.0)  # Default energy range
+            elif param_name == 'zenith':
+                param_ranges['zenith'] = (-np.pi, np.pi)
+            elif param_name == 'azimuth':
+                param_ranges['azimuth'] = (0, 2*np.pi)
+            elif param_name == 'position':
+                param_ranges['position'] = (-llrnet.domain_size/2, llrnet.domain_size/2)
+            elif param_name in ['x', 'y', 'z']:
+                param_ranges[param_name] = (-llrnet.domain_size/2, llrnet.domain_size/2)
+            else:
+                # For other parameters, try to infer from true event
+                if param_name in true_event:
+                    val = true_event[param_name]
+                    if isinstance(val, torch.Tensor):
+                        val = val.item()
+                    param_ranges[param_name] = (val * 0.5, val * 2.0)
+                else:
+                    param_ranges[param_name] = (0.0, 1.0)
+    
+    # Calculate true detector response for all detector points (fixed for all parameter variations)
+    true_detector_responses = []
+    for det_point in detector_points:
+        true_detector_responses.append(signal_surrogate_func(
+            opt_point=det_point, 
+            event_params=true_event
+        ))
+    
+    # Count effective detector points (non-zero response)
+    num_effective_detector_points = sum(1 for resp in true_detector_responses if resp != 0.0)
+    
+    # Get true event features for all detector points and sum their log-likelihoods
+    true_llr_sum = 0.0
+    with torch.no_grad():
+        for det_point in detector_points:
+            true_features = llrnet.prepare_data_from_raw(
+                point=det_point,
+                event_data=true_event,
+                surrogate_func=signal_surrogate_func,
+                event_labels=event_labels,
+                noise_scale=llrnet.signal_noise_scale,
+            )
+            true_llr_sum += llrnet.predict_log_likelihood_ratio(true_features.unsqueeze(0)).item()
+    
+    # Create parameter grids
+    if len(param_names) == 1:
+        # 1D case
+        param_name = param_names[0]
+        param_min, param_max = param_ranges[param_name]
+        # Use log spacing for energy
+        if param_name == 'energy':
+            param_values = np.logspace(np.log10(param_min), np.log10(param_max), n_points)
+        else:
+            param_values = np.linspace(param_min, param_max, n_points)
+        
+        # Calculate NLL for each parameter value (summed across detector points)
+        nll_values = []
+        
+        for param_val in param_values:
+            # Create modified event with varied parameter
+            modified_event = {k: v.clone() if torch.is_tensor(v) else v for k, v in true_event.items()}
+            
+            # Update direction if varying zenith/azimuth and network trained with direction
+            if 'direction' in event_labels and (param_name == 'zenith' or param_name == 'azimuth'):
+                theta = true_event['zenith'].item() if 'zenith' in true_event else cart_to_sph(modified_event['direction'])[0].item()
+                phi = true_event['azimuth'].item() if 'azimuth' in true_event else cart_to_sph(modified_event['direction'])[1].item()
+                
+                if param_name == 'zenith':
+                    theta = torch.tensor(param_val, dtype=torch.float32)
+                elif param_name == 'azimuth':
+                    phi = torch.tensor(param_val, dtype=torch.float32)
+                modified_event['direction'] = sph_to_cart(theta, phi)
+            
+            # Set zenith/azimuth in modified_event if they are being varied
+            if param_name == 'zenith':
+                modified_event['zenith'] = torch.tensor([param_val], dtype=torch.float32)
+            elif param_name == 'azimuth':
+                modified_event['azimuth'] = torch.tensor([param_val], dtype=torch.float32)
+            
+            # Update the specific parameter
+            if param_name == 'position':
+                # Special handling for position (3D vector)
+                if isinstance(modified_event[param_name], torch.Tensor):
+                    modified_event[param_name] = modified_event[param_name].clone()
+                    modified_event[param_name][0] = param_val  # Vary first coordinate
+                else:
+                    modified_event[param_name][0] = param_val
+            elif param_name in ['x', 'y', 'z']:
+                # Handle individual position coordinates
+                coord_idx = {'x': 0, 'y': 1, 'z': 2}[param_name]
+                if 'position' in modified_event:
+                    if isinstance(modified_event['position'], torch.Tensor):
+                        modified_event['position'] = modified_event['position'].clone()
+                        modified_event['position'][0][coord_idx] = param_val
+                    else:
+                        modified_event['position'][0][coord_idx] = param_val
+            elif param_name in event_labels:
+                # Only set if parameter is in event_labels
+                modified_event[param_name] = torch.tensor([param_val], dtype=torch.float32)
+            
+            # Sum log-likelihoods across all detector points
+            llr_sum = 0.0
+            filtered_true_event = {k: v for k, v in true_event.items() if k in event_labels}
+            
+            for det_point, true_response in zip(detector_points, true_detector_responses):
+                # Skip if response is zero and skip_zero_response is True
+                if skip_zero_response and true_response == 0.0:
+                    continue
+                    
+                # Create features with modified parameters but TRUE detector response
+                features = llrnet.prepare_data_from_raw(
+                    point=det_point,
+                    event_data=modified_event,  # Full event for surrogate (if called)
+                    surrogate_func=signal_surrogate_func,
+                    signal_event_data=true_event,  # Filtered for feature extraction
+                    event_labels=event_labels,
+                    noise_scale=0.0,  # No noise for evaluation
+
+                )
+                
+                # Predict LLR and add to sum
+                with torch.no_grad():
+                    llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                    llr_sum += llr
+            
+            # Store raw NLL (will normalize later)
+            nll = -llr_sum
+            nll_values.append(nll)
+        
+        nll_values = np.array(nll_values)
+        
+        # Normalize to minimum NLL value
+        min_nll = np.min(nll_values)
+        nll_values = nll_values - min_nll
+        
+        # Find minimum location
+        min_idx = np.argmin(nll_values)
+        min_param_val = param_values[min_idx]
+        
+        # Create 1D plot
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.plot(param_values, nll_values, 'b-', linewidth=2)
+        
+        # Mark minimum NLL value
+        ax.plot(min_param_val, 0.0, 'g*', markersize=15, 
+               markeredgecolor='black', markeredgewidth=1.5, label='Minimum NLL', zorder=5)
+        
+        # Mark true parameter value
+        if param_name in ['x', 'y', 'z']:
+            coord_idx = {'x': 0, 'y': 1, 'z': 2}[param_name]
+            true_param_val = true_event['position'][0][coord_idx]
+            if isinstance(true_param_val, torch.Tensor):
+                true_param_val = true_param_val.item()
+        else:
+            true_param_val = true_event[param_name]
+            if isinstance(true_param_val, torch.Tensor):
+                true_param_val = true_param_val.item() if true_param_val.numel() == 1 else true_param_val[0].item()
+        true_nll_val = nll_values[np.argmin(np.abs(param_values - true_param_val))]
+        label_text = f'True value ({num_detector_points} detector point' + ('s' if num_detector_points > 1 else '') + ')'
+        ax.axvline(true_param_val, color='r', linestyle='--', linewidth=2, label=label_text)
+        
+        # Add horizontal lines for contour levels
+        for level in contour_levels:
+            ax.axhline(level, color='gray', linestyle=':', alpha=0.5, linewidth=1)
+            ax.text(param_min + 0.02*(param_max-param_min), level, f'NLL={level}', 
+                   fontsize=9, va='bottom', color='gray')
+        
+        ax.set_xlabel(param_name.capitalize(), fontsize=12)
+        ax.set_ylabel('Negative Log-Likelihood', fontsize=12)
+        title_suffix = f' ({num_detector_points} detector points)' if num_detector_points > 1 else ''
+        ax.set_title(f'NLL Landscape: {param_name}{title_suffix}', fontsize=14)
+        if param_name == 'energy':
+            ax.set_xscale('log')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        result = {
+            'fig': fig,
+            'ax': ax,
+            'true_event': true_event,
+            'true_nll': true_nll_val,
+            'detector_points': detector_points,
+            'num_detector_points': num_detector_points,
+            'param_grid': param_values,
+            'nll_grid': nll_values
+        }
+        
+    else:
+        # 2D case
+        param1_name, param2_name = param_names
+        param1_min, param1_max = param_ranges[param1_name]
+        param2_min, param2_max = param_ranges[param2_name]
+        
+        # Check if we should use Mollweide projection
+        is_mollweide = (use_mollweide and 
+                       set(param_names) == {'zenith', 'azimuth'})
+        
+        # Use log spacing for energy parameters
+        if param1_name == 'energy':
+            param1_values = np.logspace(np.log10(param1_min), np.log10(param1_max), n_points)
+        else:
+            param1_values = np.linspace(param1_min, param1_max, n_points)
+        
+        if param2_name == 'energy':
+            param2_values = np.logspace(np.log10(param2_min), np.log10(param2_max), n_points)
+        else:
+            param2_values = np.linspace(param2_min, param2_max, n_points)
+        
+        param1_grid, param2_grid = np.meshgrid(param1_values, param2_values)
+        nll_grid = np.zeros_like(param1_grid)
+        
+        # Calculate NLL for each parameter combination (summed across detector points)
+        for i in range(n_points):
+            for j in range(n_points):
+                # Create modified event
+                modified_event = {k: v.clone() if torch.is_tensor(v) else v for k, v in true_event.items()}
+                
+                # Update direction if varying zenith/azimuth and network trained with direction
+                if 'direction' in event_labels:
+                    if param1_name == 'zenith' or param2_name == 'zenith' or param1_name == 'azimuth' or param2_name == 'azimuth':
+                        theta = true_event['zenith'] if 'zenith' in true_event else cart_to_sph(true_event['direction'])[0]
+                        phi = true_event['azimuth'] if 'azimuth' in true_event else cart_to_sph(true_event['direction'])[1]
+                        
+                        if param1_name == 'zenith':
+                            theta = torch.tensor(param1_grid[i, j], dtype=torch.float32)
+                        elif param1_name == 'azimuth':
+                            phi = torch.tensor(param1_grid[i, j], dtype=torch.float32)
+                        if param2_name == 'zenith':
+                            theta = torch.tensor(param2_grid[i, j], dtype=torch.float32)
+                        elif param2_name == 'azimuth':
+                            phi = torch.tensor(param2_grid[i, j], dtype=torch.float32)
+                        
+                        modified_event['direction'] = sph_to_cart(theta, phi)
+                
+                # Set zenith/azimuth in modified_event if they are being varied
+                if param1_name == 'zenith':
+                    modified_event['zenith'] = torch.tensor([param1_grid[i, j]], dtype=torch.float32)
+                elif param1_name == 'azimuth':
+                    modified_event['azimuth'] = torch.tensor([param1_grid[i, j]], dtype=torch.float32)
+                if param2_name == 'zenith':
+                    modified_event['zenith'] = torch.tensor([param2_grid[i, j]], dtype=torch.float32)
+                elif param2_name == 'azimuth':
+                    modified_event['azimuth'] = torch.tensor([param2_grid[i, j]], dtype=torch.float32)
+                
+                # Update both parameters (only if in event_labels or position-related)
+                for param_name, param_val in [(param1_name, param1_grid[i, j]), 
+                                               (param2_name, param2_grid[i, j])]:
+                    if param_name == 'position':
+                        if isinstance(modified_event[param_name], torch.Tensor):
+                            modified_event[param_name] = modified_event[param_name].clone()
+                            modified_event[param_name][0] = param_val
+                        else:
+                            modified_event[param_name][0] = param_val
+                    elif param_name in ['x', 'y', 'z']:
+                        # Handle individual position coordinates
+                        coord_idx = {'x': 0, 'y': 1, 'z': 2}[param_name]
+                        if 'position' in modified_event:
+                            if isinstance(modified_event['position'], torch.Tensor):
+                                modified_event['position'] = modified_event['position'].clone()
+                                modified_event['position'][0][coord_idx] = param_val
+                            else:
+                                modified_event['position'][0][coord_idx] = param_val
+                    elif param_name in event_labels:
+                        # Only set if parameter is in event_labels
+                        modified_event[param_name] = torch.tensor([param_val], dtype=torch.float32)
+                
+                # Sum log-likelihoods across all detector points
+                llr_sum = 0.0
+                filtered_true_event = {k: v for k, v in true_event.items() if k in event_labels}
+                
+                for det_point, true_response in zip(detector_points, true_detector_responses):
+                    # Skip if response is zero and skip_zero_response is True
+                    if skip_zero_response and true_response == 0.0:
+                        continue
+                        
+                    # Create features with TRUE detector response
+                    features = llrnet.prepare_data_from_raw(
+                        point=det_point,
+                        event_data=modified_event,  # Full event for surrogate (if called)
+                        surrogate_func=signal_surrogate_func,
+                        signal_event_data=filtered_true_event,  # Filtered for feature extraction
+                        event_labels=event_labels,
+                        noise_scale=0.0,
+                    )
+                    
+                    # Predict LLR and add to sum
+                    with torch.no_grad():
+                        llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                        llr_sum += llr
+                
+                # Store raw NLL (will normalize later)
+                nll_grid[i, j] = -llr_sum
+        
+        # Normalize to minimum NLL value
+        min_nll = np.min(nll_grid)
+        nll_grid = nll_grid - min_nll
+        
+        # Find minimum location
+        min_idx = np.unravel_index(np.argmin(nll_grid), nll_grid.shape)
+        min_param1_val = param1_grid[min_idx]
+        min_param2_val = param2_grid[min_idx]
+        
+        # Create 2D contour plot
+        if is_mollweide:
+            # For Mollweide projection, we need azimuth in [-pi, pi] and zenith as latitude
+            # Convert zenith (0 to pi) to latitude (-pi/2 to pi/2)
+            # and azimuth (0 to 2pi) to longitude (-pi to pi)
+            
+            # Determine which parameter is which
+            if param1_name == 'azimuth':
+                lon_grid = param1_grid - np.pi  # Convert [0, 2pi] to [-pi, pi]
+                lat_grid = np.pi/2 - param2_grid  # Convert zenith [0, pi] to latitude [pi/2, -pi/2]
+                lon_values = param1_values - np.pi
+                lat_values = np.pi/2 - param2_values
+            else:  # param1_name == 'zenith'
+                lon_grid = param2_grid - np.pi  # Convert [0, 2pi] to [-pi, pi]
+                lat_grid = np.pi/2 - param1_grid  # Convert zenith [0, pi] to latitude [pi/2, -pi/2]
+                lon_values = param2_values - np.pi
+                lat_values = np.pi/2 - param1_values
+            
+            fig = plt.figure(figsize=figsize)
+            ax = fig.add_subplot(111, projection='mollweide')
+            
+            # Plot filled contours
+            contourf = ax.contourf(lon_grid, lat_grid, nll_grid, 
+                                   levels=20, cmap=cmap, alpha=0.7)
+            
+            # Plot contour lines at specific levels
+            contour = ax.contour(lon_grid, lat_grid, nll_grid, 
+                                levels=contour_levels, colors='white', 
+                                linewidths=2, alpha=0.8)
+            try:
+                ax.clabel(contour, inline=True, fontsize=10, fmt='%.0f')
+            except (IndexError, ValueError):
+                # Skip labeling if contours are invalid or too sparse in Mollweide projection
+                pass
+            
+            # Mark minimum NLL location (convert to lat/lon)
+            if param1_name == 'azimuth':
+                min_lon = min_param1_val - np.pi
+                min_lat = np.pi/2 - min_param2_val
+            else:
+                min_lon = min_param2_val - np.pi
+                min_lat = np.pi/2 - min_param1_val
+            
+            ax.plot(min_lon, min_lat, 'g*', markersize=20, 
+                   markeredgecolor='black', markeredgewidth=2, label='Minimum NLL', zorder=5)
+            
+            # Mark true parameter values (convert to lat/lon)
+            if param1_name in ['x', 'y', 'z']:
+                coord_idx = {'x': 0, 'y': 1, 'z': 2}[param1_name]
+                true_param1_val = true_event['position'][0][coord_idx]
+                if isinstance(true_param1_val, torch.Tensor):
+                    true_param1_val = true_param1_val.item()
+            else:
+                true_param1_val = true_event[param1_name]
+                if isinstance(true_param1_val, torch.Tensor):
+                    true_param1_val = true_param1_val.item() if true_param1_val.numel() == 1 else true_param1_val[0].item()
+            
+            if param2_name in ['x', 'y', 'z']:
+                coord_idx = {'x': 0, 'y': 1, 'z': 2}[param2_name]
+                true_param2_val = true_event['position'][0][coord_idx]
+                if isinstance(true_param2_val, torch.Tensor):
+                    true_param2_val = true_param2_val.item()
+            else:
+                true_param2_val = true_event[param2_name]
+                if isinstance(true_param2_val, torch.Tensor):
+                    true_param2_val = true_param2_val.item() if true_param2_val.numel() == 1 else true_param2_val[0].item()
+            
+            if param1_name == 'azimuth':
+                true_lon = true_param1_val - np.pi
+                true_lat = np.pi/2 - true_param2_val
+            else:
+                true_lon = true_param2_val - np.pi
+                true_lat = np.pi/2 - true_param1_val
+            
+            # Get NLL at true parameter values
+            true_idx1 = np.argmin(np.abs(param1_values - true_param1_val))
+            true_idx2 = np.argmin(np.abs(param2_values - true_param2_val))
+            true_nll_val = nll_grid[true_idx2, true_idx1]
+            
+            ax.plot(true_lon, true_lat, 'r*', markersize=20, 
+                   markeredgecolor='white', markeredgewidth=2, label='True values', zorder=5)
+            
+            # Set custom tick labels in degrees
+            # Azimuth: convert from [-π, π] to [0°, 360°]
+            ax.set_xlabel('Azimuth (degrees)', fontsize=12)
+            xticks_rad = ax.get_xticks()
+            xticks_deg = [(x + np.pi) * 180 / np.pi for x in xticks_rad]
+            ax.set_xticklabels([f'{int(deg)}°' for deg in xticks_deg])
+            
+            # Zenith: convert from [-π/2, π/2] to [0°, 180°]
+            ax.set_ylabel('Zenith (degrees)', fontsize=12)
+            yticks_rad = ax.get_yticks()
+            yticks_deg = [(np.pi/2 - y) * 180 / np.pi for y in yticks_rad]
+            ax.set_yticklabels([f'{int(deg)}°' for deg in yticks_deg])
+            
+            if skip_zero_response and num_effective_detector_points != num_detector_points:
+                title_suffix = f' ({num_effective_detector_points}/{num_detector_points} effective detector points)'
+            else:
+                title_suffix = f' ({num_detector_points} detector points)'
+            ax.set_title(f'NLL Landscape{title_suffix}', fontsize=14)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Add colorbar
+            cbar = plt.colorbar(contourf, ax=ax, orientation='horizontal', pad=0.07, fraction=0.046)
+            cbar.set_label('Negative Log-Likelihood', fontsize=11)
+            
+        else:
+            # Standard Cartesian plot
+            fig, ax = plt.subplots(figsize=figsize)
+            
+            # Plot filled contours
+            contourf = ax.contourf(param1_grid, param2_grid, nll_grid, 
+                                   levels=20, cmap=cmap, alpha=0.7)
+            
+            # Plot contour lines at specific levels
+            contour = ax.contour(param1_grid, param2_grid, nll_grid, 
+                                levels=contour_levels, colors='white', 
+                                linewidths=2, alpha=0.8)
+            ax.clabel(contour, inline=True, fontsize=10, fmt='%.0f')
+            
+            # Mark minimum NLL location
+            ax.plot(min_param1_val, min_param2_val, 'g*', markersize=20, 
+                   markeredgecolor='black', markeredgewidth=2, label='Minimum NLL', zorder=5)
+            
+            # Mark true parameter values
+            if param1_name in ['x', 'y', 'z']:
+                coord_idx = {'x': 0, 'y': 1, 'z': 2}[param1_name]
+                true_param1_val = true_event['position'][0][coord_idx]
+                if isinstance(true_param1_val, torch.Tensor):
+                    true_param1_val = true_param1_val.item()
+          
+            else:
+                true_param1_val = true_event[param1_name]
+                if isinstance(true_param1_val, torch.Tensor):
+                    true_param1_val = true_param1_val.item() if true_param1_val.numel() == 1 else true_param1_val[0].item()
+            
+            if param2_name in ['x', 'y', 'z']:
+                coord_idx = {'x': 0, 'y': 1, 'z': 2}[param2_name]
+                true_param2_val = true_event['position'][0][coord_idx]
+                if isinstance(true_param2_val, torch.Tensor):
+                    true_param2_val = true_param2_val.item()
+            else:
+                true_param2_val = true_event[param2_name]
+                if isinstance(true_param2_val, torch.Tensor):
+                    true_param2_val = true_param2_val.item() if true_param2_val.numel() == 1 else true_param2_val[0].item()
+            
+            # Get NLL at true parameter values
+            true_idx1 = np.argmin(np.abs(param1_values - true_param1_val))
+            true_idx2 = np.argmin(np.abs(param2_values - true_param2_val))
+            true_nll_val = nll_grid[true_idx2, true_idx1]  # Note: meshgrid uses (y, x) indexing
+                
+            ax.plot(true_param1_val, true_param2_val, 'r*', markersize=20, 
+                   markeredgecolor='white', markeredgewidth=2, label='True values', zorder=5)
+            
+            ax.set_xlabel(param1_name.capitalize(), fontsize=12)
+            ax.set_ylabel(param2_name.capitalize(), fontsize=12)
+            if skip_zero_response and num_effective_detector_points != num_detector_points:
+                title_suffix = f' ({num_effective_detector_points}/{num_detector_points} effective detector points)'
+            else:
+                title_suffix = f' ({num_detector_points} detector points)'
+            ax.set_title(f'NLL Landscape: {param1_name} vs {param2_name}{title_suffix}', fontsize=14)
+            if param1_name == 'energy':
+                ax.set_xscale('log')
+            if param2_name == 'energy':
+                ax.set_yscale('log')
+            #fix legend to bottom left corner, next to cbar
+            fig.legend(ax.get_legend_handles_labels()[0], ax.get_legend_handles_labels()[1], loc='lower left')
+            
+            # Add colorbar
+            cbar = plt.colorbar(contourf, ax=ax)
+            cbar.set_label('Negative Log-Likelihood', fontsize=11)
+        
+        result = {
+            'fig': fig,
+            'ax': ax,
+            'true_event': true_event,
+            'true_nll': true_nll_val,
+            'min_nll_params': {param1_name: min_param1_val, param2_name: min_param2_val},
+            'detector_points': detector_points,
+            'num_detector_points': num_detector_points,
+            'param_grid': (param1_grid, param2_grid),
+            'nll_grid': nll_grid
+        }
+    
+    plt.tight_layout()
+    return result
+
+def plot_nll_landscape_compare(
+    llrnet, 
+    signal_sampler, 
+    signal_surrogate_func,
+    param_names=None, 
+    param_ranges=None, 
+    n_points=50,
+    event_labels=['position', 'energy', 'zenith', 'azimuth'],
+    true_event=None, 
+    detector_point=None, 
+    figsize=(10, 8),
+    contour_levels=[1, 4, 9], 
+    cmap='viridis',
+    logscale_e = True
+):
+    """
+    Compares the NLL landscape from LLRnet with a true Poisson NLL landscape.
+
+    This function visualizes how the predicted negative log-likelihood from the network
+    compares to an analytical NLL derived from a Poisson distribution. It plots contour
+    lines for both landscapes on the same axes.
+    
+    When multiple detector points are provided, the log-likelihoods are summed
+    across all points to produce a combined likelihood landscape for both the
+    network prediction and the true Poisson likelihood.
+
+    Parameters:
+    -----------
+    llrnet : LLRnet
+        Trained LLRnet instance (must be trained with signal-only approach).
+    signal_sampler : ToySampler
+        Sampler for generating signal event parameters and detector points.
+    signal_surrogate_func : callable
+        Function to calculate light yield for signal events (e.g., LightSabre).
+    param_names : list of str, optional
+        Names of 2 parameters to vary. Defaults to ['energy', 'zenith'].
+    param_ranges : dict, optional
+        Dictionary mapping parameter names to (min, max) tuples.
+    n_points : int
+        Number of points to sample along each parameter axis.
+    event_labels : list
+        List of event parameter keys to include as features.
+    true_event : dict, optional
+        True event parameters. If None, a new event is sampled.
+    detector_point : torch.Tensor or list of torch.Tensor, optional
+        Detector point coordinates. Can be a single point or a list/tensor of multiple points.
+        If None, a new point is sampled. If multiple points, log-likelihoods are summed.
+    figsize : tuple
+        Figure size for the plot.
+    contour_levels : list
+        NLL contour levels to plot (default: [1, 4, 9] for ~1-3 sigma).
+    cmap : str
+        Colormap for the plot background.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    if not llrnet.is_trained:
+        raise RuntimeError("LLRnet must be trained before plotting NLL landscape")
+
+    if param_names is None:
+        param_names = ['energy', 'zenith']
+    if len(param_names) != 2:
+        raise ValueError("This comparison function is designed for 2 parameters.")
+
+    # 1. Setup: Get true event, detector point, and observed light yield
+    if true_event is None:
+        true_event = signal_sampler.sample_events(1)[0]
+    if detector_point is None:
+        detector_point = signal_sampler.sample_detector_points(1).squeeze()
+    
+    # Handle multiple detector points
+    if isinstance(detector_point, list):
+        detector_points = [p.to(llrnet.device) if isinstance(p, torch.Tensor) else torch.tensor(p, device=llrnet.device) for p in detector_point]
+    elif isinstance(detector_point, torch.Tensor):
+        if detector_point.ndim == 1:
+            detector_points = [detector_point.to(llrnet.device)]
+        else:
+            detector_points = [p.to(llrnet.device) for p in detector_point]
+    else:
+        detector_points = [torch.tensor(detector_point, device=llrnet.device)]
+    
+    num_detector_points = len(detector_points)
+
+    # Get observed light yields for all detector points
+    ly_observed_list = []
+    with torch.no_grad():
+        for det_point in detector_points:
+            ly_obs = signal_surrogate_func(opt_point=det_point, event_params=true_event)
+            # Ensure observed light yield is non-negative for Poisson likelihood
+            ly_obs = torch.clamp(ly_obs, min=0.0)
+            ly_observed_list.append(ly_obs)
+
+    # 2. Create parameter grids
+    param1_name, param2_name = param_names
+    if param_ranges is None:
+        param_ranges = {}
+        for param_name in param_names:
+            true_val = true_event[param_name].item()
+            param_ranges[param_name] = (true_val * 0.5, true_val * 1.5)
+
+    param1_min, param1_max = param_ranges[param1_name]
+    param2_min, param2_max = param_ranges[param2_name]
+    
+    # Use log spacing for energy parameters
+    if param1_name == 'energy':
+        param1_values = np.logspace(np.log10(param1_min), np.log10(param1_max), n_points)
+    else:
+        param1_values = np.linspace(param1_min, param1_max, n_points)
+    
+    if param2_name == 'energy':
+        param2_values = np.logspace(np.log10(param2_min), np.log10(param2_max), n_points)
+    else:
+        param2_values = np.linspace(param2_min, param2_max, n_points)
+    
+    param1_grid, param2_grid = np.meshgrid(param1_values, param2_values)
+    
+    nll_grid_net = np.zeros_like(param1_grid)
+    nll_grid_true = np.zeros_like(param1_grid)
+
+    # 3. Calculate NLL grids for both models (summed across detector points)
+    for i in range(n_points):
+        for j in range(n_points):
+            hypothesis_event = {k: v.clone() if torch.is_tensor(v) else v for k, v in true_event.items()}
+
+            # Update direction if varying zenith/azimuth and network trained with direction
+            if 'direction' in event_labels:
+                if param1_name == 'zenith' or param2_name == 'zenith' or param1_name == 'azimuth' or param2_name == 'azimuth':
+                    # Get current angles from direction
+                    theta = true_event['zenith'] if 'zenith' in true_event else cart_to_sph(true_event['direction'])[0]
+                    phi = true_event['azimuth'] if 'azimuth' in true_event else cart_to_sph(true_event['direction'])[1]
+                    
+                    # Update the angle being varied
+                    if param1_name == 'zenith':
+                        theta = torch.tensor(param1_grid[i, j], dtype=torch.float32)
+                    elif param1_name == 'azimuth':
+                        phi = torch.tensor(param1_grid[i, j], dtype=torch.float32)
+                    if param2_name == 'zenith':
+                        theta = torch.tensor(param2_grid[i, j], dtype=torch.float32)
+                    elif param2_name == 'azimuth':
+                        phi = torch.tensor(param2_grid[i, j], dtype=torch.float32)
+                    
+                    # Update direction vector
+                    hypothesis_event['direction'] = sph_to_cart(theta, phi)
+            
+            # Set zenith/azimuth explicitly if they are being varied
+            if param1_name == 'zenith':
+                hypothesis_event['zenith'] = torch.tensor([param1_grid[i, j]], device=llrnet.device, dtype=torch.float32)
+            elif param1_name == 'azimuth':
+                hypothesis_event['azimuth'] = torch.tensor([param1_grid[i, j]], device=llrnet.device, dtype=torch.float32)
+            if param2_name == 'zenith':
+                hypothesis_event['zenith'] = torch.tensor([param2_grid[i, j]], device=llrnet.device, dtype=torch.float32)
+            elif param2_name == 'azimuth':
+                hypothesis_event['azimuth'] = torch.tensor([param2_grid[i, j]], device=llrnet.device, dtype=torch.float32)
+            
+            # Set parameters if they're in event_labels
+            if param1_name in event_labels:
+                hypothesis_event[param1_name] = torch.tensor([param1_grid[i, j]], device=llrnet.device, dtype=torch.float32)
+            if param2_name in event_labels:
+                hypothesis_event[param2_name] = torch.tensor([param2_grid[i, j]], device=llrnet.device, dtype=torch.float32)
+            
+            # Sum across all detector points for both network and true likelihood
+            llr_sum = 0.0
+            nll_true_sum = 0.0
+            
+            for det_point, ly_obs in zip(detector_points, ly_observed_list):
+                # a) NLL from LLRnet
+                features = llrnet.prepare_data_from_raw(
+                    point=det_point,
+                    event_data=hypothesis_event,
+                    surrogate_func=signal_surrogate_func,
+                    signal_event_data=true_event,
+                    event_labels=event_labels,
+                )
+                
+                with torch.no_grad():
+                    llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                    llr_sum += llr
+                
+                # b) "True" NLL from Poisson Likelihood
+                with torch.no_grad():
+                    ly_expected = signal_surrogate_func(opt_point=det_point, event_params=hypothesis_event)
+                    ly_expected = torch.clamp(ly_expected, min=1e-10)
+                    
+                    # Poisson log-likelihood: log(P(obs|expected)) = obs*log(expected) - expected - log(obs!)
+                    # For NLL we need -log(P(obs|expected))
+                    
+                    poisson_nll = (ly_expected - ly_obs * torch.log(ly_expected)).sum().item() + torch.lgamma(ly_obs + 1).sum().item()
+                    nll_true_sum += poisson_nll
+            
+            nll_grid_net[i, j] = -llr_sum
+            nll_grid_true[i, j] = nll_true_sum
+
+    # 4. Normalize grids and plot
+    nll_grid_net -= np.min(nll_grid_net)
+    nll_grid_true -= np.min(nll_grid_true)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Plot contour lines for both NLLs (no filled contours)
+    contour_true = ax.contour(param1_grid, param2_grid, nll_grid_true, levels=contour_levels, colors='black', linewidths=2, linestyles='--')
+    contour_net = ax.contour(param1_grid, param2_grid, nll_grid_net, levels=contour_levels, colors='red', linewidths=2)
+    
+    # Add contour labels
+    ax.clabel(contour_true, inline=True, fontsize=10, fmt='%.0f')
+    ax.clabel(contour_net, inline=True, fontsize=10, fmt='%.0f')
+    
+    # Create proxy artists for legend
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='red', lw=2, label='LLRnet Predicted NLL'),
+        Line2D([0], [0], color='black', lw=2, linestyle='--', label='Poisson NLL'),
+        Line2D([0], [0], color='green', marker='*', markersize=15, label='True Parameters'),
+        Line2D([0], [0], color='red', marker='o', markersize=10, label='LLRnet Min NLL', linestyle='None'),
+        Line2D([0], [0], color='black', marker='s', markersize=10, label='Poisson Min NLL', linestyle='None')
+    ]
+
+    # Mark true parameter values and minimum NLL locations
+    true_param1_val = true_event[param1_name].item()
+    true_param2_val = true_event[param2_name].item()
+    ax.plot(true_param1_val, true_param2_val, 'g*', markersize=15, markeredgecolor='white', label='True Parameters', zorder=10)
+    ax.plot(param1_grid[np.unravel_index(np.argmin(nll_grid_net), nll_grid_net.shape)],
+            param2_grid[np.unravel_index(np.argmin(nll_grid_net), nll_grid_net.shape)],
+            'ro', markersize=10, label='LLRnet Min NLL', zorder=10)
+    ax.plot(param1_grid[np.unravel_index(np.argmin(nll_grid_true), nll_grid_true.shape)],
+            param2_grid[np.unravel_index(np.argmin(nll_grid_true), nll_grid_true.shape)],
+            'ks', markersize=10, label='Poisson Min NLL', zorder=10)
+
+    ax.set_xlabel(param1_name.capitalize(), fontsize=12)
+    ax.set_ylabel(param2_name.capitalize(), fontsize=12)
+    title_suffix = f' ({num_detector_points} detector points)' if num_detector_points > 1 else ''
+    ax.set_title(f'NLL Comparison: {param1_name} vs {param2_name}{title_suffix}', fontsize=14)
+    if param1_name == 'energy':
+        ax.set_xscale('log')
+    if param2_name == 'energy':
+        ax.set_yscale('log')
+    ax.legend(handles=legend_elements)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    return {
+        'fig': fig, 'ax': ax, 'true_event': true_event, 'detector_points': detector_points,
+        'num_detector_points': num_detector_points,
+        'param_grid': (param1_grid, param2_grid), 'nll_grid_net': nll_grid_net, 'nll_grid_true': nll_grid_true
+    }
+
+
+def plot_nll_landscape_with_sampling(
+    llrnet, 
+    signal_sampler, 
+    signal_surrogate_func,
+    param_name='energy',
+    param_range=None,
+    n_param_points=50,
+    num_detector_points=10,
+    num_iterations=100,
+    event_labels=['position', 'energy', 'zenith', 'azimuth'],
+    true_event=None,
+    figsize=(10, 8),
+    contour_percentiles=[2.5, 97.5],  # 95% confidence interval
+    cmap='viridis',
+    skip_zero_response=False,
+    min_detector_points = 1
+):
+    """
+    Plot NLL landscape with uncertainty from random detector point sampling.
+    
+    This function evaluates the NLL landscape for a single parameter while randomly
+    sampling detector points multiple times. For each parameter value, it:
+    1. Randomly samples N detector points (num_detector_points times)
+    2. Calculates the summed NLL across those points
+    3. Repeats this process multiple times (num_iterations)
+    4. Plots the median NLL and confidence interval (default 95%)
+    
+    This provides insight into how the NLL landscape varies with different random
+    selections of detector points, showing both the typical behavior (median) and
+    the uncertainty (confidence interval).
+    
+    Parameters:
+    -----------
+    llrnet : LLRnet
+        Trained LLRnet instance (must be trained with signal-only approach)
+    signal_sampler : ToySampler
+        Sampler instance for generating signal event parameters and detector points
+    signal_surrogate_func : callable
+        Function to calculate light yield for signal events
+    param_name : str
+        Name of the parameter to vary. Must be a key in event_labels.
+        Examples: 'energy', 'zenith', 'azimuth'
+    param_range : tuple, optional
+        (min, max) range for the parameter. If None, uses default ranges.
+    n_param_points : int
+        Number of points to sample along the parameter axis
+    num_detector_points : int
+        Number of detector points to randomly sample for each iteration
+    num_iterations : int
+        Number of random sampling iterations to perform at each parameter value
+    event_labels : list
+        List of event parameter keys to include as features
+    true_event : dict, optional
+        True event parameters. If None, samples a new event from signal_sampler.
+    figsize : tuple
+        Figure size (width, height)
+    contour_percentiles : list
+        Percentiles for confidence interval (default [2.5, 97.5] for 95% CI)
+    cmap : str
+        Colormap for the plot
+    skip_zero_response : bool
+        If True, skip detector points with zero response when calculating total LLR
+        (effectively adds zero to the sum for those points). The title will show the
+        average number of effective detector points used. (default: False)
+        
+    Returns:
+    --------
+    dict : Dictionary containing:
+        - 'fig': matplotlib figure
+        - 'ax': matplotlib axis
+        - 'true_event': true event parameters used
+        - 'param_values': parameter values tested
+        - 'nll_median': median NLL at each parameter value
+        - 'nll_lower': lower confidence bound
+        - 'nll_upper': upper confidence bound
+        - 'nll_all': all NLL values (n_param_points, num_iterations)
+        
+    Example:
+    --------
+    >>> # Plot energy landscape with uncertainty
+    >>> result = plot_nll_landscape_with_sampling(
+    ...     llrnet=trained_model,
+    ...     signal_sampler=sampler,
+    ...     signal_surrogate_func=signal_func,
+    ...     param_name='energy',
+    ...     param_range=(1.0, 100.0),
+    ...     n_param_points=50,
+    ...     num_detector_points=20,
+    ...     num_iterations=100
+    ... )
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    if not llrnet.is_trained:
+        raise RuntimeError("LLRnet must be trained before plotting NLL landscape")
+    
+    # Sample true event if not provided
+    if true_event is None:
+        true_event = signal_sampler.sample_events(1)[0]
+    
+    # Get parameter range
+    if param_range is None:
+        if param_name == 'energy':
+            param_range = (0.8, 1.0)
+        elif param_name == 'zenith':
+            param_range = (-np.pi, np.pi)
+        elif param_name == 'azimuth':
+            param_range = (0, 2*np.pi)
+        elif param_name in ['x', 'y', 'z']:
+            param_range = (-llrnet.domain_size/2, llrnet.domain_size/2)
+        else:
+            # Try to infer from true event
+            if param_name in true_event:
+                val = true_event[param_name]
+                if isinstance(val, torch.Tensor):
+                    val = val.item()
+                param_range = (val * 0.5, val * 2.0)
+            else:
+                param_range = (0.0, 1.0)
+    
+    param_min, param_max = param_range
+    
+    # Use log spacing for energy
+    if param_name == 'energy':
+        param_values = np.logspace(np.log10(param_min), np.log10(param_max), n_param_points)
+    else:
+        param_values = np.linspace(param_min, param_max, n_param_points)
+    
+    # Store NLL values for all iterations
+    nll_all = np.zeros((n_param_points, num_iterations))
+    
+    # Track effective detector points (non-zero response) for computing average
+    effective_detector_counts = []
+    
+    # For each parameter value
+    for param_idx, param_val in enumerate(param_values):
+        # Create modified event with varied parameter
+        modified_event = {k: v.clone() if torch.is_tensor(v) else v for k, v in true_event.items()}
+        
+        # Update direction if varying zenith/azimuth
+        if 'direction' in event_labels and (param_name == 'zenith' or param_name == 'azimuth'):
+            theta, phi = cart_to_sph(modified_event['direction'])
+            if param_name == 'zenith':
+                theta = torch.tensor(param_val, dtype=torch.float32)
+            elif param_name == 'azimuth':
+                phi = torch.tensor(param_val, dtype=torch.float32)
+            modified_event['direction'] = sph_to_cart(theta, phi)
+        
+        # Set zenith/azimuth explicitly
+        if param_name == 'zenith':
+            modified_event['zenith'] = torch.tensor([param_val], dtype=torch.float32)
+        elif param_name == 'azimuth':
+            modified_event['azimuth'] = torch.tensor([param_val], dtype=torch.float32)
+        
+        # Update the specific parameter
+        if param_name == 'position':
+            if isinstance(modified_event[param_name], torch.Tensor):
+                modified_event[param_name] = modified_event[param_name].clone()
+                modified_event[param_name][0] = param_val
+            else:
+                modified_event[param_name][0] = param_val
+        elif param_name in ['x', 'y', 'z']:
+            coord_idx = {'x': 0, 'y': 1, 'z': 2}[param_name]
+            if 'position' in modified_event:
+                if isinstance(modified_event['position'], torch.Tensor):
+                    modified_event['position'] = modified_event['position'].clone()
+                    modified_event['position'][0][coord_idx] = param_val
+                else:
+                    modified_event['position'][0][coord_idx] = param_val
+        elif param_name in event_labels:
+            modified_event[param_name] = torch.tensor([param_val], dtype=torch.float32)
+        
+        # For each iteration, sample random detector points
+        iter_idx = 0
+        max_resample_attempts = 1000  # Prevent infinite loops
+        while iter_idx < num_iterations:
+            # Sample random detector points
+            detector_points = signal_sampler.sample_detector_points(num_detector_points)
+            
+            # Get true detector responses for these points
+            true_detector_responses = []
+            for det_point in detector_points:
+                true_detector_responses.append(signal_surrogate_func(
+                    opt_point=det_point,
+                    event_params=true_event
+                ))
+            
+            # Count effective detector points (non-zero response)
+            num_effective = sum(1 for resp in true_detector_responses if resp != 0.0)
+            
+            # If skip_zero_response is True, resample if no effective points
+            if skip_zero_response and num_effective < min_detector_points:
+                max_resample_attempts -= 1
+                if max_resample_attempts > 0:
+                    continue  # Resample detector points
+            
+            # Valid set of detector points found
+            effective_detector_counts.append(num_effective)
+            
+            # Sum log-likelihoods across all detector points
+            llr_sum = 0.0
+            # filtered_true_event = {k: v for k, v in true_event.items() if k in event_labels}
+            
+            for det_point, true_response in zip(detector_points, true_detector_responses):
+                # Skip if response is zero and skip_zero_response is True
+                if skip_zero_response and true_response == 0.0:
+                    continue
+                    
+                # Create features
+                features = llrnet.prepare_data_from_raw(
+                    point=det_point,
+                    event_data=modified_event,
+                    surrogate_func=signal_surrogate_func,
+                    signal_event_data=true_event,
+                    event_labels=event_labels,
+                    noise_scale=0.0,
+                )
+                
+                # Predict LLR and add to sum
+                with torch.no_grad():
+                    llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                    llr_sum += llr
+            
+            # Store NLL for this iteration
+            nll_all[param_idx, iter_idx] = -llr_sum
+            iter_idx += 1  # Move to next iteration
+    
+    # Normalize NLL values for each iteration separately
+    for iter_idx in range(num_iterations):
+        min_nll = np.min(nll_all[:, iter_idx])
+        nll_all[:, iter_idx] = nll_all[:, iter_idx] - min_nll
+    
+    # Calculate median and percentiles
+    nll_median = np.median(nll_all, axis=1)
+    nll_lower = np.percentile(nll_all, contour_percentiles[0], axis=1)
+    nll_upper = np.percentile(nll_all, contour_percentiles[1], axis=1)
+    
+    min_nll = np.min(nll_median)
+    nll_median = nll_median - min_nll
+    nll_lower = nll_lower - min_nll
+    nll_upper = nll_upper - min_nll
+    
+    # Find minimum of median
+    min_idx = np.argmin(nll_median)
+    min_param_val = param_values[min_idx]
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Plot median line
+    ax.plot(param_values, nll_median, 'b-', linewidth=2, label='Median NLL')
+    
+    # Plot confidence interval as shaded region
+    ci_label = f'{contour_percentiles[1] - contour_percentiles[0]}% CI'
+    ax.fill_between(param_values, nll_lower, nll_upper, alpha=0.3, label=ci_label)
+    
+    # Mark minimum NLL value
+    ax.plot(min_param_val, nll_median[min_idx], 'g*', markersize=15,
+            markeredgecolor='black', markeredgewidth=1.5, label='Minimum Median NLL', zorder=5)
+    
+    # Mark true parameter value
+    if param_name in ['x', 'y', 'z']:
+        coord_idx = {'x': 0, 'y': 1, 'z': 2}[param_name]
+        true_param_val = true_event['position'][0][coord_idx]
+        if isinstance(true_param_val, torch.Tensor):
+            true_param_val = true_param_val.item()
+    else:
+        true_param_val = true_event[param_name]
+        if isinstance(true_param_val, torch.Tensor):
+            true_param_val = true_param_val.item() if true_param_val.numel() == 1 else true_param_val[0].item()
+    
+    ax.axvline(true_param_val, color='r', linestyle='--', linewidth=2,
+               label=f'True value')
+    
+    ax.set_xlabel(param_name.capitalize(), fontsize=12)
+    ax.set_ylabel('Negative Log-Likelihood', fontsize=12)
+    
+    # Calculate average effective detector points and create title
+    if skip_zero_response and len(effective_detector_counts) > 0:
+        avg_effective = np.mean(effective_detector_counts)
+        title = f'NLL Landscape for: {param_name} with avg {avg_effective:.1f}/{num_detector_points} effective detector points'
+    else:
+        title = f'NLL Landscape for: {param_name} with {num_detector_points} detector points'
+    ax.set_title(title, fontsize=14)
+    
+    if param_name == 'energy':
+        ax.set_xscale('log')
+    
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    return {
+        'fig': fig,
+        'ax': ax,
+        'true_event': true_event,
+        'param_values': param_values,
+        'nll_median': nll_median,
+        'nll_lower': nll_lower,
+        'nll_upper': nll_upper,
+        'nll_all': nll_all,
+        'num_detector_points': num_detector_points,
+        'num_iterations': num_iterations
+    }

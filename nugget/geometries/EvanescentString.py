@@ -7,13 +7,14 @@ import torch.nn.functional as F
 class EvanescentString(Geometry):
     """Evanescent string geometry optimizer."""
     
-    def __init__(self, device=None, dim=3, domain_size=2,
-                n_strings=1000, points_per_string=5, starting_weight=1.0, custom_string_spacing=None, hex_type='hexagonal'):
+    def __init__(self, device=None, dim=3, domain_size=2, random_weights=False, hybrid_mix_init=0.5,
+                n_strings=1000, points_per_string=5, starting_weight=1.0, custom_string_spacing=None, hex_type='hexagonal', ):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         self.n_strings = n_strings
         self.points_per_string = points_per_string
         self.starting_weight = starting_weight
         self.custom_string_spacing = custom_string_spacing
+        self.random_weights = random_weights
         if hex_type == 'hexagonal':
             self.hex_func = self.create_uniform_hexagonal_grid
         elif hex_type == 'circular':
@@ -24,8 +25,9 @@ class EvanescentString(Geometry):
             self.hex_func = self.create_uniform_hexagonal_grid
         # Create hexagonal grid for strings
         original_dim = self.dim
+        self.hybrid_mix = hybrid_mix_init
         self.dim = 2
-        self.hex_grid = self.hex_func(n_points=self.n_strings, optimal_spacing=self.custom_string_spacing)
+        self.hex_grid = self.hex_func(n_points=self.n_strings, optimal_spacing=self.custom_string_spacing, hybrid_mix=self.hybrid_mix)
         self.dim = original_dim
         
         
@@ -91,7 +93,10 @@ class EvanescentString(Geometry):
                 result['string_weights'] = string_weights
             else:
                 # Default to uniform weights if not provided
-                result['string_weights'] = torch.ones(self.n_strings, device=self.device, dtype=torch.float32)*self.starting_weight
+                if not self.random_weights:
+                    result['string_weights'] = torch.ones(self.n_strings, device=self.device, dtype=torch.float32)*self.starting_weight
+                else:
+                    result['string_weights'] = torch.rand(self.n_strings, device=self.device, dtype=torch.float32)*8 - 4 # Random weights between -4 and 4
         else:
             # Create string_xy (hex grid or random based on self.optimize_xy)
             string_xy = self.hex_grid.clone()
@@ -99,9 +104,11 @@ class EvanescentString(Geometry):
             # Initialize z_values uniformly along each string
             z_values = torch.linspace(-self.half_domain, self.half_domain, self.points_per_string, device=self.device)
             z_values = z_values.repeat(self.n_strings)
-            
-            string_weights = torch.ones(self.n_strings, device=self.device, dtype=torch.float32)*self.starting_weight
-        
+            if not self.random_weights:
+                string_weights = torch.ones(self.n_strings, device=self.device, dtype=torch.float32)*self.starting_weight
+            else:
+                string_weights = torch.rand(self.n_strings, device=self.device, dtype=torch.float32)*8 - 4 # Random weights between -4 and 4
+
         string_indices = torch.arange(self.n_strings, device=self.device, dtype=torch.long)
         
         points_3d = torch.zeros(self.n_strings * self.points_per_string, 3, device=self.device)
@@ -114,6 +121,7 @@ class EvanescentString(Geometry):
             points_3d[start_idx:end_idx, 2] = z_values[start_idx:end_idx]  # z value
             
         return {
+            'hybrid_mix': self.hybrid_mix_init,
             'points_3d': points_3d,
             'active_points': points_3d,  # Initially all points are active
             'string_xy': string_xy,
@@ -152,7 +160,7 @@ class EvanescentString(Geometry):
         threshold = kwargs.get('weight_threshold', 0.7)
         active_strings_mask = string_probs > threshold
         active_string_indices = torch.where(active_strings_mask)[0]
-        
+        hybrid_mix = kwargs.get('hybrid_mix', self.hybrid_mix)
         # Count how many strings are active
         n_active_strings = string_indices[active_strings_mask]
         
@@ -221,6 +229,7 @@ class EvanescentString(Geometry):
             'active_string_indices': active_string_indices,  # Which strings are active
             'active_points': active_points_3d, # Points for active strings only
             'points_per_string_list': [self.points_per_string] * len(string_indices),  # Each active string has points_per_string points  
-            'weight_threshold': threshold
+            'weight_threshold': threshold,
+            'hybrid_mix': hybrid_mix
         }
         
