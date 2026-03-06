@@ -23,4 +23,4 @@ class Uniform(Surrogate):
         if opt_point.ndim == 1:
             opt_point = opt_point.unsqueeze(0)
         factor = self.kwargs.get('factor', 1.0)
-        return factor * torch.ones(opt_point.shape[0], device=self.device, dtype=torch.float32)
+        return factor * torch.ones(opt_point.shape[0], device=self.device)

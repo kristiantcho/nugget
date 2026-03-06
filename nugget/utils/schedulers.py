@@ -76,7 +76,7 @@ class Scheduler:
 class CosineScheduler(Scheduler):
     """Cosine annealing learning rate scheduler."""
     
-    def __init__(self, optimizer, num_iterations, eta_min=0, device=None):
+    def __init__(self, optimizer, num_iterations, eta_min=1e-3, device=None):
         """
         Initialize the cosine scheduler.
         
