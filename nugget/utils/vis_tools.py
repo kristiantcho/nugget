@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
 from matplotlib.colors import Normalize
+from matplotlib.ticker import MaxNLocator, FuncFormatter
 from IPython.display import clear_output, display
 import math
 import re # Added for regex pattern matching in GIF frame sorting
@@ -44,7 +45,7 @@ class Visualizer:
     @staticmethod
     def _safe_tensor_convert(tensor_input, allow_none=True):
         """
-        Safely convert torch tensors by cloning and detaching them.
+        Safely convert torch tensors by cloning, detaching, and moving to CPU.
         Other data types are returned unchanged.
         
         Parameters:
@@ -57,14 +58,14 @@ class Visualizer:
         Returns:
         --------
         Any
-            For torch.Tensor: cloned and detached tensor
-            For list of tensors: list of cloned and detached tensors
+            For torch.Tensor: cloned, detached tensor on CPU
+            For list of tensors: list of cloned, detached tensors on CPU
             For other types: unchanged input
         """
         if tensor_input is None and allow_none:
             return None
         if torch.is_tensor(tensor_input):
-            return tensor_input.clone().detach()
+            return tensor_input.clone().detach().cpu()
         elif isinstance(tensor_input, list):
             # Handle lists that might contain tensors
             return [Visualizer._safe_tensor_convert(item, allow_none) for item in tensor_input]
@@ -105,10 +106,15 @@ class Visualizer:
     PLOT_ENERGY_RESOLUTION = "energy_resolution"
     PLOT_ANGULAR_RESOLUTION_HISTORY = "angular_resolution_history"
     PLOT_ENERGY_RESOLUTION_HISTORY = "energy_resolution_history"
+    PLOT_ANGULAR_RESOLUTION_VS_ZENITH = "angular_resolution_vs_zenith"
+    PLOT_ANGULAR_RESOLUTION_VS_ENERGY = "angular_resolution_vs_energy"
+    PLOT_ENERGY_RESOLUTION_VS_ENERGY = "energy_resolution_vs_energy"
     PLOT_LOSS_COMPONENTS = "loss_components"
     PLOT_UW_LOSS_COMPONENTS = "uw_loss_components"
     PLOT_LLR_HISTOGRAM_POINTS = "llr_histogram_points"
     PLOT_STRING_XY_ROV_PENALTY = "string_xy_rov_penalty"
+    PLOT_ALM_MU = "alm_mu"
+    PLOT_ALM_LAMBDA = "alm_lambda"
 
     
     def __init__(self, device=None, dim=3, domain_size=2.0, gif_temp_dir=None):
@@ -131,6 +137,51 @@ class Visualizer:
         self.gif_frames = [] # Added to store frames for the GIF
         self.gif_temp_dir = gif_temp_dir# Temporary directory for storing individual images
         self.gif_image_paths = [] # List to track saved image paths
+
+    @staticmethod
+    def _pad_frames_to_max_size(frames, background_value=255):
+        """Pad frames to the maximum (H, W) using a white background.
+
+        Matplotlib can produce slightly different pixel sizes between frames when
+        saving with bbox_inches='tight' (e.g., due to colorbars, legends, or twinx axes).
+        Padding keeps the final GIF size consistent while preserving each frame's
+        original rendering.
+        """
+        if not frames:
+            return frames
+
+        valid = [f for f in frames if isinstance(f, np.ndarray) and f.ndim >= 2]
+        if not valid:
+            return frames
+
+        target_h = int(max(f.shape[0] for f in valid))
+        target_w = int(max(f.shape[1] for f in valid))
+
+        padded_frames = []
+        for frame in frames:
+            if not isinstance(frame, np.ndarray) or frame.ndim < 2:
+                padded_frames.append(frame)
+                continue
+
+            h, w = frame.shape[0], frame.shape[1]
+            if h == target_h and w == target_w:
+                padded_frames.append(frame)
+                continue
+
+            y0 = (target_h - h) // 2
+            x0 = (target_w - w) // 2
+
+            if frame.ndim == 2:
+                canvas = np.full((target_h, target_w), background_value, dtype=frame.dtype)
+                canvas[y0:y0 + h, x0:x0 + w] = frame
+                padded_frames.append(canvas)
+            else:
+                channels = frame.shape[2]
+                canvas = np.full((target_h, target_w, channels), background_value, dtype=frame.dtype)
+                canvas[y0:y0 + h, x0:x0 + w, :] = frame
+                padded_frames.append(canvas)
+
+        return padded_frames
     
     def _standardize_axis_formatting(self, ax, max_ticks=5, label_precision=2, fontsize=8):
         """
@@ -147,6 +198,16 @@ class Visualizer:
         fontsize : int
             Font size for tick labels
         """
+        def _ticks_are_integers(ticks, atol=1e-9):
+            ticks = np.asarray(ticks, dtype=float)
+            if ticks.size == 0:
+                return False
+            finite = np.isfinite(ticks)
+            if not np.any(finite):
+                return False
+            ticks = ticks[finite]
+            return np.allclose(ticks, np.round(ticks), atol=atol, rtol=0.0)
+
         if hasattr(ax, 'xaxis') and hasattr(ax, 'yaxis'):
             # Limit number of ticks to prevent overcrowding
             # ax.locator_params(axis='x', nbins=max_ticks)
@@ -154,16 +215,28 @@ class Visualizer:
             
             # Format tick labels to consistent precision only if not log scaled
             if ax.get_xscale() != 'log':
-                ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.{label_precision}f}'))
+                xticks = ax.get_xticks()
+                if _ticks_are_integers(xticks):
+                    ax.xaxis.set_major_locator(MaxNLocator(nbins=max_ticks, integer=True))
+                    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{int(round(x))}'))
+                else:
+                    ax.xaxis.set_major_locator(MaxNLocator(nbins=max_ticks))
+                    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:.{label_precision}f}'))
             if ax.get_yscale() != 'log':
-                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, p: f'{y:.{label_precision}f}'))
+                yticks = ax.get_yticks()
+                if _ticks_are_integers(yticks):
+                    ax.yaxis.set_major_locator(MaxNLocator(nbins=max_ticks, integer=True))
+                    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, p: f'{int(round(y))}'))
+                else:
+                    ax.yaxis.set_major_locator(MaxNLocator(nbins=max_ticks))
+                    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, p: f'{y:.{label_precision}f}'))
             
             # Set consistent tick label size
             ax.tick_params(axis='both', which='major', labelsize=fontsize)
             
             # Ensure tick labels don't extend beyond plot area
-            ax.tick_params(axis='x', rotation=0, pad=2)
-            ax.tick_params(axis='y', rotation=0, pad=2)
+            ax.tick_params(axis='x', rotation=0, pad=3)
+            ax.tick_params(axis='y', rotation=0, pad=3)
     
     def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=1, zoom_range=None):
         """
@@ -185,7 +258,7 @@ class Visualizer:
             
         # Get ROV dimensions
         # rov_rec_width = rov_penalty.rov_rec_width
-        rov_rec_width = rov_penalty.rov_tri_length*3
+        rov_rec_width = rov_penalty.rov_rec_width
         rov_height = rov_penalty.rov_height
         rov_tri_length = rov_penalty.rov_tri_length
         if zoom_range is not None:
@@ -210,27 +283,146 @@ class Visualizer:
             x_offset = -ax_lims/2 + 0.05 * ax_lims
             y_offset = -ax_lims/2 + 0.05 * ax_lims
 
-        # Draw rectangular part
-        rect_x = [x_offset, x_offset + rec_width, x_offset + rec_width, x_offset, x_offset]
+        # Intended shape (to match ROVPenalty): triangle nose first, then rectangle.
+        # Triangle from x_offset .. x_offset+tri_length widening to full height,
+        # followed by rectangle of constant height.
+
+        # Draw triangular part (nose)
+        tri_x = [x_offset, x_offset + tri_length, x_offset + tri_length, x_offset]
+        tri_y = [y_offset, y_offset - rec_height/2, y_offset + rec_height/2, y_offset]
+        ax.plot(tri_x, tri_y, 'r-', linewidth=2, alpha=0.7, label='ROV Safe Space')
+
+        # Draw rectangular part (corridor)
+        rect_x = [x_offset + tri_length, x_offset + tri_length + rec_width, x_offset + tri_length + rec_width, x_offset + tri_length, x_offset + tri_length]
         rect_y = [y_offset - rec_height/2, y_offset - rec_height/2, y_offset + rec_height/2, y_offset + rec_height/2, y_offset - rec_height/2]
-        ax.plot(rect_x, rect_y, 'r-', linewidth=2, alpha=0.7, label='ROV Safe Space')
-        
-        # Draw triangular part
-        tri_x = [x_offset + rec_width, x_offset + rec_width + tri_length, x_offset + rec_width, x_offset + rec_width]
-        tri_y = [y_offset - rec_height/2, y_offset, y_offset + rec_height/2, y_offset - rec_height/2]
-        ax.plot(tri_x, tri_y, 'r-', linewidth=2, alpha=0.7)
-        
-        # Fill the shape with semi-transparent red
-        # Combine rectangle and triangle vertices for filling
-        fill_x = [x_offset, x_offset + rec_width, x_offset + rec_width + tri_length, x_offset + rec_width, x_offset]
-        fill_y = [y_offset - rec_height/2, y_offset - rec_height/2, y_offset, y_offset + rec_height/2, y_offset + rec_height/2]
+        ax.plot(rect_x, rect_y, 'r-', linewidth=2, alpha=0.7)
+
+        # Fill the combined shape
+        fill_x = [x_offset, x_offset + tri_length, x_offset + tri_length + rec_width, x_offset + tri_length + rec_width, x_offset + tri_length]
+        fill_y = [y_offset, y_offset - rec_height/2, y_offset - rec_height/2, y_offset + rec_height/2, y_offset + rec_height/2]
         ax.fill(fill_x, fill_y, 'red', alpha=0.2)
-        
-        # Add "ROV" text inside the rectangular part of the safe space
-        text_x = x_offset + rec_width/2  # Center of rectangle
+
+        # Add "ROV" text inside the rectangular part of the safe space.
+        # Compute a fontsize that fits the rectangle *in display pixels*, so it
+        # stays consistent under different axis limits/zoom levels.
+        text_x = x_offset + tri_length + rec_width / 2  # Center of rectangle
         text_y = y_offset  # Center vertically
-        ax.text(text_x, text_y, 'ROV', fontsize=21*rec_width, fontweight='bold', 
-                ha='center', va='center', color='darkred', alpha=0.8)
+
+        text_artist = ax.text(
+            text_x,
+            text_y,
+            'ROV',
+            fontsize=10.0,
+            fontweight='bold',
+            ha='center',
+            va='center',
+            color='darkred',
+            alpha=0.8,
+        )
+
+        # Fit fontsize to the rectangle bounds. This requires a renderer.
+        try:
+            fig = ax.figure
+            if fig is not None and fig.canvas is not None:
+                # Ensure a renderer exists.
+                fig.canvas.draw()
+                renderer = fig.canvas.get_renderer()
+
+                rect_x0 = x_offset + tri_length
+                rect_x1 = rect_x0 + rec_width
+                rect_y0 = y_offset - rec_height / 2
+                rect_y1 = y_offset + rec_height / 2
+
+                (x0_px, y0_px), (x1_px, y1_px) = ax.transData.transform(
+                    np.array([[rect_x0, rect_y0], [rect_x1, rect_y1]], dtype=float)
+                )
+                rect_w_px = float(abs(x1_px - x0_px))
+                rect_h_px = float(abs(y1_px - y0_px))
+
+                bbox = text_artist.get_window_extent(renderer=renderer)
+                text_w_px = float(bbox.width)
+                text_h_px = float(bbox.height)
+
+                if rect_w_px > 0 and rect_h_px > 0 and text_w_px > 0 and text_h_px > 0:
+                    # Scale linearly with fontsize; keep a small margin.
+                    margin = 0.90
+                    scale = margin * min(rect_w_px / text_w_px, rect_h_px / text_h_px)
+                    new_fontsize = float(np.clip(10.0 * scale, 1.0, 72.0))
+                    if np.isfinite(new_fontsize) and new_fontsize > 0:
+                        text_artist.set_fontsize(new_fontsize)
+        except Exception:
+            # Best-effort sizing; keep default fontsize on failure.
+            pass
+
+    def _draw_rov_safe_space_at_string(
+        self,
+        ax,
+        origin_xy,
+        angle_rad,
+        rov_penalty=None,
+        *,
+        alpha=0.12,
+        line_alpha=0.55,
+        linewidth=1.5,
+        zorder=2,
+    ):
+        """Draw a rotated ROV safe-space corridor anchored at a string.
+
+        The geometry matches `ROVPenalty`.
+        Note: the angle convention is the one used in `ROVPenalty`'s rotation
+        (local->world is a rotation by `-angle_rad`).
+        """
+        if rov_penalty is None or origin_xy is None or angle_rad is None:
+            return
+
+        try:
+            x0 = float(origin_xy[0])
+            y0 = float(origin_xy[1])
+            a = float(angle_rad)
+        except Exception:
+            return
+
+        L_rect = float(rov_penalty.rov_rec_width)
+        W_rect = float(rov_penalty.rov_height)
+        L_tri = float(rov_penalty.rov_tri_length)
+        half_height = W_rect / 2.0
+
+        # Local polygon (x forward, y sideways): triangle nose then rectangle.
+        poly_local = np.array(
+            [
+                [0.0, 0.0],
+                [L_tri, -half_height],
+                [L_tri + L_rect, -half_height],
+                [L_tri + L_rect, half_height],
+                [L_tri, half_height],
+            ],
+            dtype=float,
+        )
+
+        # Transform local -> world. (Inverse of the rotation used in ROVPenalty.)
+        c = float(np.cos(a))
+        s = float(np.sin(a))
+        rot = np.array([[c, s], [-s, c]], dtype=float)
+        poly_world = poly_local @ rot.T
+        poly_world[:, 0] += x0
+        poly_world[:, 1] += y0
+
+        poly_world_closed = np.vstack([poly_world, poly_world[0]])
+        ax.plot(
+            poly_world_closed[:, 0],
+            poly_world_closed[:, 1],
+            color='red',
+            linewidth=linewidth,
+            alpha=float(np.clip(line_alpha, 0.0, 1.0)),
+            zorder=zorder,
+        )
+        ax.fill(
+            poly_world[:, 0],
+            poly_world[:, 1],
+            color='red',
+            alpha=float(np.clip(alpha, 0.0, 1.0)),
+            zorder=zorder,
+        )
 
     def _safe_griddata_interpolation(self, points_xy, values, grid_points, resolution, method='linear', fill_value=None):
         """
@@ -263,13 +455,13 @@ class Visualizer:
         values = self._safe_tensor_convert(values, allow_none=False)  
         grid_points = self._safe_tensor_convert(grid_points, allow_none=False)
         
-        # Convert tensors to numpy if needed
+        # Convert tensors to numpy if needed (already cloned/detached/CPU by _safe_tensor_convert)
         if torch.is_tensor(points_xy):
-            points_xy = points_xy.detach().cpu().numpy()
+            points_xy = points_xy.numpy()
         if torch.is_tensor(values):
-            values = values.detach().cpu().numpy()
+            values = values.numpy()
         if torch.is_tensor(grid_points):
-            grid_points = grid_points.detach().cpu().numpy()
+            grid_points = grid_points.numpy()
         
         # Handle finite values
         finite_mask = np.isfinite(values)
@@ -383,6 +575,8 @@ class Visualizer:
             - 'energy_resolution': Energy resolution from Fisher Information using Cramér-Rao bound
             - 'loss_components': Individual loss components and total loss from loss dictionary
             - 'uw_loss_components': Individual unweighted loss components and total unweighted loss
+            - 'alm_mu': ALM penalty parameters (mu) history for each constraint
+            - 'alm_lambda': ALM Lagrange multipliers (lambda) history for each constraint
         make_gif : bool
             Whether to generate and save a GIF of the progress.
         gif_plot_selection : list of str or None
@@ -422,7 +616,11 @@ class Visualizer:
             - signal_event_params: Event parameters dict for signal surrogate function
             - background_surrogate_func: Surrogate function for background
             - background_event_params: Event parameters dict for background surrogate function
-            - rov_penalty: ROVPenalty object for displaying ROV safe space on string_xy and string_weights_scatter plots
+                        - rov_penalty / rov_penalty_func: ROVPenalty object for displaying ROV safe space on string_xy and
+                            string_weights_scatter plots
+                        - rov_draw_safe_space_on_violations: bool, optional. If True, the `string_xy_rov_penalty` plot will
+                            draw a per-string ROV safe-space corridor for strings with violation >= 1, oriented by
+                            `rov_least_blocked_angle_per_string` (both are expected to be present in kwargs from `ROVPenalty`).
             - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range] 
               instead of the default domain boundaries [-half_domain, half_domain]
             - plot_with_surrogate: bool, optional. If True and 'light_surrogate_func' and 'surrogate_event_params' 
@@ -469,14 +667,25 @@ class Visualizer:
                 print("No plot types selected for GIF frame, skipping GIF update for this iteration.")
             else:
                 num_gif_plots = len(current_gif_plot_types)
-                num_gif_cols = 3  # Or a different layout, e.g., 2 for smaller GIF frames
+                # Render GIF frames using the same layout defaults as the regular (non-GIF)
+                # plotting path so the plot appears "as is".
+                if num_gif_plots < 3:
+                    num_gif_cols = num_gif_plots
+                else:
+                    num_gif_cols = 3
                 num_gif_rows = (num_gif_plots + num_gif_cols - 1) // num_gif_cols
-                
-                gif_fig_size = (12, 3.5 * num_gif_rows) 
 
-                fig_gif, axes_gif_array = plt.subplots(num_gif_rows, num_gif_cols, 
-                                                       figsize=gif_fig_size, squeeze=False,
-                                                       ) # MODIFIED
+                if gif_fixed_figsize is not None:
+                    gif_fig_size = gif_fixed_figsize
+                else:
+                    gif_fig_size = (5 * num_gif_cols, 4.5 * num_gif_rows)
+
+                fig_gif, axes_gif_array = plt.subplots(
+                    num_gif_rows,
+                    num_gif_cols,
+                    figsize=gif_fig_size,
+                    squeeze=False,
+                )
                 axes_gif_flat_for_loop = axes_gif_array.flatten()
 
                 for i, plot_type_gif in enumerate(current_gif_plot_types):
@@ -500,15 +709,12 @@ class Visualizer:
                 
                 for i in range(num_gif_plots, num_gif_rows * num_gif_cols):
                     axes_gif_flat_for_loop[i].axis('off')
-                
-                # Apply consistent formatting to all axes to handle tick label length variations
-                if gif_standardize_ticks:
-                    for ax in axes_gif_flat_for_loop:
-                        self._standardize_axis_formatting(ax)
-                
-                # Use constrained layout instead of tight_layout for more consistent spacing
-                fig_gif.subplots_adjust(left=0.08, right=0.95, top=0.95, bottom=0.08, 
-                                      wspace=0.3, hspace=0.4)
+                # Keep plots as-is for GIF frames (no extra tick/layout standardization).
+                # Match the regular display path by using tight_layout.
+                try:
+                    fig_gif.tight_layout()
+                except Exception:
+                    pass
                 
                 if save_individual_images:
                     # Save individual image to disk
@@ -534,9 +740,17 @@ class Visualizer:
                                 add_on = 0
                     image_filename = f"frame_{iteration+add_on:04d}.png"
                     image_path = os.path.join(self.gif_temp_dir, image_filename)
-                    # Use consistent save parameters for identical image sizes
-                    fig_gif.savefig(image_path, format='png', dpi=100, bbox_inches=None, 
-                                   facecolor='white', edgecolor='none', pad_inches=0.1)
+                    # Save the frame exactly as rendered (no bbox tightening).
+                    # Frame sizes may vary; we pad them during GIF compilation.
+                    fig_gif.savefig(
+                        image_path,
+                        format='png',
+                        dpi=100,
+                        bbox_inches=None,
+                        facecolor='white',
+                        edgecolor='none',
+                        pad_inches=0.1,
+                    )
                     self.gif_image_paths.append(image_path)
                     print(f"Saved GIF frame {len(self.gif_image_paths)} to {image_path}")
                     
@@ -546,9 +760,15 @@ class Visualizer:
                 else:
                     # Original method: store frames in memory
                     img_buf = io.BytesIO()
-                    # Use consistent save parameters for identical image sizes
-                    fig_gif.savefig(img_buf, format='png', dpi=100, bbox_inches=None,
-                                   facecolor='white', edgecolor='none', pad_inches=0.1)
+                    fig_gif.savefig(
+                        img_buf,
+                        format='png',
+                        dpi=100,
+                        bbox_inches=None,
+                        facecolor='white',
+                        edgecolor='none',
+                        pad_inches=0.1,
+                    )
                     img_buf.seek(0)
                     self.gif_frames.append(imageio.v3.imread(img_buf))
                     img_buf.close()
@@ -556,7 +776,8 @@ class Visualizer:
                     # Compile GIF from memory frames
                     if self.gif_frames and compile_gif_on_iteration:
                         try:
-                            imageio.mimsave(gif_filename, self.gif_frames, fps=gif_fps)
+                            frames = self._pad_frames_to_max_size(self.gif_frames)
+                            imageio.mimsave(gif_filename, frames, fps=gif_fps)
                             print(f"GIF '{gif_filename}' updated with {len(self.gif_frames)} frames (Iteration {iteration}).")
                         except Exception as e:
                             print(f"Error saving GIF: {e}")
@@ -647,12 +868,18 @@ class Visualizer:
         
         # Hide unused axes
         if num_plots > 1:
-            for i in range(num_plots, num_rows * 3):
-                row_idx = i // 3
-                col_idx = i % 3
+            total_axes = num_rows * ncols
+            for i in range(num_plots, total_axes):
+                row_idx = i // ncols
+                col_idx = i % ncols
                 axes[row_idx, col_idx].axis('off')
         
-        fig.tight_layout() # ADDED
+        # tight_layout can fail for some edge cases (e.g. pathological font sizes).
+        # Visualization should not crash the evaluator, so make this best-effort.
+        try:
+            fig.tight_layout()
+        except Exception as exc:
+            print(f"Warning: fig.tight_layout() failed: {exc}")
         plt.show()
     
     def _create_plot(self, 
@@ -715,7 +942,7 @@ class Visualizer:
                 kwargs[key] = self._safe_tensor_convert(kwargs[key])
         
         # Convert points to numpy for plotting
-        points_xyz = points.detach().cpu().numpy()
+        points_xyz = points.clone().detach().cpu().numpy()
         geometry_type = kwargs.get('geometry_type', None) # Get geometry_type from kwargs
         
         # Extract zoom_range parameter for contour plots
@@ -816,7 +1043,7 @@ class Visualizer:
                 
                 if string_xy is not None:
                     # Draw vertical lines for strings with alpha based on string weights
-                    xy_np = string_xy.detach().cpu().numpy()
+                    xy_np = string_xy.clone().detach().cpu().numpy()
                     for i, (x, y) in enumerate(xy_np):
                         line_alpha = string_weights[i] if string_weights is not None else 0.3
                         # Apply sigmoid if needed
@@ -875,9 +1102,11 @@ class Visualizer:
         elif plot_type == self.PLOT_STRING_XY:
             # String positions in XY plane
             if string_xy is not None:
-                xy_np = string_xy.detach().cpu().numpy()
+                xy_np = string_xy.clone().detach().cpu().numpy()
                 string_weights = kwargs.get('string_weights', None)
                 weight_threshold = kwargs.get('weight_threshold', 0.7)
+                max_radius = kwargs.get('max_radius', None)
+                draw_radius = kwargs.get('draw_radius', False)
                 
                 # Create colormap based on number of points per string
                 if points_per_string_list is not None:
@@ -895,11 +1124,16 @@ class Visualizer:
                         # alpha_vals = torch.nn.functional.softplus(torch.tensor(alpha_vals)).detach().cpu().numpy()  # Apply softplus for smoothness
                         # Ensure minimum visibility and filter active strings
                         alpha_vals = np.clip(alpha_vals, 0.05, 1.0)
+                        # Filter alpha_vals to match the filtered coordinates (only strings with points > 0)
+                        alpha_vals = np.array([alpha_vals[s] for s in range(len(alpha_vals)) if points_per_string_list[s] > 0])
+                        # Handle NaN values if they exist
+                        if np.any(np.isnan(alpha_vals)):
+                            alpha_vals = np.nan_to_num(alpha_vals, nan=0.5)
                         # print("Alpha values:", alpha_vals)
                         # active_mask = np.array(points_per_string_list) > 0
                         # alpha_vals = alpha_vals[active_mask] if len(alpha_vals) == len(points_per_string_list) else [0.8] * sum(active_mask)
-                        # weight_mask = np.array([string_weights[idx] >= weight_threshold for idx in string_indices])
-                        weight_mask = np.array([True]*len(xy_np))
+                        weight_mask = np.array([string_weights[idx] >= weight_threshold for idx in string_indices])
+                        # weight_mask = np.array([True]*len(alpha_vals))
                     else:
                         alpha_vals = 0.8
                         weight_mask = np.array([True]*len(xy_np))
@@ -911,12 +1145,12 @@ class Visualizer:
                         sc = ax.scatter(
                             np.array([xy_np[s, 0] for s in range(len(xy_np)) if points_per_string_list[s] > 0])[weight_mask],
                             np.array([xy_np[s, 1] for s in range(len(xy_np)) if points_per_string_list[s] > 0])[weight_mask],
-                            s=[min([40, 30 * 200 / len(xy_np[weight_mask])]) 
+                            s=[min([40, 30 * 200 / len(xy_np)]) 
                             for s in range(len(xy_np[weight_mask])) if np.array(points_per_string_list)[weight_mask][s] > 0],
                             c=[np.array(points_per_string_list)[weight_mask][s] for s in range(len(xy_np[weight_mask])) 
                             if np.array(points_per_string_list)[weight_mask][s] > 0],
                             cmap=cmap,
-                            alpha=alpha_vals,
+                            alpha=alpha_vals[weight_mask],
                             norm=norm
                         )
                     
@@ -944,9 +1178,16 @@ class Visualizer:
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
                 
+                # Draw radius circle around origin if requested
+                if draw_radius and max_radius is not None:
+                    circle = plt.Circle((0, 0), max_radius, color='blue', fill=False, 
+                                       linewidth=5, linestyle='--', alpha=0.2)
+                    ax.add_patch(circle)
+                    # ax.legend()
+                
                 # Add ROV safe space visualization if ROV penalty is available
 
-                rov_penalty = kwargs.get('rov_penalty_func', None)
+                rov_penalty = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
                 if rov_penalty is not None:
                     self._draw_rov_safe_space(ax, rov_penalty)
             else:
@@ -956,17 +1197,42 @@ class Visualizer:
         elif plot_type == self.PLOT_STRING_XY_ROV_PENALTY:
             # String positions in XY plane colored by ROV penalty per string
             if string_xy is not None:
-                xy_np = string_xy.detach().cpu().numpy()
+                xy_np = string_xy.clone().detach().cpu().numpy()
                 rov_penalty_per_string = kwargs.get('rov_penalty_per_string', None)
+                rov_least_blocked_angle_per_string = kwargs.get('rov_least_blocked_angle_per_string', None)
                 string_weights = kwargs.get('string_weights', None)
-                
+                draw_rov_safe_space_on_violations = bool(kwargs.get('rov_draw_safe_space_on_violations', False))
+                weight_threshold = kwargs.get('weight_threshold', 0.7)
                 if rov_penalty_per_string is not None:
                     # Convert ROV penalty per string to numpy
                     if torch.is_tensor(rov_penalty_per_string):
-                        rov_penalty_np = rov_penalty_per_string.detach().cpu().numpy()
+                        rov_penalty_np = rov_penalty_per_string.clone().detach().cpu().numpy()
                     else:
                         rov_penalty_np = np.array(rov_penalty_per_string)
                     rov_penalty_np*= len(xy_np)
+
+                    # Optionally draw the per-string ROV safe-space corridor for
+                    # strings with a (displayed) violation >= 1, oriented by the
+                    # least-blocked angle.
+                    if draw_rov_safe_space_on_violations:
+                        rov_penalty_func = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
+                        if rov_penalty_func is not None and rov_least_blocked_angle_per_string is not None:
+                            if torch.is_tensor(rov_least_blocked_angle_per_string):
+                                rov_angles_np = rov_least_blocked_angle_per_string.detach().cpu().numpy()
+                            else:
+                                rov_angles_np = np.array(rov_least_blocked_angle_per_string)
+
+                            if rov_angles_np.shape[0] == xy_np.shape[0]:
+                                violation_mask = rov_penalty_np >= weight_threshold
+                                viol_idx = np.where(violation_mask)[0]
+                                for i in viol_idx:
+                                    self._draw_rov_safe_space_at_string(
+                                        ax,
+                                        origin_xy=xy_np[i],
+                                        angle_rad=rov_angles_np[i],
+                                        rov_penalty=rov_penalty_func,
+                                        zorder=1,
+                                    )
                     
                     # Use string weights for alpha transparency (no threshold filtering)
                     if string_weights is not None:
@@ -988,20 +1254,20 @@ class Visualizer:
                     sc = ax.scatter(
                         xy_np[:, 0],
                         xy_np[:, 1],
-                        s=min([100, 50 * 200 / len(xy_np)]),
+                        s=min([30, 50 * 200 / len(xy_np)]),
                         c=rov_penalty_np,
                         cmap=cmap,
                         norm=norm,
                         alpha=alpha_vals if isinstance(alpha_vals, np.ndarray) else alpha_vals,
-                        # edgecolors='black',
-                        linewidths=0.5
+                        edgecolors='black',
+                        linewidths=0.1
                     )
                     
                     # Add colorbar
                     cbar = fig.colorbar(sc, ax=ax)
                     cbar.set_label('ROV Penalty')
                     
-                    rov_penalty = kwargs.get('rov_penalty_func', None)
+                    rov_penalty = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
                     if rov_penalty is not None:
                         self._draw_rov_safe_space(ax, rov_penalty, zoom_range=zoom_range)
                     
@@ -1054,20 +1320,33 @@ class Visualizer:
             # Signal function contour plot
             signal_funcs = kwargs.get('signal_funcs', [])
             signal_surrogate_func = kwargs.get('signal_surrogate_func', None)
-            signal_event_params = kwargs.get('signal_event_params', None)
+            signal_event_params = kwargs.get('resolution_params', None)
+            if signal_event_params is None:    
+                signal_event_params = kwargs.get('signal_event_params', None)
+            if kwargs.get("plot_geom_contour_only", False):
+                x_lim_min = min(points_xyz[:, 0])
+                x_lim_max = max(points_xyz[:, 0])
+                y_lim_min = min(points_xyz[:, 1])
+                y_lim_max = max(points_xyz[:, 1])
+                z_lim_min = min(points_xyz[:, 2])
+                z_lim_max = max(points_xyz[:, 2])
+            else:
+                x_lim_min, x_lim_max = -self.half_domain, self.half_domain
+                y_lim_min, y_lim_max = -self.half_domain, self.half_domain
+                z_lim_min, z_lim_max = -self.half_domain, self.half_domain
             
             # Check if we have either the old format or new surrogate format
             if signal_funcs or (signal_surrogate_func is not None and signal_event_params is not None):
                 # Create a 2D grid in the XY plane at Z=0 for visualization
                 resolution = slice_res
-                x_grid = torch.linspace(-self.half_domain, self.half_domain, resolution, device=self.device)
-                y_grid = torch.linspace(-self.half_domain, self.half_domain, resolution, device=self.device)
+                x_grid = torch.linspace(x_lim_min, x_lim_max, resolution, device=self.device)
+                y_grid = torch.linspace(y_lim_min, y_lim_max, resolution, device=self.device)
                 X, Y = torch.meshgrid(x_grid, y_grid, indexing='ij')
                 
                 grid_z = 0.0  # Z-slice at z=0
                 if multi_slice:
                     # Create multiple slices if multi_slice is True
-                    z_slices = np.linspace(-self.half_domain, self.half_domain, resolution)
+                    z_slices = np.linspace(z_lim_min, z_lim_max, resolution)
                     grid_points = []
                     for z in z_slices:
                         grid_points.append(torch.stack([X.flatten(), Y.flatten(), 
@@ -1080,22 +1359,31 @@ class Visualizer:
                 
                 # Handle new surrogate function format
                 if signal_surrogate_func is not None and signal_event_params is not None:
-                    if not multi_slice:
-                        # Evaluate surrogate function at each grid point
-                        grid_values = []
-                        for point in grid_points:
-                            value = signal_surrogate_func(opt_point=point, event_params=signal_event_params)
-                            grid_values.append(value)
-                        signal_values = torch.stack(grid_values).reshape(resolution, resolution).detach().cpu().numpy()
+                    # Check if signal_event_params is a list of events or a single event
+                    if isinstance(signal_event_params, list):
+                        event_params_list = signal_event_params
                     else:
-                        # Multi-slice evaluation
-                        for i, z in enumerate(z_slices):
-                            slice_values = []
-                            for point in grid_points[i]:
-                                value = signal_surrogate_func(opt_point=point, event_params=signal_event_params)
-                                slice_values.append(value)
-                            signal_values += torch.stack(slice_values).reshape(resolution, resolution).detach().cpu().numpy()
-                        signal_values /= len(z_slices)
+                        event_params_list = [signal_event_params]
+                    
+                    if not multi_slice:
+                        # Evaluate surrogate function at all grid points at once for each event
+                        event_values = []
+                        for event_params in event_params_list:
+                            values = signal_surrogate_func(opt_point=grid_points, event_params=event_params).reshape(resolution, resolution).clone().detach().cpu().numpy()
+                            event_values.append(values)
+                        # Average over all events
+                        signal_values = np.mean(event_values, axis=0)
+                    else:
+                        # Multi-slice evaluation - evaluate entire 3D grid at once for each event
+                        all_grid_points = torch.cat(grid_points, dim=0)
+                        event_values = []
+                        for event_params in event_params_list:
+                            all_values = signal_surrogate_func(opt_point=all_grid_points, event_params=event_params)
+                            # Reshape to (num_z_slices, resolution, resolution) and average over z dimension
+                            event_value = all_values.reshape(len(z_slices), resolution, resolution).mean(dim=0).clone().detach().cpu().numpy()
+                            event_values.append(event_value)
+                        # Average over all events
+                        signal_values = np.mean(event_values, axis=0)
                 
                 # Handle old signal functions format (backward compatibility)
                 elif signal_funcs:
@@ -1104,7 +1392,7 @@ class Visualizer:
                     if not multi_slice:
                         if not vis_all_signals:
                             signal_func = signal_funcs[np.random.randint(0, len(signal_funcs))]
-                            signal_values = signal_func(grid_points).reshape(resolution, resolution).detach().cpu().numpy()
+                            signal_values = signal_func(grid_points).reshape(resolution, resolution).clone().detach().cpu().numpy()
                         else:
                             for i in range(len(signal_funcs)):
                                 signal_values += signal_funcs[i](grid_points).reshape(resolution, resolution).detach().cpu().numpy()
@@ -1113,17 +1401,26 @@ class Visualizer:
                         if not vis_all_signals:
                             signal_func = signal_funcs[np.random.randint(0, len(signal_funcs))]
                             for i in range(len(z_slices)):
-                                signal_values += signal_func(grid_points[i]).reshape(resolution, resolution).detach().cpu().numpy()
+                                signal_values += signal_func(grid_points[i]).reshape(resolution, resolution).clone().detach().cpu().numpy()
                             signal_values /= len(z_slices)
                         else:
                             for signal_func in signal_funcs:
                                 for i in range(len(z_slices)):
-                                    signal_values += signal_func(grid_points[i]).reshape(resolution, resolution).detach().cpu().numpy()
+                                    signal_values += signal_func(grid_points[i]).reshape(resolution, resolution).clone().detach().cpu().numpy()
                             signal_values /= len(signal_funcs) * len(z_slices)
                 
+                # Apply log transformation if requested
+                use_log_charge = kwargs.get('use_log_charge', False)
+                if use_log_charge:
+                    # Replace zeros or very small values with minimum value to avoid log(0)
+                    min_val = np.min(signal_values[signal_values > 0]) if np.any(signal_values > 0) else 0.1
+                    signal_values = np.where(signal_values <= 0, min_val, signal_values)
+                    signal_values = np.log10(signal_values)
+                
                 # Plot signal function
-                c1 = ax.contourf(X.cpu().numpy(), Y.cpu().numpy(), signal_values, cmap='viridis', levels=20)
-                fig.colorbar(c1, ax=ax)
+                c1 = ax.contourf(X.clone().detach().cpu().numpy(), Y.clone().detach().cpu().numpy(), signal_values, cmap='viridis', levels=20)
+                colorbar_label = 'Log10(Signal)' if use_log_charge else 'Signal'
+                fig.colorbar(c1, ax=ax, label=colorbar_label)
                 
                 # Show points near the slice with alpha based on string weights
                 string_weights = kwargs.get('string_weights', None)
@@ -1142,7 +1439,7 @@ class Visualizer:
                 # print("Alpha values:", alpha_values)
                 # alpha_values = [alpha_values[i] if alpha_values[i] > 0.7 else 0.1 for i in range(len(alpha_values))]
                 
-                ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='white')
                 
                 # Set appropriate title based on input type
                 if signal_surrogate_func is not None:
@@ -1193,32 +1490,41 @@ class Visualizer:
             if not no_background:
                 # Handle new surrogate function format
                 if background_surrogate_func is not None and background_event_params is not None:
-                    if not multi_slice:
-                        # Evaluate surrogate function at each grid point
-                        grid_values = []
-                        for point in grid_points:
-                            value = background_surrogate_func(opt_point=point, event_params=background_event_params)
-                            grid_values.append(value)
-                        bkg_values = torch.stack(grid_values).reshape(resolution, resolution).detach().cpu().numpy() * kwargs.get('background_scale', 1.0)
+                    # Check if background_event_params is a list of events or a single event
+                    if isinstance(background_event_params, list):
+                        event_params_list = background_event_params
                     else:
-                        # Multi-slice evaluation
-                        for i, z in enumerate(z_slices):
-                            slice_values = []
-                            for point in grid_points[i]:
-                                value = background_surrogate_func(opt_point=point, event_params=background_event_params)
-                                slice_values.append(value)
-                            bkg_values += torch.stack(slice_values).reshape(resolution, resolution).detach().cpu().numpy() * kwargs.get('background_scale', 1.0)
-                        bkg_values /= len(z_slices)
+                        event_params_list = [background_event_params]
+                    
+                    if not multi_slice:
+                        # Evaluate surrogate function at all grid points at once for each event
+                        event_values = []
+                        for event_params in event_params_list:
+                            values = background_surrogate_func(opt_point=grid_points, event_params=event_params).reshape(resolution, resolution).clone().detach().cpu().numpy() * kwargs.get('background_scale', 1.0)
+                            event_values.append(values)
+                        # Average over all events
+                        bkg_values = np.mean(event_values, axis=0)
+                    else:
+                        # Multi-slice evaluation - evaluate entire 3D grid at once for each event
+                        all_grid_points = torch.cat(grid_points, dim=0)
+                        event_values = []
+                        for event_params in event_params_list:
+                            all_values = background_surrogate_func(opt_point=all_grid_points, event_params=event_params)
+                            # Reshape to (num_z_slices, resolution, resolution) and average over z dimension
+                            event_value = all_values.reshape(len(z_slices), resolution, resolution).mean(dim=0).clone().detach().cpu().numpy() * kwargs.get('background_scale', 1.0)
+                            event_values.append(event_value)
+                        # Average over all events
+                        bkg_values = np.mean(event_values, axis=0)
                 
                 # Handle old background functions format (backward compatibility)
                 elif background_funcs:
                     for background_func in background_funcs:
                         if not multi_slice:
-                            bkg_values += background_func(grid_points).reshape(resolution, resolution).detach().cpu().numpy()*kwargs.get('background_scale', 1.0)
+                            bkg_values += background_func(grid_points).reshape(resolution, resolution).clone().detach().cpu().numpy()*kwargs.get('background_scale', 1.0)
                         else:
                             temp_bkg_values = np.zeros((resolution, resolution))
                             for i in range(len(z_slices)):
-                                temp_bkg_values += background_func(grid_points[i]).reshape(resolution, resolution).detach().cpu().numpy()*kwargs.get('background_scale', 1.0)
+                                temp_bkg_values += background_func(grid_points[i]).reshape(resolution, resolution).clone().detach().cpu().numpy()*kwargs.get('background_scale', 1.0)
                             bkg_values += temp_bkg_values/len(z_slices)
             else:
                 # For no_background=True case, fill with constant value matching the SNR loss
@@ -1232,7 +1538,7 @@ class Visualizer:
             else:
                 plot_title = "Combined Background"
                 
-            c2 = ax.contourf(X.cpu().numpy(), Y.cpu().numpy(), bkg_values, 
+            c2 = ax.contourf(X.clone().detach().cpu().numpy(), Y.clone().detach().cpu().numpy(), bkg_values, 
                             cmap='plasma', levels=20)
             fig.colorbar(c2, ax=ax)
             
@@ -1267,8 +1573,8 @@ class Visualizer:
             if len(optimize_params) == 1 and all_snr is not None:
                 param_name = optimize_params[0]
                 if param_name in param_values:
-                    param_vals = param_values[param_name].detach().cpu().numpy()
-                    snr_vals = all_snr.cpu().numpy()
+                    param_vals = param_values[param_name].clone().detach().cpu().numpy()
+                    snr_vals = all_snr.clone().detach().cpu().numpy()
                     
                     # Sort by parameter value
                     sort_idx = np.argsort(param_vals)
@@ -1297,9 +1603,9 @@ class Visualizer:
                 
                 if param1 in param_values and param2 in param_values:
                     # Get parameter values
-                    param1_vals = param_values[param1].detach().cpu().numpy()
-                    param2_vals = param_values[param2].detach().cpu().numpy()
-                    snr_vals = all_snr.detach().cpu().numpy();
+                    param1_vals = param_values[param1].clone().detach().cpu().numpy()
+                    param2_vals = param_values[param2].clone().detach().cpu().numpy()
+                    snr_vals = all_snr.clone().detach().cpu().numpy();
                     
                     # Create a grid of unique parameter values
                     param1_unique = np.unique(param1_vals)
@@ -1374,10 +1680,10 @@ class Visualizer:
             # Helper for evaluation
             def _eval_sfunc(sfunc_obj, points_to_eval):
                 if callable(sfunc_obj):
-                    return sfunc_obj(points_to_eval).reshape(resolution, resolution).detach().cpu().numpy()
+                    return sfunc_obj(points_to_eval).reshape(resolution, resolution).clone().detach().cpu().numpy()
                 # Check for __call__ if not directly callable (e.g. for some class instances)
                 elif hasattr(sfunc_obj, '__call__'):
-                    return sfunc_obj.__call__(points_to_eval).reshape(resolution, resolution).detach().cpu().numpy()
+                    return sfunc_obj.__call__(points_to_eval).reshape(resolution, resolution).clone().detach().cpu().numpy()
                 raise TypeError("Surrogate function object is not callable and has no __call__ method.")
 
             if multi_slice:
@@ -1489,7 +1795,7 @@ class Visualizer:
             c1 = ax.contourf(X_np, Y_np, final_values_for_contour, cmap='viridis', levels=20)
             fig.colorbar(c1, ax=ax)
             
-            points_np = points.detach().cpu().numpy()
+            points_np = points.clone().detach().cpu().numpy()
             title_str = "Surrogate Function"
             
             # Get string weights for alpha transparency
@@ -1609,7 +1915,7 @@ class Visualizer:
                     
                     for true_func_callable in list_of_true_func_callables:
                         try:
-                            grid_true_single_func = true_func_callable(grid_points_current_slice).reshape(resolution, resolution).detach().cpu().numpy()
+                            grid_true_single_func = true_func_callable(grid_points_current_slice).reshape(resolution, resolution).clone().detach().cpu().numpy()
                             current_slice_true_sum += grid_true_single_func
 
                             if plot_type != self.PLOT_TRUE_FUNCTION and compute_rbf_interpolant:
@@ -1672,7 +1978,7 @@ class Visualizer:
                 num_funcs_evaluated_on_single_set = 0
                 for true_func_callable in list_of_true_func_callables:
                     try:
-                        grid_true_single_func = true_func_callable(grid_points_single_slice).reshape(resolution, resolution).detach().cpu().numpy()
+                        grid_true_single_func = true_func_callable(grid_points_single_slice).reshape(resolution, resolution).clone().detach().cpu().numpy()
                         accumulated_true_values += grid_true_single_func # Summing directly
 
                         if plot_type != self.PLOT_TRUE_FUNCTION and compute_rbf_interpolant:
@@ -1705,7 +2011,7 @@ class Visualizer:
                  ax.text(0.5, 0.5, "No data to plot after processing.", ha='center', va='center', transform=ax.transAxes)
                  return
 
-            points_np = points.detach().cpu().numpy()
+            points_np = points.clone().detach().cpu().numpy()
             title_prefix = ""
             title_suffix = ""
 
@@ -1776,12 +2082,14 @@ class Visualizer:
                 
                 if string_weights is not None:
                     # Convert tensors to numpy arrays
-                    xy_np = string_xy.detach().cpu().numpy()
+                    xy_np = string_xy.clone().detach().cpu().numpy()
                     weights_np = string_weights
                     # Create alpha values: 1 if weight > 0.7, else 0.5
                     alphas = [1 if weights_np[i] > 0.7 else 0.6 for i in range(len(weights_np))]
                     # edge_colors=['k' if weights_np[i] > 0.7 else 'none' for i in range(len(weights_np))]
-                    # Create scatter plot
+                    # Create scatter plot with explicit normalization
+                    
+                    norm = Normalize(vmin=0, vmax=1)
                     scatter = ax.scatter(
                         xy_np[:, 0], 
                         xy_np[:, 1], 
@@ -1789,10 +2097,12 @@ class Visualizer:
                         cmap='Greens',
                         alpha=alphas,
                         edgecolors=None,
-                        s=min([40,30*200/len(weights_np)])
+                        s=min([40,30*200/len(weights_np)]),
+                        norm=norm
                         )
                     
-                    # Add colorbar
+                    # Add colorbar (that is consistently scaled from 0 to 1 for all iterations)
+                  
                     cbar = fig.colorbar(scatter, ax=ax)
                     cbar.set_label('String Weight')
                     
@@ -1820,12 +2130,12 @@ class Visualizer:
             if llr_per_string is not None and string_xy is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(llr_per_string, 'detach'):
-                    llr_values_np = llr_per_string.detach().cpu().numpy()
+                    llr_values_np = llr_per_string.clone().detach().cpu().numpy()
                 else:
                     llr_values_np = np.array(llr_per_string)
                     
                 if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
+                    string_positions_np = string_xy.clone().detach().cpu().numpy()
                 else:
                     string_positions_np = np.array(string_xy)
                 
@@ -1888,12 +2198,12 @@ class Visualizer:
             if signal_llr_per_string is not None and string_xy is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(signal_llr_per_string, 'detach'):
-                    signal_llr_values_np = signal_llr_per_string.detach().cpu().numpy()
+                    signal_llr_values_np = signal_llr_per_string.clone().detach().cpu().numpy()
                 else:
                     signal_llr_values_np = np.array(signal_llr_per_string)
                     
                 if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
+                    string_positions_np = string_xy.clone().detach().cpu().numpy()
                 else:
                     string_positions_np = np.array(string_xy)
                 
@@ -1955,12 +2265,12 @@ class Visualizer:
             if signal_llr_per_string is not None and string_xy is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(signal_llr_per_string, 'detach'):
-                    signal_llr_values_np = signal_llr_per_string.detach().cpu().numpy()
+                    signal_llr_values_np = signal_llr_per_string.clone().detach().cpu().numpy()
                 else:
                     signal_llr_values_np = np.array(signal_llr_per_string)
                     
                 if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
+                    string_positions_np = string_xy.clone().detach().cpu().numpy()
                 else:
                     string_positions_np = np.array(string_xy)
                 
@@ -2022,11 +2332,11 @@ class Visualizer:
             if signal_llr_per_points is not None and points is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(signal_llr_per_points, 'detach'):
-                    signal_llr_values_np = signal_llr_per_points.detach().cpu().numpy()
+                    signal_llr_values_np = signal_llr_per_points.clone().detach().cpu().numpy()
                 else:
                     signal_llr_values_np = np.array(signal_llr_per_points)
                 
-                points_np = points.detach().cpu().numpy()
+                points_np = points.clone().detach().cpu().numpy()
                 
                 # Create a grid for interpolation in XY plane
                 resolution = slice_res
@@ -2080,12 +2390,12 @@ class Visualizer:
             if background_llr_per_string is not None and string_xy is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(background_llr_per_string, 'detach'):
-                    background_llr_values_np = background_llr_per_string.detach().cpu().numpy()
+                    background_llr_values_np = background_llr_per_string.clone().detach().cpu().numpy()
                 else:
                     background_llr_values_np = np.array(background_llr_per_string)
                     
                 if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
+                    string_positions_np = string_xy.clone().detach().cpu().numpy()
                 else:
                     string_positions_np = np.array(string_xy)
                 
@@ -2147,12 +2457,12 @@ class Visualizer:
             if background_llr_per_string is not None and string_xy is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(background_llr_per_string, 'detach'):
-                    background_llr_values_np = background_llr_per_string.detach().cpu().numpy()
+                    background_llr_values_np = background_llr_per_string.clone().detach().cpu().numpy()
                 else:
                     background_llr_values_np = np.array(background_llr_per_string)
                     
                 if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
+                    string_positions_np = string_xy.clone().detach().cpu().numpy()
                 else:
                     string_positions_np = np.array(string_xy)
                 
@@ -2214,11 +2524,11 @@ class Visualizer:
             if background_llr_per_points is not None and points is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(background_llr_per_points, 'detach'):
-                    background_llr_values_np = background_llr_per_points.detach().cpu().numpy()
+                    background_llr_values_np = background_llr_per_points.clone().detach().cpu().numpy()
                 else:
                     background_llr_values_np = np.array(background_llr_per_points)
                 
-                points_np = points.detach().cpu().numpy()
+                points_np = points.clone().detach().cpu().numpy()
                 
                 # Create a grid for interpolation in XY plane
                 resolution = slice_res
@@ -2274,19 +2584,19 @@ class Visualizer:
             if signal_llr_per_string is not None and background_llr_per_string is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(signal_llr_per_string, 'detach'):
-                    signal_llr_values_np = signal_llr_per_string.detach().cpu().numpy()
+                    signal_llr_values_np = signal_llr_per_string.clone().detach().cpu().numpy()
                 else:
                     signal_llr_values_np = np.array(signal_llr_per_string)
                     
                 if hasattr(background_llr_per_string, 'detach'):
-                    background_llr_values_np = background_llr_per_string.detach().cpu().numpy()
+                    background_llr_values_np = background_llr_per_string.clone().detach().cpu().numpy()
                 else:
                     background_llr_values_np = np.array(background_llr_per_string)
                 
                 # Apply string weights if available
                 if string_weights is not None:
                     if hasattr(string_weights, 'detach'):
-                        weights_np = string_weights.detach().cpu().numpy()
+                        weights_np = string_weights.clone().detach().cpu().numpy()
                     else:
                         weights_np = np.array(string_weights)
                     
@@ -2364,14 +2674,14 @@ class Visualizer:
                 
                 # Convert to numpy array
                 if hasattr(available_data, 'detach'):
-                    llr_values_np = available_data.detach().cpu().numpy()
+                    llr_values_np = available_data.clone().detach().cpu().numpy()
                 else:
                     llr_values_np = np.array(available_data)
                 
                 # Apply string weights if available
                 if string_weights is not None:
                     if hasattr(string_weights, 'detach'):
-                        weights_np = string_weights.detach().cpu().numpy()
+                        weights_np = string_weights.clone().detach().cpu().numpy()
                     else:
                         weights_np = np.array(string_weights)
                     
@@ -2411,12 +2721,12 @@ class Visualizer:
             if signal_llr_per_points is not None and background_llr_per_points is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(signal_llr_per_points, 'detach'):
-                    signal_llr_values_np = signal_llr_per_points.detach().cpu().numpy()
+                    signal_llr_values_np = signal_llr_per_points.clone().detach().cpu().numpy()
                 else:
                     signal_llr_values_np = np.array(signal_llr_per_points)
                     
                 if hasattr(background_llr_per_points, 'detach'):
-                    background_llr_values_np = background_llr_per_points.detach().cpu().numpy()
+                    background_llr_values_np = background_llr_per_points.clone().detach().cpu().numpy()
                 else:
                     background_llr_values_np = np.array(background_llr_per_points)
                 
@@ -2477,7 +2787,7 @@ class Visualizer:
                 
                 # Convert to numpy array
                 if hasattr(available_data, 'detach'):
-                    llr_values_np = available_data.detach().cpu().numpy()
+                    llr_values_np = available_data.clone().detach().cpu().numpy()
                 else:
                     llr_values_np = np.array(available_data)
                 
@@ -2508,9 +2818,11 @@ class Visualizer:
             plot_with_surrogate = kwargs.get('plot_with_surrogate', False)
             light_surrogate_func = kwargs.get('signal_surrogate_func', None)
             surrogate_event_params = kwargs.get('signal_event_params', None)
+            if surrogate_event_params is None:
+                surrogate_event_params = kwargs.get('resolution_params', None)
             
             # Check if we should use surrogate function for full domain contour
-            if plot_with_surrogate and (light_surrogate_func is not None) and (surrogate_event_params is not None):
+            if (plot_with_surrogate or (signal_light_yield_per_string is not None)) and (light_surrogate_func is not None) and (surrogate_event_params is not None):
                 # Handle multiple sets of event parameters
                 if isinstance(surrogate_event_params, list):
                     event_params_list = surrogate_event_params
@@ -2554,7 +2866,7 @@ class Visualizer:
                                     opt_point=opt_point,
                                     event_params=event_params
                                 )
-                                slice_values.append(light_yield_val.detach().cpu().numpy().item())
+                                slice_values.append(light_yield_val.clone().detach().cpu().numpy().item())
                             
                             # Reshape and add to z-slice average for this event
                             slice_grid = np.array(slice_values).reshape(resolution, resolution)
@@ -2577,7 +2889,7 @@ class Visualizer:
                                 opt_point=opt_point,
                                 event_params=event_params
                             )
-                            grid_values.append(light_yield_val.detach().cpu().numpy().item())
+                            grid_values.append(light_yield_val.clone().detach().cpu().numpy().item())
                         
                         # Reshape to grid and add to average
                         event_grid = np.array(grid_values).reshape(resolution, resolution)
@@ -2595,12 +2907,12 @@ class Visualizer:
                 # Original implementation using per-string values
                 # Convert to numpy arrays if they're tensors
                 if hasattr(signal_light_yield_per_string, 'detach'):
-                    signal_light_yield_values_np = signal_light_yield_per_string.detach().cpu().numpy()
+                    signal_light_yield_values_np = signal_light_yield_per_string.clone().detach().cpu().numpy()
                 else:
                     signal_light_yield_values_np = np.array(signal_light_yield_per_string)
                     
                 if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
+                    string_positions_np = string_xy.clone().detach().cpu().numpy()
                 else:
                     string_positions_np = np.array(string_xy)
                 
@@ -2649,7 +2961,7 @@ class Visualizer:
             # Always overlay string positions if available (regardless of method used)
             if string_xy is not None:
                 if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
+                    string_positions_np = string_xy.clone().detach().cpu().numpy()
                 else:
                     string_positions_np = np.array(string_xy)
                     
@@ -2676,7 +2988,7 @@ class Visualizer:
                 # Color string positions by their per-string light yield if available
                 if signal_light_yield_per_string is not None:
                     if hasattr(signal_light_yield_per_string, 'detach'):
-                        signal_light_yield_values_np = signal_light_yield_per_string.detach().cpu().numpy()
+                        signal_light_yield_values_np = signal_light_yield_per_string.clone().detach().cpu().numpy()
                     else:
                         signal_light_yield_values_np = np.array(signal_light_yield_per_string)
                         
@@ -2686,8 +2998,9 @@ class Visualizer:
                                        label='String Positions')
                 else:
                     # Just show string positions without color coding
+                    point_size = min([60, 40*200*size_factor/len(string_indices)]) if (string_indices is not None and len(string_indices) > 0) else 60
                     scatter = ax.scatter(string_x, string_y, c='red', 
-                                       s=min([60, 40*200*size_factor/len(string_indices)]) if string_indices else 60, 
+                                       s=point_size, 
                                        alpha=alpha_values, edgecolor='black', linewidth=1,
                                        label='String Positions')
                 
@@ -2702,11 +3015,11 @@ class Visualizer:
             if signal_light_yield_per_points is not None and points is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(signal_light_yield_per_points, 'detach'):
-                    signal_light_yield_values_np = signal_light_yield_per_points.detach().cpu().numpy()
+                    signal_light_yield_values_np = signal_light_yield_per_points.clone().detach().cpu().numpy()
                 else:
                     signal_light_yield_values_np = np.array(signal_light_yield_per_points)
                 
-                points_np = points.detach().cpu().numpy()
+                points_np = points.clone().detach().cpu().numpy()
                 
                 # Create a grid for interpolation in XY plane
                 resolution = slice_res
@@ -2760,12 +3073,12 @@ class Visualizer:
             if snr_per_string is not None and string_xy is not None:
                 # Convert to numpy arrays if they're tensors
                 if hasattr(snr_per_string, 'detach'):
-                    snr_values_np = snr_per_string.detach().cpu().numpy()
+                    snr_values_np = snr_per_string.clone().detach().cpu().numpy()
                 else:
                     snr_values_np = np.array(snr_per_string)
                     
                 if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
+                    string_positions_np = string_xy.clone().detach().cpu().numpy()
                 else:
                     string_positions_np = np.array(string_xy)
                 
@@ -2829,7 +3142,7 @@ class Visualizer:
             # if fisher_info_per_string is not None and string_xy is not None:
             #     # Convert to numpy arrays if they're tensors
             #     if hasattr(string_xy, 'detach'):
-            #         string_positions_np = string_xy.detach().cpu().numpy()
+            #         string_positions_np = string_xy.clone().detach().cpu().numpy()
             #     else:
             #         string_positions_np = np.array(string_xy)
                 
@@ -2838,7 +3151,7 @@ class Visualizer:
             #     for s_idx in range(len(fisher_info_per_string)):
             #         fisher_matrix = fisher_info_per_string[s_idx]
             #         # if hasattr(fisher_matrix, 'detach'):
-            #         #     fisher_matrix = fisher_matrix.detach().cpu().numpy()
+            #         #     fisher_matrix = fisher_matrix.clone().detach().cpu().numpy()
                     
             #         # Add regularization for numerical stability
             #         reg_matrix = torch.eye(fisher_matrix.shape[0]) * 1e-6
@@ -2865,7 +3178,7 @@ class Visualizer:
             if fisher_info_per_string_per_event is not None:
                 fisher_info_per_string_per_event = np.array(fisher_info_per_string_per_event)
                 if hasattr(string_xy, 'detach'):
-                    string_positions_np = string_xy.detach().cpu().numpy()
+                    string_positions_np = string_xy.clone().detach().cpu().numpy()
                 else:
                     string_positions_np = np.array(string_xy)
                 
@@ -2994,6 +3307,260 @@ class Visualizer:
                 ax.text(0.5, 0.5, "Energy resolution history not available\n(Pass 'energy_resolution_history' in kwargs)", 
                       ha='center', va='center', transform=ax.transAxes)
         
+        elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
+            # Plot binned angular resolution vs zenith angle
+            resolution_per_event = kwargs.get('resolution_per_event', None)
+            signal_event_params = kwargs.get('resolution_params', None)
+            # max_angular_resolution = kwargs.get('max_angular_resolution', np.pi)
+            n_bins = kwargs.get('n_zenith_bins', 10)
+            
+            if resolution_per_event is not None and signal_event_params is not None:
+                # Convert to numpy
+                if isinstance(resolution_per_event, torch.Tensor):
+                    res_values = resolution_per_event.clone().detach().cpu().numpy()
+                else:
+                    res_values = np.array(resolution_per_event)
+                
+                # Extract zenith angles from event parameters
+                zenith_values = []
+                for event_params in signal_event_params:
+                    if isinstance(event_params, dict) and 'zenith' in event_params:
+                        zenith = event_params['zenith']
+                        if isinstance(zenith, torch.Tensor):
+                            zenith_values.append(zenith.detach().cpu().item())
+                        else:
+                            zenith_values.append(float(zenith))
+                
+                zenith_values = np.array(zenith_values)
+                
+                # Filter out NaN/Inf values
+                valid_mask = np.isfinite(res_values) & np.isfinite(zenith_values)
+                res_values = res_values[valid_mask]
+                zenith_values = zenith_values[valid_mask]
+                
+                if len(res_values) > 0 and len(zenith_values) > 0:
+                    # Convert to degrees for easier interpretation
+                    zenith_deg = np.rad2deg(zenith_values)
+                    
+                    # Create bins
+                    bin_edges = np.linspace(0, 180, n_bins + 1)
+                    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                    
+                    # Compute binned statistics
+                    bin_means = []
+                    bin_stds = []
+                    bin_counts = []
+                    
+                    for i in range(n_bins):
+                        mask = (zenith_deg >= bin_edges[i]) & (zenith_deg < bin_edges[i+1])
+                        if mask.sum() > 0:
+                            bin_means.append(np.mean(res_values[mask]))
+                            bin_stds.append(np.std(res_values[mask]))
+                            bin_counts.append(mask.sum())
+                        else:
+                            bin_means.append(np.nan)
+                            bin_stds.append(np.nan)
+                            bin_counts.append(0)
+                    
+                    bin_means = np.array(bin_means)
+                    bin_stds = np.array(bin_stds)
+                    bin_counts = np.array(bin_counts)
+                    
+                    # Plot with error bars
+                    valid_bins = ~np.isnan(bin_means)
+                    # ax.errorbar(bin_centers[valid_bins], bin_means[valid_bins], 
+                    #            yerr=bin_stds[valid_bins], fmt='o-', capsize=5, 
+                    #            linewidth=2, markersize=8, label='Mean ± Std')
+                    ax.plot(bin_centers[valid_bins], bin_means[valid_bins], 'o-', linewidth=2, markersize=8, label='Mean')
+                    # Add scatter plot of raw data points (semi-transparent)
+                    # ax.scatter(zenith_deg, res_values, alpha=0.3, s=20, 
+                    #           c='gray', label='Individual events')
+                    
+                    ax.set_xlabel('Zenith Angle (degrees)', fontsize=10)
+                    ax.set_ylabel('Angular Resolution (radians)', fontsize=10)
+                    ax.set_title(f'Angular Resolution vs Zenith', fontsize=12)
+                    ax.grid(True, alpha=0.3)
+                    ax.legend()
+                    
+                    # Add secondary y-axis for resolution in degrees
+                    ax2 = ax.twinx()
+                    ax2.set_ylabel('Angular Resolution (degrees)', fontsize=10)
+                    ax2.set_ylim(np.rad2deg(ax.get_ylim()[0]), np.rad2deg(ax.get_ylim()[1]))
+                    ax2.tick_params(axis='y')
+                    
+                    # Add text showing bin counts
+                    # textstr = f'Total events: {len(res_values)}\n'
+                    # textstr += f'Bins: {n_bins}\n'
+                    # textstr += f'Mean resolution: {np.mean(res_values):.3f} rad ({np.rad2deg(np.mean(res_values)):.2f}°)'
+                    # ax.text(0.02, 0.98, textstr, transform=ax.transAxes,
+                    #        verticalalignment='top', bbox=dict(boxstyle='round', 
+                    #        facecolor='wheat', alpha=0.5), fontsize=10)
+                else:
+                    ax.text(0.5, 0.5, 'No valid data', ha='center', va='center', 
+                           transform=ax.transAxes, fontsize=14)
+            else:
+                ax.text(0.5, 0.5, 'Data not available\\nProvide resolution_per_event and signal_event_params', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        
+        elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY:
+            # Plot binned angular resolution vs log10(energy)
+            resolution_per_event = kwargs.get('resolution_per_event', None)
+            signal_event_params = kwargs.get('resolution_params', None)
+            n_bins = kwargs.get('n_energy_bins', 10)
+
+            if resolution_per_event is not None and signal_event_params is not None:
+                # Convert to numpy
+                if isinstance(resolution_per_event, torch.Tensor):
+                    res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
+                else:
+                    res_values = np.array(resolution_per_event).flatten()
+
+                # Extract energy values from event parameters
+                energy_values = []
+                for event_params in signal_event_params:
+                    if isinstance(event_params, dict) and 'energy' in event_params:
+                        energy = event_params['energy']
+                        if isinstance(energy, torch.Tensor):
+                            energy_values.append(energy.detach().cpu().item())
+                        else:
+                            energy_values.append(float(energy))
+
+                energy_values = np.array(energy_values)
+
+                # Filter out NaN/Inf and non-positive energy values
+                valid_mask = np.isfinite(res_values) & np.isfinite(energy_values) & (energy_values > 0)
+                res_values = res_values[valid_mask]
+                energy_values = energy_values[valid_mask]
+
+                if len(res_values) > 0 and len(energy_values) > 0:
+                    # Create logarithmic bins for energy
+                    log_energy_min = np.log10(energy_values.min())
+                    log_energy_max = np.log10(energy_values.max())
+                    bin_edges = np.logspace(log_energy_min, log_energy_max, n_bins + 1)
+                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])  # Geometric mean
+
+                    # Compute binned statistics
+                    bin_means = []
+                    bin_stds = []
+                    bin_counts = []
+
+                    for i in range(n_bins):
+                        mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i+1])
+                        if mask.sum() > 0:
+                            bin_means.append(np.mean(res_values[mask]))
+                            bin_stds.append(np.std(res_values[mask]))
+                            bin_counts.append(mask.sum())
+                        else:
+                            bin_means.append(np.nan)
+                            bin_stds.append(np.nan)
+                            bin_counts.append(0)
+
+                    bin_means = np.array(bin_means)
+
+                    # Plot mean line vs log10(energy)
+                    valid_bins = ~np.isnan(bin_means)
+                    ax.plot(np.log10(bin_centers[valid_bins]), bin_means[valid_bins], 'o-',
+                            linewidth=2, markersize=8, label='Mean')
+
+                    ax.set_xlabel('log$_{10}$(Energy / GeV)', fontsize=10)
+                    ax.set_ylabel('Angular Resolution (radians)', fontsize=10)
+                    ax.set_title('Angular Resolution vs log$_{10}$(Energy)', fontsize=12)
+                    ax.grid(True, alpha=0.3)
+                    ax.legend()
+
+                    # Add secondary y-axis in degrees
+                    ax2 = ax.twinx()
+                    ax2.set_ylabel('Angular Resolution (degrees)', fontsize=10)
+                    ax2.set_ylim(np.rad2deg(ax.get_ylim()[0]), np.rad2deg(ax.get_ylim()[1]))
+                    ax2.tick_params(axis='y')
+                else:
+                    ax.text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                            transform=ax.transAxes, fontsize=14)
+            else:
+                ax.text(0.5, 0.5, 'Data not available\nProvide resolution_per_event and resolution_params',
+                        ha='center', va='center', transform=ax.transAxes, fontsize=12)
+
+        elif plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
+            # Plot binned energy resolution vs energy
+            resolution_per_event = kwargs.get('resolution_per_event', None)
+            signal_event_params = kwargs.get('resolution_params', None)
+            n_bins = kwargs.get('n_energy_bins', 10)
+            use_relative_energy = kwargs.get('use_relative_energy', False)
+            
+            if resolution_per_event is not None and signal_event_params is not None:
+                # Convert to numpy
+                if isinstance(resolution_per_event, torch.Tensor):
+                    res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
+                else:
+                    res_values = np.array(resolution_per_event).flatten()
+                
+                # Extract energy values from event parameters
+                energy_values = []
+                for event_params in signal_event_params:
+                    if isinstance(event_params, dict) and 'energy' in event_params:
+                        energy = event_params['energy']
+                        if isinstance(energy, torch.Tensor):
+                            energy_values.append(energy.detach().cpu().item())
+                        else:
+                            energy_values.append(float(energy))
+                
+                energy_values = np.array(energy_values)
+                
+                # Filter out NaN/Inf values
+                valid_mask = np.isfinite(res_values) & np.isfinite(energy_values)
+                res_values = res_values[valid_mask]
+                energy_values = energy_values[valid_mask]
+                
+                if len(res_values) > 0 and len(energy_values) > 0:
+                    # Create logarithmic bins for energy
+                    log_energy_min = np.log10(energy_values.min())
+                    log_energy_max = np.log10(energy_values.max())
+                    bin_edges = np.logspace(log_energy_min, log_energy_max, n_bins + 1)
+                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])  # Geometric mean for log scale
+                    
+                    # Compute binned statistics
+                    bin_means = []
+                    bin_stds = []
+                    bin_counts = []
+                    
+                    for i in range(n_bins):
+                        mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i+1])
+                        if mask.sum() > 0:
+                            bin_means.append(np.mean(res_values[mask]))
+                            bin_stds.append(np.std(res_values[mask]))
+                            bin_counts.append(mask.sum())
+                        else:
+                            bin_means.append(np.nan)
+                            bin_stds.append(np.nan)
+                            bin_counts.append(0)
+                    
+                    bin_means = np.array(bin_means)
+                    bin_stds = np.array(bin_stds)
+                    bin_counts = np.array(bin_counts)
+                    
+                    # Plot with error bars
+                    valid_bins = ~np.isnan(bin_means)
+                    ax.plot(bin_centers[valid_bins], bin_means[valid_bins], 'o-', 
+                           linewidth=2, markersize=8, label='Mean')
+                    
+                    ax.set_xlabel('Energy (GeV)', fontsize=10)
+                    if use_relative_energy:
+                        ax.set_ylabel('Relative Energy Resolution (ΔE/E)', fontsize=10)
+                        ax.set_title(f'Relative Energy Resolution vs Energy', fontsize=12)
+                    else:
+                        ax.set_ylabel('Energy Resolution (GeV)', fontsize=10)
+                        ax.set_title(f'Energy Resolution vs Energy', fontsize=12)
+                    
+                    ax.set_xscale('log')
+                    ax.grid(True, alpha=0.3, which='both')
+                    ax.legend()
+                else:
+                    ax.text(0.5, 0.5, 'No valid data', ha='center', va='center', 
+                           transform=ax.transAxes, fontsize=14)
+            else:
+                ax.text(0.5, 0.5, 'Data not available\nProvide resolution_per_event and signal_event_params', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        
         elif plot_type == self.PLOT_LOSS_COMPONENTS:
             # Loss components plot from loss dictionary
             loss_dict = kwargs.get('loss_dict', None)
@@ -3067,6 +3634,16 @@ class Visualizer:
                 all_values.extend(total_loss)
                 if all_values and all(val > 0 for val in all_values):
                     ax.set_yscale('log')
+                    # Set y-axis limits
+                    min_val = min(all_values) if all_values else 1e-4
+                    max_val = max(total_loss) if total_loss else 1.0
+                    
+                    # Set lower limit to 1e-4 if any loss reaches that value
+                    if min_val <= 1e-4:
+                        ax.set_ylim(bottom=1e-4)
+                    
+                    # Adjust upper limit based on total loss with some margin
+                    ax.set_ylim(top=max_val * 1.5)
             else:
                 ax.text(0.5, 0.5, "Loss dictionary not available or empty\n(Pass 'loss_dict' in kwargs)", 
                       ha='center', va='center', transform=ax.transAxes)
@@ -3082,6 +3659,7 @@ class Visualizer:
                     if loss_history and len(loss_history) > 0:
                         # transform each component to [1, 0] range for better visibility (min at 0, max at 1)
                         loss_array = np.log10(loss_history)
+                        loss_array[np.isnan(loss_array)] = 0.0  # Handle NaN values by setting them to 0 (log10(1))
                         if len(loss_array) > 0 and np.max(loss_array) > np.min(loss_array):
                             # Normalize to [0, 1] first, then scale to [1e-2, 1]
                             normalized_loss = (loss_array - np.min(loss_array)) / (np.max(loss_array) - np.min(loss_array))
@@ -3146,6 +3724,69 @@ class Visualizer:
             else:
                 ax.text(0.5, 0.5, "Unweighted loss dictionary not available or empty\n(Pass 'uw_loss_dict' in kwargs)", 
                       ha='center', va='center', transform=ax.transAxes)
+        
+        elif plot_type == self.PLOT_ALM_MU:
+            # Plot ALM penalty parameter (mu) history for each constraint
+            alm_mus_history = kwargs.get('alm_mus_history', {})
+            loss_iterations_dict = kwargs.get('loss_iterations_dict', {})
+            
+            if not alm_mus_history:
+                ax.text(0.5, 0.5, 'No ALM mu history available', 
+                       ha='center', va='center', transform=ax.transAxes)
+                ax.set_title('ALM Penalty Parameters (μ)')
+            else:
+                # Get the iteration numbers (use the first available loss component's iterations)
+                if loss_iterations_dict:
+                    iterations = loss_iterations_dict[list(loss_iterations_dict.keys())[0]]
+                else:
+                    # Fall back to assuming sequential iterations
+                    max_len = max(len(v) for v in alm_mus_history.values()) if alm_mus_history else 0
+                    iterations = list(range(max_len))
+                
+                # Plot mu for each constraint
+                for constraint_name, mu_history in alm_mus_history.items():
+                    if len(mu_history) > 0:
+                        # Align iterations with history length
+                        plot_iterations = iterations[:len(mu_history)]
+                        ax.plot(plot_iterations, mu_history, label=f'{constraint_name}', linewidth=2)
+                
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('μ (Penalty Parameter)')
+                ax.set_title('ALM Penalty Parameters (μ) History')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                ax.set_yscale('log')  # Often mu values vary over orders of magnitude
+        
+        elif plot_type == self.PLOT_ALM_LAMBDA:
+            # Plot ALM Lagrange multiplier (lambda) history for each constraint
+            alm_lambdas_history = kwargs.get('alm_lambdas_history', {})
+            loss_iterations_dict = kwargs.get('loss_iterations_dict', {})
+            
+            if not alm_lambdas_history:
+                ax.text(0.5, 0.5, 'No ALM lambda history available', 
+                       ha='center', va='center', transform=ax.transAxes)
+                ax.set_title('ALM Lagrange Multipliers (λ)')
+            else:
+                # Get the iteration numbers (use the first available loss component's iterations)
+                if loss_iterations_dict:
+                    iterations = loss_iterations_dict[list(loss_iterations_dict.keys())[0]]
+                else:
+                    # Fall back to assuming sequential iterations
+                    max_len = max(len(v) for v in alm_lambdas_history.values()) if alm_lambdas_history else 0
+                    iterations = list(range(max_len))
+                
+                # Plot lambda for each constraint
+                for constraint_name, lambda_history in alm_lambdas_history.items():
+                    if len(lambda_history) > 0:
+                        # Align iterations with history length
+                        plot_iterations = iterations[:len(lambda_history)]
+                        ax.plot(plot_iterations, lambda_history, label=f'{constraint_name}', linewidth=2)
+                
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('λ (Lagrange Multiplier)')
+                ax.set_title('ALM Lagrange Multipliers (λ) History')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
         
         else:
             # Unknown plot type
@@ -3256,7 +3897,7 @@ class Visualizer:
         
         # Convert to numpy for plotting
         if torch.is_tensor(points_3d):
-            points_np = points_3d.detach().cpu().numpy()
+            points_np = points_3d.clone().detach().cpu().numpy()
         else:
             points_np = points_3d
             
@@ -3301,7 +3942,7 @@ class Visualizer:
                 
                 # Add vertical line for string if string_xy is provided
                 if string_xy is not None:
-                    x_pos, y_pos = string_xy[s].detach().cpu().numpy()
+                    x_pos, y_pos = string_xy[s].clone().detach().cpu().numpy()
                     
                     # Add a vertical line for the string
                     fig.add_trace(
@@ -3454,6 +4095,7 @@ class Visualizer:
                     print(f"Warning: Image file not found: {image_path}")
             
             if images:
+                images = self._pad_frames_to_max_size(images)
                 imageio.mimsave(gif_filename, images, fps=gif_fps)
                 print(f"Successfully compiled GIF '{gif_filename}' with {len(images)} frames.")
                 return True
@@ -3492,7 +4134,8 @@ class Visualizer:
         elif self.gif_frames:
             # Fallback: compile from memory frames if no saved images
             try:
-                imageio.mimsave(gif_filename, self.gif_frames, fps=gif_fps)
+                frames = self._pad_frames_to_max_size(self.gif_frames)
+                imageio.mimsave(gif_filename, frames, fps=gif_fps)
                 print(f"Successfully compiled GIF '{gif_filename}' from {len(self.gif_frames)} memory frames.")
                 success = True
             except Exception as e:
@@ -3529,7 +4172,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        event_labels=['position', 'energy', 'zenith', 'azimuth'],
                        true_event=None, detector_point=None, figsize=(10, 8),
                        contour_levels=[0, 1, 4, 9], cmap='viridis',
-                       use_mollweide=False, skip_zero_response=False):
+                       use_mollweide=False, skip_zero_response=False, use_patd=False):
     """
     Plot negative log-likelihood landscape for a trained signal-only LLRnet.
     
@@ -3552,7 +4195,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     signal_sampler : ToySampler
         Sampler instance for generating signal event parameters and detector points
     signal_surrogate_func : callable
-        Function to calculate light yield for signal events
+        Function to calculate light yield for signal events (or PATD generator if use_patd=True)
     param_names : list of str, optional
         Names of 1 or 2 parameters to vary. Must be keys in event_labels.
         If None, defaults to ['energy', 'zenith'] for 2D or ['energy'] for 1D.
@@ -3583,6 +4226,10 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         If True, skip detector points with zero response when calculating total LLR
         (effectively adds zero to the sum for those points). This can be useful when
         some detector points have zero expected response for certain parameter values.
+        (default: False)
+    use_patd : bool
+        If True, uses PATD (Photon Arrival Time Distribution) mode with evaluate_patd_likelihood
+        method. The likelihoods from all photon hits across all detector points are summed.
         (default: False)
         
    """
@@ -3653,10 +4300,15 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     # Calculate true detector response for all detector points (fixed for all parameter variations)
     true_detector_responses = []
     for det_point in detector_points:
-        true_detector_responses.append(signal_surrogate_func(
+        response = signal_surrogate_func(
             opt_point=det_point, 
             event_params=true_event
-        ))
+        )
+        # Extract num_photons if using PATD mode, otherwise use the response directly
+        if use_patd and isinstance(response, dict):
+            true_detector_responses.append(response['num_photons'])
+        else:
+            true_detector_responses.append(response)
     
     # Count effective detector points (non-zero response)
     num_effective_detector_points = sum(1 for resp in true_detector_responses if resp != 0.0)
@@ -3664,15 +4316,27 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     # Get true event features for all detector points and sum their log-likelihoods
     true_llr_sum = 0.0
     with torch.no_grad():
-        for det_point in detector_points:
-            true_features = llrnet.prepare_data_from_raw(
-                point=det_point,
-                event_data=true_event,
-                surrogate_func=signal_surrogate_func,
-                event_labels=event_labels,
-                noise_scale=llrnet.signal_noise_scale,
-            )
-            true_llr_sum += llrnet.predict_log_likelihood_ratio(true_features.unsqueeze(0)).item()
+        if use_patd:
+            # In PATD mode, sum likelihoods across all photon hits from all detector points
+            for det_point in detector_points:
+                llr_result = llrnet.evaluate_patd_likelihood(
+                    point=det_point,
+                    event_data=true_event,
+                    signal_surrogate_func=signal_surrogate_func,
+                    event_labels=event_labels
+                )
+                true_llr_sum += llr_result['joint_log_likelihood']
+        else:
+            # Standard mode using light yield features
+            for det_point in detector_points:
+                true_features = llrnet.prepare_data_from_raw(
+                    point=det_point,
+                    event_data=true_event,
+                    surrogate_func=signal_surrogate_func,
+                    event_labels=event_labels,
+                    noise_scale=llrnet.signal_noise_scale,
+                )
+                true_llr_sum += llrnet.predict_log_likelihood_ratio(true_features.unsqueeze(0)).item()
     
     # Create parameter grids
     if len(param_names) == 1:
@@ -3738,22 +4402,32 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                 # Skip if response is zero and skip_zero_response is True
                 if skip_zero_response and true_response == 0.0:
                     continue
-                    
-                # Create features with modified parameters but TRUE detector response
-                features = llrnet.prepare_data_from_raw(
-                    point=det_point,
-                    event_data=modified_event,  # Full event for surrogate (if called)
-                    surrogate_func=signal_surrogate_func,
-                    signal_event_data=true_event,  # Filtered for feature extraction
-                    event_labels=event_labels,
-                    noise_scale=0.0,  # No noise for evaluation
-
-                )
                 
-                # Predict LLR and add to sum
                 with torch.no_grad():
-                    llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
-                    llr_sum += llr
+                    if use_patd:
+                        # In PATD mode, evaluate likelihood based on photon arrival times
+                        # The modified_event represents the hypothesis parameters
+                        llr_result = llrnet.evaluate_patd_likelihood(
+                            point=det_point,
+                            event_data=modified_event,
+                            signal_surrogate_func=signal_surrogate_func,
+                            event_labels=event_labels
+                        )
+                        llr_sum += llr_result['joint_log_likelihood']
+                    else:
+                        # Standard mode: create features with modified parameters but TRUE detector response
+                        features = llrnet.prepare_data_from_raw(
+                            point=det_point,
+                            event_data=modified_event,  # Full event for surrogate (if called)
+                            surrogate_func=signal_surrogate_func,
+                            signal_event_data=true_event,  # Filtered for feature extraction
+                            event_labels=event_labels,
+                            noise_scale=0.0,  # No noise for evaluation
+                        )
+                        
+                        # Predict LLR and add to sum
+                        llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                        llr_sum += llr
             
             # Store raw NLL (will normalize later)
             nll = -llr_sum
@@ -3799,7 +4473,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         
         ax.set_xlabel(param_name.capitalize(), fontsize=12)
         ax.set_ylabel('Negative Log-Likelihood', fontsize=12)
-        title_suffix = f' ({num_detector_points} detector points)' if num_detector_points > 1 else ''
+        if skip_zero_response and num_effective_detector_points != num_detector_points:
+            title_suffix = f' ({num_effective_detector_points}/{num_detector_points} effective detector points)'
         ax.set_title(f'NLL Landscape: {param_name}{title_suffix}', fontsize=14)
         if param_name == 'energy':
             ax.set_xscale('log')
@@ -3904,21 +4579,32 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                     # Skip if response is zero and skip_zero_response is True
                     if skip_zero_response and true_response == 0.0:
                         continue
-                        
-                    # Create features with TRUE detector response
-                    features = llrnet.prepare_data_from_raw(
-                        point=det_point,
-                        event_data=modified_event,  # Full event for surrogate (if called)
-                        surrogate_func=signal_surrogate_func,
-                        signal_event_data=filtered_true_event,  # Filtered for feature extraction
-                        event_labels=event_labels,
-                        noise_scale=0.0,
-                    )
                     
-                    # Predict LLR and add to sum
                     with torch.no_grad():
-                        llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
-                        llr_sum += llr
+                        if use_patd:
+                            # In PATD mode, evaluate likelihood based on photon arrival times
+                            # The modified_event represents the hypothesis parameters
+                            llr_result = llrnet.evaluate_patd_likelihood(
+                                point=det_point,
+                                event_data=modified_event,
+                                signal_surrogate_func=signal_surrogate_func,
+                                event_labels=event_labels
+                            )
+                            llr_sum += llr_result['joint_log_likelihood']
+                        else:
+                            # Standard mode: create features with TRUE detector response
+                            features = llrnet.prepare_data_from_raw(
+                                point=det_point,
+                                event_data=modified_event,  # Full event for surrogate (if called)
+                                surrogate_func=signal_surrogate_func,
+                                signal_event_data=filtered_true_event,  # Filtered for feature extraction
+                                event_labels=event_labels,
+                                noise_scale=0.0,
+                            )
+                            
+                            # Predict LLR and add to sum
+                            llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                            llr_sum += llr
                 
                 # Store raw NLL (will normalize later)
                 nll_grid[i, j] = -llr_sum

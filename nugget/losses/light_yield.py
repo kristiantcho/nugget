@@ -61,34 +61,24 @@ class WeightedLightYieldLoss(LossFunction):
 
     def light_yield_per_string(self, surrogate_func, event_params, string_xy, points_3d, noise_scale=0.0):
         
-        signal_yield_per_string = torch.zeros(len(string_xy), device=self.device)
-        n_strings = len(string_xy)
-        for s_idx in range(n_strings):
-            # Create optimization points for this string
-            # Sample points along the string (assuming strings extend in z-direction)
-            mask = (points_3d[:, 1] == string_xy[s_idx][1]) & (points_3d[:, 0] == string_xy[s_idx][0])
-            string_points = points_3d[mask]    
-            
-            signal_yield_for_string = torch.zeros(len(string_points), device=self.device)
+        # Compute light yield for all points at once for each event
+        signal_yields_all_events = []
+        for params in event_params:
+            # Call surrogate_func once with all points
+            signal_yield = surrogate_func(opt_point=points_3d, event_params=params)  # Shape (num_points,)
+            if noise_scale > 0.0:
+                signal_yield = signal_yield + signal_yield * torch.randn(size=signal_yield.shape, device=self.device) * noise_scale
+            signal_yields_all_events.append(signal_yield)
         
-            for point_idx, point in enumerate(string_points):
-                # Compute signal light yield for this point
-                signal_yields = []
-                for params in event_params:
-                    signal_yield = surrogate_func(opt_point=point, event_params=params)  # Shape (num_points,)
-                    if noise_scale > 0.0:
-                        signal_yield = signal_yield + signal_yield*torch.randn(size=signal_yield.shape, device=self.device) * noise_scale
-                    
-                    signal_yields.append(signal_yield)
-                
-                
-                # Convert to tensors and compute average
-                signal_yields = torch.stack(signal_yields)
-                avg_signal = torch.mean(signal_yields)
-                signal_yield_for_string[point_idx] = avg_signal
-            # summed SNR across all points on this string
-      
-                signal_yield_per_string[s_idx] = torch.sum(signal_yield_for_string)
+        # Average across all events - shape: (num_points,)
+        avg_signal_per_point = torch.stack(signal_yields_all_events).mean(dim=0)
+        
+        # Sum per string using masks
+        signal_yield_per_string = torch.zeros(len(string_xy), device=self.device)
+        for s_idx in range(len(string_xy)):
+            mask = (points_3d[:, 1] == string_xy[s_idx][1]) & (points_3d[:, 0] == string_xy[s_idx][0])
+            signal_yield_per_string[s_idx] = torch.sum(avg_signal_per_point[mask])
+        
         return signal_yield_per_string
     
     def __call__(self, geom_dict, **kwargs):

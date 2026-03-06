@@ -3,9 +3,9 @@ from scipy.stats._distn_infrastructure import rv_frozen
 from scipy.special import  gammainc, gammaincinv, gamma, gammaln, hyp1f1
 import numpy as np
 import os
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
+# os.environ['OMP_NUM_THREADS'] = '1'
+# os.environ['MKL_NUM_THREADS'] = '1'
+# os.environ['OPENBLAS_NUM_THREADS'] = '1'
 # code taken and adapted from https://github.com/philippeller/freeDOM
 
 class pandel_gen(rv_continuous):

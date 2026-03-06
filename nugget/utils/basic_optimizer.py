@@ -4,10 +4,12 @@ from conflictfree.grad_operator import ConFIG_update
 from conflictfree.weight_model import WeightModel, EqualWeight
 from typing import Optional, Sequence, Union
 import pickle
+import os
+import re
 
 class Optimizer():
     
-    def __init__(self, device=None, geometry=None, visualizer=None, conflict_free=False, use_custom_cf_weight=True, use_alm=False, alm_params=None):
+    def __init__(self, device=None, geometry=None, visualizer=None, conflict_free=False, use_custom_cf_weight=True, use_alm=False, alm_params=None, sigmoid_losses=False, sigmoid_softness=1.0):
         
         self.device=device if device is not None else torch.device('cpu')
         self.geometry = geometry
@@ -15,6 +17,8 @@ class Optimizer():
         self.conflict_free = conflict_free
         self.use_custom_cf_weight = use_custom_cf_weight
         self.use_alm = use_alm
+        self.sigmoid_losses = sigmoid_losses
+        self.sigmoid_softness = sigmoid_softness  # Default softness for sigmoid losses (can be adjusted via loss_params_dict)
         
         # ALM parameters based on the algorithm in the image
         if alm_params is None:
@@ -22,6 +26,12 @@ class Optimizer():
         self.alm_gamma = alm_params.get('gamma', 1e-2)  # global learning rate
         self.alm_alpha = alm_params.get('alpha', 0.9)   # discounting factor (default from RMSprop)
         self.alm_epsilon = alm_params.get('epsilon', 1e-8)  # numerical stability constant
+        
+        # ALM parameter bounds (None means no limit)
+        self.alm_lambda_min = alm_params.get('lambda_min', None)  # Minimum value for Lagrange multipliers
+        self.alm_lambda_max = alm_params.get('lambda_max', None)  # Maximum value for Lagrange multipliers
+        self.alm_mu_min = alm_params.get('mu_min', None)  # Minimum value for penalty parameters
+        self.alm_mu_max = alm_params.get('mu_max', None)  # Maximum value for penalty parameters
         
         # ALM state variables (initialized when constraints are set)
         self.alm_lambdas = {}  # Lagrange multipliers for each constraint
@@ -49,22 +59,26 @@ class Optimizer():
             self.geom_dict = self.geometry.update_points(**self.geom_dict)
     
     def _initialize_alm_parameters(self):
-        """Initialize ALM parameters for constraint loss components"""
+        """Initialize ALM parameters for constraint loss components (preserves existing non-zero values)"""
         for constraint_name in self.constraints_list:
-            # Initialize Lagrange multipliers (λ) 
-            self.alm_lambdas[constraint_name] = torch.tensor(0.0, device=self.device, requires_grad=False)
-            # Initialize penalty parameters (μ) 
-            self.alm_mus[constraint_name] = torch.tensor(1.0, device=self.device, requires_grad=False)
-            # Initialize weighted moving averages for gradients
-            self.alm_v_lambda[constraint_name] = torch.tensor(0.0, device=self.device)
-            self.alm_v_mu[constraint_name] = torch.tensor(0.0, device=self.device)
+            # Initialize Lagrange multipliers (λ) only if not already set
+            if constraint_name not in self.alm_lambdas:
+                self.alm_lambdas[constraint_name] = torch.tensor(0.0, device=self.device, requires_grad=False)
+            # Initialize penalty parameters (μ) only if not already set
+            if constraint_name not in self.alm_mus:
+                self.alm_mus[constraint_name] = torch.tensor(1.0, device=self.device, requires_grad=False)
+            # Initialize weighted moving averages for gradients only if not already set
+            if constraint_name not in self.alm_v_lambda:
+                self.alm_v_lambda[constraint_name] = torch.tensor(0.0, device=self.device)
+            if constraint_name not in self.alm_v_mu:
+                self.alm_v_mu[constraint_name] = torch.tensor(0.0, device=self.device)
     
     def _update_alm_parameters(self):
         """Update ALM parameters according to the algorithm"""
         for constraint_name in self.constraints_list:
             if constraint_name in self.loss_dict and len(self.loss_dict[constraint_name]) > 0:
                 # Get the latest constraint value C_i(θ)
-                constraint_value = self.loss_dict[constraint_name][-1].item()
+                constraint_value = self.loss_dict[constraint_name][-1].detach().item()
                 # Update weighted moving average for lambda gradient 
                 lambda_grad_squared = constraint_value ** 2
                 self.alm_v_lambda[constraint_name] = (self.alm_alpha * self.alm_v_lambda[constraint_name] + 
@@ -74,9 +88,21 @@ class Optimizer():
                 denominator = torch.sqrt(self.alm_v_lambda[constraint_name]) + self.alm_epsilon
                 self.alm_mus[constraint_name] = self.alm_gamma / denominator
                 
+                # Apply bounds on μ if specified
+                if self.alm_mu_min is not None:
+                    self.alm_mus[constraint_name] = torch.clamp(self.alm_mus[constraint_name], min=self.alm_mu_min)
+                if self.alm_mu_max is not None:
+                    self.alm_mus[constraint_name] = torch.clamp(self.alm_mus[constraint_name], max=self.alm_mu_max)
+                
                 # Update λ 
                 self.alm_lambdas[constraint_name] = (self.alm_lambdas[constraint_name] + 
                                                    self.alm_mus[constraint_name] * constraint_value)
+                
+                # Apply bounds on λ if specified
+                if self.alm_lambda_min is not None:
+                    self.alm_lambdas[constraint_name] = torch.clamp(self.alm_lambdas[constraint_name], min=self.alm_lambda_min)
+                if self.alm_lambda_max is not None:
+                    self.alm_lambdas[constraint_name] = torch.clamp(self.alm_lambdas[constraint_name], max=self.alm_lambda_max)
     
     def loss_update_step(self):
         
@@ -141,22 +167,14 @@ class Optimizer():
             if self.use_alm:
                 self._update_alm_parameters()
         else:
-            # Handle ALM and regular losses
+            # Handle regular and (optionally) ALM-augmented losses.
+            # Note: when ALM is enabled, constraint losses are expected to have been stored in
+            # self.loss_dict already in augmented form (see optimize()).
             for loss_name, loss_fn in self.loss_dict.items():
                 if self.loss_weights_dict.get(loss_name) != 0.0:
                     loss_value = loss_fn[-1]
-                    
-                    if self.use_alm and loss_name in self.constraints_list:
-                        # Apply ALM formulation for constraint: λC(θ) + (1/2)μC²(θ)
-                        constraint_value = self.uw_loss_dict[loss_name][-1]
-                        augmented_loss = (self.alm_lambdas[loss_name] * constraint_value + 
-                                        0.5 * self.alm_mus[loss_name] * constraint_value ** 2)
-                        total_loss += augmented_loss
-                        augmented_loss.backward(retain_graph=True)
-                    else:
-                        # Regular loss handling
-                        total_loss += loss_value
-                        loss_value.backward(retain_graph=True)
+                    total_loss += loss_value
+                    loss_value.backward(retain_graph=True)
             # total_loss.backward()
             # Update parameters
             for key in self.optimizers.keys():
@@ -173,6 +191,20 @@ class Optimizer():
 
         return total_loss
 
+    def _snapshot_geom_dict(self):
+        """Create a pickle-friendly snapshot of the current geometry.
+
+        Tensors are detached and moved to CPU to make snapshots easier to load
+        on machines without GPU access.
+        """
+        snapshot = {}
+        for key, value in self.geom_dict.items():
+            if torch.is_tensor(value):
+                snapshot[key] = value.detach().cpu().clone()
+            else:
+                snapshot[key] = value
+        return snapshot
+
     def optimize(self, loss_func_dict, loss_dict={}, uw_loss_dict={}, loss_weights_dict = {}, loss_params_dict={}, n_iter=100, print_freq=10, vis_freq=None, vis_kwargs={}, gif_freq=None, **kwargs):
         
         self.loss_dict = loss_dict
@@ -186,11 +218,59 @@ class Optimizer():
         self.save_best_geom_file = kwargs.get('save_best_geom_file', None)
         self.save_last_geom = kwargs.get('save_last_geom', False)
         self.sample_every = loss_params_dict.get('sample_every', None)
-        self.constraints_list = kwargs.get('constraints_list', [])
+        self.save_geom_folder = kwargs.get('save_geom_folder', None)
+        self.save_geom_freq = kwargs.get('save_geom_freq', 100)
+        self.continue_saving = kwargs.get('continue_saving', False)  # Whether to continue incrementing geom save index from existing files in save_geom_folder
+        # Optional: only apply sigmoid to a subset of losses.
+        # - If provided (list/tuple/set of strings), sigmoid is applied only to those loss names.
+        # - If not provided, preserves legacy behavior (sigmoid applied to all losses when enabled).
+        self.sigmoid_loss_list = kwargs.get('sigmoid_loss_list', loss_params_dict.get('sigmoid_loss_list', None))
+        # Check both kwargs and loss_params_dict for constraints_list
+        self.constraints_list = kwargs.get('constraints_list', loss_params_dict.get('constraints_list', []))
         
         # Initialize ALM parameters for constraints
         if self.use_alm:
             self._initialize_alm_parameters()
+
+        # Optional: save intermediate geometry dictionaries.
+        # Saves geom_0.pkl (initial) then geom_1.pkl, ... every save_geom_freq iterations.
+        self._geom_save_enabled = self.save_geom_folder is not None
+        self._geom_save_idx = 0
+        if self._geom_save_enabled:
+            if not isinstance(self.save_geom_folder, str):
+                raise TypeError("save_geom_folder must be a string path")
+            if not isinstance(self.save_geom_freq, int):
+                raise TypeError("save_geom_freq must be an int")
+            if self.save_geom_freq <= 0:
+                raise ValueError("save_geom_freq must be a positive integer")
+            os.makedirs(self.save_geom_folder, exist_ok=True)
+
+            if self.continue_saving:
+                existing_indices = []
+                try:
+                    for filename in os.listdir(self.save_geom_folder):
+                        match = re.fullmatch(r"geom_(\d+)\.pkl", filename)
+                        if match:
+                            try:
+                                existing_indices.append(int(match.group(1)))
+                            except ValueError:
+                                continue
+                except FileNotFoundError:
+                    existing_indices = []
+                self._geom_save_idx = (max(existing_indices) + 1) if existing_indices else 0
+
+            initial_path = os.path.join(self.save_geom_folder, f"geom_{self._geom_save_idx}.pkl")
+            with open(initial_path, 'wb') as f:
+                pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        # Initialize ALM history dictionaries
+        self.alm_lambdas_history = {}
+        self.alm_mus_history = {}
+        if self.use_alm:
+            for constraint_name in self.constraints_list:
+                self.alm_lambdas_history[constraint_name] = []
+                self.alm_mus_history[constraint_name] = []
+        
         for key in loss_func_dict:
             if key not in self.loss_dict:
                 self.loss_dict[key] = []
@@ -248,7 +328,20 @@ class Optimizer():
                     vis_kwargs.update({loss_name: loss_stuff})
                 if loss_value is not None:
                     weight = self.loss_weights_dict.get(loss_name, 1.0)
+                    # Store the per-loss objective term that will actually be used downstream.
+                    # For ALM constraints, this is the augmented loss: λC(θ) + (1/2)μC(θ)^2.
                     weighted_loss = weight * loss_value
+                    if self.sigmoid_losses:
+                        apply_sigmoid = True
+                        if self.sigmoid_loss_list is not None:
+                            apply_sigmoid = loss_name in set(self.sigmoid_loss_list)
+                        if apply_sigmoid:
+                            weighted_loss = torch.sigmoid(self.sigmoid_softness * weighted_loss) - 0.5
+                    if self.use_alm and loss_name in self.constraints_list:
+                        weighted_loss = (
+                            self.alm_lambdas[loss_name] * weighted_loss
+                            + 0.5 * self.alm_mus[loss_name] * weighted_loss ** 2
+                        )
                     if weight != 0.0:
                         self.loss_dict[loss_name].append(weighted_loss)
                         self.uw_loss_dict[loss_name].append(loss_value)
@@ -261,8 +354,16 @@ class Optimizer():
                 vis_kwargs['loss_weights_dict'] = self.loss_weights_dict
                 vis_kwargs['loss_func_dict'] = loss_func_dict
                 vis_kwargs['loss_iterations_dict'] = self.loss_iterations_dict
+                if self.use_alm:
+                    vis_kwargs['alm_lambdas_history'] = self.alm_lambdas_history
+                    vis_kwargs['alm_mus_history'] = self.alm_mus_history
             self.total_loss.append(self.loss_update_step())
             
+            # Update ALM history after loss update step
+            if self.use_alm:
+                for constraint_name in self.constraints_list:
+                    self.alm_lambdas_history[constraint_name].append(self.alm_lambdas[constraint_name].item())
+                    self.alm_mus_history[constraint_name].append(self.alm_mus[constraint_name].item())
 
             # Step the schedulers
             if len(self.schedulers) > 0:
@@ -272,6 +373,14 @@ class Optimizer():
                             continue
                     self.schedulers[key].step()
             self.geom_dict = self.geometry.update_points(**self.geom_dict)
+
+            if self._geom_save_enabled:
+                local_step = (it - max_iter) + 1  # 1..n_iter for this optimize() call
+                if local_step % self.save_geom_freq == 0:
+                    self._geom_save_idx += 1
+                    geom_path = os.path.join(self.save_geom_folder, f"geom_{self._geom_save_idx}.pkl")
+                    with open(geom_path, 'wb') as f:
+                        pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
             if self.save_best_geom_file is not None and (self.total_loss[-1] == min(self.total_loss) or self.save_last_geom):
                 with open(self.save_best_geom_file, 'wb') as f:
                     pickle.dump(self.geom_dict, f)

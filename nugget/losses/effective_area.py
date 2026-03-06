@@ -19,30 +19,55 @@ def muon_range(energy):
     """
     a = 0.212/1.2
     b = 0.251e-3/1.2
-    return torch.log(1 + energy * b/a) / b
+    return np.log(1 + energy * b/a) / b
 
 def average_chord_length(cos_theta, cyl_radius, cyl_height):
     """Calculate average chord length of cylinder for a given direction"""
-    cos_theta = np.asarray(cos_theta)
-    mask = cos_theta == 0
-    result = np.empty_like(cos_theta)
-    if np.any(mask):
-        result[mask] = np.pi * cyl_radius / 2
-
-    if np.any(~mask):
-        ct_masked = cos_theta[~mask]
-        result[~mask] = cyl_radius / ((cyl_radius / (cyl_height / torch.abs(ct_masked))) + 2/torch.pi*torch.sqrt(1 - (ct_masked * ct_masked)))
+    # Convert to torch tensor if not already, preserve gradient
+    if not isinstance(cos_theta, torch.Tensor):
+        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float32)
+    
+    # Ensure it's at least 1D for indexing
+    is_scalar = cos_theta.dim() == 0
+    if is_scalar:
+        cos_theta = cos_theta.unsqueeze(0)
+    
+    # Create mask for cos_theta == 0
+    mask = (cos_theta == 0)
+    
+    # Initialize result
+    result = torch.ones_like(cos_theta)
+    
+    # Handle cos_theta == 0 case
+    if torch.any(mask):
+        result = torch.where(mask, np.pi * cyl_radius / 2, result)
+    
+    # Handle cos_theta != 0 case
+    if torch.any(~mask):
+        # Use where to maintain differentiability
+        ct_masked = torch.abs(cos_theta)
+        chord_nonzero = cyl_radius / ((cyl_radius / (cyl_height / ct_masked)) + 2/np.pi*torch.sqrt(1 - cos_theta * cos_theta))
+        result = torch.where(~mask, chord_nonzero, result)
+    
+    # Return scalar if input was scalar
+    if is_scalar:
+        result = result.squeeze(0)
+    
     return result
 
 def projected_area(cos_theta, cyl_radius, cyl_height):
     """Calculate projected area of cylinder for a given direction"""
-    cap = torch.pi*cyl_radius**2
+    # Ensure cos_theta is a torch tensor
+    if not isinstance(cos_theta, torch.Tensor):
+        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float32)
+    
+    cap = np.pi*cyl_radius**2
     sides = 2*cyl_radius*cyl_height
     return cap*torch.abs(cos_theta) + sides*torch.sqrt(1 - cos_theta**2)
 
 def cyl_volume(cyl_radius, cyl_height):
     """Calculate cylinder volume"""
-    return torch.pi*cyl_radius**2*cyl_height
+    return np.pi*cyl_radius**2*cyl_height
 
 
 def interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nu", extend_range=False):
@@ -76,6 +101,9 @@ def neutrino_effective_area(cos_theta, energy, cyl_radius, cyl_height, xsec, tra
     """Calculate neutrino effective area"""
 
     tprob = transmission(cos_theta, energy, flavor=flavor)
+    # Convert transmission probability to torch tensor if needed
+    if not isinstance(tprob, torch.Tensor):
+        tprob = torch.as_tensor(tprob, dtype=torch.float32)
 
     if average_nu_nubar:
         factor = 0.5
@@ -250,44 +278,115 @@ class TransmissionProb:
         """
         return self.splines[flavor](cos_theta, np.log10(energy), grid=False)
     
+# def get_bounding_cylinder(positions):
+#     """Get bounding cylinder for a set of 3D points."""
+
+#     x_min, y_min = torch.amin(positions[:, :2], axis=0)
+
+#     x_max, y_max = torch.amax(positions[:, :2], axis=0)
+#     z_min = torch.amin(positions[:, 2])
+#     z_max = torch.amax(positions[:, 2])
+
+#     center_x = (x_min + x_max) / 2
+#     center_y = (y_min + y_max) / 2
+#     center_z = (z_min + z_max) / 2
+
+#     radius = torch.sqrt(((x_max - x_min) / 2)**2 + ((y_max - y_min) / 2)**2)
+
+#     height = z_max - z_min
+
+#     return torch.tensor([center_x, center_y, center_z]), radius, height
+
 def get_bounding_cylinder(positions):
-    """Get bounding cylinder for a set of 3D points."""
-
-    x_min, y_min = torch.amin(positions[:, :2], axis=0)
-
-    x_max, y_max = torch.amax(positions[:, :2], axis=0)
+    """Get tightest bounding cylinder for a set of 3D points."""
+    
+    xy_positions = positions[:, :2]
+    
+    # Start with centroid
+    center_xy = torch.mean(xy_positions, dim=0)
+    
+    # Get radius from centroid
+    distances = torch.norm(xy_positions - center_xy, dim=1)
+    radius = torch.max(distances)
+    
+    # Optional: Refine by checking if we can reduce radius
+    # by slightly moving the center
+    max_dist_idx = torch.argmax(distances)
+    farthest_point = xy_positions[max_dist_idx]
+    
+    # Z-bounds
     z_min = torch.amin(positions[:, 2])
     z_max = torch.amax(positions[:, 2])
-
-    center_x = (x_min + x_max) / 2
-    center_y = (y_min + y_max) / 2
     center_z = (z_min + z_max) / 2
-
-    radius = torch.sqrt(((x_max - x_min) / 2)**2 + ((y_max - y_min) / 2)**2)
-
-    height = z_max - z_min
-
-    return torch.tensor([center_x, center_y, center_z]), radius, height
-
-def get_weighted_bounding_cylinder(points, point_weights=1, temperature=0.1):
-    """Get bounding cylinder for a set of 3D points using softmax weighted bounds."""
-
-    weights_min = torch.sum(torch.softmax(-points*point_weights / temperature, dim=0) * points, dim=0)
-    weights_max = torch.sum(torch.softmax(points*point_weights / temperature, dim=0) * points, dim=0)
-
-    x_min, y_min, z_min = weights_min
-    x_max, y_max, z_max = weights_max
-    
-    center_x = (x_min + x_max) / 2
-    center_y = (y_min + y_max) / 2
-    center_z = (z_min + z_max) / 2
-    radius = torch.sqrt(((x_max - x_min) / 2)**2 + ((y_max - y_min) / 2)**2)
-    
     height = z_max - z_min
     
-    return torch.tensor([center_x, center_y, center_z]), radius, height
+    center = torch.tensor([center_xy[0], center_xy[1], center_z], device=positions.device)
+    return center, radius, height
 
-class effective_area_loss(LossFunction):
+def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.0):
+    """Get weighted bounding cylinder using differentiable centroid-based approach.
+    
+    This version uses weighted centroids and softmax-based operations to compute
+    the bounding cylinder properties in a fully differentiable manner.
+    
+    Parameters:
+    -----------
+    positions : torch.Tensor
+        3D positions of points, shape (n_points, 3)
+    point_weights : torch.Tensor, optional
+        Weights for each point, shape (n_points,). If None, uniform weights are used.
+    temperature : float
+        Temperature parameter for softmax operations. Lower values make the 
+        bounds tighter but less differentiable. Default: 1.0
+        
+    Returns:
+    --------
+    tuple
+        (center, radius, height) where center is [cx, cy, cz], radius is the 
+        weighted radius in XY plane, and height is weighted Z extent
+    """
+    device = positions.device
+    xy_positions = positions[:, :2]
+    z_positions = positions[:, 2]
+    
+    # Handle point weights
+    if point_weights is None:
+        point_weights = torch.ones(len(positions), device=device)
+    
+    # Normalize weights to sum to 1
+    weights_normalized = point_weights #/ torch.sum(point_weights)
+    
+    # Weighted centroid in XY
+    center_xy = torch.sum(weights_normalized.unsqueeze(1) * xy_positions, dim=0)
+    
+    # Weighted centroid in Z
+    center_z = torch.sum(weights_normalized * z_positions, dim=0)
+    
+    # Calculate distances from weighted centroid
+    distances_xy = torch.norm(xy_positions - center_xy.unsqueeze(0), dim=1)
+    
+    # Soft-maximum for radius using weighted softmax
+    # This is differentiable and approximates max(distances)
+    softmax_weights = torch.softmax(point_weights * distances_xy / temperature, dim=0)
+    radius = torch.sum(softmax_weights * distances_xy)
+    
+    # Soft bounds for height using weighted softmax
+    # Soft minimum for z
+    z_min_weights = torch.softmax(-point_weights * z_positions / temperature, dim=0)
+    z_min = torch.sum(z_min_weights * z_positions)
+    
+    # Soft maximum for z
+    z_max_weights = torch.softmax(point_weights * z_positions / temperature, dim=0)
+    z_max = torch.sum(z_max_weights * z_positions)
+    
+    # Recalculate center_z as midpoint of soft bounds
+    center_z = (z_min + z_max) / 2
+    height = z_max - z_min
+    
+    center = torch.stack([center_xy[0], center_xy[1], center_z])
+    return center, radius, height
+
+class EffectiveAreaLoss(LossFunction):
     """Loss class to maximize neutrino effective area."""
     
     def __init__(self, xsec=CrossSection(), transmission=TransmissionProb(), flavor="numu", average_nu_nubar=True, trigger = TriggerLoss(), device=None, domain_size=2500):
@@ -304,7 +403,7 @@ class effective_area_loss(LossFunction):
         self.transmission = transmission
         self.flavor = flavor
         self.average_nu_nubar = average_nu_nubar
-        self.trigger = trigger(device=self.device)
+        self.trigger = trigger
         self.domain_size = domain_size
 
     def map_string_weights_to_points(self, points_3d, string_xy, string_weights):
@@ -370,6 +469,9 @@ class effective_area_loss(LossFunction):
         energy_range = kwargs.get('energy_range', (1e2, 1e8))
         zenith_range = kwargs.get('zenith_range', (-1, 1))
         temperature = kwargs.get('bounding_cylinder_temperature', 0.1)
+        cylinder_kwargs = kwargs.get('cylinder_sampler_kwargs', {})
+        perfect_trigger = kwargs.get('perfect_efficiency', False)
+        pc_ly_per_event_per_point_per_e_per_ct = kwargs.get('pc_ly_per_point_per_event_per_e_per_ct', None)
         
         
         # signal_sampler = CylinderSampler(event_type='signal', domain_size=2500, E_min=energy_range, E_max=1e8, energy_dist='log_uniform')
@@ -389,6 +491,8 @@ class effective_area_loss(LossFunction):
                 string_xy = points_3d[unique_indices, :2]
             
             point_weights = self.map_string_weights_to_points(points_3d, string_xy, string_weights)
+        else:
+            point_weights = torch.ones(len(points_3d), device=self.device)
         
         center, cyl_radius, cyl_height = get_weighted_bounding_cylinder(points_3d, point_weights=point_weights, temperature=temperature)
         
@@ -400,12 +504,15 @@ class effective_area_loss(LossFunction):
         effective_areas = torch.zeros((num_zenith_bins, num_energy_bins), device=self.device)
         for e_ind, e in enumerate(energy_centers):
             for ct_ind, ct in enumerate(zenith_centers):
-                sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=e, E_max=e, cos_range=(ct, ct), event_type='signal').sample_events(num_events)
-                light_yield_per_event_per_point = torch.zeros((len(sampled_events), len(points_3d)), device=self.device)
-                for i, event_params in enumerate(sampled_events):
-                    light_yield_per_event_per_point[i] = surrogate_func(opt_point=points_3d, event_params=event_params)
-                detector_efficiency = torch.mean(self.trigger.compute_detector_efficiency_batch_events(points_3d=points_3d, precomputed_light_yield=light_yield_per_event_per_point,
-                                                                        string_weights=point_weights, surrogate_func=surrogate_func, event_params_list=sampled_events)) 
+                if perfect_trigger:
+                    detector_efficiency = 1.0
+                else:
+                    sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=e, E_max=e, cos_range=(ct, ct), event_type='signal', **cylinder_kwargs).sample_events(num_events)
+                    light_yield_per_event_per_point = torch.zeros((len(sampled_events), len(points_3d)), device=self.device)
+                    for i, event_params in enumerate(sampled_events):
+                        light_yield_per_event_per_point[i] = surrogate_func(opt_point=points_3d, event_params=event_params)
+                    detector_efficiency = torch.mean(self.trigger.compute_trigger_probability_batch_events(points_3d=points_3d, precomputed_light_yield=light_yield_per_event_per_point,
+                                                                            string_weights=point_weights, surrogate_func=surrogate_func, event_params_list=sampled_events)) 
                 eff_area = neutrino_effective_area(ct, e, cyl_radius, cyl_height, self.xsec, self.transmission, flavor=self.flavor, average_nu_nubar=self.average_nu_nubar)
                 effective_areas[ct_ind, e_ind] = eff_area * detector_efficiency
 
@@ -420,7 +527,9 @@ class effective_area_loss(LossFunction):
             "effective_area_loss": effective_area_loss,
             "bounding_cylinder_radius": cyl_radius,
             "bounding_cylinder_height": cyl_height,
-            "effective_area_matrix": effective_areas
+            "effective_area_matrix": effective_areas,
+            "energy_centers": energy_centers,
+            "zenith_centers": zenith_centers
         }      
                 
                 

@@ -11,19 +11,19 @@ import numpy as np
 # -------------------------
 # @dataclass
 class CylinderSurface():
-   def __init__(self, center, height, radius):
+   def __init__(self, center, height, radius, device=None):
         if isinstance(center, torch.Tensor):
-            self.center = center
+            self.center = center.to(device) if device is not None else center
         else:
-            self.center = torch.tensor(center)
+            self.center = torch.tensor(center, device=device)
         if isinstance(height, torch.Tensor):
-            self.height = height
+            self.height = height.to(device) if device is not None else height
         else:
-            self.height = torch.tensor(height)
+            self.height = torch.tensor(height, device=device)
         if isinstance(radius, torch.Tensor):
-            self.radius = radius
+            self.radius = radius.to(device) if device is not None else radius
         else:
-            self.radius = torch.tensor(radius)
+            self.radius = torch.tensor(radius, device=device)
 # -------------------------
 # Spherical <-> Cartesian
 # -------------------------
@@ -475,9 +475,11 @@ class CylinderSampler(Sampler):
         
         # Set up cylinder geometry
         if cylinder_center is None:
-            cylinder_center = torch.zeros(3)
+            cylinder_center = torch.zeros(3, device=self.device)
         elif not isinstance(cylinder_center, torch.Tensor):
-            cylinder_center = torch.tensor(cylinder_center)
+            cylinder_center = torch.tensor(cylinder_center, device=self.device)
+        else:
+            cylinder_center = cylinder_center.to(self.device)
         if cylinder_height is None:
             cylinder_height = domain_size
         if cylinder_radius is None:
@@ -485,7 +487,8 @@ class CylinderSampler(Sampler):
         self.cylinder = CylinderSurface(
             center=cylinder_center,
             height=cylinder_height,
-            radius=cylinder_radius
+            radius=cylinder_radius,
+            device=self.device
         )
         
         # Option to find exact intersection with cylinder
@@ -496,6 +499,9 @@ class CylinderSampler(Sampler):
         
         # Option to randomly sample position along ray within cubic domain
         self.random_position_within_cubic_domain = kwargs.get('random_position_within_cubic_domain', False)
+        
+        # Option to force events to point towards cylinder center
+        self.point_towards_center = kwargs.get('point_towards_center', False)
         
         # Event type for energy sampling
         self.event_type = kwargs.get('event_type', 'signal')
@@ -596,6 +602,14 @@ class CylinderSampler(Sampler):
 
         # Build bias tensor (float32)
         bias = torch.tensor([x_bias, y_bias, z_bias], device=self.device, dtype=torch.float32) * 1.0
+
+        # Override directions if point_towards_center is enabled
+        if self.point_towards_center:
+            for i in range(num_events):
+                direction_to_center = self.cylinder.center - positions[i]
+                direction_norm = torch.sqrt(torch.sum(direction_to_center**2))
+                if direction_norm > 1e-15:
+                    directions[i] = direction_to_center / direction_norm
 
         event_params_list = []
         for i in range(num_events):

@@ -1,25 +1,67 @@
 import torch
 from torch import tensor
 from torch.special import gammainc, gammaln
+import numpy as np
+import scipy
 
-# Try to import hyp1f1 from torch.special (may not be available in all versions)
-try:
-    from torch.special import hyp1f1
-except ImportError:
-    # Fallback: use scipy if available
-    try:
-        from scipy.special import hyp1f1 as scipy_hyp1f1
-        def hyp1f1(a, b, z):
-            """Wrapper to convert scipy hyp1f1 to torch tensor"""
-            import numpy as np
-            result = scipy_hyp1f1(a.cpu().numpy() if isinstance(a, torch.Tensor) else a,
-                                  b.cpu().numpy() if isinstance(b, torch.Tensor) else b,
-                                  z.cpu().numpy() if isinstance(z, torch.Tensor) else z)
-            return torch.as_tensor(result, device=z.device if isinstance(z, torch.Tensor) else 'cpu')
-    except ImportError:
-        # If neither available, define a stub that will raise an error if used
-        def hyp1f1(a, b, z):
-            raise NotImplementedError("hyp1f1 not available. Install scipy or use PyTorch version with hyp1f1 support.")
+class Hyp1f1Function(torch.autograd.Function):
+    """
+    Differentiable wrapper for confluent hypergeometric function hyp1f1.
+    Uses the derivative formula: d/dz hyp1f1(a, b, z) = (a/b) * hyp1f1(a+1, b+1, z)
+    """
+    
+    @staticmethod
+    def forward(ctx, a, b, z):
+        # Save for backward pass
+        ctx.save_for_backward(a, b, z)
+        
+        # Compute hyp1f1 using scipy
+        a_np = a.detach().cpu().numpy() if isinstance(a, torch.Tensor) else a
+        b_np = b.detach().cpu().numpy() if isinstance(b, torch.Tensor) else b
+        z_np = z.detach().cpu().numpy() if isinstance(z, torch.Tensor) else z
+        
+        result = scipy.special.hyp1f1(a_np, b_np, z_np)
+        return torch.as_tensor(result, dtype=z.dtype, device=z.device)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        a, b, z = ctx.saved_tensors
+        
+        # Derivative with respect to z: d/dz hyp1f1(a, b, z) = (a/b) * hyp1f1(a+1, b+1, z)
+        a_np = a.detach().cpu().numpy()
+        b_np = b.detach().cpu().numpy()
+        z_np = z.detach().cpu().numpy()
+        
+        # Compute derivative
+        deriv_z = (a_np / b_np) * scipy.special.hyp1f1(a_np + 1, b_np + 1, z_np)
+        deriv_z = torch.as_tensor(deriv_z, dtype=z.dtype, device=z.device)
+        
+        grad_z = grad_output * deriv_z
+        
+        # For simplicity, we don't compute gradients w.r.t. a and b (typically constant parameters)
+        return None, None, grad_z
+
+def hyp1f1(a, b, z):
+    """
+    Differentiable confluent hypergeometric function (Kummer's function).
+    
+    Args:
+        a: first parameter
+        b: second parameter  
+        z: variable (will support gradients)
+    
+    Returns:
+        hyp1f1(a, b, z) as a torch tensor with gradient support
+    """
+    # Convert inputs to tensors if needed
+    if not isinstance(a, torch.Tensor):
+        a = torch.as_tensor(a, dtype=torch.float32)
+    if not isinstance(b, torch.Tensor):
+        b = torch.as_tensor(b, dtype=torch.float32)
+    if not isinstance(z, torch.Tensor):
+        z = torch.as_tensor(z, dtype=torch.float32)
+    
+    return Hyp1f1Function.apply(a, b, z)
 
 # ---------------------------------------------------------------------
 #  PANDEL
@@ -58,7 +100,16 @@ class Pandel():
         # Gamma distribution
         d = torch.as_tensor(d)
         xi = d / self.lambda_s
-        gamma_sample = torch.distributions.Gamma(xi, self.rho).sample(size)
+        
+        # Convert size to tuple format expected by PyTorch
+        if size is None:
+            sample_shape = torch.Size()
+        elif isinstance(size, int):
+            sample_shape = torch.Size([size])
+        else:
+            sample_shape = torch.Size(size) if not isinstance(size, torch.Size) else size
+            
+        gamma_sample = torch.distributions.Gamma(xi, self.rho).sample(sample_shape)
         return gamma_sample
 
 
@@ -108,7 +159,7 @@ class CPandel():
         return pref * (term1 - term2)
 
     def f2(self, xi, t, eta):
-        return torch.exp(self.rho**2 * self.s**2 / 2) * self.pandel.pdf(t, xi * self.lambda_s)
+        return np.exp(self.rho**2 * self.s**2 / 2) * self.pandel.pdf(t, xi * self.lambda_s)
 
     def f3(self, xi, t, eta):
         z = -eta / torch.sqrt(4 * xi - 2)

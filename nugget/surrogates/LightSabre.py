@@ -1,8 +1,8 @@
 from nugget.surrogates.base_surrogate import Surrogate
 import torch
 import numpy as np
-# from nugget.surrogates.pandel import Pandel, CPandel
-from nugget.surrogates.cpandel import cpandel_gen as CPandel
+from nugget.surrogates.pandel import Pandel, CPandel
+# from nugget.surrogates.cpandel import cpandel_gen as CPandel
 
 
 class LightSabre(Surrogate):
@@ -16,7 +16,7 @@ class LightSabre(Surrogate):
     """
     
     def __init__(self, device=None, dim=3, domain_size=2, 
-                 effective_photocathode_area=84e-4, lambda_p=25.0, lambda_mu=3.0, **kwargs):
+                 effective_photocathode_area=84e-4, **kwargs):
         """
         Initialize the LightSabre surrogate model.
         
@@ -41,8 +41,6 @@ class LightSabre(Surrogate):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         
         self.effective_photocathode_area = effective_photocathode_area
-        self.lambda_p = lambda_p
-        self.lambda_mu = lambda_mu
         self.kwargs = kwargs
         
         # Polynomial coefficients for photons per meter calculation (reversed order for polyval)
@@ -189,8 +187,8 @@ class LightSabre(Surrogate):
         sin_theta_c = torch.sin(theta_c)
         
         # Optical parameters for ice
-        lambda_abs = 125.0  # Absorption length in meters
-        lambda_sca = 33.0   # Scattering length in meters
+        lambda_abs = self.kwargs.get('lambda_abs', 44.7)  # Absorption length in meters
+        lambda_sca = self.kwargs.get('lambda_sca', 57.4)   # Scattering length in meters
         
         # Calculate effective photon propagation length
         lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
@@ -292,9 +290,17 @@ class LightSabre(Surrogate):
         Parameters:
         -----------
         event_params : dict
-            Contains 'position', 'zenith', 'azimuth', 'energy'
+            Contains 'position', 'energy', and either:
+            - 'direction': Cartesian direction vector of shape (3,). If present,
+              this is used directly and 'zenith'/'azimuth' are ignored.
+            - 'zenith' and 'azimuth': spherical angles in radians, used only
+              when 'direction' is not in event_params.
         opt_point : torch.Tensor
             Optimization point where light yield is evaluated (single point or array)
+        gradient_mode : bool
+            If True, enables gradient tracking (requires_grad=True) on all event
+            parameter tensors (position, energy, direction or zenith/azimuth).
+            Can also be set via the 'gradient_mode' constructor kwarg. Default: False.
             
         Returns:
         --------
@@ -304,6 +310,7 @@ class LightSabre(Surrogate):
         # Extract parameters
         opt_point = kwargs.get('opt_point', None)
         event_params = kwargs.get('event_params', None)
+        gradient_mode = kwargs.get('gradient_mode', self.kwargs.get('gradient_mode', False))
         
         if event_params is None:
             raise ValueError("event_params must be provided")
@@ -313,32 +320,59 @@ class LightSabre(Surrogate):
         
         # Extract event parameters
         track_pos = event_params.get('position', None)
-        zenith = event_params.get('zenith', None)
-        azimuth = event_params.get('azimuth', None)
         energy = event_params.get('energy', None)
+        angular_dir = event_params.get('direction', None)
         
-        if track_pos is None or zenith is None or azimuth is None or energy is None:
-            raise ValueError("event_params must contain 'position', 'zenith', 'azimuth', and 'energy'")
+        if track_pos is None or energy is None:
+            raise ValueError("event_params must contain 'position' and 'energy'")
         
-        # Convert spherical angles to Cartesian direction
-        if isinstance(zenith, torch.Tensor):
-            theta = zenith.squeeze()
-            phi = azimuth.squeeze()
+        # Convert position to tensor and optionally enable gradients
+        if not isinstance(track_pos, torch.Tensor):
+            track_pos = torch.tensor(track_pos, dtype=torch.float32, device=self.device)
         else:
-            theta = torch.tensor(zenith, device=self.device).squeeze()
-            phi = torch.tensor(azimuth, device=self.device).squeeze()
+            track_pos = track_pos.to(self.device)
+        if gradient_mode:
+            track_pos = track_pos.requires_grad_(True)
         
-        # Ensure theta and phi are scalars (0-dimensional tensors)
-        if theta.dim() > 0:
-            theta = theta.squeeze()
-        if phi.dim() > 0:
-            phi = phi.squeeze()
+        # Convert energy to tensor and optionally enable gradients
+        if not isinstance(energy, torch.Tensor):
+            energy = torch.tensor(energy, dtype=torch.float32, device=self.device)
+        else:
+            energy = energy.to(self.device)
+        if gradient_mode:
+            energy = energy.requires_grad_(True)
         
-        track_dir = torch.stack([
-            torch.sin(theta) * torch.cos(phi),
-            torch.sin(theta) * torch.sin(phi),
-            torch.cos(theta)
-        ])
+        # Build track direction: prefer 'direction', fall back to zenith/azimuth
+        if angular_dir is not None:
+            if not isinstance(angular_dir, torch.Tensor):
+                track_dir = torch.tensor(angular_dir, dtype=torch.float32, device=self.device).squeeze()
+            else:
+                track_dir = angular_dir.to(self.device).squeeze()
+            if gradient_mode:
+                track_dir = track_dir.requires_grad_(True)
+        else:
+            zenith = event_params.get('zenith', None)
+            azimuth = event_params.get('azimuth', None)
+            if zenith is None or azimuth is None:
+                raise ValueError(
+                    "event_params must contain either 'direction' or both 'zenith' and 'azimuth'"
+                )
+            if not isinstance(zenith, torch.Tensor):
+                theta = torch.tensor(zenith, dtype=torch.float32, device=self.device).squeeze()
+            else:
+                theta = zenith.to(self.device).squeeze()
+            if not isinstance(azimuth, torch.Tensor):
+                phi = torch.tensor(azimuth, dtype=torch.float32, device=self.device).squeeze()
+            else:
+                phi = azimuth.to(self.device).squeeze()
+            if gradient_mode:
+                theta = theta.requires_grad_(True)
+                phi = phi.requires_grad_(True)
+            track_dir = torch.stack([
+                torch.sin(theta) * torch.cos(phi),
+                torch.sin(theta) * torch.sin(phi),
+                torch.cos(theta)
+            ])
         
         # Call the main function
         light_yield = self.__call__(
@@ -432,6 +466,7 @@ class LightSabrePATD(LightSabre):
         zenith = event_params.get('zenith', None)
         azimuth = event_params.get('azimuth', None)
         energy = event_params.get('energy', None)
+        angular_dir = event_params.get('direction', None)
         
         # Convert to tensors
         if isinstance(track_pos, torch.Tensor):
@@ -451,26 +486,34 @@ class LightSabrePATD(LightSabre):
         else:
             theta = torch.tensor(zenith, device=self.device).squeeze()
             phi = torch.tensor(azimuth, device=self.device).squeeze()
-  
-        track_dir = torch.stack([
-            torch.sin(theta) * torch.cos(phi),
-            torch.sin(theta) * torch.sin(phi),
-            torch.cos(theta)
-        ])
-        track_dir = track_dir / torch.norm(track_dir)  # Normalize
+        if angular_dir is not None:
+            if isinstance(angular_dir, torch.Tensor):
+                track_dir = angular_dir.to(self.device).squeeze()
+            else:
+                track_dir = torch.tensor(angular_dir, device=self.device).squeeze()
+        else:
+            track_dir = torch.stack([
+                torch.sin(theta) * torch.cos(phi),
+                torch.sin(theta) * torch.sin(phi),
+                torch.cos(theta)
+            ])
+            track_dir = track_dir / torch.norm(track_dir)  # Normalize
         
         # Get expected number of photons at detector
-        
-        light_yield = self.__call__(
-            track_pos=track_pos,
-            track_dir=track_dir,
-            track_energy=energy,
-            om_positions=opt_point
-        )
-        if self.kwargs.get('use_poisson', False):
-            light_yield = torch.poisson(light_yield)
+        if self.kwargs.get('input_photons', None) is None:
+            light_yield = self.__call__(
+                track_pos=track_pos,
+                track_dir=track_dir,
+                track_energy=energy,
+                om_positions=opt_point
+            )
+            if self.kwargs.get('use_poisson', False):
+                light_yield = torch.poisson(light_yield)
+        else:
+            light_yield = torch.tensor(self.kwargs.get('input_photons', None), device=self.device)   
         
         expected_N = torch.round(light_yield).int().item()
+  
         
         # Limit sampling if max_photons is provided
         if max_photons is not None and max_photons < expected_N:
@@ -483,8 +526,8 @@ class LightSabrePATD(LightSabre):
         # Find the foot of the perpendicular from detector to track
         # Foot point is: track_pos + t_foot * track_dir where t_foot = (detector_pos - track_pos) · track_dir
         to_detector = detector_pos - track_pos
-        t_foot = torch.dot(to_detector, track_dir)
-        # foot_point = track_pos + t_foot * track_dir
+        t_foot = torch.dot(to_detector, track_dir) #distance along track to foot point
+        foot_length = torch.norm(torch.linalg.cross(to_detector, track_dir))/torch.norm(track_dir)
         if not self.use_max_energy_dist:
         # Get the maximum distance S along track from foot point in both directions
             S = self.kwargs.get('track_segment_length', 200.0)  # Default 200m
@@ -509,21 +552,21 @@ class LightSabrePATD(LightSabre):
         distances = torch.norm(track_points - detector_pos.unsqueeze(0), dim=1)
         # print(distances[::50])
         
-        # Cherenkov angle for ice
+        # Cherenkov angle for water
         theta_c = torch.acos(torch.tensor(1.0/self.refractive_index, device=self.device))
         sin_theta_c = torch.sin(theta_c)
         
-        # Optical parameters
-        lambda_abs = 125.0
-        lambda_sca = 33.0
+        # Optical parameters for water from Tobias K.
+        lambda_abs = 44.7
+        lambda_sca = 57.4
         lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
         zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device))
         lambda_c = lambda_sca / (3.0 * zeta)
         lambda_mu = (lambda_c / sin_theta_c**2 * 2.0 / (np.pi * lambda_p))
         
         # Avoid division by zero
-        distances_safe = torch.clamp(distances, min=1e-6)
-        
+        # distances_safe = torch.clamp(distances, min=1e-6)
+        distances_safe = distances
         # Calculate weights (unnormalized probabilities)
         numerator = (1.0 / (2.0 * np.pi * sin_theta_c))
         numerator = numerator * torch.exp(-distances_safe / lambda_p)
@@ -537,10 +580,12 @@ class LightSabrePATD(LightSabre):
         weights = weights / torch.sum(weights)
         
         # Sample N points along the track according to weights
-        sampled_indices = torch.multinomial(weights, N, replacement=True)
-        sampled_track_points = track_points[sampled_indices]
+        # Convert N to int if it's a tensor, otherwise it's already a Python int
+        num_samples = int(N.item()) if isinstance(N, torch.Tensor) else int(N)
+        sampled_indices = torch.multinomial(weights, num_samples, replacement=True)
+        # sampled_track_points = track_points[sampled_indices]
         sampled_t_vals = t_vals[sampled_indices]
-        
+        sampled_track_points = track_pos.unsqueeze(0) + sampled_t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
         # Calculate geometric distances for sampled points
         d_geom = torch.norm(sampled_track_points - detector_pos.unsqueeze(0), dim=1)
         
@@ -550,24 +595,38 @@ class LightSabrePATD(LightSabre):
         
         # Calculate geometric time: t_geom = d/(c/n) + s/v_mu
         t_geom = d_geom / (c / self.refractive_index) + s / v_mu
-        
+        # t_geom_foot = t_foot / (c / self.refractive_index) + foot_length / v_mu
+        # t_geom_track = torch.norm(to_detector) / (c / self.refractive_index)
+        # t_geom_min = min(t_geom_foot, t_geom_track)
+        if v_mu != c/self.refractive_index:
+            short_track = t_foot - ((c / self.refractive_index) * foot_length)/torch.sqrt(torch.tensor(v_mu**2 - (c / self.refractive_index)**2, device=self.device))
+            t_geom_min = (short_track / v_mu)  +  torch.sqrt((short_track-t_foot)**2 + foot_length**2) / (c / self.refractive_index)
+        else:
+            t_geom_min = torch.norm(to_detector) / (c / self.refractive_index)
         # Initialize CPandel model
         cpandel = CPandel(
             tau=cpandel_params.get('tau', 557.),
             lambda_s=cpandel_params.get('lambda_s', 33.3),
             lambda_a=cpandel_params.get('lambda_a', 98.),
-            v=cpandel_params.get('v', 0.3/1.3),
+            v=cpandel_params.get('v', 0.3/1.33),
             s=cpandel_params.get('s', 5.0)
         )
         
         # Sample residual times using CPandel for all geometric distances at once (vectorized)
-        d_geom_numpy = d_geom.cpu().numpy()
-        t_residual_numpy = cpandel.rvs(d=d_geom_numpy, size=N)
-        t_residual = torch.from_numpy(t_residual_numpy).float().to(self.device)
+        # When d is already an array of N distances, don't pass size parameter
+        # to avoid creating an N×N matrix
+        d_geom_numpy = d_geom.detach().cpu().numpy()
+        t_residual_output = cpandel.rvs(d=d_geom_numpy, size=None)
+        
+        # Handle both torch tensor and numpy array outputs
+        if isinstance(t_residual_output, torch.Tensor):
+            t_residual = t_residual_output.float().to(self.device)
+        else:
+            t_residual = torch.from_numpy(t_residual_output).float().to(self.device)
         
         # Total hit time = geometric time + residual time
         hit_times = t_geom + t_residual
         
         # need to think of a better return structure here
         
-        return {'hit_times': hit_times, 'num_photons': N, 'expected_photons': expected_N, 'residual_times': t_residual}
+        return {'hit_times': hit_times, 'num_photons': N, 'expected_photons': expected_N, 'residual_times': t_residual, 'geometric_times': t_geom, 't_geom_min': t_geom_min, 'd_geom': d_geom}

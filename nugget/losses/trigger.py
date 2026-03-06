@@ -26,6 +26,8 @@ class TriggerLoss(LossFunction):
                  t3_temperature=1.0,
                  t_temperature=1.0,
                  weight_sigmoid_sharpness=1.0,
+                 allow_clusters=False,
+                 min_clusters_size=2,
                  print_loss=False):
         """
         Initialize the trigger loss function.
@@ -62,6 +64,8 @@ class TriggerLoss(LossFunction):
         self.t_temperature = t_temperature
         self.weight_sigmoid_sharpness = weight_sigmoid_sharpness
         self.print_loss = print_loss
+        self.allow_clusters = allow_clusters
+        self.min_clusters_size = int(min_clusters_size)  # Minimum cluster size if clusters are allowed
     
     def map_string_weights_to_points(self, points_3d, string_xy, string_weights):
         """
@@ -263,14 +267,19 @@ class TriggerLoss(LossFunction):
         upper_triangular_mask = upper_triangular_mask.unsqueeze(0)  # (1, n_points, n_points)
         pair_contributions_unique = pair_contributions * upper_triangular_mask
         
-        # Sum all unique pair contributions for each event
-        pair_sums = torch.sum(pair_contributions_unique, dim=2)  # Shape: (n_events, n_points) sum over each points neighbours
-        
-        # Apply final sigmoid for all events
-        t3_values = torch.sigmoid(self.t3_temperature * (pair_sums - self.min_pairs_threshold))
-        
-        # Take softmax weighted sum to see if there exists 1 point with enough neighbours that fulfill the condition
-        t_values = torch.sum(t3_values*torch.softmax(t3_values*self.t_temperature, dim=1), dim=1)
+        if not self.allow_clusters:
+            # Sum all unique pair contributions for each event
+            pair_sums = torch.sum(pair_contributions_unique, dim=2)  # Shape: (n_events, n_points) sum over each points neighbours
+            
+            # Apply final sigmoid for all events
+            t3_values = torch.sigmoid(self.t3_temperature * (pair_sums - self.min_pairs_threshold))
+            
+            # Take softmax weighted sum to see if there exists 1 point with enough neighbours that fulfill the condition
+            t_values = torch.sum(t3_values*torch.softmax(t3_values*self.t_temperature, dim=1), dim=1)
+        else:
+            # If clusters are allowed, we can sum contributions across all points without softmax
+            pair_sums = torch.sum(pair_contributions_unique, dim=(1, 2))  # Shape: (n_events,)
+            t_values = torch.sigmoid(self.t3_temperature * (pair_sums - 2*self.min_pairs_threshold))
         return t_values  # Shape: (n_events,)
     
     def compute_trigger_probability_single_event(self, 
@@ -375,21 +384,140 @@ class TriggerLoss(LossFunction):
         # Create upper triangular mask (excluding diagonal)
         upper_triangular_mask = torch.triu(torch.ones(n_points, n_points, device=points_3d.device), diagonal=1)
         pair_contributions_unique = pair_contributions * upper_triangular_mask
-        
-        # Sum all unique pair contributions
-        pair_sum = torch.sum(pair_contributions_unique, dim=1)  # Shape: (n_points,) sum over each points neighbours
-        
-        # Apply final sigmoid
-        t3 = torch.sigmoid(self.t3_temperature * (pair_sum - self.min_pairs_threshold))
-        
-        # print(f"T3 computation time: {time.time() - time_start:.4f} s", flush=True)
-        t_values = torch.sum(t3*torch.softmax(t3*self.t_temperature))
+        if not self.allow_clusters:
+            # Sum all unique pair contributions
+            pair_sum = torch.sum(pair_contributions_unique, dim=1)  # Shape: (n_points,) sum over each points neighbours
+            
+            # Apply final sigmoid
+            t3 = torch.sigmoid(self.t3_temperature * (pair_sum - self.min_pairs_threshold))
+            
+            # print(f"T3 computation time: {time.time() - time_start:.4f} s", flush=True)
+            t_values = torch.sum(t3*torch.softmax(t3*self.t_temperature))
+        else:
+            # If clusters are allowed, we can sum contributions across all points without softmax
+            pair_sum = torch.sum(pair_contributions_unique)  # Shape: scalar
+            t3 = torch.sigmoid(self.t3_temperature * (pair_sum - 2*self.min_pairs_threshold)) # 2* because of double counting pairs in this case
+            t_values = t3
         return {
             't3_values': t3,
             't1_values': t1_values,
             't2_values': t2_matrix,
             't_values': t_values
         }
+    
+    def compute_trigger_probability_single_event_alt(
+        self,
+        points_3d,
+        event_params,
+        surrogate_func,
+        string_weights=None,
+        precomputed_light_yield=None,
+                                    ):
+        """
+        Chain-based trigger:
+        checks for existence of a chain of k causally connected points.
+        """
+
+        n_points = len(points_3d)
+        k = int(self.min_pairs_threshold)
+
+        # -------------------------
+        # Step 1: t1 (same as before)
+        # -------------------------
+        if precomputed_light_yield is not None:
+            light_yields = precomputed_light_yield
+        else:
+            light_yields = surrogate_func(opt_point=points_3d, event_params=event_params)
+
+        if string_weights is None:
+            string_weights = torch.ones(n_points, device=points_3d.device)
+
+        t1 = string_weights * torch.sigmoid(
+            self.t1_temperature * (light_yields - self.light_yield_threshold)
+        )
+
+        # -------------------------
+        # Step 2: t2 (same as before)
+        # -------------------------
+        track_pos = event_params["position"]
+        zenith = event_params["zenith"]
+        azimuth = event_params["azimuth"]
+
+        if not isinstance(track_pos, torch.Tensor):
+            track_pos = torch.tensor(track_pos, device=points_3d.device)
+
+        theta = zenith if isinstance(zenith, torch.Tensor) else torch.tensor(zenith, device=points_3d.device)
+        phi   = azimuth if isinstance(azimuth, torch.Tensor) else torch.tensor(azimuth, device=points_3d.device)
+
+        track_dir = torch.stack([
+            torch.sin(theta) * torch.cos(phi),
+            torch.sin(theta) * torch.sin(phi),
+            torch.cos(theta),
+        ])
+        track_dir = track_dir / torch.norm(track_dir)
+
+        pairwise_distances = self.compute_pairwise_distances_along_track(
+            points_3d, track_pos, track_dir
+        )
+
+        t2 = torch.sigmoid(
+            self.t2_temperature * (self.pairwise_distance_threshold - pairwise_distances)
+        )
+        
+        direction_mask, ds = self.directional_cut_along_track(points_3d, track_pos, track_dir)
+        t2 = t2 * direction_mask # only allow connections in the correct direction along the track
+
+        # no self-edges
+        t2 = t2 * (1 - torch.eye(n_points, device=points_3d.device))
+
+        # -------------------------
+        # Step 3: chain DP
+        # -------------------------
+        # dp[j] = total weight of all chains ending at j
+        dp = t1.clone()  # chains of length 1
+
+        for _ in range(k - 1):
+            # message passing: dp_new[j] = t1[j] * sum_i dp[i] * t2[i,j]
+            dp = t1 * (dp @ t2)
+
+        # dp[j] now measures "how many k-chains end at j"
+        chain_strength = dp
+
+        # -------------------------
+        # Step 4: trigger aggregation
+        # -------------------------
+        t3_values = torch.sigmoid(
+            self.t3_temperature * (chain_strength - self.min_pairs_threshold)
+        )
+
+        # "exists at least one chain"
+        t_values = torch.sum(
+            t3_values * torch.softmax(t3_values * self.t_temperature, dim=0)
+        )
+
+        return {
+            "t3_values": t3_values,   # per-point chain strength
+            "t1_values": t1,
+            "t2_values": t2,
+            "t_values": t_values,
+        }
+        
+    def directional_cut_along_track(self, points_3d, track_pos, track_dir):
+        """
+        points_3d: (N, 3)
+        track_pos: (3,)
+        track_dir: (3,), normalized
+        """
+
+        # scalar projection along track
+        s = (points_3d - track_pos) @ track_dir  # (N,)
+
+        # s_j - s_i > 0
+        ds = s[None, :] - s[:, None]              # (N, N)
+
+        return (ds > 0).float(), ds
+
+  
     
     def __call__(self, geom_dict, **kwargs):
         """

@@ -6,3 +6,6 @@ from . import SymbolicReg
 from . import Uniform
 from . import pandel
 from . import cpandel
+from . import ChargeNet
+from . import HitFlowNet
+from . import HitFlow
