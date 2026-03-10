@@ -3,10 +3,40 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import time
+import math
 import random
 import pickle
 import gc
 from torch.func import jacrev, jvp, vmap, linearize
+
+
+def _pos_norm_divisor_from_domain_size(domain_size, *, device, dtype=torch.float32):
+    """Match LLRnet's norm_pos scaling.
+
+    - Scalar domain_size: divide all coordinates by (domain_size/2).
+    - Tuple/list (width, height): divide x,y by (width/2) and z by (height/2).
+
+    Returns either a Python float or a (3,) torch.Tensor on `device`.
+    """
+    if isinstance(domain_size, torch.Tensor):
+        # If it's a scalar tensor.
+        domain_size = domain_size.item()
+
+    if isinstance(domain_size, (tuple, list)) and len(domain_size) == 2:
+        width, height = domain_size
+        if isinstance(width, torch.Tensor):
+            width = width.item()
+        if isinstance(height, torch.Tensor):
+            height = height.item()
+        width = float(width)
+        height = float(height)
+        return torch.tensor(
+            [width / 2.0, width / 2.0, height / 2.0],
+            device=device,
+            dtype=dtype,
+        )
+
+    return float(domain_size) / 2.0
 
 
 def _llr_mask_from_true_ly(true_ly, *, threshold=0.5, sharpness=12.0):
@@ -176,7 +206,8 @@ def _build_features_from_cached_responses(
         domain_size = getattr(llr_net, 'domain_size', None)
         if domain_size is None:
             raise AttributeError("llr_net.norm_pos=True but llr_net.domain_size is missing")
-        norm_points = pts_3 / (domain_size / 2)
+        divisor = _pos_norm_divisor_from_domain_size(domain_size, device=device, dtype=pts_3.dtype)
+        norm_points = pts_3 / divisor
     else:
         norm_points = pts_3
 
@@ -231,7 +262,8 @@ def _build_features_from_cached_responses(
             domain_size = getattr(llr_net, 'domain_size', None)
             if domain_size is None:
                 raise AttributeError("llr_net.norm_pos=True but llr_net.domain_size is missing")
-            feature = feature / (domain_size / 2)
+            divisor = _pos_norm_divisor_from_domain_size(domain_size, device=device, dtype=feature.dtype)
+            feature = feature / divisor
         event_param_features.append(feature.flatten())
 
     if event_param_features:
@@ -779,8 +811,8 @@ def directional_resolution(F3, n):
 
         # --- Angular resolution (approx small-angle) ---
         eigvals = torch.linalg.eigvalsh(Cov2)
-        eigvals = torch.nn.functional.softplus(eigvals, beta=5)
-        eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
+        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
+        # eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
         sigma_eff = torch.sqrt(torch.mean(eigvals) + 1e-10)  # Add epsilon for numerical stability
         r68 = 1.515 * sigma_eff
         
@@ -820,7 +852,7 @@ def directional_resolution(F3, n):
         F2 = torch.bmm(torch.bmm(B.transpose(1, 2), F3), B)  # (N, 2, 2)
         
         # Add regularization
-        F2 = F2 + 1e-5 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)  # Increased regularization for stability
+        F2 = F2 + 1e-8 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)  # Increased regularization for stability
         
         # --- Invert to get covariance (N, 2, 2) ---
         try:
@@ -837,8 +869,8 @@ def directional_resolution(F3, n):
         
         # --- Angular resolution for all events ---
         eigvals = torch.linalg.eigvalsh(Cov2)  # (N, 2)
-        eigvals = torch.nn.functional.softplus(eigvals, beta=1000)
-        eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
+        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
+        # eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
         sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) + 1e-10)  # (N,) Add epsilon for numerical stability
         r68 = 1.515 * sigma_eff  # (N,)
         
@@ -954,58 +986,92 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
     # -----------------------------------------------------------------------
     if llr_net is None:
         # ---- surrogate-only path -----------------------------------------------
-        # The surrogate directly returns the Poisson mean λ (no noise averaging
-        # needed — llr_iterations is ignored per specification).
-        # Create n_points INDEPENDENT parameter copies so that ly[i] has its own
-        # gradient path: J[i] = ∂λ(point_i)/∂theta.
-        batched_grad_params = {}
-        for param_name in fisher_info_params:
-            pv = event_params.get(param_name).to(device)
-            # one copy per point
-            copies = pv.unsqueeze(0).expand(n_points, *pv.shape).clone().detach().to(device).requires_grad_(True)
-            batched_grad_params[param_name] = copies  # (n_points, *param_shape)
+        # The surrogate directly returns the Poisson mean λ.
+        # We mirror the LLR-mode principle: build a Jacobian J of the vector output
+        # (one λ per point) w.r.t. the event parameters, then form per-point Fishers.
+        # Note: for a Poisson mean parameterization, Fisher per point is
+        #   F_i = (∂λ_i/∂θ)(∂λ_i/∂θ)^T / λ_i
 
-        # Fully-batched surrogate call; fall back to sequential if not supported.
-        try:
-            params_b = {p: batched_grad_params[p] for p in fisher_info_params}
-            params_b.update(fixed_params)
-            ly_all = surrogate_func(opt_point=point,
-                                    event_params={k: (v[0] if k in fisher_info_params else v)
-                                                  for k, v in params_b.items()})
-            if not isinstance(ly_all, torch.Tensor) or ly_all.shape[0] != n_points:
-                raise ValueError
-        except Exception:
-            ly_list = []
-            for pt_idx in range(n_points):
-                p_i = {p: batched_grad_params[p][pt_idx] for p in fisher_info_params}
-                p_i.update(fixed_params)
-                ly_list.append(surrogate_func(opt_point=point[pt_idx], event_params=p_i))
-            ly_all = torch.stack(ly_list)   # (n_points,)
+        llr_autodiff_mode_local = (llr_autodiff_mode or 'jacrev').lower()
+        if llr_autodiff_mode_local not in {'jacrev', 'jvp'}:
+            raise ValueError(
+                f"Unsupported llr_autodiff_mode={llr_autodiff_mode!r} for surrogate-only path; "
+                "expected 'jacrev' or 'jvp'."
+            )
 
-        # Per-point gradients: J[i] = ∂ly[i]/∂param_copy_i
-        grad_parts = []
-        for param_name in fisher_info_params:
-            param_tensor = batched_grad_params[param_name]
-            param_size   = param_tensor[0].numel()
-            g = torch.autograd.grad(
-                outputs=ly_all,
-                inputs=param_tensor,
-                grad_outputs=torch.ones_like(ly_all),
-                create_graph=False,
-                retain_graph=True,
-                only_inputs=True,
-                allow_unused=True,
-            )[0]
-            grad_parts.append(g.view(n_points, param_size) if g is not None
-                               else torch.zeros(n_points, param_size, device=device))
+        theta_shapes = [event_params[p].detach().to(device).shape for p in fisher_info_params]
+        theta_numels = [int(event_params[p].detach().to(device).numel()) for p in fisher_info_params]
+        theta0_flat = torch.cat([event_params[p].detach().to(device).reshape(-1) for p in fisher_info_params], dim=0)
+        total_dims_local = int(theta0_flat.numel())
 
-        J       = torch.cat(grad_parts, dim=1)   # (n_points, total_dims)
-        ly_vals = ly_all.detach()
+        pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
+        fisher_per_point = torch.zeros(n_points, total_dims_local, total_dims_local, device=device)
 
-        # Fisher formula: F_i = (∂λ_i/∂θ)(∂λ_i/∂θ)ᵀ / λ_i
-        grad_outer = torch.bmm(J.unsqueeze(-1), J.unsqueeze(-2))  # (n_points, D, D)
-        grad_outer = grad_outer / ly_vals.clamp(min=1e-10).view(n_points, 1, 1)
-        fisher_per_point = grad_outer   # (n_points, total_dims, total_dims)
+        def _surrogate_batched(pts_3, params_dict):
+            """Evaluate surrogate over a point batch; fall back to a point loop."""
+            try:
+                ly_b = surrogate_func(opt_point=pts_3, event_params=params_dict)
+                if not isinstance(ly_b, torch.Tensor):
+                    raise TypeError
+                ly_b = ly_b.reshape(-1)
+                if ly_b.numel() != pts_3.shape[0]:
+                    raise ValueError
+                return ly_b
+            except Exception:
+                ly_list = []
+                for i in range(pts_3.shape[0]):
+                    ly_list.append(surrogate_func(opt_point=pts_3[i], event_params=params_dict))
+                return torch.stack(ly_list).reshape(-1)
+
+        for p_start in range(0, n_points, pt_chunk):
+            p_end = min(p_start + pt_chunk, n_points)
+            pts = point[p_start:p_end]
+            B = pts.shape[0]
+
+            def _theta_only_fn(theta_flat):
+                params = _unflatten_theta(
+                    theta_flat,
+                    fisher_info_params=fisher_info_params,
+                    theta_shapes=theta_shapes,
+                    theta_numels=theta_numels,
+                    fixed_params=fixed_params,
+                )
+                return _surrogate_batched(pts, params)
+
+            if llr_autodiff_mode_local == 'jacrev':
+                # Reverse-mode Jacobian: J is (B, D)
+                J = jacrev(_theta_only_fn, chunk_size=jacrev_chunk_size)(theta0_flat)
+                if not isinstance(J, torch.Tensor):
+                    J = torch.as_tensor(J, device=device)
+                J = J.reshape(B, total_dims_local)
+                ly_vals = _theta_only_fn(theta0_flat).detach().reshape(-1)
+
+            else:
+                # Forward-mode Jacobian via JVPs: linearize then apply to basis vectors.
+                basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims_local
+                ly0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
+                ly_vals = ly0.detach().reshape(-1)
+
+                cols_parts = []
+                for d_start in range(0, total_dims_local, basis_chunk_size):
+                    d_end = min(d_start + basis_chunk_size, total_dims_local)
+                    k = d_end - d_start
+                    basis_chunk = torch.zeros(k, total_dims_local, device=device, dtype=theta0_flat.dtype)
+                    rows = torch.arange(k, device=device)
+                    cols_idx = torch.arange(d_start, d_end, device=device)
+                    basis_chunk[rows, cols_idx] = 1
+                    cols_chunk = vmap(jvp_fn)(basis_chunk)  # (k, B)
+                    cols_parts.append(cols_chunk)
+
+                cols = torch.cat(cols_parts, dim=0)  # (D, B)
+                J = cols.permute(1, 0).contiguous()  # (B, D)
+                del cols_parts, cols, jvp_fn, ly0
+
+            # Per-point Fisher (Poisson mean): outer / lambda
+            outer = torch.bmm(J.unsqueeze(-1), J.unsqueeze(-2))  # (B, D, D)
+            outer = outer / ly_vals.clamp(min=1e-10).view(B, 1, 1)
+            fisher_per_point[p_start:p_end] = outer.detach()
+            del J, outer, ly_vals, pts
 
     else:
         # ---- LLR-network path -----------------------------------------------

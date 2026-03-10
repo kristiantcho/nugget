@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
     name="nugget",
     version="2.0",
-    description="NeUtrino experiement Geometry optimization and General Evaluation Tool",
+    description="NeUtrino experiment Geometry optimization and General Evaluation Tool",
     author="",
     author_email="",
     packages=find_packages(),

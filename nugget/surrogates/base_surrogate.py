@@ -8,7 +8,7 @@ class Surrogate:
         self.device = device if device is not None else torch.device("cpu")
         self.dim = dim
         self.domain_size = domain_size
-        self.half_domain = domain_size / 2
+        # self.half_domain = domain_size / 2
      
     def __call__(self, opt_point=None, event_params=None):
         """

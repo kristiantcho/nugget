@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import math
 from nugget.surrogates.base_surrogate import Surrogate
 from nflows.distributions.normal import StandardNormal
 from nflows.flows.base import Flow
@@ -12,13 +13,19 @@ class LogTransform(Transform):
     
     def forward(self, x, context=None):
         # x > 0
-        y = torch.log10(x)
-        log_det = -torch.log(x).sum(dim=-1)
+        y = torch.log10(x) / 5.0
+        # y = log10(x)/5 => dy/dx = 1 / (5 * ln(10) * x)
+        # log|det J| = sum_i [ -log(x_i) - log(5 * ln(10)) ]
+        log_scale = math.log(5.0 * math.log(10.0))
+        log_det = -torch.log(x).sum(dim=-1) - x.shape[-1] * log_scale
         return y, log_det
 
     def inverse(self, y, context=None):
-        x = 10**y
-        log_det = y.sum(dim=-1) * np.log(10)
+        x = 10 ** (y * 5.0)
+        # dx/dy = 5 * ln(10) * x
+        # log|det J| = sum_i [ log(x_i) + log(5 * ln(10)) ]
+        log_scale = math.log(5.0 * math.log(10.0))
+        log_det = torch.log(x).sum(dim=-1) + y.shape[-1] * log_scale
         return x, log_det
 
 
@@ -121,23 +128,41 @@ class HitFlow(Surrogate):
         torch.Tensor
             Feature vector of shape (num_hits, context_features)
         """
-        # Always use the model's fixed domain_size for normalization
+        # Always use the model's fixed domain_size for normalization.
+        # If domain_size is (width, height), normalize x,y by (width/2) and z by (height/2).
         domain_size = self.domain_size
+        if isinstance(domain_size, torch.Tensor):
+            domain_size = domain_size.item()
+
+        if isinstance(domain_size, (tuple, list)) and len(domain_size) == 2:
+            width, height = domain_size
+            if isinstance(width, torch.Tensor):
+                width = width.item()
+            if isinstance(height, torch.Tensor):
+                height = height.item()
+            x_scale = width / 2.0
+            y_scale = width / 2.0
+            z_scale = height / 2.0
+        else:
+            # Original behavior: divide all coordinates by scalar domain_size
+            x_scale = domain_size/2
+            y_scale = domain_size/2
+            z_scale = domain_size/2
         
         # Extract and scale parameters
-        energy = torch.log10(event_params['energy']).squeeze()
+        energy = torch.log10(event_params['energy']).squeeze()/8.0
         
-        # Scale coordinates by domain size
-        x = coordinate[0] / domain_size
-        y = coordinate[1] / domain_size
-        z = coordinate[2] / domain_size
+        # Scale coordinates
+        x = coordinate[0] / x_scale
+        y = coordinate[1] / y_scale
+        z = coordinate[2] / z_scale
         
         # Vertex position
-        v_x = event_params['position'][0][0] / domain_size
-        v_y = event_params['position'][0][1] / domain_size
-        v_z = event_params['position'][0][2] / domain_size
+        v_x = event_params['position'][0][0] / x_scale
+        v_y = event_params['position'][0][1] / y_scale
+        v_z = event_params['position'][0][2] / z_scale
         
-        # Direction
+        # Direction§
         d_x = event_params['direction'][0]
         d_y = event_params['direction'][1]
         d_z = event_params['direction'][2]
@@ -146,7 +171,7 @@ class HitFlow(Surrogate):
         if isinstance(num_hits, torch.Tensor):
             log_hits = torch.log10(num_hits.float())
         else:
-            log_hits = torch.log10(torch.tensor(num_hits, dtype=torch.float32, device=self.device))
+            log_hits = torch.log10(torch.tensor(num_hits, dtype=torch.float32, device=self.device))/6.0
         
         # Build feature list
         feature_list = [energy, x, y, z, v_x, v_y, v_z, d_x, d_y, d_z, log_hits]
@@ -200,6 +225,7 @@ class HitFlow(Surrogate):
         list
             Training losses
         """
+        self.flow.train()
         # Initialize optimizer
         self.optimizer = torch.optim.Adam(self.flow.parameters(), lr=lr)
         
@@ -252,11 +278,15 @@ class HitFlow(Surrogate):
                 
                 # Get hit times and shift to start near zero
                 hit_times = patd_dict['hit_times']
-                if max_hits_per_event is not None and len(hit_times) > max_hits_per_event:
-                    hit_times = hit_times[:max_hits_per_event]
-                    
                 min_time = torch.min(hit_times)
-                hit_times_shifted = (hit_times - min_time + 1e-3).unsqueeze(1)
+                if max_hits_per_event is not None and len(hit_times) > max_hits_per_event:
+                    # randomly sample max_hits_per_event from hit_times
+                    indices = torch.randperm(len(hit_times))[:max_hits_per_event]
+                    hit_times = hit_times[indices]
+                    # hit_times = hit_times[:max_hits_per_event]
+                    
+                
+                hit_times_shifted = (hit_times - min_time + 1e-5).unsqueeze(1)
                 
                 # Create context features
                 features_batch = self.create_event_features(
@@ -535,9 +565,9 @@ class HitFlow(Surrogate):
         self.is_trained = checkpoint['is_trained']
         
         # Load cylinder variation parameters if available
-        self.vary_cylinder = checkpoint.get('vary_cylinder', False)
-        self.min_domain_size = checkpoint.get('min_domain_size', 1000)
-        self.max_domain_size = checkpoint.get('max_domain_size', 5000)
+        # self.vary_cylinder = checkpoint.get('vary_cylinder', False)
+        # self.min_domain_size = checkpoint.get('min_domain_size', 1000)
+        # self.max_domain_size = checkpoint.get('max_domain_size', 5000)
         
         # Rebuild and load flow
         self._build_flow()
