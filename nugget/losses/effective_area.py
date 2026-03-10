@@ -9,8 +9,9 @@ from nugget.losses.trigger import TriggerLoss
 import torch
 from nugget.samplers.cyl_sampler import CylinderSampler
 
-data_dir = Path(__file__).resolve().parents[2]/ "nugget" / "assets" / "data"
-
+# Default packaged data directory (nugget/assets/data)
+# data_dir = Path(__file__).resolve().parents[1] / "assets" / "data"
+data_dir=''
 def muon_range(energy):
     """
     Approximate muon range
@@ -143,9 +144,16 @@ class CrossSection:
         self.y_sampling_splines = {}
 
         if filename is None:
-            filename = os.path.join(data_dir, "csms_square.h5")
+            filename = data_dir / "csms_square.h5"
 
-        with h5py.File(filename) as hdl:
+        filename = Path(filename)
+        if not filename.exists():
+            raise FileNotFoundError(
+                f"Cross section table not found: {filename}. "
+                "Pass 'filename=' explicitly or ensure nugget/assets/data is present."
+            )
+
+        with h5py.File(filename, "r") as hdl:
             self._logenergies = hdl["energies"][:] -9 # GeV
 
             zs = hdl["zs"][:]
@@ -255,14 +263,25 @@ class CrossSection:
 class TransmissionProb:
     """Neutrino transmission probability through Earth."""
     
-    def __init__(self, filename=os.path.join(data_dir, "transm_inter_splines.pickle")
+    def __init__(self, filename=None
                  ):
         """Initialize transmission probability interpolators.
         
         Args:
             filename: Path to pickle file containing transmission splines
         """
-        data = pickle.load(open(filename, "rb"))
+        if filename is None:
+            filename = data_dir / "transm_inter_splines.pickle"
+
+        filename = Path(filename)
+        if not filename.exists():
+            raise FileNotFoundError(
+                f"Transmission spline file not found: {filename}. "
+                "Pass 'filename=' explicitly or ensure nugget/assets/data is present."
+            )
+
+        with open(filename, "rb") as f:
+            data = pickle.load(f)
         self.splines = data["transmission_prob"]
 
     def __call__(self, cos_theta, energy, flavor="numu"):
@@ -389,7 +408,16 @@ def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.
 class EffectiveAreaLoss(LossFunction):
     """Loss class to maximize neutrino effective area."""
     
-    def __init__(self, xsec=CrossSection(), transmission=TransmissionProb(), flavor="numu", average_nu_nubar=True, trigger = TriggerLoss(), device=None, domain_size=2500):
+    def __init__(
+        self,
+        xsec=None,
+        transmission=None,
+        flavor="numu",
+        average_nu_nubar=True,
+        trigger=None,
+        device=None,
+        domain_size=2500,
+    ):
         """Initialize effective area loss function.
         
         Args:
@@ -399,11 +427,11 @@ class EffectiveAreaLoss(LossFunction):
             average_nu_nubar: Whether to average over neutrinos and antineutrinos
         """
         super().__init__(device)
-        self.xsec = xsec
-        self.transmission = transmission
+        self.xsec = CrossSection() if xsec is None else xsec
+        self.transmission = TransmissionProb() if transmission is None else transmission
         self.flavor = flavor
         self.average_nu_nubar = average_nu_nubar
-        self.trigger = trigger
+        self.trigger = TriggerLoss(device=self.device) if trigger is None else trigger
         self.domain_size = domain_size
 
     def map_string_weights_to_points(self, points_3d, string_xy, string_weights):
