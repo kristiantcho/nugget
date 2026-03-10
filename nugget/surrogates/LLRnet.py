@@ -321,6 +321,32 @@ class LLRnet(Surrogate):
         self.train_losses = []
         self.val_losses = []
         self.is_trained = False
+
+    def _pos_norm_divisor(self):
+        """Return a divisor for normalizing (x,y,z) positions.
+
+        - If domain_size is scalar: divisor is (domain_size/2) (original behavior).
+        - If domain_size is (width, height): divisor is (width/2, width/2, height/2).
+
+        Returns a float or a (3,) torch.Tensor on self.device.
+        """
+        domain_size = self.domain_size
+        if isinstance(domain_size, torch.Tensor):
+            domain_size = domain_size.item()
+
+        if isinstance(domain_size, (tuple, list)) and len(domain_size) == 2:
+            width, height = domain_size
+            if isinstance(width, torch.Tensor):
+                width = width.item()
+            if isinstance(height, torch.Tensor):
+                height = height.item()
+            return torch.tensor(
+                [width / 2.0, width / 2.0, height / 2.0],
+                device=self.device,
+                dtype=torch.float32,
+            )
+
+        return domain_size / 2.0
         
     def _build_network(self, input_dim):
         """Build the parallel MLP network architecture with multiple Fourier feature mappings."""
@@ -710,7 +736,7 @@ class LLRnet(Surrogate):
         
         # Add point coordinates
         if self.norm_pos:
-            norm_points = point_tensor / (self.domain_size / 2)
+            norm_points = point_tensor / self._pos_norm_divisor()
         else:
             norm_points = point_tensor
         feature_list.extend(norm_points.flatten())  # (3,)
@@ -757,7 +783,7 @@ class LLRnet(Surrogate):
                 if self.log_scale_energy and key == 'energy':
                     feature = torch.log10(feature + 1e-10)
                 if self.norm_pos and key == 'position':
-                    feature = feature / (self.domain_size / 2)
+                    feature = feature / self._pos_norm_divisor()
                 feature_list.extend(feature.flatten())  # (feature_dim,)
         
         # Build base features (same for all photons in an event)
@@ -889,7 +915,7 @@ class LLRnet(Surrogate):
             # Generate event features for all points (vectorized)
             # Point coordinates - shape: (n_points, 3)
             if self.norm_pos:
-                norm_points = point_tensor / (self.domain_size/2)
+                norm_points = point_tensor / self._pos_norm_divisor()
             else:
                 norm_points = point_tensor
             
@@ -936,7 +962,7 @@ class LLRnet(Surrogate):
                     if self.log_scale_energy and key == 'energy':
                         feature = torch.log10(feature + 1e-10)
                     if self.norm_pos and key == 'position':
-                        feature = feature/(self.domain_size/2)
+                        feature = feature / self._pos_norm_divisor()
                     event_param_features.append(feature.flatten())
             
             # Concatenate event params (scalar/vector features)
@@ -1066,7 +1092,7 @@ class LLRnet(Surrogate):
             
             # Flatten point coordinates to (N, 3) or (N*3,) depending on batch
             if self.norm_pos:
-                norm_points = point_tensor / (self.domain_size/2)
+                norm_points = point_tensor / self._pos_norm_divisor()
             else:
                 norm_points = point_tensor
             
@@ -1123,7 +1149,7 @@ class LLRnet(Surrogate):
                     if self.log_scale_energy and key == 'energy':
                         feature = torch.log10(feature + 1e-10)
                     if self.norm_pos and key == 'position':
-                        feature = feature/(self.domain_size/2)
+                        feature = feature / self._pos_norm_divisor()
                     # Handle batching: replicate event parameter for each point
                     if is_batched:
                         # Ensure feature is at least 1D and flatten

@@ -139,6 +139,29 @@ class Visualizer:
         self.gif_image_paths = [] # List to track saved image paths
 
     @staticmethod
+    def _z_value_for_confidence(confidence_level: float = 0.95) -> float:
+        """Return the (two-sided) z-value for a given confidence level.
+
+        Falls back to the 95% normal z-value if SciPy stats is unavailable.
+        """
+        try:
+            confidence_level = float(confidence_level)
+        except Exception:
+            confidence_level = 0.95
+
+        confidence_level = float(np.clip(confidence_level, 0.0, 1.0))
+        if confidence_level <= 0.0:
+            return 0.0
+
+        try:
+            from scipy.stats import norm
+
+            return float(norm.ppf(0.5 + confidence_level / 2.0))
+        except Exception:
+            # Common default.
+            return 1.959963984540054
+
+    @staticmethod
     def _pad_frames_to_max_size(frames, background_value=255):
         """Pad frames to the maximum (H, W) using a white background.
 
@@ -498,7 +521,8 @@ class Visualizer:
     
     def visualize_progress(self, 
                           iteration: int = None, 
-                          points: torch.Tensor=None, 
+                          points: torch.Tensor=None,
+                          points_3d: torch.Tensor=None,
                           loss_history: List[float]=None, 
                           string_indices: Optional[List[int]] = None, 
                           points_per_string_list: Optional[List[int]] = None, 
@@ -573,6 +597,9 @@ class Visualizer:
             - 'fisher_info_logdet': Log determinant of Fisher Information matrix contour plot
             - 'angular_resolution': Angular resolution from Fisher Information using Cramér-Rao bound
             - 'energy_resolution': Energy resolution from Fisher Information using Cramér-Rao bound
+            - 'angular_resolution_vs_zenith': Binned angular resolution vs zenith
+            - 'angular_resolution_vs_energy': Binned angular resolution vs energy
+            - 'energy_resolution_vs_energy': Binned energy resolution vs energy
             - 'loss_components': Individual loss components and total loss from loss dictionary
             - 'uw_loss_components': Individual unweighted loss components and total unweighted loss
             - 'alm_mu': ALM penalty parameters (mu) history for each constraint
@@ -630,7 +657,28 @@ class Visualizer:
             - surrogate_event_params: dict or list of dicts, optional. Event parameters to pass to the surrogate function.
               Can be a single dict containing 'position', 'zenith', 'azimuth', 'energy', etc., or a list of such dicts.
               If a list is provided, the light yield will be averaged over all events in the list.
+
+                        For resolution-vs-* plots ('angular_resolution_vs_zenith', 'angular_resolution_vs_energy', 'energy_resolution_vs_energy'):
+                        - resolution_per_event: array-like, per-event resolution values
+                        - resolution_params: list of dicts, each containing 'zenith' and/or 'energy'
+                                                - resolution_stat: {'median', 'mean'}, optional. Defaults to 'median'.
+                                                        If 'median': the line is the median and `resolution_ci_percentiles` apply to residuals around the median.
+                                                        If 'mean': the line is the mean and the band is ±2σ per bin (ignores residual quantiles).
+                                                        (Backwards-compat alias: resolution_use_mean=True)
+                                                - show_resolution_ci: bool, optional. If True, draws a two-sided residual-quantile band around the median in each bin
+                                                - resolution_ci_percentiles: tuple(float, float), optional. Percentiles for the residual band (default: (16, 84))
+                                                - resolution_ci_level: float in (0, 1), optional. Alternative specification as a central containment level. Ignored if
+                                                    resolution_ci_percentiles is provided.
+                        - zenith_range / zenith_range_deg: tuple(min, max), optional. Restrict zenith range for binning.
+                        - energy_range: tuple(min, max), optional. Restrict energy range for binning.
+                                                - resolution_logy: bool, optional. If True, uses log scale for the angular-resolution y-axis (vs zenith and vs energy).
+                                                    (Backwards-compat alias: resolution_logy_vs_zenith)
+                        - n_zenith_bins / n_energy_bins: int, optional. Number of bins
         """
+        # Backwards-compat: allow callers to pass `points_3d`.
+        if points is None and points_3d is not None:
+            points = points_3d
+
         # Safely handle torch tensor inputs by cloning and detaching them
         points = self._safe_tensor_convert(points)
         string_xy = self._safe_tensor_convert(string_xy)
@@ -669,11 +717,11 @@ class Visualizer:
                 num_gif_plots = len(current_gif_plot_types)
                 # Render GIF frames using the same layout defaults as the regular (non-GIF)
                 # plotting path so the plot appears "as is".
-                if num_gif_plots < 3:
-                    num_gif_cols = num_gif_plots
-                else:
-                    num_gif_cols = 3
+                # Keep up to 3 plots per row; don't allocate empty 3rd column for 1-2 plots.
+                num_gif_cols = 3 if num_gif_plots >= 3 else int(num_gif_plots)
+                num_gif_cols = max(1, int(num_gif_cols))
                 num_gif_rows = (num_gif_plots + num_gif_cols - 1) // num_gif_cols
+                num_gif_rows = max(1, int(num_gif_rows))
 
                 if gif_fixed_figsize is not None:
                     gif_fig_size = gif_fixed_figsize
@@ -828,25 +876,17 @@ class Visualizer:
         
         # Create figure with proper layout based on number of plots
         num_plots = len(plot_types)
-        num_rows = (num_plots + 2) // 3  # Ceiling division to get number of rows needed
-        if num_plots < 3:
-            ncols = num_plots
-        else:
-            ncols = 3
-        fig, axes = plt.subplots(num_rows, ncols, figsize=(5 * ncols, 4.5 * num_rows)) # MODIFIED
-
-        # If only one row, ensure axes is still a 2D array
-        if num_rows == 1 and ncols > 1:
-            axes = axes.reshape(1, -1)
+        # Keep up to 3 plots per row; don't allocate empty 3rd column for 1-2 plots.
+        ncols = 3 if num_plots >= 3 else int(num_plots)
+        ncols = max(1, int(ncols))
+        num_rows = (num_plots + 2) // 3
+        num_rows = max(1, int(num_rows))
+        fig, axes = plt.subplots(num_rows, ncols, figsize=(5 * ncols, 4.5 * num_rows), squeeze=False) # MODIFIED
+        axes_flat = axes.flatten()
         
         # Generate each requested plot
         for i, plot_type in enumerate(plot_types):
-            if len(plot_types) > 1:
-                row_idx = i // ncols
-                col_idx = i % ncols
-                ax = axes[row_idx, col_idx]
-            else:
-                ax = axes
+            ax = axes_flat[i]
 
             # Create the specified plot type
             self._create_plot(
@@ -867,12 +907,9 @@ class Visualizer:
             )
         
         # Hide unused axes
-        if num_plots > 1:
-            total_axes = num_rows * ncols
-            for i in range(num_plots, total_axes):
-                row_idx = i // ncols
-                col_idx = i % ncols
-                axes[row_idx, col_idx].axis('off')
+        total_axes = num_rows * ncols
+        for i in range(num_plots, total_axes):
+            axes_flat[i].axis('off')
         
         # tight_layout can fail for some edge cases (e.g. pathological font sizes).
         # Visualization should not crash the evaluator, so make this best-effort.
@@ -881,20 +918,933 @@ class Visualizer:
         except Exception as exc:
             print(f"Warning: fig.tight_layout() failed: {exc}")
         plt.show()
+
+    def visualize_multi_progress(
+        self,
+        *,
+        geom_vis_kwargs: Dict[str, Dict[str, Any]],
+        plot_types: Optional[List[str]] = None,
+        iteration: int = 0,
+        slice_res: int = 50,
+        multi_slice: bool = False,
+        loss_type: str = 'rbf',
+        make_gif: bool = False,
+        **shared_kwargs,
+    ) -> None:
+        """Visualize multiple geometries in a single call.
+
+        Notes
+        -----
+        - History/performance plots (loss, SNR, LLR) are overlaid with one line per geometry.
+        - Geometry plots (e.g. string_xy, string_xy_rov_penalty) are rendered as separate
+          subplots per geometry, with the geometry name annotated in each subplot.
+        - GIF generation is currently not supported in multi-geometry mode.
+        """
+
+        if make_gif:
+            make_gif = False
+
+        if not geom_vis_kwargs:
+            print("Warning: visualize_multi_progress called with no geometries.")
+            return
+
+        # Determine plot_types if not provided.
+        if plot_types is None:
+            first_payload = next(iter(geom_vis_kwargs.values()))
+            plot_types = first_payload.get('plot_types', None)
+        if plot_types is None:
+            plot_types = [self.PLOT_LOSS]
+
+        # Clear output once for the whole multi-geometry rendering.
+        clear_output(wait=True)
+
+        overlay_plot_types = {
+            self.PLOT_LOSS,
+            self.PLOT_UW_LOSS,
+            self.PLOT_SNR_HISTORY,
+            self.PLOT_LLR_HISTORY,
+            # Curve/metric plots (overlay is meaningful and does not require plotting XY geometry)
+            self.PLOT_PARAM_1D,
+            self.PLOT_ANGULAR_RESOLUTION,
+            self.PLOT_ENERGY_RESOLUTION,
+            self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH,
+            self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
+            self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
+            self.PLOT_LOSS_COMPONENTS,
+            self.PLOT_UW_LOSS_COMPONENTS,
+            self.PLOT_ALM_MU,
+            self.PLOT_ALM_LAMBDA,
+        }
+        # Everything not in overlay_plot_types is rendered as one subplot per geometry.
+
+        geom_items = list(geom_vis_kwargs.items())
+        n_geoms = len(geom_items)
+
+        for plot_type in plot_types:
+            if plot_type in overlay_plot_types:
+                fig, ax = plt.subplots(1, 1, figsize=(6.5, 4.5))
+
+                any_series = False
+                for geom_name, payload in geom_items:
+                    payload = dict(payload)
+                    payload.update(shared_kwargs)
+
+                    # Pull the relevant series.
+                    if plot_type in (self.PLOT_LOSS, self.PLOT_UW_LOSS):
+                        series = payload.get('loss_history', None)
+                        if series is not None:
+                            ax.plot(series, label=str(geom_name))
+                            any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_SNR_HISTORY:
+                        series = payload.get('snr_history', None)
+                        if series is not None:
+                            ax.plot(series, label=str(geom_name))
+                            any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_LLR_HISTORY:
+                        series = payload.get('llr_history', None)
+                        if series is not None:
+                            pts = payload.get('points', payload.get('points_3d', None))
+                            try:
+                                npts = len(pts) if pts is not None else None
+                            except Exception:
+                                npts = None
+                            if npts:
+                                series = np.array(series) / float(npts)
+                            ax.plot(series, label=str(geom_name))
+                            any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_PARAM_1D:
+                        optimize_params = payload.get('optimize_params', [])
+                        param_values = payload.get('param_values', {})
+                        all_snr = payload.get('all_snr', None)
+
+                        if len(optimize_params) == 1 and all_snr is not None:
+                            param_name = optimize_params[0]
+                            if param_name in param_values:
+                                try:
+                                    param_vals = param_values[param_name].clone().detach().cpu().numpy()
+                                except Exception:
+                                    param_vals = np.array(param_values[param_name])
+                                try:
+                                    snr_vals = all_snr.clone().detach().cpu().numpy()
+                                except Exception:
+                                    snr_vals = np.array(all_snr)
+                                sort_idx = np.argsort(param_vals)
+                                ax.plot(param_vals[sort_idx], snr_vals[sort_idx], marker='o', linewidth=2, label=str(geom_name))
+                                any_series = True
+                        continue
+
+                    if plot_type in (self.PLOT_ANGULAR_RESOLUTION, self.PLOT_ENERGY_RESOLUTION):
+                        uw_loss_dict = payload.get('uw_loss_dict', None)
+                        if isinstance(uw_loss_dict, dict):
+                            key = 'angular_resolution_loss' if plot_type == self.PLOT_ANGULAR_RESOLUTION else 'energy_resolution_loss'
+                            series = uw_loss_dict.get(key, None)
+                            if series is not None:
+                                series = np.array(series)
+                                if plot_type == self.PLOT_ANGULAR_RESOLUTION:
+                                    series = series * 180.0
+                                ax.plot(series, linewidth=2, label=str(geom_name))
+                                any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
+                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_params = payload.get('resolution_params', None)
+                        n_bins = payload.get('n_zenith_bins', 10)
+                        resolution_stat = payload.get('resolution_stat', None)
+                        if resolution_stat is None and bool(payload.get('resolution_use_mean', False)):
+                            resolution_stat = 'mean'
+                        resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+                        if resolution_stat not in ('median', 'mean'):
+                            resolution_stat = 'median'
+                        show_resolution_ci = bool(payload.get('show_resolution_ci', False))
+                        resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
+                        resolution_ci_level = payload.get('resolution_ci_level', None)
+                        zenith_range = payload.get('zenith_range', None)
+                        zenith_range_deg = payload.get('zenith_range_deg', None)
+                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
+                        min_ang_res = payload.get('min_angular_resolution', None)
+                        max_ang_res = payload.get('max_angular_resolution', None)
+                        if not resolution_logy:
+                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', False))
+
+                        if resolution_per_event is not None and resolution_params is not None:
+                            try:
+                                res_values = resolution_per_event.clone().detach().cpu().numpy()
+                            except Exception:
+                                res_values = np.array(resolution_per_event)
+
+                            zenith_values = []
+                            for event_params in resolution_params:
+                                if isinstance(event_params, dict) and 'zenith' in event_params:
+                                    zenith = event_params['zenith']
+                                    try:
+                                        zenith_values.append(float(zenith.detach().cpu().item()))
+                                    except Exception:
+                                        try:
+                                            zenith_values.append(float(zenith))
+                                        except Exception:
+                                            pass
+                            zenith_values = np.array(zenith_values)
+
+                            valid_mask = np.isfinite(res_values) & np.isfinite(zenith_values)
+                            res_values = np.array(res_values)[valid_mask]
+                            zenith_values = zenith_values[valid_mask]
+
+                            if len(res_values) > 0 and len(zenith_values) > 0:
+                                zenith_deg = np.rad2deg(zenith_values)
+                                # Optional zenith range restriction.
+                                zmin_deg, zmax_deg = 0.0, 180.0
+                                if zenith_range_deg is not None and len(zenith_range_deg) == 2:
+                                    try:
+                                        zmin_deg, zmax_deg = float(zenith_range_deg[0]), float(zenith_range_deg[1])
+                                    except Exception:
+                                        zmin_deg, zmax_deg = 0.0, 180.0
+                                elif zenith_range is not None and len(zenith_range) == 2:
+                                    try:
+                                        zmin_deg = float(np.rad2deg(float(zenith_range[0])))
+                                        zmax_deg = float(np.rad2deg(float(zenith_range[1])))
+                                    except Exception:
+                                        zmin_deg, zmax_deg = 0.0, 180.0
+                                if zmax_deg < zmin_deg:
+                                    zmin_deg, zmax_deg = zmax_deg, zmin_deg
+
+                                range_mask = (zenith_deg >= zmin_deg) & (zenith_deg <= zmax_deg)
+                                zenith_deg = zenith_deg[range_mask]
+                                res_values = np.array(res_values)[range_mask]
+
+                                if resolution_logy:
+                                    pos_mask = np.array(res_values) > 0
+                                    zenith_deg = zenith_deg[pos_mask]
+                                    res_values = np.array(res_values)[pos_mask]
+
+                                bin_edges = np.linspace(zmin_deg, zmax_deg, int(n_bins) + 1)
+                                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+                                bin_medians = []
+                                band_lower = []
+                                band_upper = []
+                                bin_counts = []
+                                for i in range(int(n_bins)):
+                                    mask = (zenith_deg >= bin_edges[i]) & (zenith_deg < bin_edges[i + 1])
+                                    if mask.sum() > 0:
+                                        vals = np.array(res_values[mask], dtype=float)
+                                        if resolution_stat == 'mean':
+                                            center_val = float(np.nanmean(vals))
+                                            spread_val = float(np.nanstd(vals))
+                                        else:
+                                            center_val = float(np.nanmedian(vals))
+                                            spread_val = np.nan
+                                        bin_medians.append(center_val)
+                                        if show_resolution_ci:
+                                            if resolution_stat == 'mean':
+                                                lo = center_val - 2.0 * spread_val
+                                                hi = center_val + 2.0 * spread_val
+                                                if min_ang_res is not None:
+                                                    lo = max(float(min_ang_res), lo)
+                                                if max_ang_res is not None:
+                                                    hi = min(float(max_ang_res), hi)
+                                                band_lower.append(lo)
+                                                band_upper.append(float(hi))
+                                            else:
+                                                q_lo = None
+                                                q_hi = None
+                                                if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                                    try:
+                                                        q_lo = float(resolution_ci_percentiles[0])
+                                                        q_hi = float(resolution_ci_percentiles[1])
+                                                    except Exception:
+                                                        q_lo, q_hi = None, None
+                                                if q_lo is None or q_hi is None:
+                                                    if resolution_ci_level is not None:
+                                                        try:
+                                                            lvl = float(resolution_ci_level)
+                                                            lvl = float(np.clip(lvl, 0.0, 1.0))
+                                                            alpha = 0.5 * (1.0 - lvl)
+                                                            q_lo = 100.0 * alpha
+                                                            q_hi = 100.0 * (1.0 - alpha)
+                                                        except Exception:
+                                                            q_lo, q_hi = 16.0, 84.0
+                                                    else:
+                                                        q_lo, q_hi = 16.0, 84.0
+                                                if q_hi < q_lo:
+                                                    q_lo, q_hi = q_hi, q_lo
+                                                resid = vals - center_val
+                                                band_lower.append(center_val + np.nanpercentile(resid, q_lo))
+                                                band_upper.append(center_val + np.nanpercentile(resid, q_hi))
+                                        else:
+                                            band_lower.append(np.nan)
+                                            band_upper.append(np.nan)
+                                        bin_counts.append(int(mask.sum()))
+                                    else:
+                                        bin_medians.append(np.nan)
+                                        band_lower.append(np.nan)
+                                        band_upper.append(np.nan)
+                                        bin_counts.append(0)
+
+                                bin_medians = np.array(bin_medians)
+                                band_lower = np.array(band_lower)
+                                band_upper = np.array(band_upper)
+                                bin_counts = np.array(bin_counts)
+                                if min_ang_res is not None or max_ang_res is not None:
+                                    lo_lim = -np.inf
+                                    hi_lim = np.inf
+                                    try:
+                                        if min_ang_res is not None:
+                                            lo_lim = float(min_ang_res)
+                                    except Exception:
+                                        lo_lim = -np.inf
+                                    try:
+                                        if max_ang_res is not None:
+                                            hi_lim = float(max_ang_res)
+                                    except Exception:
+                                        hi_lim = np.inf
+                                    if np.isfinite(lo_lim) and np.isfinite(hi_lim) and hi_lim < lo_lim:
+                                        lo_lim, hi_lim = hi_lim, lo_lim
+
+                                    bin_medians = np.clip(bin_medians, lo_lim, hi_lim)
+                                    if show_resolution_ci:
+                                        band_lower = np.clip(band_lower, lo_lim, hi_lim)
+                                        band_upper = np.clip(band_upper, lo_lim, hi_lim)
+                                        band_lower = np.minimum(band_lower, band_upper)
+                                valid_bins = np.isfinite(bin_medians)
+                                if np.any(valid_bins):
+                                    line = ax.plot(
+                                        bin_centers[valid_bins],
+                                        bin_medians[valid_bins],
+                                        'o-',
+                                        linewidth=2,
+                                        markersize=6,
+                                        label=str(geom_name),
+                                    )[0]
+
+                                    if show_resolution_ci:
+                                        valid_band = valid_bins & np.isfinite(band_lower) & np.isfinite(band_upper)
+                                        if np.any(valid_band):
+                                            ax.plot(
+                                                bin_centers[valid_band],
+                                                band_lower[valid_band],
+                                                linestyle='--',
+                                                linewidth=1.5,
+                                                color=line.get_color(),
+                                                alpha=0.8,
+                                                zorder=1,
+                                            )
+                                            ax.plot(
+                                                bin_centers[valid_band],
+                                                band_upper[valid_band],
+                                                linestyle='--',
+                                                linewidth=1.5,
+                                                color=line.get_color(),
+                                                alpha=0.8,
+                                                zorder=1,
+                                            )
+
+                                    if resolution_logy:
+                                        ax.set_yscale('log')
+
+                                any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY:
+                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_params = payload.get('resolution_params', None)
+                        n_bins = payload.get('n_energy_bins', 10)
+                        resolution_stat = payload.get('resolution_stat', None)
+                        if resolution_stat is None and bool(payload.get('resolution_use_mean', False)):
+                            resolution_stat = 'mean'
+                        resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+                        if resolution_stat not in ('median', 'mean'):
+                            resolution_stat = 'median'
+                        show_resolution_ci = bool(payload.get('show_resolution_ci', False))
+                        resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
+                        resolution_ci_level = payload.get('resolution_ci_level', None)
+                        energy_range = payload.get('energy_range', None)
+                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
+                        if not resolution_logy:
+                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', False))
+                        min_ang_res = payload.get('min_angular_resolution', None)
+                        max_ang_res = payload.get('max_angular_resolution', None)
+
+                        if resolution_per_event is not None and resolution_params is not None:
+                            try:
+                                res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
+                            except Exception:
+                                res_values = np.array(resolution_per_event).flatten()
+
+                            energy_values = []
+                            for event_params in resolution_params:
+                                if isinstance(event_params, dict) and 'energy' in event_params:
+                                    energy = event_params['energy']
+                                    try:
+                                        energy_values.append(float(energy.detach().cpu().item()))
+                                    except Exception:
+                                        try:
+                                            energy_values.append(float(energy))
+                                        except Exception:
+                                            pass
+                            energy_values = np.array(energy_values)
+
+                            valid_mask = np.isfinite(res_values) & np.isfinite(energy_values) & (energy_values > 0)
+                            res_values = res_values[valid_mask]
+                            energy_values = energy_values[valid_mask]
+
+                            if energy_range is not None and len(energy_range) == 2:
+                                try:
+                                    emin, emax = float(energy_range[0]), float(energy_range[1])
+                                    if emax < emin:
+                                        emin, emax = emax, emin
+                                    range_mask = (energy_values >= emin) & (energy_values <= emax)
+                                    res_values = res_values[range_mask]
+                                    energy_values = energy_values[range_mask]
+                                except Exception:
+                                    pass
+
+                            if resolution_logy:
+                                pos_mask = np.array(res_values) > 0
+                                res_values = np.array(res_values)[pos_mask]
+                                energy_values = np.array(energy_values)[pos_mask]
+
+                            if len(res_values) > 0 and len(energy_values) > 0:
+                                log_energy_min = np.log10(energy_values.min())
+                                log_energy_max = np.log10(energy_values.max())
+                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+
+                                bin_medians = []
+                                band_lower = []
+                                band_upper = []
+                                bin_counts = []
+                                for i in range(int(n_bins)):
+                                    mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
+                                    if mask.sum() > 0:
+                                        vals = np.array(res_values[mask], dtype=float)
+                                        if resolution_stat == 'mean':
+                                            center_val = float(np.nanmean(vals))
+                                            spread_val = float(np.nanstd(vals))
+                                        else:
+                                            center_val = float(np.nanmedian(vals))
+                                            spread_val = np.nan
+                                        bin_medians.append(center_val)
+                                        if show_resolution_ci:
+                                            if resolution_stat == 'mean':
+                                                lo = center_val - 2.0 * spread_val
+                                                hi = center_val + 2.0 * spread_val
+                                                if min_ang_res is not None:
+                                                    lo = float(max(lo, min_ang_res))
+                                                if max_ang_res is not None:    
+                                                    hi = float(min(hi, max_ang_res))
+                                                band_lower.append(lo)
+                                                band_upper.append(float(hi))
+                                            else:
+                                                q_lo = None
+                                                q_hi = None
+                                                if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                                    try:
+                                                        q_lo = float(resolution_ci_percentiles[0])
+                                                        q_hi = float(resolution_ci_percentiles[1])
+                                                    except Exception:
+                                                        q_lo, q_hi = None, None
+                                                if q_lo is None or q_hi is None:
+                                                    if resolution_ci_level is not None:
+                                                        try:
+                                                            lvl = float(resolution_ci_level)
+                                                            lvl = float(np.clip(lvl, 0.0, 1.0))
+                                                            alpha = 0.5 * (1.0 - lvl)
+                                                            q_lo = 100.0 * alpha
+                                                            q_hi = 100.0 * (1.0 - alpha)
+                                                        except Exception:
+                                                            q_lo, q_hi = 16.0, 84.0
+                                                    else:
+                                                        q_lo, q_hi = 16.0, 84.0
+                                                if q_hi < q_lo:
+                                                    q_lo, q_hi = q_hi, q_lo
+                                                resid = vals - center_val
+                                                band_lower.append(center_val + np.nanpercentile(resid, q_lo))
+                                                band_upper.append(center_val + np.nanpercentile(resid, q_hi))
+                                        else:
+                                            band_lower.append(np.nan)
+                                            band_upper.append(np.nan)
+                                        bin_counts.append(int(mask.sum()))
+                                    else:
+                                        bin_medians.append(np.nan)
+                                        band_lower.append(np.nan)
+                                        band_upper.append(np.nan)
+                                        bin_counts.append(0)
+
+                                bin_medians = np.array(bin_medians)
+                                band_lower = np.array(band_lower)
+                                band_upper = np.array(band_upper)
+                                bin_counts = np.array(bin_counts)
+                                if min_ang_res is not None or max_ang_res is not None:
+                                    lo_lim = -np.inf
+                                    hi_lim = np.inf
+                                    try:
+                                        if min_ang_res is not None:
+                                            lo_lim = float(min_ang_res)
+                                    except Exception:
+                                        lo_lim = -np.inf
+                                    try:
+                                        if max_ang_res is not None:
+                                            hi_lim = float(max_ang_res)
+                                    except Exception:
+                                        hi_lim = np.inf
+                                    if np.isfinite(lo_lim) and np.isfinite(hi_lim) and hi_lim < lo_lim:
+                                        lo_lim, hi_lim = hi_lim, lo_lim
+
+                                    bin_medians = np.clip(bin_medians, lo_lim, hi_lim)
+                                    if show_resolution_ci:
+                                        band_lower = np.clip(band_lower, lo_lim, hi_lim)
+                                        band_upper = np.clip(band_upper, lo_lim, hi_lim)
+                                        band_lower = np.minimum(band_lower, band_upper)
+                                x_plot = np.log10(bin_centers)
+                                valid_bins = np.isfinite(bin_medians)
+                                if np.any(valid_bins):
+                                    line = ax.plot(
+                                        x_plot[valid_bins],
+                                        bin_medians[valid_bins],
+                                        'o-',
+                                        linewidth=2,
+                                        markersize=6,
+                                        label=str(geom_name),
+                                    )[0]
+
+                                    if show_resolution_ci:
+                                        valid_band = valid_bins & np.isfinite(band_lower) & np.isfinite(band_upper)
+                                        if np.any(valid_band):
+                                            ax.plot(
+                                                x_plot[valid_band],
+                                                band_lower[valid_band],
+                                                linestyle='--',
+                                                linewidth=1.5,
+                                                color=line.get_color(),
+                                                alpha=0.8,
+                                                zorder=1,
+                                            )
+                                            ax.plot(
+                                                x_plot[valid_band],
+                                                band_upper[valid_band],
+                                                linestyle='--',
+                                                linewidth=1.5,
+                                                color=line.get_color(),
+                                                alpha=0.8,
+                                                zorder=1,
+                                            )
+
+                                    if resolution_logy:
+                                        ax.set_yscale('log')
+
+                                any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
+                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_params = payload.get('resolution_params', None)
+                        n_bins = payload.get('n_energy_bins', 10)
+                        use_relative_energy = payload.get('use_relative_energy', False)
+                        resolution_stat = payload.get('resolution_stat', None)
+                        if resolution_stat is None and bool(payload.get('resolution_use_mean', False)):
+                            resolution_stat = 'mean'
+                        resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+                        if resolution_stat not in ('median', 'mean'):
+                            resolution_stat = 'median'
+                        show_resolution_ci = bool(payload.get('show_resolution_ci', False))
+                        resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
+                        resolution_ci_level = payload.get('resolution_ci_level', None)
+                        energy_range = payload.get('energy_range', None)
+
+                        if resolution_per_event is not None and resolution_params is not None:
+                            try:
+                                res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
+                            except Exception:
+                                res_values = np.array(resolution_per_event).flatten()
+
+                            energy_values = []
+                            for event_params in resolution_params:
+                                if isinstance(event_params, dict) and 'energy' in event_params:
+                                    energy = event_params['energy']
+                                    try:
+                                        energy_values.append(float(energy.detach().cpu().item()))
+                                    except Exception:
+                                        try:
+                                            energy_values.append(float(energy))
+                                        except Exception:
+                                            pass
+
+                            energy_values = np.array(energy_values)
+                            valid_mask = np.isfinite(res_values) & np.isfinite(energy_values) & (energy_values > 0)
+                            res_values = res_values[valid_mask]
+                            energy_values = energy_values[valid_mask]
+
+                            if energy_range is not None and len(energy_range) == 2:
+                                try:
+                                    emin, emax = float(energy_range[0]), float(energy_range[1])
+                                    if emax < emin:
+                                        emin, emax = emax, emin
+                                    range_mask = (energy_values >= emin) & (energy_values <= emax)
+                                    res_values = res_values[range_mask]
+                                    energy_values = energy_values[range_mask]
+                                except Exception:
+                                    pass
+
+                            if len(res_values) > 0 and len(energy_values) > 0:
+                                log_energy_min = np.log10(energy_values.min())
+                                log_energy_max = np.log10(energy_values.max())
+                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+
+                                bin_medians = []
+                                band_lower = []
+                                band_upper = []
+                                bin_counts = []
+                                for i in range(int(n_bins)):
+                                    mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
+                                    if mask.sum() > 0:
+                                        vals = np.array(res_values[mask], dtype=float)
+                                        if resolution_stat == 'mean':
+                                            center_val = float(np.nanmean(vals))
+                                            spread_val = float(np.nanstd(vals))
+                                        else:
+                                            center_val = float(np.nanmedian(vals))
+                                            spread_val = np.nan
+                                        bin_medians.append(center_val)
+                                        if show_resolution_ci:
+                                            if resolution_stat == 'mean':
+                                                band_lower.append(center_val - 2.0 * spread_val)
+                                                band_upper.append(center_val + 2.0 * spread_val)
+                                            else:
+                                                q_lo = None
+                                                q_hi = None
+                                                if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                                    try:
+                                                        q_lo = float(resolution_ci_percentiles[0])
+                                                        q_hi = float(resolution_ci_percentiles[1])
+                                                    except Exception:
+                                                        q_lo, q_hi = None, None
+                                                if q_lo is None or q_hi is None:
+                                                    if resolution_ci_level is not None:
+                                                        try:
+                                                            lvl = float(resolution_ci_level)
+                                                            lvl = float(np.clip(lvl, 0.0, 1.0))
+                                                            alpha = 0.5 * (1.0 - lvl)
+                                                            q_lo = 100.0 * alpha
+                                                            q_hi = 100.0 * (1.0 - alpha)
+                                                        except Exception:
+                                                            q_lo, q_hi = 16.0, 84.0
+                                                    else:
+                                                        q_lo, q_hi = 16.0, 84.0
+                                                if q_hi < q_lo:
+                                                    q_lo, q_hi = q_hi, q_lo
+                                                resid = vals - center_val
+                                                band_lower.append(center_val + np.nanpercentile(resid, q_lo))
+                                                band_upper.append(center_val + np.nanpercentile(resid, q_hi))
+                                        else:
+                                            band_lower.append(np.nan)
+                                            band_upper.append(np.nan)
+                                        bin_counts.append(int(mask.sum()))
+                                    else:
+                                        bin_medians.append(np.nan)
+                                        band_lower.append(np.nan)
+                                        band_upper.append(np.nan)
+                                        bin_counts.append(0)
+
+                                bin_medians = np.array(bin_medians)
+                                band_lower = np.array(band_lower)
+                                band_upper = np.array(band_upper)
+                                bin_counts = np.array(bin_counts)
+
+                                valid_bins = np.isfinite(bin_medians)
+                                if np.any(valid_bins):
+                                    line = ax.plot(
+                                        bin_centers[valid_bins],
+                                        bin_medians[valid_bins],
+                                        marker='o',
+                                        linewidth=2,
+                                        label=str(geom_name),
+                                    )[0]
+
+                                    if show_resolution_ci:
+                                        valid_band = valid_bins & np.isfinite(band_lower) & np.isfinite(band_upper)
+                                        if np.any(valid_band):
+                                            ax.fill_between(
+                                                bin_centers[valid_band],
+                                                band_lower[valid_band],
+                                                band_upper[valid_band],
+                                                color=line.get_color(),
+                                                alpha=0.12,
+                                                zorder=1,
+                                            )
+
+                                any_series = True
+
+                                ax.set_xscale('log')
+                                ax.grid(True, alpha=0.3, which='both')
+                                ax.set_xlabel('Energy (GeV)')
+                                ax.set_ylabel('Relative Energy Resolution (ΔE/E)' if use_relative_energy else 'Energy Resolution (GeV)')
+                        continue
+
+                    if plot_type in (self.PLOT_LOSS_COMPONENTS, self.PLOT_UW_LOSS_COMPONENTS):
+                        data_key = 'loss_dict' if plot_type == self.PLOT_LOSS_COMPONENTS else 'uw_loss_dict'
+                        loss_dict = payload.get(data_key, None)
+                        loss_filter_list = payload.get('loss_filter', []) if plot_type == self.PLOT_LOSS_COMPONENTS else []
+                        loss_weights_dict = payload.get('loss_weights_dict', None)
+                        loss_iterations_dict = payload.get('loss_iterations_dict', None)
+                        if isinstance(loss_dict, dict) and loss_dict:
+                            for loss_name, hist in loss_dict.items():
+                                if plot_type == self.PLOT_LOSS_COMPONENTS and loss_name in loss_filter_list:
+                                    continue
+                                if loss_weights_dict is not None and loss_name in loss_weights_dict and loss_weights_dict[loss_name] == 0.0:
+                                    continue
+                                if not hist:
+                                    continue
+                                label = f"{geom_name}:{loss_name}"
+                                if loss_iterations_dict is not None:
+                                    iterations = loss_iterations_dict.get(loss_name, None)
+                                else:
+                                    iterations = None
+
+                                if iterations is not None and len(iterations) == len(hist):
+                                    ax.plot(iterations, hist, label=label, alpha=0.75, linewidth=2)
+                                else:
+                                    ax.plot(hist, label=label, alpha=0.75, linewidth=2)
+                                any_series = True
+                        continue
+
+                    if plot_type in (self.PLOT_ALM_MU, self.PLOT_ALM_LAMBDA):
+                        history_key = 'alm_mus_history' if plot_type == self.PLOT_ALM_MU else 'alm_lambdas_history'
+                        history_dict = payload.get(history_key, {})
+                        loss_iterations_dict = payload.get('loss_iterations_dict', {})
+                        if history_dict:
+                            if loss_iterations_dict:
+                                iterations = loss_iterations_dict[list(loss_iterations_dict.keys())[0]]
+                            else:
+                                max_len = max(len(v) for v in history_dict.values()) if history_dict else 0
+                                iterations = list(range(max_len))
+                            for constraint_name, series in history_dict.items():
+                                if not series:
+                                    continue
+                                label = f"{geom_name}:{constraint_name}"
+                                plot_iterations = iterations[:len(series)]
+                                ax.plot(plot_iterations, series, label=label, linewidth=2)
+                                any_series = True
+                        continue
+
+                if not any_series:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        f"{plot_type}: no data available",
+                        ha='center',
+                        va='center',
+                        transform=ax.transAxes,
+                    )
+
+                # Titles/labels similar to _create_plot.
+                if plot_type == self.PLOT_LOSS:
+                    ax.set_title(f"Loss (Iteration {iteration})")
+                    ax.set_xlabel("Iteration")
+                    ax.set_ylabel("Loss")
+                    if loss_type == 'rbf' and any_series:
+                        ax.set_yscale('log')
+                elif plot_type == self.PLOT_UW_LOSS:
+                    ax.set_title(f"(unweighted) Loss (Iteration {iteration})")
+                    ax.set_xlabel("Iteration")
+                    ax.set_ylabel("Loss")
+                    if loss_type == 'rbf' and any_series:
+                        ax.set_yscale('log')
+                elif plot_type == self.PLOT_SNR_HISTORY:
+                    ax.set_title("Total Signal-to-Noise Ratio")
+                    ax.set_xlabel("Iteration")
+                    ax.set_ylabel("SNR")
+                elif plot_type == self.PLOT_LLR_HISTORY:
+                    ax.set_title("Mean Log-Likelihood Ratio")
+                    ax.set_xlabel("Iteration")
+                    ax.set_ylabel("LLR")
+                elif plot_type == self.PLOT_PARAM_1D:
+                    ax.set_title("SNR vs Parameter")
+                    ax.set_xlabel("Parameter")
+                    ax.set_ylabel("SNR")
+                elif plot_type == self.PLOT_ANGULAR_RESOLUTION:
+                    ax.set_title('Angular Resolution History')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel('Angular Resolution (degrees)')
+                    ax.grid(True, alpha=0.3)
+                elif plot_type == self.PLOT_ENERGY_RESOLUTION:
+                    ax.set_title('Energy Resolution History')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel('Energy Resolution [GeV]')
+                    ax.grid(True, alpha=0.3)
+                elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
+                    ax.set_title('Angular Resolution vs Zenith')
+                    ax.set_xlabel('Zenith Angle (degrees)')
+                    ax.set_ylabel('Angular Resolution (radians)')
+                    ax.grid(True, alpha=0.3)
+                    try:
+                        ax2 = ax.twinx()
+                        ax2.set_ylabel('Angular Resolution (degrees)')
+                        ax2.set_yscale(ax.get_yscale())
+                        y0, y1 = ax.get_ylim()
+                        ax2.set_ylim(np.rad2deg(y0), np.rad2deg(y1))
+                        ax2.tick_params(axis='y')
+                    except Exception:
+                        pass
+                elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY:
+                    ax.set_title('Angular Resolution vs log$_{10}$(Energy)')
+                    ax.set_xlabel('log$_{10}$(Energy / GeV)')
+                    ax.set_ylabel('Angular Resolution (radians)')
+                    ax.grid(True, alpha=0.3)
+                    try:
+                        ax2 = ax.twinx()
+                        ax2.set_ylabel('Angular Resolution (degrees)')
+                        ax2.set_yscale(ax.get_yscale())
+                        y0, y1 = ax.get_ylim()
+                        ax2.set_ylim(np.rad2deg(y0), np.rad2deg(y1))
+                        ax2.tick_params(axis='y')
+                    except Exception:
+                        pass
+                elif plot_type == self.PLOT_LOSS_COMPONENTS:
+                    ax.set_title('Loss Components')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel('Loss Value')
+                    ax.grid(True, alpha=0.3)
+                elif plot_type == self.PLOT_UW_LOSS_COMPONENTS:
+                    ax.set_title('Unweighted Loss Components')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel('Loss Value')
+                    ax.grid(True, alpha=0.3)
+                elif plot_type == self.PLOT_ALM_MU:
+                    ax.set_title('ALM Penalty Parameters (μ) History')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel('μ (Penalty Parameter)')
+                    ax.grid(True, alpha=0.3)
+                    if any_series:
+                        ax.set_yscale('log')
+                elif plot_type == self.PLOT_ALM_LAMBDA:
+                    ax.set_title('ALM Lagrange Multipliers (λ) History')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel('λ (Lagrange Multiplier)')
+                    ax.grid(True, alpha=0.3)
+
+                if any_series:
+                    ax.legend(fontsize=8)
+
+                try:
+                    fig.tight_layout()
+                except Exception:
+                    pass
+                plt.show()
+                continue
+
+            # Everything else: one subplot per geometry.
+            # Keep up to 3 geometries per row; don't allocate empty 3rd column for 1-2 geometries.
+            ncols = 3 if n_geoms >= 3 else int(n_geoms)
+            ncols = max(1, int(ncols))
+            nrows = (n_geoms + ncols - 1) // ncols
+            nrows = max(1, int(nrows))
+            fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows), squeeze=False)
+            axes_flat = axes.flatten()
+
+            for idx, (geom_name, payload) in enumerate(geom_items):
+                ax = axes_flat[idx]
+                payload = dict(payload)
+                payload.update(shared_kwargs)
+
+                per_iter = payload.get('iteration', iteration)
+                per_slice_res = payload.get('slice_res', slice_res)
+                per_multi_slice = payload.get('multi_slice', multi_slice)
+                per_loss_type = payload.get('loss_type', loss_type)
+
+                points = payload.get('points', payload.get('points_3d', None))
+                loss_history = payload.get('loss_history', None)
+                string_indices = payload.get('string_indices', None)
+                points_per_string_list = payload.get('points_per_string_list', None)
+                string_xy = payload.get('string_xy', None)
+
+                # Avoid passing base args twice via **payload.
+                base_keys = {
+                    'iteration',
+                    'points',
+                    'points_3d',
+                    'loss_history',
+                    'string_indices',
+                    'points_per_string_list',
+                    'string_xy',
+                    'slice_res',
+                    'multi_slice',
+                    'loss_type',
+                    'plot_types',
+                    'make_gif',
+                }
+                extra = {k: v for k, v in payload.items() if k not in base_keys}
+
+                self._create_plot(
+                    plot_type=plot_type,
+                    ax=ax,
+                    fig=fig,
+                    iteration=per_iter,
+                    points=points,
+                    loss_history=loss_history,
+                    string_indices=string_indices,
+                    points_per_string_list=points_per_string_list,
+                    string_xy=string_xy,
+                    slice_res=per_slice_res,
+                    multi_slice=per_multi_slice,
+                    loss_type=per_loss_type,
+                    **extra,
+                )
+
+                # Some plot types (3D) swap axes; grab the most recently created axis.
+                ax_label = ax
+                if plot_type == self.PLOT_3D_POINTS and len(fig.axes) > 0:
+                    ax_label = fig.axes[-1]
+
+                # Always annotate geometry name on per-geometry subplots.
+                try:
+                    ax_label.text(
+                        0.02,
+                        0.98,
+                        str(geom_name),
+                        transform=ax_label.transAxes,
+                        ha='left',
+                        va='top',
+                        fontsize=9,
+                        bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.7, edgecolor='none'),
+                    )
+                except Exception:
+                    pass
+
+            # Hide unused axes (if any)
+            for j in range(n_geoms, nrows * ncols):
+                try:
+                    axes_flat[j].axis('off')
+                except Exception:
+                    pass
+
+            try:
+                fig.tight_layout()
+            except Exception:
+                pass
+            plt.show()
     
     def _create_plot(self, 
                    plot_type: str, 
                    ax: plt.Axes, 
                    fig: plt.Figure, 
                    iteration: int, 
-                   points_3d: torch.Tensor, 
-                   loss_history: List[float], 
-                   string_indices: Optional[List[int]], 
-                   points_per_string_list: Optional[List[int]], 
-                   string_xy: Optional[torch.Tensor],
-                   slice_res: int, 
-                   multi_slice: bool, 
-                   loss_type: str,
+                   points: torch.Tensor = None,
+                   points_3d: torch.Tensor = None,
+                   loss_history: List[float] = None, 
+                   string_indices: Optional[List[int]] = None, 
+                   points_per_string_list: Optional[List[int]] = None, 
+                   string_xy: Optional[torch.Tensor] = None,
+                   slice_res: int = 50, 
+                   multi_slice: bool = False, 
+                   loss_type: str = 'rbf',
                    **kwargs) -> None:
         """
         Create a specific type of plot on the given axes.
@@ -928,8 +1878,12 @@ class Visualizer:
         kwargs : dict
             Additional keyword arguments for specific plot types.
         """
+        # Backwards-compat: allow callers to pass `points_3d`.
+        if points is None and points_3d is not None:
+            points = points_3d
+
         # Safely handle torch tensor inputs by cloning and detaching them
-        points = self._safe_tensor_convert(points_3d)
+        points = self._safe_tensor_convert(points)
         string_xy = self._safe_tensor_convert(string_xy)
         if kwargs.get('string_weights') is not None:    
             kwargs['string_weights'] = torch.sigmoid(kwargs['string_weights'].clone())
@@ -1145,7 +2099,7 @@ class Visualizer:
                         sc = ax.scatter(
                             np.array([xy_np[s, 0] for s in range(len(xy_np)) if points_per_string_list[s] > 0])[weight_mask],
                             np.array([xy_np[s, 1] for s in range(len(xy_np)) if points_per_string_list[s] > 0])[weight_mask],
-                            s=[min([40, 30 * 200 / len(xy_np)]) 
+                            s=[min([40, 30 * 200 / len(xy_np[weight_mask])]) 
                             for s in range(len(xy_np[weight_mask])) if np.array(points_per_string_list)[weight_mask][s] > 0],
                             c=[np.array(points_per_string_list)[weight_mask][s] for s in range(len(xy_np[weight_mask])) 
                             if np.array(points_per_string_list)[weight_mask][s] > 0],
@@ -3313,6 +4267,22 @@ class Visualizer:
             signal_event_params = kwargs.get('resolution_params', None)
             # max_angular_resolution = kwargs.get('max_angular_resolution', np.pi)
             n_bins = kwargs.get('n_zenith_bins', 10)
+            resolution_stat = kwargs.get('resolution_stat', None)
+            if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
+                resolution_stat = 'mean'
+            resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+            if resolution_stat not in ('median', 'mean'):
+                resolution_stat = 'median'
+            show_resolution_ci = bool(kwargs.get('show_resolution_ci', False))
+            resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
+            resolution_ci_level = kwargs.get('resolution_ci_level', None)
+            zenith_range = kwargs.get('zenith_range', None)
+            zenith_range_deg = kwargs.get('zenith_range_deg', None)
+            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
+            min_ang_res = kwargs.get('min_angular_resolution', None)
+            max_ang_res = kwargs.get('max_angular_resolution', None)
+            if not resolution_logy:
+                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', False))
             
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
@@ -3341,37 +4311,197 @@ class Visualizer:
                 if len(res_values) > 0 and len(zenith_values) > 0:
                     # Convert to degrees for easier interpretation
                     zenith_deg = np.rad2deg(zenith_values)
+
+                    # Optional zenith range restriction.
+                    zmin_deg, zmax_deg = 0.0, 180.0
+                    if zenith_range_deg is not None and len(zenith_range_deg) == 2:
+                        try:
+                            zmin_deg, zmax_deg = float(zenith_range_deg[0]), float(zenith_range_deg[1])
+                        except Exception:
+                            zmin_deg, zmax_deg = 0.0, 180.0
+                    elif zenith_range is not None and len(zenith_range) == 2:
+                        try:
+                            zmin_deg = float(np.rad2deg(float(zenith_range[0])))
+                            zmax_deg = float(np.rad2deg(float(zenith_range[1])))
+                        except Exception:
+                            zmin_deg, zmax_deg = 0.0, 180.0
+                    if zmax_deg < zmin_deg:
+                        zmin_deg, zmax_deg = zmax_deg, zmin_deg
+
+                    range_mask = (zenith_deg >= zmin_deg) & (zenith_deg <= zmax_deg)
+                    zenith_deg = zenith_deg[range_mask]
+                    res_values = res_values[range_mask]
+
+                    if resolution_logy:
+                        pos_mask = np.array(res_values) > 0
+                        zenith_deg = zenith_deg[pos_mask]
+                        res_values = res_values[pos_mask]
                     
                     # Create bins
-                    bin_edges = np.linspace(0, 180, n_bins + 1)
+                    bin_edges = np.linspace(zmin_deg, zmax_deg, n_bins + 1)
                     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
                     
                     # Compute binned statistics
-                    bin_means = []
-                    bin_stds = []
+                    bin_medians = []
+                    band_lower = []
+                    band_upper = []
                     bin_counts = []
                     
                     for i in range(n_bins):
                         mask = (zenith_deg >= bin_edges[i]) & (zenith_deg < bin_edges[i+1])
                         if mask.sum() > 0:
-                            bin_means.append(np.mean(res_values[mask]))
-                            bin_stds.append(np.std(res_values[mask]))
+                            vals = np.array(res_values[mask], dtype=float)
+                            if resolution_stat == 'mean':
+                                center_val = float(np.nanmean(vals))
+                                spread_val = float(np.nanstd(vals))
+                            else:
+                                center_val = float(np.nanmedian(vals))
+                                spread_val = np.nan
+                            bin_medians.append(center_val)
+                            if show_resolution_ci:
+                                if resolution_stat == 'mean':
+                                    lo = center_val - 2.0 * spread_val
+                                    hi = center_val + 2.0 * spread_val
+                                    if min_ang_res is not None:    
+                                        lo = float(max(lo, min_ang_res))
+                                    if max_ang_res is not None:
+                                        hi = float(min(hi, max_ang_res))
+                                    band_lower.append(lo)
+                                    band_upper.append(float(hi))
+                                else:
+                                    q_lo = None
+                                    q_hi = None
+                                    if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                        try:
+                                            q_lo = float(resolution_ci_percentiles[0])
+                                            q_hi = float(resolution_ci_percentiles[1])
+                                        except Exception:
+                                            q_lo, q_hi = None, None
+                                    if q_lo is None or q_hi is None:
+                                        if resolution_ci_level is not None:
+                                            try:
+                                                lvl = float(resolution_ci_level)
+                                                lvl = float(np.clip(lvl, 0.0, 1.0))
+                                                alpha = 0.5 * (1.0 - lvl)
+                                                q_lo = 100.0 * alpha
+                                                q_hi = 100.0 * (1.0 - alpha)
+                                            except Exception:
+                                                q_lo, q_hi = 16.0, 84.0
+                                        else:
+                                            q_lo, q_hi = 16.0, 84.0
+                                    if q_hi < q_lo:
+                                        q_lo, q_hi = q_hi, q_lo
+                                    resid = vals - center_val
+                                    band_lower.append(center_val + np.nanpercentile(resid, q_lo))
+                                    band_upper.append(center_val + np.nanpercentile(resid, q_hi))
+                            else:
+                                band_lower.append(np.nan)
+                                band_upper.append(np.nan)
                             bin_counts.append(mask.sum())
                         else:
-                            bin_means.append(np.nan)
-                            bin_stds.append(np.nan)
+                            bin_medians.append(np.nan)
+                            band_lower.append(np.nan)
+                            band_upper.append(np.nan)
                             bin_counts.append(0)
                     
-                    bin_means = np.array(bin_means)
-                    bin_stds = np.array(bin_stds)
+                    bin_medians = np.array(bin_medians)
+                    band_lower = np.array(band_lower)
+                    band_upper = np.array(band_upper)
                     bin_counts = np.array(bin_counts)
+                    if min_ang_res is not None or max_ang_res is not None:
+                        lo_lim = -np.inf
+                        hi_lim = np.inf
+                        try:
+                            if min_ang_res is not None:
+                                lo_lim = float(min_ang_res)
+                        except Exception:
+                            lo_lim = -np.inf
+                        try:
+                            if max_ang_res is not None:
+                                hi_lim = float(max_ang_res)
+                        except Exception:
+                            hi_lim = np.inf
+                        if np.isfinite(lo_lim) and np.isfinite(hi_lim) and hi_lim < lo_lim:
+                            lo_lim, hi_lim = hi_lim, lo_lim
+
+                        bin_medians = np.clip(bin_medians, lo_lim, hi_lim)
+                        if show_resolution_ci:
+                            band_lower = np.clip(band_lower, lo_lim, hi_lim)
+                            band_upper = np.clip(band_upper, lo_lim, hi_lim)
+                            band_lower = np.minimum(band_lower, band_upper)
+
+                    ci_lower = band_lower
+                    ci_upper = band_upper
                     
                     # Plot with error bars
-                    valid_bins = ~np.isnan(bin_means)
+                    valid_bins = np.isfinite(bin_medians)
                     # ax.errorbar(bin_centers[valid_bins], bin_means[valid_bins], 
                     #            yerr=bin_stds[valid_bins], fmt='o-', capsize=5, 
                     #            linewidth=2, markersize=8, label='Mean ± Std')
-                    ax.plot(bin_centers[valid_bins], bin_means[valid_bins], 'o-', linewidth=2, markersize=8, label='Mean')
+                    if show_resolution_ci and ci_lower is not None and ci_upper is not None:
+                        valid_ci = valid_bins & np.isfinite(ci_lower) & np.isfinite(ci_upper)
+                        if np.any(valid_ci):
+                            q_lo, q_hi = 16.0, 84.0
+                            ci_label = None
+                            if resolution_stat == 'mean':
+                                ci_label = 'Mean ± 2σ'
+                            else:
+                                if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                    try:
+                                        q_lo = float(resolution_ci_percentiles[0])
+                                        q_hi = float(resolution_ci_percentiles[1])
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                elif resolution_ci_level is not None:
+                                    try:
+                                        lvl = float(resolution_ci_level)
+                                        lvl = float(np.clip(lvl, 0.0, 1.0))
+                                        alpha = 0.5 * (1.0 - lvl)
+                                        q_lo = 100.0 * alpha
+                                        q_hi = 100.0 * (1.0 - alpha)
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                if q_hi < q_lo:
+                                    q_lo, q_hi = q_hi, q_lo
+                                ci_label = f"Residual band (p{q_lo:g}-p{q_hi:g})"
+                            ax.plot(
+                                bin_centers[valid_ci],
+                                ci_lower[valid_ci],
+                                linestyle='--',
+                                linewidth=1.5,
+                                color='gray',
+                                alpha=0.9,
+                                label=str(ci_label),
+                                zorder=1,
+                            )
+                            ax.plot(
+                                bin_centers[valid_ci],
+                                ci_upper[valid_ci],
+                                linestyle='--',
+                                linewidth=1.5,
+                                color='gray',
+                                alpha=0.9,
+                                label='_nolegend_',
+                                zorder=1,
+                            )
+                    ax.plot(
+                        bin_centers[valid_bins],
+                        bin_medians[valid_bins],
+                        'o-',
+                        linewidth=2,
+                        markersize=8,
+                        label=('Mean' if resolution_stat == 'mean' else 'Median'),
+                    )
+                    if resolution_logy:
+                        ax.set_yscale('log')
+
+                    if resolution_stat == 'mean':
+                        try:
+                            y0, y1 = ax.get_ylim()
+                            if y0 < 1e-5:
+                                ax.set_ylim(bottom=1e-5)
+                        except Exception:
+                            pass
                     # Add scatter plot of raw data points (semi-transparent)
                     # ax.scatter(zenith_deg, res_values, alpha=0.3, s=20, 
                     #           c='gray', label='Individual events')
@@ -3385,6 +4515,7 @@ class Visualizer:
                     # Add secondary y-axis for resolution in degrees
                     ax2 = ax.twinx()
                     ax2.set_ylabel('Angular Resolution (degrees)', fontsize=10)
+                    ax2.set_yscale(ax.get_yscale())
                     ax2.set_ylim(np.rad2deg(ax.get_ylim()[0]), np.rad2deg(ax.get_ylim()[1]))
                     ax2.tick_params(axis='y')
                     
@@ -3407,6 +4538,21 @@ class Visualizer:
             resolution_per_event = kwargs.get('resolution_per_event', None)
             signal_event_params = kwargs.get('resolution_params', None)
             n_bins = kwargs.get('n_energy_bins', 10)
+            resolution_stat = kwargs.get('resolution_stat', None)
+            if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
+                resolution_stat = 'mean'
+            resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+            if resolution_stat not in ('median', 'mean'):
+                resolution_stat = 'median'
+            show_resolution_ci = bool(kwargs.get('show_resolution_ci', False))
+            resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
+            resolution_ci_level = kwargs.get('resolution_ci_level', None)
+            energy_range = kwargs.get('energy_range', None)
+            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
+            min_ang_res = kwargs.get('min_angular_resolution', None)
+            max_ang_res = kwargs.get('max_angular_resolution', None)
+            if not resolution_logy:
+                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', False))
 
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
@@ -3432,6 +4578,22 @@ class Visualizer:
                 res_values = res_values[valid_mask]
                 energy_values = energy_values[valid_mask]
 
+                if energy_range is not None and len(energy_range) == 2:
+                    try:
+                        emin, emax = float(energy_range[0]), float(energy_range[1])
+                        if emax < emin:
+                            emin, emax = emax, emin
+                        range_mask = (energy_values >= emin) & (energy_values <= emax)
+                        res_values = res_values[range_mask]
+                        energy_values = energy_values[range_mask]
+                    except Exception:
+                        pass
+
+                if resolution_logy:
+                    pos_mask = np.array(res_values) > 0
+                    res_values = np.array(res_values)[pos_mask]
+                    energy_values = np.array(energy_values)[pos_mask]
+
                 if len(res_values) > 0 and len(energy_values) > 0:
                     # Create logarithmic bins for energy
                     log_energy_min = np.log10(energy_values.min())
@@ -3440,27 +4602,163 @@ class Visualizer:
                     bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])  # Geometric mean
 
                     # Compute binned statistics
-                    bin_means = []
-                    bin_stds = []
+                    bin_medians = []
+                    band_lower = []
+                    band_upper = []
                     bin_counts = []
 
                     for i in range(n_bins):
                         mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i+1])
                         if mask.sum() > 0:
-                            bin_means.append(np.mean(res_values[mask]))
-                            bin_stds.append(np.std(res_values[mask]))
+                            vals = np.array(res_values[mask], dtype=float)
+                            if resolution_stat == 'mean':
+                                center_val = float(np.nanmean(vals))
+                                spread_val = float(np.nanstd(vals))
+                            else:
+                                center_val = float(np.nanmedian(vals))
+                                spread_val = np.nan
+                            bin_medians.append(center_val)
+                            if show_resolution_ci:
+                                if resolution_stat == 'mean':
+                                    lo = center_val - 2.0 * spread_val
+                                    hi = center_val + 2.0 * spread_val
+                                    if min_ang_res is not None:    
+                                        lo = float(max(lo, min_ang_res))
+                                    if max_ang_res is not None:
+                                        hi = float(min(hi, max_ang_res))
+                                    band_lower.append(lo)
+                                    band_upper.append(float(hi))
+                                else:
+                                    q_lo = None
+                                    q_hi = None
+                                    if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                        try:
+                                            q_lo = float(resolution_ci_percentiles[0])
+                                            q_hi = float(resolution_ci_percentiles[1])
+                                        except Exception:
+                                            q_lo, q_hi = None, None
+                                    if q_lo is None or q_hi is None:
+                                        if resolution_ci_level is not None:
+                                            try:
+                                                lvl = float(resolution_ci_level)
+                                                lvl = float(np.clip(lvl, 0.0, 1.0))
+                                                alpha = 0.5 * (1.0 - lvl)
+                                                q_lo = 100.0 * alpha
+                                                q_hi = 100.0 * (1.0 - alpha)
+                                            except Exception:
+                                                q_lo, q_hi = 16.0, 84.0
+                                        else:
+                                            q_lo, q_hi = 16.0, 84.0
+                                    if q_hi < q_lo:
+                                        q_lo, q_hi = q_hi, q_lo
+                                    resid = vals - center_val
+                                    band_lower.append(center_val + np.nanpercentile(resid, q_lo))
+                                    band_upper.append(center_val + np.nanpercentile(resid, q_hi))
+                            else:
+                                band_lower.append(np.nan)
+                                band_upper.append(np.nan)
                             bin_counts.append(mask.sum())
                         else:
-                            bin_means.append(np.nan)
-                            bin_stds.append(np.nan)
+                            bin_medians.append(np.nan)
+                            band_lower.append(np.nan)
+                            band_upper.append(np.nan)
                             bin_counts.append(0)
 
-                    bin_means = np.array(bin_means)
+                    bin_medians = np.array(bin_medians)
+                    band_lower = np.array(band_lower)
+                    band_upper = np.array(band_upper)
+                    bin_counts = np.array(bin_counts)
+                    if min_ang_res is not None or max_ang_res is not None:
+                        lo_lim = -np.inf
+                        hi_lim = np.inf
+                        try:
+                            if min_ang_res is not None:
+                                lo_lim = float(min_ang_res)
+                        except Exception:
+                            lo_lim = -np.inf
+                        try:
+                            if max_ang_res is not None:
+                                hi_lim = float(max_ang_res)
+                        except Exception:
+                            hi_lim = np.inf
+                        if np.isfinite(lo_lim) and np.isfinite(hi_lim) and hi_lim < lo_lim:
+                            lo_lim, hi_lim = hi_lim, lo_lim
+
+                        bin_medians = np.clip(bin_medians, lo_lim, hi_lim)
+                        if show_resolution_ci:
+                            band_lower = np.clip(band_lower, lo_lim, hi_lim)
+                            band_upper = np.clip(band_upper, lo_lim, hi_lim)
+                            band_lower = np.minimum(band_lower, band_upper)
+                    ci_lower = band_lower
+                    ci_upper = band_upper
 
                     # Plot mean line vs log10(energy)
-                    valid_bins = ~np.isnan(bin_means)
-                    ax.plot(np.log10(bin_centers[valid_bins]), bin_means[valid_bins], 'o-',
-                            linewidth=2, markersize=8, label='Mean')
+                    valid_bins = np.isfinite(bin_medians)
+                    x_plot = np.log10(bin_centers)
+                    if show_resolution_ci and ci_lower is not None and ci_upper is not None:
+                        valid_ci = valid_bins & np.isfinite(ci_lower) & np.isfinite(ci_upper)
+                        if np.any(valid_ci):
+                            q_lo, q_hi = 16.0, 84.0
+                            ci_label = None
+                            if resolution_stat == 'mean':
+                                ci_label = 'Mean ± 2σ'
+                            else:
+                                if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                    try:
+                                        q_lo = float(resolution_ci_percentiles[0])
+                                        q_hi = float(resolution_ci_percentiles[1])
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                elif resolution_ci_level is not None:
+                                    try:
+                                        lvl = float(resolution_ci_level)
+                                        lvl = float(np.clip(lvl, 0.0, 1.0))
+                                        alpha = 0.5 * (1.0 - lvl)
+                                        q_lo = 100.0 * alpha
+                                        q_hi = 100.0 * (1.0 - alpha)
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                if q_hi < q_lo:
+                                    q_lo, q_hi = q_hi, q_lo
+                                ci_label = f"Residual band (p{q_lo:g}-p{q_hi:g})"
+                            ax.plot(
+                                x_plot[valid_ci],
+                                ci_lower[valid_ci],
+                                linestyle='--',
+                                linewidth=1.5,
+                                color='gray',
+                                alpha=0.9,
+                                label=str(ci_label),
+                                zorder=1,
+                            )
+                            ax.plot(
+                                x_plot[valid_ci],
+                                ci_upper[valid_ci],
+                                linestyle='--',
+                                linewidth=1.5,
+                                color='gray',
+                                alpha=0.9,
+                                label='_nolegend_',
+                                zorder=1,
+                            )
+                    ax.plot(
+                        x_plot[valid_bins],
+                        bin_medians[valid_bins],
+                        'o-',
+                        linewidth=2,
+                        markersize=8,
+                        label=('Mean' if resolution_stat == 'mean' else 'Median'),
+                    )
+                    if resolution_logy:
+                        ax.set_yscale('log')
+
+                    if resolution_stat == 'mean':
+                        try:
+                            y0, y1 = ax.get_ylim()
+                            if y0 < 1e-5:
+                                ax.set_ylim(bottom=1e-5)
+                        except Exception:
+                            pass
 
                     ax.set_xlabel('log$_{10}$(Energy / GeV)', fontsize=10)
                     ax.set_ylabel('Angular Resolution (radians)', fontsize=10)
@@ -3471,6 +4769,7 @@ class Visualizer:
                     # Add secondary y-axis in degrees
                     ax2 = ax.twinx()
                     ax2.set_ylabel('Angular Resolution (degrees)', fontsize=10)
+                    ax2.set_yscale(ax.get_yscale())
                     ax2.set_ylim(np.rad2deg(ax.get_ylim()[0]), np.rad2deg(ax.get_ylim()[1]))
                     ax2.tick_params(axis='y')
                 else:
@@ -3486,6 +4785,16 @@ class Visualizer:
             signal_event_params = kwargs.get('resolution_params', None)
             n_bins = kwargs.get('n_energy_bins', 10)
             use_relative_energy = kwargs.get('use_relative_energy', False)
+            resolution_stat = kwargs.get('resolution_stat', None)
+            if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
+                resolution_stat = 'mean'
+            resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+            if resolution_stat not in ('median', 'mean'):
+                resolution_stat = 'median'
+            show_resolution_ci = bool(kwargs.get('show_resolution_ci', False))
+            resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
+            resolution_ci_level = kwargs.get('resolution_ci_level', None)
+            energy_range = kwargs.get('energy_range', None)
             
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
@@ -3510,6 +4819,17 @@ class Visualizer:
                 valid_mask = np.isfinite(res_values) & np.isfinite(energy_values)
                 res_values = res_values[valid_mask]
                 energy_values = energy_values[valid_mask]
+
+                if energy_range is not None and len(energy_range) == 2:
+                    try:
+                        emin, emax = float(energy_range[0]), float(energy_range[1])
+                        if emax < emin:
+                            emin, emax = emax, emin
+                        range_mask = (energy_values >= emin) & (energy_values <= emax)
+                        res_values = res_values[range_mask]
+                        energy_values = energy_values[range_mask]
+                    except Exception:
+                        pass
                 
                 if len(res_values) > 0 and len(energy_values) > 0:
                     # Create logarithmic bins for energy
@@ -3519,29 +4839,114 @@ class Visualizer:
                     bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])  # Geometric mean for log scale
                     
                     # Compute binned statistics
-                    bin_means = []
-                    bin_stds = []
+                    bin_medians = []
+                    band_lower = []
+                    band_upper = []
                     bin_counts = []
                     
                     for i in range(n_bins):
                         mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i+1])
                         if mask.sum() > 0:
-                            bin_means.append(np.mean(res_values[mask]))
-                            bin_stds.append(np.std(res_values[mask]))
+                            vals = np.array(res_values[mask], dtype=float)
+                            if resolution_stat == 'mean':
+                                center_val = float(np.nanmean(vals))
+                                spread_val = float(np.nanstd(vals))
+                            else:
+                                center_val = float(np.nanmedian(vals))
+                                spread_val = np.nan
+                            bin_medians.append(center_val)
+                            if show_resolution_ci:
+                                if resolution_stat == 'mean':
+                                    band_lower.append(center_val - 2.0 * spread_val)
+                                    band_upper.append(center_val + 2.0 * spread_val)
+                                else:
+                                    q_lo = None
+                                    q_hi = None
+                                    if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                        try:
+                                            q_lo = float(resolution_ci_percentiles[0])
+                                            q_hi = float(resolution_ci_percentiles[1])
+                                        except Exception:
+                                            q_lo, q_hi = None, None
+                                    if q_lo is None or q_hi is None:
+                                        if resolution_ci_level is not None:
+                                            try:
+                                                lvl = float(resolution_ci_level)
+                                                lvl = float(np.clip(lvl, 0.0, 1.0))
+                                                alpha = 0.5 * (1.0 - lvl)
+                                                q_lo = 100.0 * alpha
+                                                q_hi = 100.0 * (1.0 - alpha)
+                                            except Exception:
+                                                q_lo, q_hi = 16.0, 84.0
+                                        else:
+                                            q_lo, q_hi = 16.0, 84.0
+                                    if q_hi < q_lo:
+                                        q_lo, q_hi = q_hi, q_lo
+                                    resid = vals - center_val
+                                    band_lower.append(center_val + np.nanpercentile(resid, q_lo))
+                                    band_upper.append(center_val + np.nanpercentile(resid, q_hi))
+                            else:
+                                band_lower.append(np.nan)
+                                band_upper.append(np.nan)
                             bin_counts.append(mask.sum())
                         else:
-                            bin_means.append(np.nan)
-                            bin_stds.append(np.nan)
+                            bin_medians.append(np.nan)
+                            band_lower.append(np.nan)
+                            band_upper.append(np.nan)
                             bin_counts.append(0)
                     
-                    bin_means = np.array(bin_means)
-                    bin_stds = np.array(bin_stds)
+                    bin_medians = np.array(bin_medians)
+                    band_lower = np.array(band_lower)
+                    band_upper = np.array(band_upper)
                     bin_counts = np.array(bin_counts)
+
+                    ci_lower = band_lower
+                    ci_upper = band_upper
                     
                     # Plot with error bars
-                    valid_bins = ~np.isnan(bin_means)
-                    ax.plot(bin_centers[valid_bins], bin_means[valid_bins], 'o-', 
-                           linewidth=2, markersize=8, label='Mean')
+                    valid_bins = np.isfinite(bin_medians)
+                    if show_resolution_ci and ci_lower is not None and ci_upper is not None:
+                        valid_ci = valid_bins & np.isfinite(ci_lower) & np.isfinite(ci_upper)
+                        if np.any(valid_ci):
+                            q_lo, q_hi = 16.0, 84.0
+                            ci_label = None
+                            if resolution_stat == 'mean':
+                                ci_label = 'Mean ± 2σ'
+                            else:
+                                if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                    try:
+                                        q_lo = float(resolution_ci_percentiles[0])
+                                        q_hi = float(resolution_ci_percentiles[1])
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                elif resolution_ci_level is not None:
+                                    try:
+                                        lvl = float(resolution_ci_level)
+                                        lvl = float(np.clip(lvl, 0.0, 1.0))
+                                        alpha = 0.5 * (1.0 - lvl)
+                                        q_lo = 100.0 * alpha
+                                        q_hi = 100.0 * (1.0 - alpha)
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                if q_hi < q_lo:
+                                    q_lo, q_hi = q_hi, q_lo
+                                ci_label = f"Residual band (p{q_lo:g}-p{q_hi:g})"
+                            ax.fill_between(
+                                bin_centers[valid_ci],
+                                ci_lower[valid_ci],
+                                ci_upper[valid_ci],
+                                alpha=0.2,
+                                label=str(ci_label),
+                                zorder=1,
+                            )
+                    ax.plot(
+                        bin_centers[valid_bins],
+                        bin_medians[valid_bins],
+                        'o-',
+                        linewidth=2,
+                        markersize=8,
+                        label=('Mean' if resolution_stat == 'mean' else 'Median'),
+                    )
                     
                     ax.set_xlabel('Energy (GeV)', fontsize=10)
                     if use_relative_energy:

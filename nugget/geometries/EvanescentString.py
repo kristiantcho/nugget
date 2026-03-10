@@ -104,6 +104,8 @@ class EvanescentString(Geometry):
                 string_xy = _as_tensor(initial_geometry['string_xy'])
                 self.n_strings = int(string_xy.shape[0])
             else:
+                if 'n_strings' in initial_geometry and initial_geometry['n_strings'] is not None:
+                    self.n_strings = int(initial_geometry['n_strings'])
                 string_xy = _default_string_xy()
 
             expected_points = int(self.n_strings) * int(self.points_per_string)

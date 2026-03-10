@@ -646,7 +646,7 @@ class StringNumberPenalty(LossFunction):
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
         # string_probs = string_weights
         if string_probs is not None:
-            return {'string_number_penalty': F.softplus(torch.sum(string_probs) - eva_min_num_strings, beta=string_number_beta)/len(string_probs)}
+            return {'string_number_penalty': F.softplus(torch.sum(string_probs) - eva_min_num_strings, beta=string_number_beta)/string_probs.shape[0]}
         else:
             return {'string_number_penalty': torch.tensor(0.0)}
 

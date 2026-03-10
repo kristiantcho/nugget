@@ -9,7 +9,7 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(event_type='signal'
 
 
 llr_net = nugget.surrogates.LLRnet.LLRnet(
-    # device='cuda',
+    device='cuda:1',
     domain_size=2500,  # Size of the detector domain
     dim=3,  # 3D spatial coordinates
     hidden_dims=[64, 64, 64, 64, 64],  # Neural network architecture
@@ -32,8 +32,8 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
     lr_scheduler_patience=35,  # Patience for LR scheduler
     use_patd=True,
-    min_photons=10,  # Minimum number of photons to consider an event valid
-    num_photons_per_sample=100,  # Number of photons to sample from each valid event
+    min_photons=5,  # Minimum number of photons to consider an event valid
+    num_photons_per_sample=1000,  # Number of photons to sample from each valid event
     input_charge=False,
     rel_time=True,
 )
