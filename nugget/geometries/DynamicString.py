@@ -1,27 +1,53 @@
 from nugget.geometries.base_geometry import Geometry
 import torch
 import numpy as np
-import torch.nn.functional as F
 
 class DynamicString(Geometry):
     """Dynamic string geometry optimizer."""
     
-    def __init__(self, device=None, dim=3, domain_size=2, random_initial_dist = False, 
-                total_points = 150, n_strings = 30, initial_random_spread = 0.1, optimize_positions_only = False,
-                min_points_per_string = 2, optimize_xy = False, even_distribution = False):
+    def __init__(self, device=None, dim=3, domain_size=2,
+                total_points = 150, n_strings = 30,
+                random_xy = False,
+                custom_z_spacing = None, points_per_string = None,
+                custom_string_spacing = None, hex_type='hexagonal', hybrid_mix_init=0.5):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
-        self.random_initial_dist = random_initial_dist
-        self.total_points = total_points
         self.n_strings = n_strings
-        self.initial_random_spread = initial_random_spread
-        self.min_points_per_string = min_points_per_string
-        self.optimize_xy = optimize_xy
-        self.even_distribution = even_distribution # False if you want to redistribute points with string logits (not working optimally yet)
-        self.optimize_positions_only = optimize_positions_only
+        self.points_per_string = points_per_string
+        self.total_points = int(self.n_strings * self.points_per_string) if self.points_per_string is not None else total_points
+        self.random_xy = random_xy
+        self.custom_z_spacing = custom_z_spacing
+        self.custom_string_spacing = custom_string_spacing
+        self.hybrid_mix = hybrid_mix_init
+        if hex_type == 'hexagonal':
+            self.hex_func = self.create_uniform_hexagonal_grid
+        elif hex_type == 'circular':
+            self.hex_func = self.create_circular_hexagonal_grid
+        elif hex_type == 'sunflower':
+            self.hex_func = self.create_sunflower_grid
+        else:
+            self.hex_func = self.create_uniform_hexagonal_grid
         original_dim = self.dim
         self.dim = 2
-        self.hex_grid = self.create_uniform_hexagonal_grid(n_points=self.n_strings)
+        self.hex_grid = self.hex_func(
+            n_points=self.n_strings,
+            optimal_spacing=self.custom_string_spacing,
+            hybrid_mix=self.hybrid_mix,
+        )
         self.dim = original_dim
+
+    def _make_z_segment(self, n_points):
+        if n_points <= 0:
+            return torch.tensor([], device=self.device, dtype=torch.float32)
+        if self.custom_z_spacing is not None:
+            return self.custom_z_spacing * (
+                torch.arange(n_points, device=self.device, dtype=torch.float32)
+                - (n_points - 1) / 2.0
+            )
+        return torch.linspace(-self.half_domain, self.half_domain, n_points, device=self.device)
+
+    def _sync_total_points_from_points_per_string(self):
+        if self.points_per_string is not None:
+            self.total_points = int(self.n_strings * self.points_per_string)
             
     
     def initialize_points(self, initial_geometry=None, **kwargs):
@@ -75,16 +101,18 @@ class DynamicString(Geometry):
                     string_xy = string_xy[active_strings_mask]
                     # Update n_strings to reflect filtered strings
                     self.n_strings = len(string_xy)
+                    self._sync_total_points_from_points_per_string()
                     print(f"Filtered string_xy to {self.n_strings} strings")
                 result['string_xy'] = string_xy
             else:
                 # Fall back to default initialization
                 string_xy = self.hex_grid.clone()
-                if self.optimize_xy:
+                if self.random_xy:
                     string_xy = torch.rand(self.n_strings, 2, device=self.device) * self.domain_size - self.half_domain
-                if active_strings_mask is not None:
-                    string_xy = string_xy[active_strings_mask]
-                    self.n_strings = len(string_xy)
+                # if active_strings_mask is not None:
+                #     string_xy = string_xy[active_strings_mask]
+                #     self.n_strings = len(string_xy)
+                #     self._sync_total_points_from_points_per_string()
                 result['string_xy'] = string_xy
             
             # Process z_values if available
@@ -198,7 +226,7 @@ class DynamicString(Geometry):
                     for s_idx in range(self.n_strings):
                         n_pts = default_points_per_string[s_idx]
                         if n_pts > 0:
-                            string_z_segment = torch.linspace(-self.half_domain, self.half_domain, n_pts, device=self.device)
+                            string_z_segment = self._make_z_segment(n_pts)
                             z_values_list.append(string_z_segment)
                     
                     # Combine all z-values
@@ -319,23 +347,6 @@ class DynamicString(Geometry):
                     
                     result['points_per_string_list'] = default_points_per_string
             
-            # Process string_logits if available
-            if 'string_logits' in initial_geometry and not self.even_distribution:
-                string_logits = initial_geometry['string_logits']
-                if not isinstance(string_logits, torch.Tensor):
-                    string_logits = torch.tensor(string_logits, device=self.device, dtype=torch.float32)
-                elif string_logits.device != self.device:
-                    string_logits = string_logits.to(self.device)
-                
-                # If filtering strings, filter the logits too
-                if active_strings_mask is not None:
-                    string_logits = string_logits[active_strings_mask]
-                
-                result['string_logits'] = string_logits
-            elif not self.even_distribution:
-                string_logits = torch.ones(self.n_strings, device=self.device, dtype=torch.float32) / self.n_strings
-                result['string_logits'] = string_logits
-            
             # Get the points
             if 'points_3d' in initial_geometry:
                 points = initial_geometry['points_3d']
@@ -383,119 +394,33 @@ class DynamicString(Geometry):
         # Regular initialization if no initial geometry is provided
         # Initialize string_xy (hex grid or random based on self.optimize_xy)
         string_xy = self.hex_grid.clone()
-        if self.optimize_xy:
+        if self.random_xy:
             string_xy = torch.rand(self.n_strings, 2, device=self.device) * self.domain_size - self.half_domain
 
-        string_logits = None
         points_3d = torch.zeros(self.total_points, 3, device=self.device)
         z_values_final = None
         string_indices_final = []
         points_per_string_list_final = None
 
-        # Determine initialization strategy
-        if not self.even_distribution:
-            # This block implements point assignment based on weighted_xy and closest string,
-            # preserving string_logits initialization based on self.random_initial_dist.
-            # This replaces the previous soft assignment and commented-out hard assignment logic.
-            if self.random_initial_dist:
-                string_logits = self.initial_random_spread * torch.randn(self.n_strings, device=self.device)
-            else:
-                string_logits = torch.ones(self.n_strings, device=self.device, dtype=torch.float32) / self.n_strings
-            
-            string_probs = F.softmax(string_logits, dim=0)
+        points_per_string_counts = [self.total_points // self.n_strings] * self.n_strings
+        remainder = self.total_points % self.n_strings
+        for i in range(remainder):
+            points_per_string_counts[i] += 1
 
-            n_points = self.total_points
-            # Using self.n_strings and self.device directly from the class instance
-
-            # Calculate weighted_xy for each point based on global string_probs
-            # string_xy_exp_for_weighted_avg: (n_points, self.n_strings, 2)
-            string_xy_exp_for_weighted_avg = string_xy.unsqueeze(0).expand(n_points, self.n_strings, 2)
-            # probs_exp_for_weighted_avg: (1, self.n_strings, 1) -> broadcasts
-            probs_exp_for_weighted_avg = string_probs.unsqueeze(0).unsqueeze(-1)
-            # weighted_xy: (n_points, 2) - each point gets its own weighted XY
-            weighted_xy = (string_xy_exp_for_weighted_avg * probs_exp_for_weighted_avg).sum(dim=1)
-
-            # Assign points to the closest string based on their weighted_xy
-            # weighted_xy_expanded: (n_points, 1, 2)
-            # string_xy_expanded_for_dist: (1, self.n_strings, 2)
-            weighted_xy_expanded = weighted_xy.unsqueeze(1)
-            string_xy_expanded_for_dist = string_xy.unsqueeze(0)
-
-            # Calculate squared Euclidean distances: (n_points, self.n_strings)
-            distances_sq = torch.sum((weighted_xy_expanded - string_xy_expanded_for_dist)**2, dim=2)
-            # assigned_string_indices_for_points: (n_points,) - index of closest string for each point
-            # Replace argmin with Gumbel-Softmax for differentiability
-            assignment_logits = -distances_sq  # Higher score for smaller distance
-            TAU = 0.01  # Temperature for Gumbel-Softmax; can be tuned or annealed
-            # assigned_string_one_hot is (n_points, n_strings), one-hot in fwd, differentiable in bwd
-            assigned_string_one_hot = F.gumbel_softmax(assignment_logits, tau=TAU, hard=True)
-            # For subsequent logic needing integer indices (forward pass for these parts)
-            assigned_string_indices_for_points = torch.argmax(assigned_string_one_hot, dim=1)
-
-            # Calculate points per string
-            points_per_string_counts = torch.zeros(self.n_strings, dtype=torch.long, device=self.device)
-            for s_idx_loop in range(self.n_strings):
-                points_per_string_counts[s_idx_loop] = (assigned_string_indices_for_points == s_idx_loop).sum()
-            
-            points_per_string_list_final = points_per_string_counts.tolist() # Store as list of ints
-
-            # Reconstruct points_3d, z_values, and string_indices
-            # points_3d is already torch.zeros(self.total_points, 3, device=self.device)
-            current_point_fill_idx = 0
-            _z_values_list = []
-            _string_indices_list = []  # This will be assigned to string_indices_final
-
-            for s_idx_loop in range(self.n_strings):
-                num_points_on_this_string = points_per_string_counts[s_idx_loop].item()
-                if num_points_on_this_string > 0:
-                    start_idx = current_point_fill_idx
-                    end_idx = current_point_fill_idx + num_points_on_this_string
-                    
-                    # Set XY for these points to the string's XY
-                    points_3d[start_idx:end_idx, 0] = string_xy[s_idx_loop, 0]
-                    points_3d[start_idx:end_idx, 1] = string_xy[s_idx_loop, 1]
-                    
-                    # Remap Z values uniformly along this string segment
-                    string_z_segment = torch.linspace(-self.half_domain, self.half_domain, num_points_on_this_string, device=self.device)
-                    points_3d[start_idx:end_idx, 2] = string_z_segment
-                    
-                    _z_values_list.append(string_z_segment)
-                    _string_indices_list.extend([s_idx_loop] * num_points_on_this_string)
-                    current_point_fill_idx += num_points_on_this_string
-            
-            if _z_values_list: # Ensure list is not empty before cat
-                z_values_final = torch.cat(_z_values_list)
-            else: # Handle case where no points are assigned (e.g. total_points = 0 or all strings get 0 points)
-                z_values_final = torch.tensor([], device=self.device, dtype=torch.float32)
-
-            string_indices_final = _string_indices_list
-            # string_logits is already set from the start of this block
-            # points_3d is modified in-place
-            # points_per_string_list_final is set
-        else: # self.even_distribution is True
-            # Strategy 3: Even distribution -> HARD ASSIGNMENT, equal distribution
-            # print(f"DEBUG GEOMETRY (initialize_points): Using EVEN distribution")
-            string_logits = None 
-            
-            points_per_string_counts = [self.total_points // self.n_strings] * self.n_strings
-            remainder = self.total_points % self.n_strings
-            for i in range(remainder):
-                points_per_string_counts[i] += 1
-            
-            _z_values_list = []
-            current_idx = 0
-            for s in range(self.n_strings):
-                n_pts = points_per_string_counts[s]
-                if n_pts > 0:
-                    string_z_segment = torch.linspace(-self.half_domain, self.half_domain, n_pts, device=self.device)
-                    points_3d[current_idx:current_idx+n_pts, 0] = string_xy[s, 0]
-                    points_3d[current_idx:current_idx+n_pts, 1] = string_xy[s, 1]
-                    points_3d[current_idx:current_idx+n_pts, 2] = string_z_segment
-                    _z_values_list.append(string_z_segment)
-                    string_indices_final.extend([s] * n_pts)
-                    current_idx += n_pts
-            z_values_final = torch.cat(_z_values_list) if _z_values_list else torch.tensor([], device=self.device)
-            points_per_string_list_final = torch.tensor(points_per_string_counts, dtype=torch.float32, device=self.device) # Tensor
+        _z_values_list = []
+        current_idx = 0
+        for s in range(self.n_strings):
+            n_pts = points_per_string_counts[s]
+            if n_pts > 0:
+                string_z_segment = self._make_z_segment(n_pts)
+                points_3d[current_idx:current_idx+n_pts, 0] = string_xy[s, 0]
+                points_3d[current_idx:current_idx+n_pts, 1] = string_xy[s, 1]
+                points_3d[current_idx:current_idx+n_pts, 2] = string_z_segment
+                _z_values_list.append(string_z_segment)
+                string_indices_final.extend([s] * n_pts)
+                current_idx += n_pts
+        z_values_final = torch.cat(_z_values_list) if _z_values_list else torch.tensor([], device=self.device)
+        points_per_string_list_final = torch.tensor(points_per_string_counts, dtype=torch.float32, device=self.device)
 
         # Ensure points_3d is correctly filled if total_points was not perfectly met by allocation
         # This is more relevant for hard allocation if current_idx < self.total_points
@@ -506,41 +431,11 @@ class DynamicString(Geometry):
             "z_values": z_values_final, 
             "string_xy": string_xy,
             "string_indices": string_indices_final, 
-            "points_per_string_list": points_per_string_list_final, # This is now a tensor
-            "string_logits": string_logits
+            "points_per_string_list": points_per_string_list_final,
         }
     
      
-    def compute_string_distribution(self, string_logits):
-        # Apply softmax to get probability distribution over strings
-        string_probs = F.softmax(string_logits, dim=0)
-        
-        # Calculate ideal number of points per string based on probabilities
-        # Each string gets at least min_points_per_string, then remaining points distributed by probability
-        remaining_points = self.total_points - self.n_strings * self.min_points_per_string
-        
-        # Base distribution ensures minimum points per string
-        ideal_points = [self.min_points_per_string] * self.n_strings
-        ideal_points = torch.tensor(ideal_points, device=self.device)
-        
-        if remaining_points > 0:
-            # Keep everything in PyTorch tensors to maintain gradient flow
-            weighted_probs = string_probs * remaining_points
-            integer_alloc = torch.floor(weighted_probs)
-            allocated = integer_alloc.sum()
-            if allocated < remaining_points:
-                decimal_part = weighted_probs - integer_alloc
-                _, sorted_indices = torch.sort(decimal_part, descending=True)
-                extra_needed = int(remaining_points - allocated)
-                for i in range(extra_needed):
-                    integer_alloc[sorted_indices[i]] += 1
-            # Do NOT cast to .long() or int here; keep as float for gradient flow
-            for i in range(self.n_strings):
-                ideal_points[i] = ideal_points[i] + integer_alloc[i]
-        
-        return ideal_points 
-        
-    def update_points(self, z_values, string_xy, points_per_string_list, string_indices, string_logits=None, **kwargs):
+    def update_points(self, z_values, string_xy, points_per_string_list, string_indices, **kwargs):
         """Update the points based on current optimization state.
         Parameters:
         -----------
@@ -552,103 +447,12 @@ class DynamicString(Geometry):
             Number of points per string (n_strings,) - Not used in the 'redis_phase' logic below.
         string_indices : list
             List of string indices for each point - Not used in the 'redis_phase' logic below.
-        string_logits : torch.Tensor or None
-            Logits for string importance (n_strings,)
         
         returns:
         --------
         dict
             Dictionary with updated tensors 
             """
-        
-        # print(f"DEBUG GEOMETRY: update_points called with even_distribution={self.even_distribution}, string_logits is None: {string_logits is None}")
-        # if string_logits is not None:
-            # print(f"DEBUG GEOMETRY: string_logits.requires_grad = {string_logits.requires_grad}")
-            
-        # if not self.even_distribution and string_logits is not None and kwargs.get("redis_phase", False):
-        #     # New logic:
-        #     # 1. Calculate weighted_xy for all n_points.
-        #     # 2. Assign each point to the string whose string_xy is closest to the point's weighted_xy.
-        #     # 3. Reconstruct points_3d: XY from assigned string, Z remapped uniformly along that string.
-
-        #     string_probs = F.softmax(string_logits, dim=0)  # (n_strings,)
-        #     n_points = self.total_points
-        #     n_strings = self.n_strings
-        #     device = self.device
-
-        #     # Calculate weighted_xy for each point based on global string_probs
-        #     # string_xy_exp: (n_points, n_strings, 2)
-        #     string_xy_exp_for_weighted_avg = string_xy.unsqueeze(0).expand(n_points, n_strings, 2)
-        #     # probs_exp: (1, n_strings, 1) -> broadcasts to (n_points, n_strings, 1)
-        #     probs_exp_for_weighted_avg = string_probs.unsqueeze(0).unsqueeze(-1)
-        #     # weighted_xy: (n_points, 2) - each point gets its own weighted XY
-        #     weighted_xy = (string_xy_exp_for_weighted_avg * probs_exp_for_weighted_avg).sum(dim=1)
-
-        #     # Assign points to the closest string based on their weighted_xy
-        #     # weighted_xy_expanded: (n_points, 1, 2)
-        #     # string_xy_expanded_for_dist: (1, n_strings, 2)
-        #     weighted_xy_expanded = weighted_xy.unsqueeze(1)
-        #     string_xy_expanded_for_dist = string_xy.unsqueeze(0)
-
-        #     # Calculate squared Euclidean distances: (n_points, n_strings)
-        #     distances_sq = torch.sum((weighted_xy_expanded - string_xy_expanded_for_dist)**2, dim=2)
-        #     # assigned_string_indices_for_points: (n_points,) - index of closest string for each original point
-        #     # Replace argmin with Gumbel-Softmax for differentiability
-        #     assignment_logits = -distances_sq  # Higher score for smaller distance
-        #     TAU = 1.0  # Temperature for Gumbel-Softmax; can be tuned or annealed
-        #     # assigned_string_one_hot is (n_points, n_strings), one-hot in fwd, differentiable in bwd
-        #     assigned_string_one_hot = F.gumbel_softmax(assignment_logits, tau=TAU, hard=True)
-        #     # For subsequent logic needing integer indices (forward pass for these parts)
-        #     assigned_string_indices_for_points = torch.argmax(assigned_string_one_hot, dim=1)
-
-        #     # Prepare for reconstructing points_3d, ordered by string
-        #     new_points_3d = torch.zeros(n_points, 3, device=device)
-            
-        #     points_per_string_counts = torch.zeros(n_strings, dtype=torch.long, device=device)
-        #     for s_idx in range(n_strings):
-        #         points_per_string_counts[s_idx] = (assigned_string_indices_for_points == s_idx).sum()
-            
-        #     points_per_string_counts_list_output = points_per_string_counts.tolist()
-            
-        #     current_point_fill_idx = 0
-        #     new_z_values_segments_list = []
-        #     final_string_indices_output_list = []
-
-        #     for s_idx in range(n_strings):
-        #         num_points_on_this_string = points_per_string_counts[s_idx].item()
-        #         if num_points_on_this_string > 0:
-        #             start_idx = current_point_fill_idx
-        #             end_idx = current_point_fill_idx + num_points_on_this_string
-                    
-        #             # Set XY for these points to the string's XY
-        #             new_points_3d[start_idx:end_idx, 0] = string_xy[s_idx, 0]
-        #             new_points_3d[start_idx:end_idx, 1] = string_xy[s_idx, 1]
-                    
-        #             # Remap Z values uniformly along this string segment
-        #             string_z_segment = torch.linspace(-self.half_domain, self.half_domain, num_points_on_this_string, device=device)
-        #             new_points_3d[start_idx:end_idx, 2] = string_z_segment
-                    
-        #             new_z_values_segments_list.append(string_z_segment)
-        #             final_string_indices_output_list.extend([s_idx] * num_points_on_this_string)
-        #             current_point_fill_idx += num_points_on_this_string
-            
-        #     final_concat_z_values = torch.cat(new_z_values_segments_list) if new_z_values_segments_list else torch.tensor([], device=device, dtype=torch.float32)
-
-        #     # Ensure all points were processed
-        #     if current_point_fill_idx != n_points:
-        #         # This might happen if some points couldn't be assigned or counts were off.
-        #         # For robustness, one might add error handling or a fallback.
-        #         # Assuming for now that all points get assigned.
-        #         pass
-
-        #     return {
-        #         "points": new_points_3d,
-        #         "z_values": final_concat_z_values,
-        #         "string_xy": string_xy, # Passed through
-        #         "string_indices": final_string_indices_output_list,
-        #         "points_per_string_list": points_per_string_counts_list_output,
-        #         "string_logits": string_logits # Passed through
-        #     }
         
         # Original hard allocation logic (if the above condition is not met)
         # Create new points_3d with updated distribution while preserving gradients
@@ -680,4 +484,4 @@ class DynamicString(Geometry):
             "string_xy": string_xy,
             "string_indices": string_indices, 
             "points_per_string_list": points_per_string_list,
-            "string_logits": string_logits if not self.even_distribution else None}
+        }

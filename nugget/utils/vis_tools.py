@@ -104,15 +104,18 @@ class Visualizer:
     PLOT_FISHER_INFO_CONTOUR = "fisher_info_contour"
     PLOT_ANGULAR_RESOLUTION = "angular_resolution"
     PLOT_ENERGY_RESOLUTION = "energy_resolution"
+    PLOT_POINTSOURCE_FOM = "pointsource_fom"
     PLOT_ANGULAR_RESOLUTION_HISTORY = "angular_resolution_history"
     PLOT_ENERGY_RESOLUTION_HISTORY = "energy_resolution_history"
     PLOT_ANGULAR_RESOLUTION_VS_ZENITH = "angular_resolution_vs_zenith"
     PLOT_ANGULAR_RESOLUTION_VS_ENERGY = "angular_resolution_vs_energy"
     PLOT_ENERGY_RESOLUTION_VS_ENERGY = "energy_resolution_vs_energy"
+    PLOT_POINTSOURCE_FOM_VS_ENERGY = "pointsource_fom_vs_energy"
     PLOT_LOSS_COMPONENTS = "loss_components"
     PLOT_UW_LOSS_COMPONENTS = "uw_loss_components"
     PLOT_LLR_HISTOGRAM_POINTS = "llr_histogram_points"
     PLOT_STRING_XY_ROV_PENALTY = "string_xy_rov_penalty"
+    PLOT_STRING_XY_LOCAL_STRING_REPULSION = "string_xy_local_string_repulsion_penalty"
     PLOT_ALM_MU = "alm_mu"
     PLOT_ALM_LAMBDA = "alm_lambda"
 
@@ -160,6 +163,60 @@ class Visualizer:
         except Exception:
             # Common default.
             return 1.959963984540054
+
+    @staticmethod
+    def _compute_fom_from_resolution(values, min_resolution=1e-12):
+        """Compute FOM and propagated uncertainty from per-event resolutions.
+
+        FOM is defined as sqrt(sum_i(1 / r_i^2)). The uncertainty is propagated as
+        (1 / (2 * FOM)) * sqrt(sum_i(1 / r_i^4)).
+        """
+        # Use float64 explicitly to avoid overflow in 1/r^4 on float32 inputs.
+        vals = np.asarray(values, dtype=np.float64)
+        min_resolution = float(min_resolution)
+        valid_mask = np.isfinite(vals) & (vals > min_resolution)
+        vals = vals[valid_mask]
+        if vals.size == 0:
+            return np.nan, np.nan
+
+        inv_sq = 1.0 / np.square(vals)
+        fom = float(np.sqrt(np.sum(inv_sq)))
+        if not np.isfinite(fom) or fom <= 0.0:
+            return np.nan, np.nan
+
+        inv_four = np.square(inv_sq)
+        fom_err = float((0.5 / fom) * np.sqrt(np.sum(inv_four)))
+        if not np.isfinite(fom_err):
+            fom_err = np.nan
+        return fom, fom_err
+
+    @staticmethod
+    def _compute_pointsource_fom_from_resolution_and_aeff(res_values, aeff_values, min_resolution=1e-12):
+        """Compute pointsource FoM and propagated uncertainty.
+
+        FoM is defined as sqrt(sum_i(A_i / (4*pi*r_i^2))).
+        """
+        res = np.asarray(res_values, dtype=np.float64)
+        aeff = np.asarray(aeff_values, dtype=np.float64)
+        min_resolution = float(min_resolution)
+
+        valid_mask = np.isfinite(res) & np.isfinite(aeff) & (res > min_resolution) & (aeff >= 0.0)
+        res = res[valid_mask]
+        aeff = aeff[valid_mask]
+        if res.size == 0:
+            return np.nan, np.nan
+
+        terms = aeff / (4.0 * np.pi * np.square(res))
+        fom = float(np.sqrt(np.sum(terms)))
+        if not np.isfinite(fom) or fom <= 0.0:
+            return np.nan, np.nan
+
+        # First-order propagation for F = sqrt(S): sigma_F ≈ (1/(2F)) * sigma_S.
+        # Here we estimate sigma_S via sqrt(sum(term_i^2)).
+        fom_err = float((0.5 / fom) * np.sqrt(np.sum(np.square(terms))))
+        if not np.isfinite(fom_err):
+            fom_err = np.nan
+        return fom, fom_err
 
     @staticmethod
     def _pad_frames_to_max_size(frames, background_value=255):
@@ -592,11 +649,13 @@ class Visualizer:
             - 'llr_histogram': LLR density histogram comparing signal and background distributions
             - 'llr_histogram_points': LLR density histogram comparing signal and background distributions per point
             - 'snr_contour': SNR contour plot based on per-string values
+            - 'string_xy_local_string_repulsion_penalty': String XY scatter colored by per-string local string repulsion penalty
             - 'signal_light_yield_contour': Signal light yield contour plot based on per-string values
             - 'signal_light_yield_contour_points': Signal light yield contour plot based on per-point values
             - 'fisher_info_logdet': Log determinant of Fisher Information matrix contour plot
             - 'angular_resolution': Angular resolution from Fisher Information using Cramér-Rao bound
             - 'energy_resolution': Energy resolution from Fisher Information using Cramér-Rao bound
+            - 'pointsource_fom': Pointsource FoM history from unweighted loss dictionary
             - 'angular_resolution_vs_zenith': Binned angular resolution vs zenith
             - 'angular_resolution_vs_energy': Binned angular resolution vs energy
             - 'energy_resolution_vs_energy': Binned energy resolution vs energy
@@ -641,10 +700,9 @@ class Visualizer:
             - background_funcs: List of background functions (old format)
             - signal_surrogate_func: Surrogate function for signal (e.g., light_yield_surrogate method)
             - signal_event_params: Event parameters dict for signal surrogate function
-            - background_surrogate_func: Surrogate function for background
-            - background_event_params: Event parameters dict for background surrogate function
-                        - rov_penalty / rov_penalty_func: ROVPenalty object for displaying ROV safe space on string_xy and
-                            string_weights_scatter plots
+                        - background_surrogate_func: Surrogate function for background
+                        - background_event_params: Event parameters dict for background surrogate function
+                        - rov_penalty / rov_penalty_func: ROVPenalty object used by `string_xy_rov_penalty`
                         - rov_draw_safe_space_on_violations: bool, optional. If True, the `string_xy_rov_penalty` plot will
                             draw a per-string ROV safe-space corridor for strings with violation >= 1, oriented by
                             `rov_least_blocked_angle_per_string` (both are expected to be present in kwargs from `ROVPenalty`).
@@ -665,14 +723,21 @@ class Visualizer:
                                                         If 'median': the line is the median and `resolution_ci_percentiles` apply to residuals around the median.
                                                         If 'mean': the line is the mean and the band is ±2σ per bin (ignores residual quantiles).
                                                         (Backwards-compat alias: resolution_use_mean=True)
+                                                - resolution_use_fom: bool, optional. If True, plots per-bin FOM = sqrt(sum(1/resolution^2)).
+                                                    Error bars are propagated as (1/(2*FOM))*sqrt(sum(1/resolution^4)).
+                                                - resolution_fom_min_resolution: float, optional. Minimum allowed resolution used in FOM mode
+                                                    to avoid divide-by-zero (default: 1e-12).
                                                 - show_resolution_ci: bool, optional. If True, draws a two-sided residual-quantile band around the median in each bin
                                                 - resolution_ci_percentiles: tuple(float, float), optional. Percentiles for the residual band (default: (16, 84))
                                                 - resolution_ci_level: float in (0, 1), optional. Alternative specification as a central containment level. Ignored if
                                                     resolution_ci_percentiles is provided.
                         - zenith_range / zenith_range_deg: tuple(min, max), optional. Restrict zenith range for binning.
                         - energy_range: tuple(min, max), optional. Restrict energy range for binning.
-                                                - resolution_logy: bool, optional. If True, uses log scale for the angular-resolution y-axis (vs zenith and vs energy).
-                                                    (Backwards-compat alias: resolution_logy_vs_zenith)
+                                                - resolution_logy: bool, optional. If True, uses log scale for y-axis on all resolution/FoM-vs plots
+                                                    ('angular_resolution_vs_zenith', 'angular_resolution_vs_energy',
+                                                    'energy_resolution_vs_energy', 'pointsource_fom_vs_energy').
+                                                    (Backwards-compat aliases: resolution_logy_angular, resolution_logy_vs_zenith,
+                                                    resolution_logy_vs_energy)
                         - n_zenith_bins / n_energy_bins: int, optional. Number of bins
         """
         # Backwards-compat: allow callers to pass `points_3d`.
@@ -763,6 +828,12 @@ class Visualizer:
                     fig_gif.tight_layout()
                 except Exception:
                     pass
+                for ax3d in fig_gif.axes:
+                    if getattr(ax3d, 'name', '') == '3d':
+                        shift_left = float(getattr(ax3d, '_plot3d_shift_left', 0.0))
+                        if shift_left != 0.0:
+                            pos = ax3d.get_position()
+                            ax3d.set_position([pos.x0 - shift_left, pos.y0, pos.width, pos.height])
                 
                 if save_individual_images:
                     # Save individual image to disk
@@ -917,6 +988,12 @@ class Visualizer:
             fig.tight_layout()
         except Exception as exc:
             print(f"Warning: fig.tight_layout() failed: {exc}")
+        for ax3d in fig.axes:
+            if getattr(ax3d, 'name', '') == '3d':
+                shift_left = float(getattr(ax3d, '_plot3d_shift_left', 0.0))
+                if shift_left != 0.0:
+                    pos = ax3d.get_position()
+                    ax3d.set_position([pos.x0 - shift_left, pos.y0, pos.width, pos.height])
         plt.show()
 
     def visualize_multi_progress(
@@ -929,6 +1006,7 @@ class Visualizer:
         multi_slice: bool = False,
         loss_type: str = 'rbf',
         make_gif: bool = False,
+        ratio_baseline_geometry: Optional[str] = None,
         **shared_kwargs,
     ) -> None:
         """Visualize multiple geometries in a single call.
@@ -967,9 +1045,11 @@ class Visualizer:
             self.PLOT_PARAM_1D,
             self.PLOT_ANGULAR_RESOLUTION,
             self.PLOT_ENERGY_RESOLUTION,
+            self.PLOT_POINTSOURCE_FOM,
             self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH,
             self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
             self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
+            self.PLOT_POINTSOURCE_FOM_VS_ENERGY,
             self.PLOT_LOSS_COMPONENTS,
             self.PLOT_UW_LOSS_COMPONENTS,
             self.PLOT_ALM_MU,
@@ -980,27 +1060,96 @@ class Visualizer:
         geom_items = list(geom_vis_kwargs.items())
         n_geoms = len(geom_items)
 
+        # Stable, consistent colors per geometry across overlay plots.
+        geom_names = [str(name) for name, _ in geom_items]
+        default_colors = plt.rcParams.get('axes.prop_cycle', None)
+        if default_colors is not None:
+            try:
+                default_colors = list(default_colors.by_key().get('color', []))
+            except Exception:
+                default_colors = []
+        if not default_colors:
+            default_colors = [f"C{i}" for i in range(max(10, len(geom_names)))]
+        geom_color = {name: default_colors[i % len(default_colors)] for i, name in enumerate(geom_names)}
+
+        ratio_plot_types = {
+            self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH,
+            self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
+            self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
+            self.PLOT_POINTSOURCE_FOM_VS_ENERGY,
+        }
+
+        if ratio_baseline_geometry is not None:
+            requested_baseline = str(ratio_baseline_geometry)
+            if requested_baseline not in geom_color:
+                print(
+                    "Warning: ratio_baseline_geometry='{}' not found in geometries: {}".format(
+                        requested_baseline,
+                        ", ".join(geom_names),
+                    )
+                )
+
+        def _baseline_name() -> Optional[str]:
+            if ratio_baseline_geometry is None:
+                return None
+            baseline = str(ratio_baseline_geometry)
+            return baseline if baseline in geom_color else None
+
         for plot_type in plot_types:
             if plot_type in overlay_plot_types:
-                fig, ax = plt.subplots(1, 1, figsize=(6.5, 4.5))
+                baseline = _baseline_name() if plot_type in ratio_plot_types else None
+                if baseline is not None and n_geoms >= 2:
+                    fig, (ax, ax_ratio) = plt.subplots(
+                        2,
+                        1,
+                        figsize=(6.5, 5.6),
+                        sharex=True,
+                        gridspec_kw={"height_ratios": [3.0, 1.0], "hspace": 0.05},
+                    )
+                else:
+                    fig, ax = plt.subplots(1, 1, figsize=(6.5, 4.5))
+                    ax_ratio = None
 
                 any_series = False
+                any_fom_series = False
+
+                # Shared y-log toggle across all resolution/FoM-vs overlay plots.
+                if plot_type in ratio_plot_types:
+                    overlay_resolution_logy = bool(shared_kwargs.get('resolution_logy', False))
+                    if not overlay_resolution_logy:
+                        overlay_resolution_logy = bool(shared_kwargs.get('resolution_logy_angular', False))
+                    if not overlay_resolution_logy:
+                        overlay_resolution_logy = bool(
+                            shared_kwargs.get('resolution_logy_vs_zenith', shared_kwargs.get('resolution_logy_vs_energy', False))
+                        )
+                    if not overlay_resolution_logy:
+                        overlay_resolution_logy = any(
+                            bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
+                            or bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
+                            for _, payload in geom_items
+                        )
+                else:
+                    overlay_resolution_logy = False
+
+                # For ratio subplot: store y(x) per geometry.
+                ratio_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
                 for geom_name, payload in geom_items:
                     payload = dict(payload)
                     payload.update(shared_kwargs)
+                    geom_name_str = str(geom_name)
 
                     # Pull the relevant series.
                     if plot_type in (self.PLOT_LOSS, self.PLOT_UW_LOSS):
                         series = payload.get('loss_history', None)
                         if series is not None:
-                            ax.plot(series, label=str(geom_name))
+                            ax.plot(series, label=geom_name_str, color=geom_color.get(geom_name_str, None))
                             any_series = True
                         continue
 
                     if plot_type == self.PLOT_SNR_HISTORY:
                         series = payload.get('snr_history', None)
                         if series is not None:
-                            ax.plot(series, label=str(geom_name))
+                            ax.plot(series, label=geom_name_str, color=geom_color.get(geom_name_str, None))
                             any_series = True
                         continue
 
@@ -1014,7 +1163,7 @@ class Visualizer:
                                 npts = None
                             if npts:
                                 series = np.array(series) / float(npts)
-                            ax.plot(series, label=str(geom_name))
+                            ax.plot(series, label=geom_name_str, color=geom_color.get(geom_name_str, None))
                             any_series = True
                         continue
 
@@ -1035,20 +1184,35 @@ class Visualizer:
                                 except Exception:
                                     snr_vals = np.array(all_snr)
                                 sort_idx = np.argsort(param_vals)
-                                ax.plot(param_vals[sort_idx], snr_vals[sort_idx], marker='o', linewidth=2, label=str(geom_name))
+                                ax.plot(
+                                    param_vals[sort_idx],
+                                    snr_vals[sort_idx],
+                                    marker='o',
+                                    linewidth=2,
+                                    label=geom_name_str,
+                                    color=geom_color.get(geom_name_str, None),
+                                )
                                 any_series = True
                         continue
 
-                    if plot_type in (self.PLOT_ANGULAR_RESOLUTION, self.PLOT_ENERGY_RESOLUTION):
+                    if plot_type in (self.PLOT_ANGULAR_RESOLUTION, self.PLOT_ENERGY_RESOLUTION, self.PLOT_POINTSOURCE_FOM):
                         uw_loss_dict = payload.get('uw_loss_dict', None)
                         if isinstance(uw_loss_dict, dict):
-                            key = 'angular_resolution_loss' if plot_type == self.PLOT_ANGULAR_RESOLUTION else 'energy_resolution_loss'
-                            series = uw_loss_dict.get(key, None)
+                            if plot_type == self.PLOT_ANGULAR_RESOLUTION:
+                                series = uw_loss_dict.get('angular_resolution_loss', None)
+                            elif plot_type == self.PLOT_ENERGY_RESOLUTION:
+                                series = uw_loss_dict.get('energy_resolution_loss', None)
+                            else:
+                                series = uw_loss_dict.get('pointsource_fom_loss', None)
+                                if series is None:
+                                    series = uw_loss_dict.get('effective_area_resolution_loss', None)
+                                if series is None:
+                                    series = uw_loss_dict.get('pointsource_fom', None)
                             if series is not None:
                                 series = np.array(series)
                                 if plot_type == self.PLOT_ANGULAR_RESOLUTION:
                                     series = series * 180.0
-                                ax.plot(series, linewidth=2, label=str(geom_name))
+                                ax.plot(series, linewidth=2, label=geom_name_str, color=geom_color.get(geom_name_str, None))
                                 any_series = True
                         continue
 
@@ -1060,8 +1224,12 @@ class Visualizer:
                         if resolution_stat is None and bool(payload.get('resolution_use_mean', False)):
                             resolution_stat = 'mean'
                         resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
-                        if resolution_stat not in ('median', 'mean'):
+                        if resolution_stat not in ('median', 'mean', 'fom'):
                             resolution_stat = 'median'
+                        resolution_use_fom = bool(payload.get('resolution_use_fom', False)) or resolution_stat == 'fom'
+                        if resolution_use_fom:
+                            resolution_stat = 'fom'
+                        resolution_fom_min_resolution = payload.get('resolution_fom_min_resolution', 1e-12)
                         show_resolution_ci = bool(payload.get('show_resolution_ci', False))
                         resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
                         resolution_ci_level = payload.get('resolution_ci_level', None)
@@ -1071,7 +1239,7 @@ class Visualizer:
                         min_ang_res = payload.get('min_angular_resolution', None)
                         max_ang_res = payload.get('max_angular_resolution', None)
                         if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', False))
+                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
 
                         if resolution_per_event is not None and resolution_params is not None:
                             try:
@@ -1129,19 +1297,36 @@ class Visualizer:
                                 bin_medians = []
                                 band_lower = []
                                 band_upper = []
+                                fom_errors = []
                                 bin_counts = []
                                 for i in range(int(n_bins)):
                                     mask = (zenith_deg >= bin_edges[i]) & (zenith_deg < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         vals = np.array(res_values[mask], dtype=float)
-                                        if resolution_stat == 'mean':
+                                        if resolution_use_fom:
+                                            center_val, fom_err = self._compute_fom_from_resolution(
+                                                vals,
+                                                min_resolution=resolution_fom_min_resolution,
+                                            )
+                                            bin_medians.append(center_val)
+                                            fom_errors.append(fom_err)
+                                            if np.isfinite(center_val) and np.isfinite(fom_err):
+                                                band_lower.append(center_val - fom_err)
+                                                band_upper.append(center_val + fom_err)
+                                            else:
+                                                band_lower.append(np.nan)
+                                                band_upper.append(np.nan)
+                                        elif resolution_stat == 'mean':
                                             center_val = float(np.nanmean(vals))
                                             spread_val = float(np.nanstd(vals))
+                                            bin_medians.append(center_val)
+                                            fom_errors.append(np.nan)
                                         else:
                                             center_val = float(np.nanmedian(vals))
                                             spread_val = np.nan
-                                        bin_medians.append(center_val)
-                                        if show_resolution_ci:
+                                            bin_medians.append(center_val)
+                                            fom_errors.append(np.nan)
+                                        if (not resolution_use_fom) and show_resolution_ci:
                                             if resolution_stat == 'mean':
                                                 lo = center_val - 2.0 * spread_val
                                                 hi = center_val + 2.0 * spread_val
@@ -1178,18 +1363,21 @@ class Visualizer:
                                                 band_lower.append(center_val + np.nanpercentile(resid, q_lo))
                                                 band_upper.append(center_val + np.nanpercentile(resid, q_hi))
                                         else:
-                                            band_lower.append(np.nan)
-                                            band_upper.append(np.nan)
+                                            if not resolution_use_fom:
+                                                band_lower.append(np.nan)
+                                                band_upper.append(np.nan)
                                         bin_counts.append(int(mask.sum()))
                                     else:
                                         bin_medians.append(np.nan)
                                         band_lower.append(np.nan)
                                         band_upper.append(np.nan)
+                                        fom_errors.append(np.nan)
                                         bin_counts.append(0)
 
                                 bin_medians = np.array(bin_medians)
                                 band_lower = np.array(band_lower)
                                 band_upper = np.array(band_upper)
+                                fom_errors = np.array(fom_errors)
                                 bin_counts = np.array(bin_counts)
                                 if min_ang_res is not None or max_ang_res is not None:
                                     lo_lim = -np.inf
@@ -1208,22 +1396,52 @@ class Visualizer:
                                         lo_lim, hi_lim = hi_lim, lo_lim
 
                                     bin_medians = np.clip(bin_medians, lo_lim, hi_lim)
-                                    if show_resolution_ci:
+                                    if show_resolution_ci or resolution_use_fom:
                                         band_lower = np.clip(band_lower, lo_lim, hi_lim)
                                         band_upper = np.clip(band_upper, lo_lim, hi_lim)
                                         band_lower = np.minimum(band_lower, band_upper)
                                 valid_bins = np.isfinite(bin_medians)
                                 if np.any(valid_bins):
-                                    line = ax.plot(
-                                        bin_centers[valid_bins],
-                                        bin_medians[valid_bins],
-                                        'o-',
-                                        linewidth=2,
-                                        markersize=6,
-                                        label=str(geom_name),
-                                    )[0]
+                                    xvals = np.array(bin_centers)[valid_bins]
+                                    yvals = np.array(bin_medians)[valid_bins]
+                                    ratio_cache[geom_name_str] = (xvals, yvals)
+                                    if resolution_use_fom:
+                                        any_fom_series = True
+                                        valid_err = valid_bins & np.isfinite(fom_errors)
+                                        if np.any(valid_err):
+                                            ax.errorbar(
+                                                bin_centers[valid_err],
+                                                bin_medians[valid_err],
+                                                yerr=fom_errors[valid_err],
+                                                fmt='o-',
+                                                linewidth=2,
+                                                markersize=6,
+                                                capsize=3,
+                                                label=geom_name_str,
+                                                color=geom_color.get(geom_name_str, None),
+                                            )
+                                        else:
+                                            line = ax.plot(
+                                                bin_centers[valid_bins],
+                                                bin_medians[valid_bins],
+                                                'o-',
+                                                linewidth=2,
+                                                markersize=6,
+                                                label=geom_name_str,
+                                                color=geom_color.get(geom_name_str, None),
+                                            )[0]
+                                    else:
+                                        line = ax.plot(
+                                            bin_centers[valid_bins],
+                                            bin_medians[valid_bins],
+                                            'o-',
+                                            linewidth=2,
+                                            markersize=6,
+                                            label=geom_name_str,
+                                            color=geom_color.get(geom_name_str, None),
+                                        )[0]
 
-                                    if show_resolution_ci:
+                                    if (not resolution_use_fom) and show_resolution_ci:
                                         valid_band = valid_bins & np.isfinite(band_lower) & np.isfinite(band_upper)
                                         if np.any(valid_band):
                                             ax.plot(
@@ -1259,15 +1477,19 @@ class Visualizer:
                         if resolution_stat is None and bool(payload.get('resolution_use_mean', False)):
                             resolution_stat = 'mean'
                         resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
-                        if resolution_stat not in ('median', 'mean'):
+                        if resolution_stat not in ('median', 'mean', 'fom'):
                             resolution_stat = 'median'
+                        resolution_use_fom = bool(payload.get('resolution_use_fom', False)) or resolution_stat == 'fom'
+                        if resolution_use_fom:
+                            resolution_stat = 'fom'
+                        resolution_fom_min_resolution = payload.get('resolution_fom_min_resolution', 1e-12)
                         show_resolution_ci = bool(payload.get('show_resolution_ci', False))
                         resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
                         resolution_ci_level = payload.get('resolution_ci_level', None)
                         energy_range = payload.get('energy_range', None)
                         resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
                         if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', False))
+                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
                         min_ang_res = payload.get('min_angular_resolution', None)
                         max_ang_res = payload.get('max_angular_resolution', None)
 
@@ -1319,19 +1541,36 @@ class Visualizer:
                                 bin_medians = []
                                 band_lower = []
                                 band_upper = []
+                                fom_errors = []
                                 bin_counts = []
                                 for i in range(int(n_bins)):
                                     mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         vals = np.array(res_values[mask], dtype=float)
-                                        if resolution_stat == 'mean':
+                                        if resolution_use_fom:
+                                            center_val, fom_err = self._compute_fom_from_resolution(
+                                                vals,
+                                                min_resolution=resolution_fom_min_resolution,
+                                            )
+                                            bin_medians.append(center_val)
+                                            fom_errors.append(fom_err)
+                                            if np.isfinite(center_val) and np.isfinite(fom_err):
+                                                band_lower.append(center_val - fom_err)
+                                                band_upper.append(center_val + fom_err)
+                                            else:
+                                                band_lower.append(np.nan)
+                                                band_upper.append(np.nan)
+                                        elif resolution_stat == 'mean':
                                             center_val = float(np.nanmean(vals))
                                             spread_val = float(np.nanstd(vals))
+                                            bin_medians.append(center_val)
+                                            fom_errors.append(np.nan)
                                         else:
                                             center_val = float(np.nanmedian(vals))
                                             spread_val = np.nan
-                                        bin_medians.append(center_val)
-                                        if show_resolution_ci:
+                                            bin_medians.append(center_val)
+                                            fom_errors.append(np.nan)
+                                        if (not resolution_use_fom) and show_resolution_ci:
                                             if resolution_stat == 'mean':
                                                 lo = center_val - 2.0 * spread_val
                                                 hi = center_val + 2.0 * spread_val
@@ -1368,18 +1607,21 @@ class Visualizer:
                                                 band_lower.append(center_val + np.nanpercentile(resid, q_lo))
                                                 band_upper.append(center_val + np.nanpercentile(resid, q_hi))
                                         else:
-                                            band_lower.append(np.nan)
-                                            band_upper.append(np.nan)
+                                            if not resolution_use_fom:
+                                                band_lower.append(np.nan)
+                                                band_upper.append(np.nan)
                                         bin_counts.append(int(mask.sum()))
                                     else:
                                         bin_medians.append(np.nan)
                                         band_lower.append(np.nan)
                                         band_upper.append(np.nan)
+                                        fom_errors.append(np.nan)
                                         bin_counts.append(0)
 
                                 bin_medians = np.array(bin_medians)
                                 band_lower = np.array(band_lower)
                                 band_upper = np.array(band_upper)
+                                fom_errors = np.array(fom_errors)
                                 bin_counts = np.array(bin_counts)
                                 if min_ang_res is not None or max_ang_res is not None:
                                     lo_lim = -np.inf
@@ -1398,23 +1640,54 @@ class Visualizer:
                                         lo_lim, hi_lim = hi_lim, lo_lim
 
                                     bin_medians = np.clip(bin_medians, lo_lim, hi_lim)
-                                    if show_resolution_ci:
+                                    if show_resolution_ci or resolution_use_fom:
                                         band_lower = np.clip(band_lower, lo_lim, hi_lim)
                                         band_upper = np.clip(band_upper, lo_lim, hi_lim)
                                         band_lower = np.minimum(band_lower, band_upper)
                                 x_plot = np.log10(bin_centers)
                                 valid_bins = np.isfinite(bin_medians)
                                 if np.any(valid_bins):
-                                    line = ax.plot(
-                                        x_plot[valid_bins],
-                                        bin_medians[valid_bins],
-                                        'o-',
-                                        linewidth=2,
-                                        markersize=6,
-                                        label=str(geom_name),
-                                    )[0]
+                                    ratio_cache[geom_name_str] = (
+                                        np.array(x_plot)[valid_bins],
+                                        np.array(bin_medians)[valid_bins],
+                                    )
+                                    if resolution_use_fom:
+                                        any_fom_series = True
+                                        valid_err = valid_bins & np.isfinite(fom_errors)
+                                        if np.any(valid_err):
+                                            ax.errorbar(
+                                                x_plot[valid_err],
+                                                bin_medians[valid_err],
+                                                yerr=fom_errors[valid_err],
+                                                fmt='o-',
+                                                linewidth=2,
+                                                markersize=6,
+                                                capsize=3,
+                                                label=geom_name_str,
+                                                color=geom_color.get(geom_name_str, None),
+                                            )
+                                        else:
+                                            line = ax.plot(
+                                                x_plot[valid_bins],
+                                                bin_medians[valid_bins],
+                                                'o-',
+                                                linewidth=2,
+                                                markersize=6,
+                                                label=geom_name_str,
+                                                color=geom_color.get(geom_name_str, None),
+                                            )[0]
+                                    else:
+                                        line = ax.plot(
+                                            x_plot[valid_bins],
+                                            bin_medians[valid_bins],
+                                            'o-',
+                                            linewidth=2,
+                                            markersize=6,
+                                            label=geom_name_str,
+                                            color=geom_color.get(geom_name_str, None),
+                                        )[0]
 
-                                    if show_resolution_ci:
+                                    if (not resolution_use_fom) and show_resolution_ci:
                                         valid_band = valid_bins & np.isfinite(band_lower) & np.isfinite(band_upper)
                                         if np.any(valid_band):
                                             ax.plot(
@@ -1451,12 +1724,19 @@ class Visualizer:
                         if resolution_stat is None and bool(payload.get('resolution_use_mean', False)):
                             resolution_stat = 'mean'
                         resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
-                        if resolution_stat not in ('median', 'mean'):
+                        if resolution_stat not in ('median', 'mean', 'fom'):
                             resolution_stat = 'median'
+                        resolution_use_fom = bool(payload.get('resolution_use_fom', False)) or resolution_stat == 'fom'
+                        if resolution_use_fom:
+                            resolution_stat = 'fom'
+                        resolution_fom_min_resolution = payload.get('resolution_fom_min_resolution', 1e-12)
                         show_resolution_ci = bool(payload.get('show_resolution_ci', False))
                         resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
                         resolution_ci_level = payload.get('resolution_ci_level', None)
                         energy_range = payload.get('energy_range', None)
+                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
+                        if not resolution_logy:
+                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
 
                         if resolution_per_event is not None and resolution_params is not None:
                             try:
@@ -1492,6 +1772,11 @@ class Visualizer:
                                 except Exception:
                                     pass
 
+                            if resolution_logy:
+                                pos_mask = np.array(res_values) > 0
+                                res_values = np.array(res_values)[pos_mask]
+                                energy_values = np.array(energy_values)[pos_mask]
+
                             if len(res_values) > 0 and len(energy_values) > 0:
                                 log_energy_min = np.log10(energy_values.min())
                                 log_energy_max = np.log10(energy_values.max())
@@ -1501,19 +1786,36 @@ class Visualizer:
                                 bin_medians = []
                                 band_lower = []
                                 band_upper = []
+                                fom_errors = []
                                 bin_counts = []
                                 for i in range(int(n_bins)):
                                     mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         vals = np.array(res_values[mask], dtype=float)
-                                        if resolution_stat == 'mean':
+                                        if resolution_use_fom:
+                                            center_val, fom_err = self._compute_fom_from_resolution(
+                                                vals,
+                                                min_resolution=resolution_fom_min_resolution,
+                                            )
+                                            bin_medians.append(center_val)
+                                            fom_errors.append(fom_err)
+                                            if np.isfinite(center_val) and np.isfinite(fom_err):
+                                                band_lower.append(center_val - fom_err)
+                                                band_upper.append(center_val + fom_err)
+                                            else:
+                                                band_lower.append(np.nan)
+                                                band_upper.append(np.nan)
+                                        elif resolution_stat == 'mean':
                                             center_val = float(np.nanmean(vals))
                                             spread_val = float(np.nanstd(vals))
+                                            bin_medians.append(center_val)
+                                            fom_errors.append(np.nan)
                                         else:
                                             center_val = float(np.nanmedian(vals))
                                             spread_val = np.nan
-                                        bin_medians.append(center_val)
-                                        if show_resolution_ci:
+                                            bin_medians.append(center_val)
+                                            fom_errors.append(np.nan)
+                                        if (not resolution_use_fom) and show_resolution_ci:
                                             if resolution_stat == 'mean':
                                                 band_lower.append(center_val - 2.0 * spread_val)
                                                 band_upper.append(center_val + 2.0 * spread_val)
@@ -1544,95 +1846,274 @@ class Visualizer:
                                                 band_lower.append(center_val + np.nanpercentile(resid, q_lo))
                                                 band_upper.append(center_val + np.nanpercentile(resid, q_hi))
                                         else:
-                                            band_lower.append(np.nan)
-                                            band_upper.append(np.nan)
+                                            if not resolution_use_fom:
+                                                band_lower.append(np.nan)
+                                                band_upper.append(np.nan)
                                         bin_counts.append(int(mask.sum()))
                                     else:
                                         bin_medians.append(np.nan)
                                         band_lower.append(np.nan)
                                         band_upper.append(np.nan)
+                                        fom_errors.append(np.nan)
                                         bin_counts.append(0)
 
                                 bin_medians = np.array(bin_medians)
                                 band_lower = np.array(band_lower)
                                 band_upper = np.array(band_upper)
+                                fom_errors = np.array(fom_errors)
                                 bin_counts = np.array(bin_counts)
 
                                 valid_bins = np.isfinite(bin_medians)
+                                if resolution_logy:
+                                    valid_bins = valid_bins & (np.array(bin_medians) > 0)
                                 if np.any(valid_bins):
-                                    line = ax.plot(
-                                        bin_centers[valid_bins],
-                                        bin_medians[valid_bins],
-                                        marker='o',
-                                        linewidth=2,
-                                        label=str(geom_name),
-                                    )[0]
+                                    ratio_cache[geom_name_str] = (
+                                        np.array(bin_centers)[valid_bins],
+                                        np.array(bin_medians)[valid_bins],
+                                    )
+                                    if resolution_use_fom:
+                                        any_fom_series = True
+                                        valid_err = valid_bins & np.isfinite(fom_errors)
+                                        if np.any(valid_err):
+                                            ax.errorbar(
+                                                bin_centers[valid_err],
+                                                bin_medians[valid_err],
+                                                yerr=fom_errors[valid_err],
+                                                fmt='o-',
+                                                linewidth=2,
+                                                markersize=6,
+                                                capsize=3,
+                                                label=geom_name_str,
+                                                color=geom_color.get(geom_name_str, None),
+                                            )
+                                        else:
+                                            line = ax.plot(
+                                                bin_centers[valid_bins],
+                                                bin_medians[valid_bins],
+                                                'o-',
+                                                linewidth=2,
+                                                markersize=6,
+                                                label=geom_name_str,
+                                                color=geom_color.get(geom_name_str, None),
+                                            )[0]
+                                    else:
+                                        line = ax.plot(
+                                            bin_centers[valid_bins],
+                                            bin_medians[valid_bins],
+                                            'o-',
+                                            linewidth=2,
+                                            markersize=6,
+                                            label=geom_name_str,
+                                            color=geom_color.get(geom_name_str, None),
+                                        )[0]
 
-                                    if show_resolution_ci:
+                                    if (not resolution_use_fom) and show_resolution_ci:
                                         valid_band = valid_bins & np.isfinite(band_lower) & np.isfinite(band_upper)
                                         if np.any(valid_band):
-                                            ax.fill_between(
+                                            ax.plot(
                                                 bin_centers[valid_band],
                                                 band_lower[valid_band],
-                                                band_upper[valid_band],
+                                                linestyle='--',
+                                                linewidth=1.5,
                                                 color=line.get_color(),
-                                                alpha=0.12,
+                                                alpha=0.8,
+                                                zorder=1,
+                                            )
+                                            ax.plot(
+                                                bin_centers[valid_band],
+                                                band_upper[valid_band],
+                                                linestyle='--',
+                                                linewidth=1.5,
+                                                color=line.get_color(),
+                                                alpha=0.8,
                                                 zorder=1,
                                             )
 
                                 any_series = True
-
-                                ax.set_xscale('log')
-                                ax.grid(True, alpha=0.3, which='both')
-                                ax.set_xlabel('Energy (GeV)')
-                                ax.set_ylabel('Relative Energy Resolution (ΔE/E)' if use_relative_energy else 'Energy Resolution (GeV)')
                         continue
 
-                    if plot_type in (self.PLOT_LOSS_COMPONENTS, self.PLOT_UW_LOSS_COMPONENTS):
-                        data_key = 'loss_dict' if plot_type == self.PLOT_LOSS_COMPONENTS else 'uw_loss_dict'
-                        loss_dict = payload.get(data_key, None)
-                        loss_filter_list = payload.get('loss_filter', []) if plot_type == self.PLOT_LOSS_COMPONENTS else []
-                        loss_weights_dict = payload.get('loss_weights_dict', None)
-                        loss_iterations_dict = payload.get('loss_iterations_dict', None)
-                        if isinstance(loss_dict, dict) and loss_dict:
-                            for loss_name, hist in loss_dict.items():
-                                if plot_type == self.PLOT_LOSS_COMPONENTS and loss_name in loss_filter_list:
-                                    continue
-                                if loss_weights_dict is not None and loss_name in loss_weights_dict and loss_weights_dict[loss_name] == 0.0:
-                                    continue
-                                if not hist:
-                                    continue
-                                label = f"{geom_name}:{loss_name}"
-                                if loss_iterations_dict is not None:
-                                    iterations = loss_iterations_dict.get(loss_name, None)
-                                else:
-                                    iterations = None
+                    if plot_type == self.PLOT_POINTSOURCE_FOM_VS_ENERGY:
+                        resolution_per_event = payload.get('resolution_per_event', None)
+                        effective_area_per_event = payload.get('effective_area_per_event', None)
+                        event_params = payload.get('resolution_params', None)
+                        if event_params is None:
+                            event_params = payload.get('effective_area_params', None)
+                        if event_params is None:
+                            event_params = payload.get('signal_event_params', None)
+                        n_bins = payload.get('n_energy_bins', 10)
+                        energy_range = payload.get('energy_range', None)
+                        fom_min_resolution = payload.get('resolution_fom_min_resolution', 1e-12)
+                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
+                        if not resolution_logy:
+                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
 
-                                if iterations is not None and len(iterations) == len(hist):
-                                    ax.plot(iterations, hist, label=label, alpha=0.75, linewidth=2)
-                                else:
-                                    ax.plot(hist, label=label, alpha=0.75, linewidth=2)
-                                any_series = True
+                        if (
+                            resolution_per_event is not None
+                            and effective_area_per_event is not None
+                            and event_params is not None
+                        ):
+                            try:
+                                res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
+                            except Exception:
+                                res_values = np.array(resolution_per_event).flatten()
+
+                            try:
+                                aeff_values = effective_area_per_event.clone().detach().cpu().numpy().flatten()
+                            except Exception:
+                                aeff_values = np.array(effective_area_per_event).flatten()
+
+                            energy_values = []
+                            for ep in event_params:
+                                if isinstance(ep, dict) and 'energy' in ep:
+                                    energy = ep['energy']
+                                    try:
+                                        energy_values.append(float(energy.detach().cpu().item()))
+                                    except Exception:
+                                        try:
+                                            energy_values.append(float(energy))
+                                        except Exception:
+                                            pass
+                            energy_values = np.array(energy_values)
+
+                            n = min(len(res_values), len(aeff_values), len(energy_values))
+                            if n > 0:
+                                res_values = res_values[:n]
+                                aeff_values = aeff_values[:n]
+                                energy_values = energy_values[:n]
+
+                            valid_mask = (
+                                np.isfinite(res_values)
+                                & np.isfinite(aeff_values)
+                                & np.isfinite(energy_values)
+                                & (energy_values > 0)
+                            )
+                            res_values = res_values[valid_mask]
+                            aeff_values = aeff_values[valid_mask]
+                            energy_values = energy_values[valid_mask]
+
+                            if energy_range is not None and len(energy_range) == 2:
+                                try:
+                                    emin, emax = float(energy_range[0]), float(energy_range[1])
+                                    if emax < emin:
+                                        emin, emax = emax, emin
+                                    range_mask = (energy_values >= emin) & (energy_values <= emax)
+                                    res_values = res_values[range_mask]
+                                    aeff_values = aeff_values[range_mask]
+                                    energy_values = energy_values[range_mask]
+                                except Exception:
+                                    pass
+
+                            if len(res_values) > 0 and len(aeff_values) > 0 and len(energy_values) > 0:
+                                log_energy_min = np.log10(energy_values.min())
+                                log_energy_max = np.log10(energy_values.max())
+                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+
+                                bin_fom = []
+                                bin_fom_err = []
+                                for i in range(int(n_bins)):
+                                    mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
+                                    if mask.sum() > 0:
+                                        fval, ferr = self._compute_pointsource_fom_from_resolution_and_aeff(
+                                            res_values[mask],
+                                            aeff_values[mask],
+                                            min_resolution=fom_min_resolution,
+                                        )
+                                        bin_fom.append(fval)
+                                        bin_fom_err.append(ferr)
+                                    else:
+                                        bin_fom.append(np.nan)
+                                        bin_fom_err.append(np.nan)
+
+                                bin_fom = np.array(bin_fom)
+                                bin_fom_err = np.array(bin_fom_err)
+                                x_plot = np.log10(bin_centers)
+                                valid_bins = np.isfinite(bin_fom)
+                                if resolution_logy:
+                                    valid_bins = valid_bins & (bin_fom > 0)
+                                if np.any(valid_bins):
+                                    ratio_cache[geom_name_str] = (
+                                        np.array(x_plot)[valid_bins],
+                                        np.array(bin_fom)[valid_bins],
+                                    )
+                                    any_fom_series = True
+
+                                    valid_err = valid_bins & np.isfinite(bin_fom_err)
+                                    if np.any(valid_err):
+                                        ax.errorbar(
+                                            x_plot[valid_err],
+                                            bin_fom[valid_err],
+                                            yerr=bin_fom_err[valid_err],
+                                            fmt='o-',
+                                            linewidth=2,
+                                            markersize=6,
+                                            capsize=3,
+                                            label=geom_name_str,
+                                            color=geom_color.get(geom_name_str, None),
+                                        )
+                                    else:
+                                        ax.plot(
+                                            x_plot[valid_bins],
+                                            bin_fom[valid_bins],
+                                            'o-',
+                                            linewidth=2,
+                                            markersize=6,
+                                            label=geom_name_str,
+                                            color=geom_color.get(geom_name_str, None),
+                                        )
+                                    any_series = True
                         continue
 
-                    if plot_type in (self.PLOT_ALM_MU, self.PLOT_ALM_LAMBDA):
-                        history_key = 'alm_mus_history' if plot_type == self.PLOT_ALM_MU else 'alm_lambdas_history'
-                        history_dict = payload.get(history_key, {})
-                        loss_iterations_dict = payload.get('loss_iterations_dict', {})
-                        if history_dict:
-                            if loss_iterations_dict:
-                                iterations = loss_iterations_dict[list(loss_iterations_dict.keys())[0]]
-                            else:
-                                max_len = max(len(v) for v in history_dict.values()) if history_dict else 0
-                                iterations = list(range(max_len))
-                            for constraint_name, series in history_dict.items():
-                                if not series:
+                # Add ratio subplot if requested for resolution-vs-* plots.
+                if ax_ratio is not None and baseline is not None:
+                    base_xy = ratio_cache.get(str(baseline), None)
+                    if base_xy is None:
+                        ax_ratio.axis('off')
+                    else:
+                        base_x, base_y = base_xy
+                        base_x = np.array(base_x, dtype=float)
+                        base_y = np.array(base_y, dtype=float)
+                        valid_base = np.isfinite(base_x) & np.isfinite(base_y)
+                        base_x = base_x[valid_base]
+                        base_y = base_y[valid_base]
+                        if len(base_x) < 2:
+                            ax_ratio.axis('off')
+                        else:
+                            sort_idx = np.argsort(base_x)
+                            bx = base_x[sort_idx]
+                            by = base_y[sort_idx]
+
+                            for name, (xvals, yvals) in ratio_cache.items():
+                                if name == str(baseline):
                                     continue
-                                label = f"{geom_name}:{constraint_name}"
-                                plot_iterations = iterations[:len(series)]
-                                ax.plot(plot_iterations, series, label=label, linewidth=2)
-                                any_series = True
-                        continue
+                                xs = np.array(xvals, dtype=float)
+                                ys = np.array(yvals, dtype=float)
+                                valid = np.isfinite(xs) & np.isfinite(ys)
+                                xs = xs[valid]
+                                ys = ys[valid]
+                                if len(xs) < 2:
+                                    continue
+                                in_range = (xs >= float(np.nanmin(bx))) & (xs <= float(np.nanmax(bx)))
+                                xs = xs[in_range]
+                                ys = ys[in_range]
+                                if len(xs) < 2:
+                                    continue
+                                by_interp = np.interp(xs, bx, by)
+                                denom = np.where(np.abs(by_interp) > 0, by_interp, np.nan)
+                                ratio = ys / denom
+
+                                ax_ratio.plot(
+                                    xs,
+                                    ratio,
+                                    'o-',
+                                    linewidth=1.6,
+                                    markersize=4,
+                                    color=geom_color.get(name, None),
+                                )
+
+                            ax_ratio.axhline(1.0, color='0.3', linewidth=1.0, linestyle='--', alpha=0.8)
+                            ax_ratio.set_ylabel('ratio', fontsize=9)
+                            ax_ratio.tick_params(axis='both', labelsize=8)
 
                 if not any_series:
                     ax.text(
@@ -1679,34 +2160,60 @@ class Visualizer:
                     ax.set_xlabel('Iteration')
                     ax.set_ylabel('Energy Resolution [GeV]')
                     ax.grid(True, alpha=0.3)
+                elif plot_type == self.PLOT_POINTSOURCE_FOM:
+                    ax.set_title('Pointsource FoM History')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel('Pointsource FoM')
+                    ax.grid(True, alpha=0.3)
                 elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
-                    ax.set_title('Angular Resolution vs Zenith')
+                    ax.set_title('Angular FOM vs Zenith' if any_fom_series else 'Angular Resolution vs Zenith')
                     ax.set_xlabel('Zenith Angle (degrees)')
-                    ax.set_ylabel('Angular Resolution (radians)')
+                    ax.set_ylabel('FOM (rad$^{-1}$)' if any_fom_series else 'Angular Resolution (radians)')
                     ax.grid(True, alpha=0.3)
-                    try:
-                        ax2 = ax.twinx()
-                        ax2.set_ylabel('Angular Resolution (degrees)')
-                        ax2.set_yscale(ax.get_yscale())
-                        y0, y1 = ax.get_ylim()
-                        ax2.set_ylim(np.rad2deg(y0), np.rad2deg(y1))
-                        ax2.tick_params(axis='y')
-                    except Exception:
-                        pass
+                    if overlay_resolution_logy:
+                        ax.set_yscale('log')
+                    if not any_fom_series:
+                        try:
+                            ax2 = ax.twinx()
+                            ax2.set_ylabel('Angular Resolution (degrees)')
+                            ax2.set_yscale(ax.get_yscale())
+                            y0, y1 = ax.get_ylim()
+                            ax2.set_ylim(np.rad2deg(y0), np.rad2deg(y1))
+                            ax2.tick_params(axis='y')
+                        except Exception:
+                            pass
                 elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY:
-                    ax.set_title('Angular Resolution vs log$_{10}$(Energy)')
+                    ax.set_title('Angular FOM vs log$_{10}$(Energy)' if any_fom_series else 'Angular Resolution vs log$_{10}$(Energy)')
                     ax.set_xlabel('log$_{10}$(Energy / GeV)')
-                    ax.set_ylabel('Angular Resolution (radians)')
+                    ax.set_ylabel('FOM (rad$^{-1}$)' if any_fom_series else 'Angular Resolution (radians)')
                     ax.grid(True, alpha=0.3)
-                    try:
-                        ax2 = ax.twinx()
-                        ax2.set_ylabel('Angular Resolution (degrees)')
-                        ax2.set_yscale(ax.get_yscale())
-                        y0, y1 = ax.get_ylim()
-                        ax2.set_ylim(np.rad2deg(y0), np.rad2deg(y1))
-                        ax2.tick_params(axis='y')
-                    except Exception:
-                        pass
+                    if overlay_resolution_logy:
+                        ax.set_yscale('log')
+                    if not any_fom_series:
+                        try:
+                            ax2 = ax.twinx()
+                            ax2.set_ylabel('Angular Resolution (degrees)')
+                            ax2.set_yscale(ax.get_yscale())
+                            y0, y1 = ax.get_ylim()
+                            ax2.set_ylim(np.rad2deg(y0), np.rad2deg(y1))
+                            ax2.tick_params(axis='y')
+                        except Exception:
+                            pass
+                elif plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
+                    ax.set_title('Energy FOM vs Energy' if any_fom_series else 'Energy Resolution vs Energy')
+                    ax.set_xlabel('Energy (GeV)')
+                    ax.set_ylabel('FOM (resolution$^{-1}$)' if any_fom_series else 'Energy Resolution (GeV)')
+                    ax.grid(True, alpha=0.3, which='both')
+                    ax.set_xscale('log')
+                    if overlay_resolution_logy:
+                        ax.set_yscale('log')
+                elif plot_type == self.PLOT_POINTSOURCE_FOM_VS_ENERGY:
+                    ax.set_title('Pointsource FoM vs log$_{10}$(Energy)')
+                    ax.set_xlabel('log$_{10}$(Energy / GeV)')
+                    ax.set_ylabel('Pointsource FoM')
+                    ax.grid(True, alpha=0.3)
+                    if overlay_resolution_logy:
+                        ax.set_yscale('log')
                 elif plot_type == self.PLOT_LOSS_COMPONENTS:
                     ax.set_title('Loss Components')
                     ax.set_xlabel('Iteration')
@@ -1730,6 +2237,18 @@ class Visualizer:
                     ax.set_ylabel('λ (Lagrange Multiplier)')
                     ax.grid(True, alpha=0.3)
 
+                # In ratio mode we use a shared-x two-row layout; the x-label should live
+                # on the bottom axis (ratio subplot) to avoid being hidden/overlapping.
+                if ax_ratio is not None:
+                    try:
+                        if bool(getattr(ax_ratio, 'axison', True)):
+                            xlabel = ax.get_xlabel()
+                            if isinstance(xlabel, str) and xlabel.strip():
+                                ax_ratio.set_xlabel(xlabel)
+                                ax.set_xlabel('')
+                    except Exception:
+                        pass
+
                 if any_series:
                     ax.legend(fontsize=8)
 
@@ -1737,8 +2256,21 @@ class Visualizer:
                     fig.tight_layout()
                 except Exception:
                     pass
+                for ax3d in fig.axes:
+                    if getattr(ax3d, 'name', '') == '3d':
+                        shift_left = float(getattr(ax3d, '_plot3d_shift_left', 0.0))
+                        if shift_left != 0.0:
+                            pos = ax3d.get_position()
+                            ax3d.set_position([pos.x0 - shift_left, pos.y0, pos.width, pos.height])
                 plt.show()
                 continue
+
+            # Everything else: one subplot per geometry.
+            # Keep up to 3 geometries per row; don't allocate empty 3rd column for 1-2 geometries.
+            ncols = 3 if n_geoms >= 3 else int(n_geoms)
+            ncols = max(1, int(ncols))
+            nrows = (n_geoms + ncols - 1) // ncols
+
 
             # Everything else: one subplot per geometry.
             # Keep up to 3 geometries per row; don't allocate empty 3rd column for 1-2 geometries.
@@ -1829,6 +2361,12 @@ class Visualizer:
                 fig.tight_layout()
             except Exception:
                 pass
+            for ax3d in fig.axes:
+                if getattr(ax3d, 'name', '') == '3d':
+                    shift_left = float(getattr(ax3d, '_plot3d_shift_left', 0.0))
+                    if shift_left != 0.0:
+                        pos = ax3d.get_position()
+                        ax3d.set_position([pos.x0 - shift_left, pos.y0, pos.width, pos.height])
             plt.show()
     
     def _create_plot(self, 
@@ -1885,12 +2423,35 @@ class Visualizer:
         # Safely handle torch tensor inputs by cloning and detaching them
         points = self._safe_tensor_convert(points)
         string_xy = self._safe_tensor_convert(string_xy)
+        string_indices = self._safe_tensor_convert(string_indices)
+        points_per_string_list = self._safe_tensor_convert(points_per_string_list)
+
+        # Normalize common index/count containers to CPU-native types for plotting.
+        if torch.is_tensor(string_indices):
+            string_indices = string_indices.detach().cpu().long().tolist()
+        elif isinstance(string_indices, np.ndarray):
+            string_indices = string_indices.astype(np.int64).tolist()
+
+        if torch.is_tensor(points_per_string_list):
+            points_per_string_list = points_per_string_list.detach().cpu().numpy()
+        elif points_per_string_list is not None and not isinstance(points_per_string_list, np.ndarray):
+            points_per_string_list = np.asarray(points_per_string_list)
+
+        if points_per_string_list is not None:
+            points_per_string_list = np.asarray(points_per_string_list).reshape(-1)
+            if points_per_string_list.dtype.kind not in ('i', 'u'):
+                points_per_string_list = np.rint(points_per_string_list).astype(np.int64)
+            else:
+                points_per_string_list = points_per_string_list.astype(np.int64, copy=False)
+            points_per_string_list = np.clip(points_per_string_list, 0, None)
+
         if kwargs.get('string_weights') is not None:    
             kwargs['string_weights'] = torch.sigmoid(kwargs['string_weights'].clone())
         # Handle potential torch tensors in common kwargs
         tensor_kwargs = ['string_weights', 'signal_funcs', 'background_funcs', 'test_points', 
                         'llr_per_string', 'signal_llr_per_string', 'background_llr_per_string',
-                        'signal_yield_per_string', 'snr_per_string', 'fisher_info_per_string']
+                        'signal_yield_per_string', 'snr_per_string', 'fisher_info_per_string',
+                        'local_string_repulsion_penalty_per_string']
         for key in tensor_kwargs:
             if key in kwargs and kwargs.get(key) is not None:
                 kwargs[key] = self._safe_tensor_convert(kwargs[key])
@@ -1958,6 +2519,8 @@ class Visualizer:
             # 3D visualization of points
             fig.delaxes(ax)  # Remove the current axis
             ax = fig.add_subplot(ax.get_subplotspec(), projection='3d')
+            # Store desired shift and apply it after tight_layout so it is not reset.
+            ax._plot3d_shift_left = float(kwargs.get('plot_3d_shift_left', 0.03))
             
             # Get string weights for alpha transparency
             string_weights = kwargs.get('string_weights', None)
@@ -1982,18 +2545,35 @@ class Visualizer:
                     alpha_values = np.clip(alpha_values, 0.05, 1.0)
                 else:
                     alpha_values = 0.8
+
+                # Size markers by both global density and per-string population.
+                # Dense scenes get smaller points; larger strings get slightly larger markers.
+                n_total_points = max(1, int(len(points_xyz)))
+                n_strings = max(1, int(len(points_per_string_list)))
+                base_size = 1800.0 / (n_total_points ** 0.55)
+                base_size *= (80.0 / (n_strings + 10.0)) ** 0.25
+                base_size = float(np.clip(base_size, 3.0, 24.0))
+
+                string_counts = np.asarray(points_per_string_list, dtype=np.float64)
+                mean_count = max(1.0, float(np.mean(np.clip(string_counts, 1.0, None))))
+                per_string_scale = np.sqrt(np.clip(string_counts, 1.0, None) / mean_count)
+                per_string_sizes = np.clip(base_size * (0.75 + 0.45 * per_string_scale), 2.0, 32.0)
                     
                 full_colors = []
                 full_alphas = []
+                full_sizes = []
                 # print("Points per string list:", points_per_string_list)
                 for string_num, num_points in enumerate(points_per_string_list):
-                    full_colors.extend([colors[string_num]] * num_points)
+                    count_i = int(num_points)
+                    full_colors.extend([colors[string_num]] * count_i)
+                    full_sizes.extend([float(per_string_sizes[string_num])] * count_i)
                     if string_weights is not None:
-                        full_alphas.extend([alpha_values[string_num]] * num_points)
+                        full_alphas.extend([alpha_values[string_num]] * count_i)
                     
+                marker_sizes = full_sizes if len(full_sizes) == n_total_points else base_size
                 
                 ax.scatter(points_xyz[:, 0], points_xyz[:, 1], points_xyz[:, 2], 
-                          c=full_colors, s=min([30,30*200/len(points_per_string_list)]), alpha=full_alphas if string_weights is not None else 0.8)
+                          c=full_colors, s=marker_sizes, alpha=full_alphas if string_weights is not None else 0.8)
                 
                 if string_xy is not None:
                     # Draw vertical lines for strings with alpha based on string weights
@@ -2009,8 +2589,10 @@ class Visualizer:
                                color=string_colors[i], alpha=line_alpha, linestyle='--')
             else:
                 # Color by z-coordinate for non-string methods
+                n_total_points = max(1, int(len(points_xyz)))
+                marker_size = float(np.clip(1800.0 / (n_total_points ** 0.55), 3.0, 24.0))
                 ax.scatter(points_xyz[:, 0], points_xyz[:, 1], points_xyz[:, 2], 
-                          c=points_xyz[:, 2], cmap='rainbow', s=30, alpha=0.8)
+                          c=points_xyz[:, 2], cmap='rainbow', s=marker_size, alpha=0.8)
             
             title_line1 = f"Optimized Points: {len(points_xyz)} total"
             if geometry_type:
@@ -2061,48 +2643,51 @@ class Visualizer:
                 weight_threshold = kwargs.get('weight_threshold', 0.7)
                 max_radius = kwargs.get('max_radius', None)
                 draw_radius = kwargs.get('draw_radius', False)
+                draw_weighted_cylinder = kwargs.get('draw_weighted_cylinder', False)
                 
                 # Create colormap based on number of points per string
                 if points_per_string_list is not None:
                     cmap = plt.cm.viridis
                     norm = Normalize(vmin=min(points_per_string_list), 
                                     vmax=max(points_per_string_list))
+                    points_per_string_arr = np.asarray(points_per_string_list)
+                    active_mask = points_per_string_arr > 0
+                    xy_active = xy_np[active_mask]
+                    points_active = points_per_string_arr[active_mask]
                     
                     # Calculate alpha values based on string weights
                     if string_weights is not None:
                         # Apply sigmoid to convert to [0,1] range if not already
                         # print("String weights:", string_weights)
-                        alpha_vals = np.array([string_weights[idx] for idx in string_indices])
+                        string_weight_vals = np.array([string_weights[idx] for idx in string_indices])
                         # if np.any(alpha_vals < 0) or np.any(alpha_vals > 1):
                         #     alpha_vals = 1 / (1 + np.exp(-alpha_vals))
                         # alpha_vals = torch.nn.functional.softplus(torch.tensor(alpha_vals)).detach().cpu().numpy()  # Apply softplus for smoothness
                         # Ensure minimum visibility and filter active strings
-                        alpha_vals = np.clip(alpha_vals, 0.05, 1.0)
-                        # Filter alpha_vals to match the filtered coordinates (only strings with points > 0)
-                        alpha_vals = np.array([alpha_vals[s] for s in range(len(alpha_vals)) if points_per_string_list[s] > 0])
+                        alpha_vals = np.clip(string_weight_vals[active_mask], 0.05, 1.0)
                         # Handle NaN values if they exist
                         if np.any(np.isnan(alpha_vals)):
                             alpha_vals = np.nan_to_num(alpha_vals, nan=0.5)
                         # print("Alpha values:", alpha_vals)
                         # active_mask = np.array(points_per_string_list) > 0
                         # alpha_vals = alpha_vals[active_mask] if len(alpha_vals) == len(points_per_string_list) else [0.8] * sum(active_mask)
-                        weight_mask = np.array([string_weights[idx] >= weight_threshold for idx in string_indices])
+                        weight_mask = string_weight_vals[active_mask] >= weight_threshold
                         # weight_mask = np.array([True]*len(alpha_vals))
                     else:
-                        alpha_vals = 0.8
-                        weight_mask = np.array([True]*len(xy_np))
+                        alpha_vals = np.full(len(xy_active), 0.8, dtype=float)
+                        weight_mask = np.ones(len(xy_active), dtype=bool)
                     
                     
                     
                     # Plot strings with size proportional to number of points and alpha based on weights
                     if np.any(weight_mask):    
+                        xy_weighted = xy_active[weight_mask]
+                        points_weighted = points_active[weight_mask]
                         sc = ax.scatter(
-                            np.array([xy_np[s, 0] for s in range(len(xy_np)) if points_per_string_list[s] > 0])[weight_mask],
-                            np.array([xy_np[s, 1] for s in range(len(xy_np)) if points_per_string_list[s] > 0])[weight_mask],
-                            s=[min([40, 30 * 200 / len(xy_np[weight_mask])]) 
-                            for s in range(len(xy_np[weight_mask])) if np.array(points_per_string_list)[weight_mask][s] > 0],
-                            c=[np.array(points_per_string_list)[weight_mask][s] for s in range(len(xy_np[weight_mask])) 
-                            if np.array(points_per_string_list)[weight_mask][s] > 0],
+                            xy_weighted[:, 0],
+                            xy_weighted[:, 1],
+                            s=min([40, 30 * 200 / max(1, len(xy_weighted))]),
+                            c=points_weighted,
                             cmap=cmap,
                             alpha=alpha_vals[weight_mask],
                             norm=norm
@@ -2121,7 +2706,7 @@ class Visualizer:
                         alpha_vals = np.clip(alpha_vals, 0.05, 1.0)
                         weight_mask = np.array([string_weights[idx] >= weight_threshold for idx in string_indices])
                     else:
-                        alpha_vals = 0.8
+                        alpha_vals = np.full(len(xy_np), 0.8, dtype=float)
                         weight_mask = np.array([True]*len(xy_np))
 
                     if np.any(weight_mask):    
@@ -2138,12 +2723,47 @@ class Visualizer:
                                        linewidth=5, linestyle='--', alpha=0.2)
                     ax.add_patch(circle)
                     # ax.legend()
-                
-                # Add ROV safe space visualization if ROV penalty is available
 
-                rov_penalty = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
-                if rov_penalty is not None:
-                    self._draw_rov_safe_space(ax, rov_penalty)
+                # Draw weighted bounding cylinder overlay if requested.
+                if draw_weighted_cylinder:
+                    cyl_center = kwargs.get('weighted_bounding_cylinder_center', kwargs.get('bounding_cylinder_center', None))
+                    cyl_radius = kwargs.get('weighted_bounding_cylinder_radius', kwargs.get('bounding_cylinder_radius', None))
+                    # print("Cylinder center:", cyl_center)
+                    # print("Cylinder radius:", cyl_radius)
+
+                    if cyl_center is not None and cyl_radius is not None:
+                        if torch.is_tensor(cyl_center):
+                            cyl_center_np = cyl_center.detach().cpu().numpy().reshape(-1)
+                        else:
+                            cyl_center_np = np.asarray(cyl_center).reshape(-1)
+
+                        if torch.is_tensor(cyl_radius):
+                            cyl_radius_val = float(cyl_radius.detach().cpu().reshape(-1)[0].item())
+                        else:
+                            cyl_radius_arr = np.asarray(cyl_radius).reshape(-1)
+                            cyl_radius_val = float(cyl_radius_arr[0])
+
+                        if cyl_center_np.shape[0] >= 2 and np.isfinite(cyl_radius_val) and cyl_radius_val > 0:
+                            weighted_circle = plt.Circle(
+                                (float(cyl_center_np[0]), float(cyl_center_np[1])),
+                                cyl_radius_val,
+                                color='orange',
+                                fill=False,
+                                linewidth=2,
+                                linestyle='-',
+                                alpha=0.9,
+                            )
+                            ax.add_patch(weighted_circle)
+                            ax.scatter(
+                                [float(cyl_center_np[0])],
+                                [float(cyl_center_np[1])],
+                                c='orange',
+                                s=30,
+                                marker='x',
+                                linewidths=1.5,
+                                alpha=0.9,
+                            )
+                
             else:
                 ax.text(0.5, 0.5, "String XY data not available", 
                       ha='center', va='center', transform=ax.transAxes)
@@ -2231,6 +2851,60 @@ class Visualizer:
                     ax.set_ylabel('Y')
                 else:
                     ax.text(0.5, 0.5, "ROV penalty per string data not available", 
+                          ha='center', va='center', transform=ax.transAxes)
+            else:
+                ax.text(0.5, 0.5, "String XY data not available", 
+                      ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_STRING_XY_LOCAL_STRING_REPULSION:
+            # String positions in XY plane colored by local string repulsion per string
+            if string_xy is not None:
+                xy_np = string_xy.clone().detach().cpu().numpy()
+                local_repulsion_per_string = kwargs.get('local_string_repulsion_penalty_per_string', None)
+                string_weights = kwargs.get('string_weights', None)
+
+                if local_repulsion_per_string is not None:
+                    if torch.is_tensor(local_repulsion_per_string):
+                        local_repulsion_np = local_repulsion_per_string.clone().detach().cpu().numpy()
+                    else:
+                        local_repulsion_np = np.array(local_repulsion_per_string)
+
+                    if local_repulsion_np.shape[0] != xy_np.shape[0]:
+                        ax.text(0.5, 0.5, "Repulsion/string count mismatch", 
+                              ha='center', va='center', transform=ax.transAxes)
+                    else:
+                        if string_weights is not None:
+                            alpha_vals = np.array([string_weights[idx] for idx in string_indices])
+                            alpha_vals = np.clip(alpha_vals, 0.05, 1.0)
+                        else:
+                            alpha_vals = 0.8
+
+                        cmap = plt.cm.RdYlGn_r  # Red for high penalty, green for low penalty
+                        vmin = 0
+                        vmax = np.max(local_repulsion_np) if np.max(local_repulsion_np) > 0 else 1.0
+                        norm = Normalize(vmin=vmin, vmax=vmax)
+
+                        sc = ax.scatter(
+                            xy_np[:, 0],
+                            xy_np[:, 1],
+                            s=min([30, 50 * 200 / len(xy_np)]),
+                            c=local_repulsion_np,
+                            cmap=cmap,
+                            norm=norm,
+                            alpha=alpha_vals if isinstance(alpha_vals, np.ndarray) else alpha_vals,
+                            edgecolors='black',
+                            linewidths=0.1
+                        )
+
+                        cbar = fig.colorbar(sc, ax=ax)
+                        cbar.set_label('Local String Repulsion Penalty')
+
+                        set_axis_limits(ax)
+                        ax.set_title('Local String Repulsion per String')
+                        ax.set_xlabel('X')
+                        ax.set_ylabel('Y')
+                else:
+                    ax.text(0.5, 0.5, "Local string repulsion per string data not available", 
                           ha='center', va='center', transform=ax.transAxes)
             else:
                 ax.text(0.5, 0.5, "String XY data not available", 
@@ -4260,6 +4934,35 @@ class Visualizer:
             else:
                 ax.text(0.5, 0.5, "Energy resolution history not available\n(Pass 'energy_resolution_history' in kwargs)", 
                       ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_POINTSOURCE_FOM:
+            # Pointsource FoM history from unweighted loss dictionary.
+            loss_dict = kwargs.get('uw_loss_dict', None)
+
+            pointsource_fom_history = None
+            if loss_dict is not None:
+                pointsource_fom_history = loss_dict.get('pointsource_fom_loss', None)
+                if pointsource_fom_history is None:
+                    pointsource_fom_history = loss_dict.get('effective_area_resolution_loss', None)
+                if pointsource_fom_history is None:
+                    pointsource_fom_history = loss_dict.get('pointsource_fom', None)
+
+            if pointsource_fom_history is not None:
+                pointsource_fom_history = np.array(pointsource_fom_history)
+                ax.plot(pointsource_fom_history, color='purple', linewidth=2, markersize=4)
+                ax.set_title('Pointsource FoM History')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Pointsource FoM')
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "Pointsource FoM history not available\n(Pass 'uw_loss_dict' with pointsource_fom/effective_area_resolution history)",
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes,
+                )
         
         elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
             # Plot binned angular resolution vs zenith angle
@@ -4271,8 +4974,12 @@ class Visualizer:
             if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
                 resolution_stat = 'mean'
             resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
-            if resolution_stat not in ('median', 'mean'):
+            if resolution_stat not in ('median', 'mean', 'fom'):
                 resolution_stat = 'median'
+            resolution_use_fom = bool(kwargs.get('resolution_use_fom', False)) or resolution_stat == 'fom'
+            if resolution_use_fom:
+                resolution_stat = 'fom'
+            resolution_fom_min_resolution = kwargs.get('resolution_fom_min_resolution', 1e-12)
             show_resolution_ci = bool(kwargs.get('show_resolution_ci', False))
             resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
             resolution_ci_level = kwargs.get('resolution_ci_level', None)
@@ -4282,7 +4989,7 @@ class Visualizer:
             min_ang_res = kwargs.get('min_angular_resolution', None)
             max_ang_res = kwargs.get('max_angular_resolution', None)
             if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', False))
+                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
             
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
@@ -4345,20 +5052,37 @@ class Visualizer:
                     bin_medians = []
                     band_lower = []
                     band_upper = []
+                    fom_errors = []
                     bin_counts = []
                     
                     for i in range(n_bins):
                         mask = (zenith_deg >= bin_edges[i]) & (zenith_deg < bin_edges[i+1])
                         if mask.sum() > 0:
                             vals = np.array(res_values[mask], dtype=float)
-                            if resolution_stat == 'mean':
+                            if resolution_use_fom:
+                                center_val, fom_err = self._compute_fom_from_resolution(
+                                    vals,
+                                    min_resolution=resolution_fom_min_resolution,
+                                )
+                                bin_medians.append(center_val)
+                                fom_errors.append(fom_err)
+                                if np.isfinite(center_val) and np.isfinite(fom_err):
+                                    band_lower.append(center_val - fom_err)
+                                    band_upper.append(center_val + fom_err)
+                                else:
+                                    band_lower.append(np.nan)
+                                    band_upper.append(np.nan)
+                            elif resolution_stat == 'mean':
                                 center_val = float(np.nanmean(vals))
                                 spread_val = float(np.nanstd(vals))
+                                bin_medians.append(center_val)
+                                fom_errors.append(np.nan)
                             else:
                                 center_val = float(np.nanmedian(vals))
                                 spread_val = np.nan
-                            bin_medians.append(center_val)
-                            if show_resolution_ci:
+                                bin_medians.append(center_val)
+                                fom_errors.append(np.nan)
+                            if (not resolution_use_fom) and show_resolution_ci:
                                 if resolution_stat == 'mean':
                                     lo = center_val - 2.0 * spread_val
                                     hi = center_val + 2.0 * spread_val
@@ -4395,18 +5119,21 @@ class Visualizer:
                                     band_lower.append(center_val + np.nanpercentile(resid, q_lo))
                                     band_upper.append(center_val + np.nanpercentile(resid, q_hi))
                             else:
-                                band_lower.append(np.nan)
-                                band_upper.append(np.nan)
+                                if not resolution_use_fom:
+                                    band_lower.append(np.nan)
+                                    band_upper.append(np.nan)
                             bin_counts.append(mask.sum())
                         else:
                             bin_medians.append(np.nan)
                             band_lower.append(np.nan)
                             band_upper.append(np.nan)
+                            fom_errors.append(np.nan)
                             bin_counts.append(0)
                     
                     bin_medians = np.array(bin_medians)
                     band_lower = np.array(band_lower)
                     band_upper = np.array(band_upper)
+                    fom_errors = np.array(fom_errors)
                     bin_counts = np.array(bin_counts)
                     if min_ang_res is not None or max_ang_res is not None:
                         lo_lim = -np.inf
@@ -4425,7 +5152,7 @@ class Visualizer:
                             lo_lim, hi_lim = hi_lim, lo_lim
 
                         bin_medians = np.clip(bin_medians, lo_lim, hi_lim)
-                        if show_resolution_ci:
+                        if show_resolution_ci or resolution_use_fom:
                             band_lower = np.clip(band_lower, lo_lim, hi_lim)
                             band_upper = np.clip(band_upper, lo_lim, hi_lim)
                             band_lower = np.minimum(band_lower, band_upper)
@@ -4438,7 +5165,29 @@ class Visualizer:
                     # ax.errorbar(bin_centers[valid_bins], bin_means[valid_bins], 
                     #            yerr=bin_stds[valid_bins], fmt='o-', capsize=5, 
                     #            linewidth=2, markersize=8, label='Mean ± Std')
-                    if show_resolution_ci and ci_lower is not None and ci_upper is not None:
+                    if resolution_use_fom:
+                        valid_err = valid_bins & np.isfinite(fom_errors)
+                        if np.any(valid_err):
+                            ax.errorbar(
+                                bin_centers[valid_err],
+                                bin_medians[valid_err],
+                                yerr=fom_errors[valid_err],
+                                fmt='o-',
+                                linewidth=2,
+                                markersize=8,
+                                capsize=4,
+                                label='FOM',
+                            )
+                        else:
+                            ax.plot(
+                                bin_centers[valid_bins],
+                                bin_medians[valid_bins],
+                                'o-',
+                                linewidth=2,
+                                markersize=8,
+                                label='FOM',
+                            )
+                    elif show_resolution_ci and ci_lower is not None and ci_upper is not None:
                         valid_ci = valid_bins & np.isfinite(ci_lower) & np.isfinite(ci_upper)
                         if np.any(valid_ci):
                             q_lo, q_hi = 16.0, 84.0
@@ -4484,14 +5233,15 @@ class Visualizer:
                                 label='_nolegend_',
                                 zorder=1,
                             )
-                    ax.plot(
-                        bin_centers[valid_bins],
-                        bin_medians[valid_bins],
-                        'o-',
-                        linewidth=2,
-                        markersize=8,
-                        label=('Mean' if resolution_stat == 'mean' else 'Median'),
-                    )
+                    if not resolution_use_fom:
+                        ax.plot(
+                            bin_centers[valid_bins],
+                            bin_medians[valid_bins],
+                            'o-',
+                            linewidth=2,
+                            markersize=8,
+                            label=('Mean' if resolution_stat == 'mean' else 'Median'),
+                        )
                     if resolution_logy:
                         ax.set_yscale('log')
 
@@ -4507,17 +5257,18 @@ class Visualizer:
                     #           c='gray', label='Individual events')
                     
                     ax.set_xlabel('Zenith Angle (degrees)', fontsize=10)
-                    ax.set_ylabel('Angular Resolution (radians)', fontsize=10)
-                    ax.set_title(f'Angular Resolution vs Zenith', fontsize=12)
+                    ax.set_ylabel('FOM (rad$^{-1}$)' if resolution_use_fom else 'Angular Resolution (radians)', fontsize=10)
+                    ax.set_title('Angular FOM vs Zenith' if resolution_use_fom else 'Angular Resolution vs Zenith', fontsize=12)
                     ax.grid(True, alpha=0.3)
                     ax.legend()
                     
-                    # Add secondary y-axis for resolution in degrees
-                    ax2 = ax.twinx()
-                    ax2.set_ylabel('Angular Resolution (degrees)', fontsize=10)
-                    ax2.set_yscale(ax.get_yscale())
-                    ax2.set_ylim(np.rad2deg(ax.get_ylim()[0]), np.rad2deg(ax.get_ylim()[1]))
-                    ax2.tick_params(axis='y')
+                    # Add secondary y-axis for resolution in degrees (not used in FOM mode).
+                    if not resolution_use_fom:
+                        ax2 = ax.twinx()
+                        ax2.set_ylabel('Angular Resolution (degrees)', fontsize=10)
+                        ax2.set_yscale(ax.get_yscale())
+                        ax2.set_ylim(np.rad2deg(ax.get_ylim()[0]), np.rad2deg(ax.get_ylim()[1]))
+                        ax2.tick_params(axis='y')
                     
                     # Add text showing bin counts
                     # textstr = f'Total events: {len(res_values)}\n'
@@ -4542,8 +5293,12 @@ class Visualizer:
             if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
                 resolution_stat = 'mean'
             resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
-            if resolution_stat not in ('median', 'mean'):
+            if resolution_stat not in ('median', 'mean', 'fom'):
                 resolution_stat = 'median'
+            resolution_use_fom = bool(kwargs.get('resolution_use_fom', False)) or resolution_stat == 'fom'
+            if resolution_use_fom:
+                resolution_stat = 'fom'
+            resolution_fom_min_resolution = kwargs.get('resolution_fom_min_resolution', 1e-12)
             show_resolution_ci = bool(kwargs.get('show_resolution_ci', False))
             resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
             resolution_ci_level = kwargs.get('resolution_ci_level', None)
@@ -4552,7 +5307,7 @@ class Visualizer:
             min_ang_res = kwargs.get('min_angular_resolution', None)
             max_ang_res = kwargs.get('max_angular_resolution', None)
             if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', False))
+                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
 
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
@@ -4605,20 +5360,37 @@ class Visualizer:
                     bin_medians = []
                     band_lower = []
                     band_upper = []
+                    fom_errors = []
                     bin_counts = []
 
                     for i in range(n_bins):
                         mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i+1])
                         if mask.sum() > 0:
                             vals = np.array(res_values[mask], dtype=float)
-                            if resolution_stat == 'mean':
+                            if resolution_use_fom:
+                                center_val, fom_err = self._compute_fom_from_resolution(
+                                    vals,
+                                    min_resolution=resolution_fom_min_resolution,
+                                )
+                                bin_medians.append(center_val)
+                                fom_errors.append(fom_err)
+                                if np.isfinite(center_val) and np.isfinite(fom_err):
+                                    band_lower.append(center_val - fom_err)
+                                    band_upper.append(center_val + fom_err)
+                                else:
+                                    band_lower.append(np.nan)
+                                    band_upper.append(np.nan)
+                            elif resolution_stat == 'mean':
                                 center_val = float(np.nanmean(vals))
                                 spread_val = float(np.nanstd(vals))
+                                bin_medians.append(center_val)
+                                fom_errors.append(np.nan)
                             else:
                                 center_val = float(np.nanmedian(vals))
                                 spread_val = np.nan
-                            bin_medians.append(center_val)
-                            if show_resolution_ci:
+                                bin_medians.append(center_val)
+                                fom_errors.append(np.nan)
+                            if (not resolution_use_fom) and show_resolution_ci:
                                 if resolution_stat == 'mean':
                                     lo = center_val - 2.0 * spread_val
                                     hi = center_val + 2.0 * spread_val
@@ -4655,18 +5427,21 @@ class Visualizer:
                                     band_lower.append(center_val + np.nanpercentile(resid, q_lo))
                                     band_upper.append(center_val + np.nanpercentile(resid, q_hi))
                             else:
-                                band_lower.append(np.nan)
-                                band_upper.append(np.nan)
+                                if not resolution_use_fom:
+                                    band_lower.append(np.nan)
+                                    band_upper.append(np.nan)
                             bin_counts.append(mask.sum())
                         else:
                             bin_medians.append(np.nan)
                             band_lower.append(np.nan)
                             band_upper.append(np.nan)
+                            fom_errors.append(np.nan)
                             bin_counts.append(0)
 
                     bin_medians = np.array(bin_medians)
                     band_lower = np.array(band_lower)
                     band_upper = np.array(band_upper)
+                    fom_errors = np.array(fom_errors)
                     bin_counts = np.array(bin_counts)
                     if min_ang_res is not None or max_ang_res is not None:
                         lo_lim = -np.inf
@@ -4685,17 +5460,40 @@ class Visualizer:
                             lo_lim, hi_lim = hi_lim, lo_lim
 
                         bin_medians = np.clip(bin_medians, lo_lim, hi_lim)
-                        if show_resolution_ci:
+                        if show_resolution_ci or resolution_use_fom:
                             band_lower = np.clip(band_lower, lo_lim, hi_lim)
                             band_upper = np.clip(band_upper, lo_lim, hi_lim)
                             band_lower = np.minimum(band_lower, band_upper)
                     ci_lower = band_lower
                     ci_upper = band_upper
-
+                    # print(fom_errors)
                     # Plot mean line vs log10(energy)
                     valid_bins = np.isfinite(bin_medians)
                     x_plot = np.log10(bin_centers)
-                    if show_resolution_ci and ci_lower is not None and ci_upper is not None:
+                    if resolution_use_fom:
+                        valid_err = valid_bins & np.isfinite(fom_errors)
+                        if np.any(valid_err):
+                            ax.errorbar(
+                                x_plot[valid_err],
+                                bin_medians[valid_err],
+                                yerr=fom_errors[valid_err],
+                                fmt='o-',
+                                linewidth=2,
+                                markersize=8,
+                                capsize=4,
+                                label='FOM',
+                            )
+                            
+                        else:
+                            ax.plot(
+                                x_plot[valid_bins],
+                                bin_medians[valid_bins],
+                                'o-',
+                                linewidth=2,
+                                markersize=8,
+                                label='FOM',
+                            )
+                    elif show_resolution_ci and ci_lower is not None and ci_upper is not None:
                         valid_ci = valid_bins & np.isfinite(ci_lower) & np.isfinite(ci_upper)
                         if np.any(valid_ci):
                             q_lo, q_hi = 16.0, 84.0
@@ -4741,14 +5539,15 @@ class Visualizer:
                                 label='_nolegend_',
                                 zorder=1,
                             )
-                    ax.plot(
-                        x_plot[valid_bins],
-                        bin_medians[valid_bins],
-                        'o-',
-                        linewidth=2,
-                        markersize=8,
-                        label=('Mean' if resolution_stat == 'mean' else 'Median'),
-                    )
+                    if not resolution_use_fom:
+                        ax.plot(
+                            x_plot[valid_bins],
+                            bin_medians[valid_bins],
+                            'o-',
+                            linewidth=2,
+                            markersize=8,
+                            label=('Mean' if resolution_stat == 'mean' else 'Median'),
+                        )
                     if resolution_logy:
                         ax.set_yscale('log')
 
@@ -4761,23 +5560,166 @@ class Visualizer:
                             pass
 
                     ax.set_xlabel('log$_{10}$(Energy / GeV)', fontsize=10)
-                    ax.set_ylabel('Angular Resolution (radians)', fontsize=10)
-                    ax.set_title('Angular Resolution vs log$_{10}$(Energy)', fontsize=12)
+                    ax.set_ylabel('FOM (rad$^{-1}$)' if resolution_use_fom else 'Angular Resolution (radians)', fontsize=10)
+                    ax.set_title('Angular FOM vs log$_{10}$(Energy)' if resolution_use_fom else 'Angular Resolution vs log$_{10}$(Energy)', fontsize=12)
                     ax.grid(True, alpha=0.3)
                     ax.legend()
 
-                    # Add secondary y-axis in degrees
-                    ax2 = ax.twinx()
-                    ax2.set_ylabel('Angular Resolution (degrees)', fontsize=10)
-                    ax2.set_yscale(ax.get_yscale())
-                    ax2.set_ylim(np.rad2deg(ax.get_ylim()[0]), np.rad2deg(ax.get_ylim()[1]))
-                    ax2.tick_params(axis='y')
+                    # Add secondary y-axis in degrees (not used in FOM mode).
+                    if not resolution_use_fom:
+                        ax2 = ax.twinx()
+                        ax2.set_ylabel('Angular Resolution (degrees)', fontsize=10)
+                        ax2.set_yscale(ax.get_yscale())
+                        ax2.set_ylim(np.rad2deg(ax.get_ylim()[0]), np.rad2deg(ax.get_ylim()[1]))
+                        ax2.tick_params(axis='y')
                 else:
                     ax.text(0.5, 0.5, 'No valid data', ha='center', va='center',
                             transform=ax.transAxes, fontsize=14)
             else:
                 ax.text(0.5, 0.5, 'Data not available\nProvide resolution_per_event and resolution_params',
                         ha='center', va='center', transform=ax.transAxes, fontsize=12)
+
+        elif plot_type == self.PLOT_POINTSOURCE_FOM_VS_ENERGY:
+            # Plot binned pointsource FoM vs log10(energy)
+            resolution_per_event = kwargs.get('resolution_per_event', None)
+            effective_area_per_event = kwargs.get('effective_area_per_event', None)
+            signal_event_params = kwargs.get('resolution_params', None)
+            if signal_event_params is None:
+                signal_event_params = kwargs.get('effective_area_params', None)
+            if signal_event_params is None:
+                signal_event_params = kwargs.get('signal_event_params', None)
+            n_bins = kwargs.get('n_energy_bins', 10)
+            energy_range = kwargs.get('energy_range', None)
+            fom_min_resolution = kwargs.get('resolution_fom_min_resolution', 1e-12)
+            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
+            if not resolution_logy:
+                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
+
+            if (
+                resolution_per_event is not None
+                and effective_area_per_event is not None
+                and signal_event_params is not None
+            ):
+                if isinstance(resolution_per_event, torch.Tensor):
+                    res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
+                else:
+                    res_values = np.array(resolution_per_event).flatten()
+
+                if isinstance(effective_area_per_event, torch.Tensor):
+                    aeff_values = effective_area_per_event.clone().detach().cpu().numpy().flatten()
+                else:
+                    aeff_values = np.array(effective_area_per_event).flatten()
+
+                energy_values = []
+                for event_params in signal_event_params:
+                    if isinstance(event_params, dict) and 'energy' in event_params:
+                        energy = event_params['energy']
+                        if isinstance(energy, torch.Tensor):
+                            energy_values.append(energy.detach().cpu().item())
+                        else:
+                            energy_values.append(float(energy))
+
+                energy_values = np.array(energy_values)
+
+                n = min(len(res_values), len(aeff_values), len(energy_values))
+                if n > 0:
+                    res_values = res_values[:n]
+                    aeff_values = aeff_values[:n]
+                    energy_values = energy_values[:n]
+
+                valid_mask = (
+                    np.isfinite(res_values)
+                    & np.isfinite(aeff_values)
+                    & np.isfinite(energy_values)
+                    & (energy_values > 0)
+                )
+                res_values = res_values[valid_mask]
+                aeff_values = aeff_values[valid_mask]
+                energy_values = energy_values[valid_mask]
+
+                if energy_range is not None and len(energy_range) == 2:
+                    try:
+                        emin, emax = float(energy_range[0]), float(energy_range[1])
+                        if emax < emin:
+                            emin, emax = emax, emin
+                        range_mask = (energy_values >= emin) & (energy_values <= emax)
+                        res_values = res_values[range_mask]
+                        aeff_values = aeff_values[range_mask]
+                        energy_values = energy_values[range_mask]
+                    except Exception:
+                        pass
+
+                if len(res_values) > 0 and len(aeff_values) > 0 and len(energy_values) > 0:
+                    log_energy_min = np.log10(energy_values.min())
+                    log_energy_max = np.log10(energy_values.max())
+                    bin_edges = np.logspace(log_energy_min, log_energy_max, n_bins + 1)
+                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+
+                    bin_fom = []
+                    bin_fom_err = []
+                    for i in range(n_bins):
+                        mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
+                        if mask.sum() > 0:
+                            fval, ferr = self._compute_pointsource_fom_from_resolution_and_aeff(
+                                res_values[mask],
+                                aeff_values[mask],
+                                min_resolution=fom_min_resolution,
+                            )
+                            bin_fom.append(fval)
+                            bin_fom_err.append(ferr)
+                        else:
+                            bin_fom.append(np.nan)
+                            bin_fom_err.append(np.nan)
+
+                    bin_fom = np.array(bin_fom)
+                    bin_fom_err = np.array(bin_fom_err)
+                    valid_bins = np.isfinite(bin_fom)
+                    if resolution_logy:
+                        valid_bins = valid_bins & (bin_fom > 0)
+                    x_plot = np.log10(bin_centers)
+
+                    valid_err = valid_bins & np.isfinite(bin_fom_err)
+                    if np.any(valid_err):
+                        ax.errorbar(
+                            x_plot[valid_err],
+                            bin_fom[valid_err],
+                            yerr=bin_fom_err[valid_err],
+                            fmt='o-',
+                            linewidth=2,
+                            markersize=8,
+                            capsize=4,
+                            label='Pointsource FoM',
+                        )
+                    else:
+                        ax.plot(
+                            x_plot[valid_bins],
+                            bin_fom[valid_bins],
+                            'o-',
+                            linewidth=2,
+                            markersize=8,
+                            label='Pointsource FoM',
+                        )
+
+                    ax.set_xlabel('log$_{10}$(Energy / GeV)', fontsize=10)
+                    ax.set_ylabel('Pointsource FoM', fontsize=10)
+                    ax.set_title('Pointsource FoM vs log$_{10}$(Energy)', fontsize=12)
+                    ax.grid(True, alpha=0.3)
+                    if resolution_logy:
+                        ax.set_yscale('log')
+                    ax.legend()
+                else:
+                    ax.text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                            transform=ax.transAxes, fontsize=14)
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    'Data not available\nProvide resolution_per_event, effective_area_per_event, and event params',
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes,
+                    fontsize=12,
+                )
 
         elif plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
             # Plot binned energy resolution vs energy
@@ -4789,12 +5731,19 @@ class Visualizer:
             if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
                 resolution_stat = 'mean'
             resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
-            if resolution_stat not in ('median', 'mean'):
+            if resolution_stat not in ('median', 'mean', 'fom'):
                 resolution_stat = 'median'
+            resolution_use_fom = bool(kwargs.get('resolution_use_fom', False)) or resolution_stat == 'fom'
+            if resolution_use_fom:
+                resolution_stat = 'fom'
+            resolution_fom_min_resolution = kwargs.get('resolution_fom_min_resolution', 1e-12)
             show_resolution_ci = bool(kwargs.get('show_resolution_ci', False))
             resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
             resolution_ci_level = kwargs.get('resolution_ci_level', None)
             energy_range = kwargs.get('energy_range', None)
+            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
+            if not resolution_logy:
+                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
             
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
@@ -4830,6 +5779,11 @@ class Visualizer:
                         energy_values = energy_values[range_mask]
                     except Exception:
                         pass
+
+                if resolution_logy:
+                    pos_mask = np.array(res_values) > 0
+                    res_values = np.array(res_values)[pos_mask]
+                    energy_values = np.array(energy_values)[pos_mask]
                 
                 if len(res_values) > 0 and len(energy_values) > 0:
                     # Create logarithmic bins for energy
@@ -4842,20 +5796,37 @@ class Visualizer:
                     bin_medians = []
                     band_lower = []
                     band_upper = []
+                    fom_errors = []
                     bin_counts = []
                     
                     for i in range(n_bins):
                         mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i+1])
                         if mask.sum() > 0:
                             vals = np.array(res_values[mask], dtype=float)
-                            if resolution_stat == 'mean':
+                            if resolution_use_fom:
+                                center_val, fom_err = self._compute_fom_from_resolution(
+                                    vals,
+                                    min_resolution=resolution_fom_min_resolution,
+                                )
+                                bin_medians.append(center_val)
+                                fom_errors.append(fom_err)
+                                if np.isfinite(center_val) and np.isfinite(fom_err):
+                                    band_lower.append(center_val - fom_err)
+                                    band_upper.append(center_val + fom_err)
+                                else:
+                                    band_lower.append(np.nan)
+                                    band_upper.append(np.nan)
+                            elif resolution_stat == 'mean':
                                 center_val = float(np.nanmean(vals))
                                 spread_val = float(np.nanstd(vals))
+                                bin_medians.append(center_val)
+                                fom_errors.append(np.nan)
                             else:
                                 center_val = float(np.nanmedian(vals))
                                 spread_val = np.nan
-                            bin_medians.append(center_val)
-                            if show_resolution_ci:
+                                bin_medians.append(center_val)
+                                fom_errors.append(np.nan)
+                            if (not resolution_use_fom) and show_resolution_ci:
                                 if resolution_stat == 'mean':
                                     band_lower.append(center_val - 2.0 * spread_val)
                                     band_upper.append(center_val + 2.0 * spread_val)
@@ -4886,18 +5857,21 @@ class Visualizer:
                                     band_lower.append(center_val + np.nanpercentile(resid, q_lo))
                                     band_upper.append(center_val + np.nanpercentile(resid, q_hi))
                             else:
-                                band_lower.append(np.nan)
-                                band_upper.append(np.nan)
+                                if not resolution_use_fom:
+                                    band_lower.append(np.nan)
+                                    band_upper.append(np.nan)
                             bin_counts.append(mask.sum())
                         else:
                             bin_medians.append(np.nan)
                             band_lower.append(np.nan)
                             band_upper.append(np.nan)
+                            fom_errors.append(np.nan)
                             bin_counts.append(0)
                     
                     bin_medians = np.array(bin_medians)
                     band_lower = np.array(band_lower)
                     band_upper = np.array(band_upper)
+                    fom_errors = np.array(fom_errors)
                     bin_counts = np.array(bin_counts)
 
                     ci_lower = band_lower
@@ -4905,7 +5879,31 @@ class Visualizer:
                     
                     # Plot with error bars
                     valid_bins = np.isfinite(bin_medians)
-                    if show_resolution_ci and ci_lower is not None and ci_upper is not None:
+                    if resolution_logy:
+                        valid_bins = valid_bins & (np.array(bin_medians) > 0)
+                    if resolution_use_fom:
+                        valid_err = valid_bins & np.isfinite(fom_errors)
+                        if np.any(valid_err):
+                            ax.errorbar(
+                                bin_centers[valid_err],
+                                bin_medians[valid_err],
+                                yerr=fom_errors[valid_err],
+                                fmt='o-',
+                                linewidth=2,
+                                markersize=8,
+                                capsize=4,
+                                label='FOM',
+                            )
+                        else:
+                            ax.plot(
+                                bin_centers[valid_bins],
+                                bin_medians[valid_bins],
+                                'o-',
+                                linewidth=2,
+                                markersize=8,
+                                label='FOM',
+                            )
+                    elif show_resolution_ci and ci_lower is not None and ci_upper is not None:
                         valid_ci = valid_bins & np.isfinite(ci_lower) & np.isfinite(ci_upper)
                         if np.any(valid_ci):
                             q_lo, q_hi = 16.0, 84.0
@@ -4939,17 +5937,21 @@ class Visualizer:
                                 label=str(ci_label),
                                 zorder=1,
                             )
-                    ax.plot(
-                        bin_centers[valid_bins],
-                        bin_medians[valid_bins],
-                        'o-',
-                        linewidth=2,
-                        markersize=8,
-                        label=('Mean' if resolution_stat == 'mean' else 'Median'),
-                    )
+                    if not resolution_use_fom:
+                        ax.plot(
+                            bin_centers[valid_bins],
+                            bin_medians[valid_bins],
+                            'o-',
+                            linewidth=2,
+                            markersize=8,
+                            label=('Mean' if resolution_stat == 'mean' else 'Median'),
+                        )
                     
                     ax.set_xlabel('Energy (GeV)', fontsize=10)
-                    if use_relative_energy:
+                    if resolution_use_fom:
+                        ax.set_ylabel('FOM (dimensionless)' if use_relative_energy else 'FOM (GeV$^{-1}$)', fontsize=10)
+                        ax.set_title('Energy FOM vs Energy', fontsize=12)
+                    elif use_relative_energy:
                         ax.set_ylabel('Relative Energy Resolution (ΔE/E)', fontsize=10)
                         ax.set_title(f'Relative Energy Resolution vs Energy', fontsize=12)
                     else:
@@ -4957,6 +5959,8 @@ class Visualizer:
                         ax.set_title(f'Energy Resolution vs Energy', fontsize=12)
                     
                     ax.set_xscale('log')
+                    if resolution_logy:
+                        ax.set_yscale('log')
                     ax.grid(True, alpha=0.3, which='both')
                     ax.legend()
                 else:
@@ -5577,7 +6581,10 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        event_labels=['position', 'energy', 'zenith', 'azimuth'],
                        true_event=None, detector_point=None, figsize=(10, 8),
                        contour_levels=[0, 1, 4, 9], cmap='viridis',
-                       use_mollweide=False, skip_zero_response=False, use_patd=False):
+                       use_mollweide=False, skip_zero_response=False, use_patd=False,
+                       num_detector_points=1, min_detector_points=1,
+                       min_detector_response=0.0, max_detector_resample_attempts=1000,
+                       plot_opposite_direction_true_params=False):
     """
     Plot negative log-likelihood landscape for a trained signal-only LLRnet.
     
@@ -5617,7 +6624,23 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         True event parameters. If None, samples a new event from signal_sampler.
     detector_point : torch.Tensor or list of torch.Tensor, optional
         Detector point coordinates. Can be a single point or a list/tensor of multiple points.
-        If None, samples a new point. If multiple points, log-likelihoods are summed.
+        If None, detector points are sampled from signal_sampler until at least
+        min_detector_points satisfy response >= min_detector_response.
+        If multiple points, log-likelihoods are summed.
+    num_detector_points : int
+        Number of detector points to sample per resampling attempt when detector_point is None.
+    min_detector_points : int
+        Minimum number of detector points required to satisfy the detector response threshold.
+    min_detector_response : float
+        Minimum detector response threshold used when selecting sampled detector points.
+    max_detector_resample_attempts : int
+        Maximum number of resampling attempts before raising an error.
+    plot_opposite_direction_true_params : bool
+        If True, and if zenith and/or azimuth are plotted, also mark the opposite
+        direction corresponding to the same physical line through the detector.
+        Opposite direction is computed as:
+        - zenith' = pi - zenith
+        - azimuth' = (azimuth + pi) mod 2*pi
     figsize : tuple
         Figure size (width, height)
     contour_levels : list
@@ -5658,26 +6681,129 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     # Sample true event and detector point if not provided
     if true_event is None:
         true_event = signal_sampler.sample_events(1)[0]
-    
+
+    def _extract_response_scalar(response_obj):
+        """Convert surrogate response to a float for thresholding/filtering."""
+        resp = response_obj
+        if use_patd and isinstance(resp, dict):
+            resp = resp.get('num_photons', 0.0)
+        if isinstance(resp, torch.Tensor):
+            if resp.numel() == 1:
+                return float(resp.item())
+            return float(resp.reshape(-1)[0].item())
+        try:
+            return float(resp)
+        except Exception:
+            return float('nan')
+
+    def _event_direction_angles(event_data):
+        """Return (zenith, azimuth) as floats when available."""
+        zen = None
+        azi = None
+
+        if event_data.get('zenith') is not None:
+            zen = _extract_response_scalar(event_data.get('zenith'))
+        if event_data.get('azimuth') is not None:
+            azi = _extract_response_scalar(event_data.get('azimuth'))
+
+        if (zen is None or not np.isfinite(zen) or azi is None or not np.isfinite(azi)) and event_data.get('direction') is not None:
+            try:
+                theta_tmp, phi_tmp = cart_to_sph(event_data['direction'])
+                if zen is None or not np.isfinite(zen):
+                    zen = _extract_response_scalar(theta_tmp)
+                if azi is None or not np.isfinite(azi):
+                    azi = _extract_response_scalar(phi_tmp)
+            except Exception:
+                pass
+
+        if zen is None or not np.isfinite(zen) or azi is None or not np.isfinite(azi):
+            return None, None
+
+        azi = float(np.mod(azi, 2 * np.pi))
+        return float(zen), azi
+
+    def _opposite_direction_angles(zen, azi):
+        """Return opposite direction angles for the same line through detector."""
+        if zen is None or azi is None:
+            return None, None
+        return float(np.pi - zen), float(np.mod(azi + np.pi, 2 * np.pi))
+
+    # Normalize detector point inputs into a list of tensors.
+    def _to_detector_points_list(detector_point_input):
+        if isinstance(detector_point_input, list):
+            return [
+                p.to(llrnet.device) if isinstance(p, torch.Tensor)
+                else torch.tensor(p, device=llrnet.device)
+                for p in detector_point_input
+            ]
+        if isinstance(detector_point_input, torch.Tensor):
+            if detector_point_input.ndim == 1:
+                return [detector_point_input.to(llrnet.device)]
+            return [p.to(llrnet.device) for p in detector_point_input]
+        return [torch.tensor(detector_point_input, device=llrnet.device)]
+
+    true_detector_responses = None
     if detector_point is None:
-        detector_point = signal_sampler.sample_detector_points(1).squeeze()
-    
-    # Handle multiple detector points
-    if isinstance(detector_point, list):
-        detector_points = [p.to(llrnet.device) if isinstance(p, torch.Tensor) else torch.tensor(p, device=llrnet.device) for p in detector_point]
-    elif isinstance(detector_point, torch.Tensor):
-        if detector_point.ndim == 1:
-            detector_points = [detector_point.to(llrnet.device)]
-        else:
-            detector_points = [p.to(llrnet.device) for p in detector_point]
+        batch_size = max(1, int(num_detector_points))
+        min_required = max(1, int(min_detector_points))
+        threshold = float(min_detector_response)
+        max_attempts = max(1, int(max_detector_resample_attempts))
+
+        selected_points = []
+        selected_responses = []
+        attempts = 0
+        while len(selected_points) < min_required:
+            attempts += 1
+            sampled_raw = signal_sampler.sample_detector_points(batch_size)
+            sampled_points = _to_detector_points_list(sampled_raw)
+
+            batch_effective_points = []
+            batch_effective_responses = []
+
+            for p in sampled_points:
+                resp_scalar = _extract_response_scalar(
+                    signal_surrogate_func(opt_point=p, event_params=true_event)
+                )
+                if np.isfinite(resp_scalar) and resp_scalar >= threshold:
+                    batch_effective_points.append(p)
+                    batch_effective_responses.append(resp_scalar)
+
+            if batch_effective_points:
+                remaining_needed = min_required - len(selected_points)
+                if len(batch_effective_points) <= remaining_needed:
+                    selected_points.extend(batch_effective_points)
+                    selected_responses.extend(batch_effective_responses)
+                else:
+                    keep_indices = np.random.choice(
+                        len(batch_effective_points),
+                        size=remaining_needed,
+                        replace=False,
+                    )
+                    for keep_idx in keep_indices:
+                        selected_points.append(batch_effective_points[keep_idx])
+                        selected_responses.append(batch_effective_responses[keep_idx])
+
+        # if len(selected_points) < min_required:
+        #     raise RuntimeError(
+        #         f"Unable to find enough detector points meeting response >= {threshold}. "
+        #         f"Found {len(selected_points)} points after {attempts} attempts; "
+        #         f"required at least {min_required}."
+        #     )
+
+        detector_points = selected_points
+        true_detector_responses = selected_responses
     else:
-        detector_points = [torch.tensor(detector_point, device=llrnet.device)]
+        detector_points = _to_detector_points_list(detector_point)
     
-    num_detector_points = len(detector_points)
+    # num_detector_points = len(detector_points)
     
     if true_event.get('azimuth') is not None:
         if true_event['azimuth'] < 0:
             true_event['azimuth'] += 2 * np.pi
+
+    true_zenith, true_azimuth = _event_direction_angles(true_event)
+    opp_zenith, opp_azimuth = _opposite_direction_angles(true_zenith, true_azimuth)
+
     # Get default parameter ranges from sampler if not provided
     if param_ranges is None:
         param_ranges = {}
@@ -5702,18 +6828,16 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                 else:
                     param_ranges[param_name] = (0.0, 1.0)
     
-    # Calculate true detector response for all detector points (fixed for all parameter variations)
-    true_detector_responses = []
-    for det_point in detector_points:
-        response = signal_surrogate_func(
-            opt_point=det_point, 
-            event_params=true_event
-        )
-        # Extract num_photons if using PATD mode, otherwise use the response directly
-        if use_patd and isinstance(response, dict):
-            true_detector_responses.append(response['num_photons'])
-        else:
-            true_detector_responses.append(response)
+    # Calculate true detector response for all detector points (fixed for all parameter variations).
+    # Reuse responses computed during resampling when available.
+    if true_detector_responses is None:
+        true_detector_responses = []
+        for det_point in detector_points:
+            response = signal_surrogate_func(
+                opt_point=det_point,
+                event_params=true_event
+            )
+            true_detector_responses.append(_extract_response_scalar(response))
     
     # Count effective detector points (non-zero response)
     num_effective_detector_points = sum(1 for resp in true_detector_responses if resp != 0.0)
@@ -5867,8 +6991,44 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             if isinstance(true_param_val, torch.Tensor):
                 true_param_val = true_param_val.item() if true_param_val.numel() == 1 else true_param_val[0].item()
         true_nll_val = nll_values[np.argmin(np.abs(param_values - true_param_val))]
-        label_text = f'True value ({num_detector_points} detector point' + ('s' if num_detector_points > 1 else '') + ')'
+        label_text = f'True value'
         ax.axvline(true_param_val, color='r', linestyle='--', linewidth=2, label=label_text)
+        ax.plot(
+            true_param_val,
+            true_nll_val,
+            'r*',
+            markersize=12,
+            markeredgecolor='white',
+            markeredgewidth=1.0,
+            zorder=6,
+        )
+
+        if plot_opposite_direction_true_params and param_name in ('zenith', 'azimuth'):
+            opp_param_val = None
+            if param_name == 'zenith':
+                opp_param_val = opp_zenith
+            elif param_name == 'azimuth':
+                opp_param_val = opp_azimuth
+
+            if opp_param_val is not None and np.isfinite(opp_param_val):
+                if not np.isfinite(true_param_val) or abs(float(opp_param_val) - float(true_param_val)) > 1e-12:
+                    ax.axvline(
+                        opp_param_val,
+                        color='magenta',
+                        linestyle='--',
+                        linewidth=2,
+                        label='Opposite-direction true value',
+                    )
+                    opp_nll_val = nll_values[np.argmin(np.abs(param_values - opp_param_val))]
+                    ax.plot(
+                        opp_param_val,
+                        opp_nll_val,
+                        'm*',
+                        markersize=11,
+                        markeredgecolor='white',
+                        markeredgewidth=1.0,
+                        zorder=6,
+                    )
         
         # Add horizontal lines for contour levels
         for level in contour_levels:
@@ -5878,8 +7038,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         
         ax.set_xlabel(param_name.capitalize(), fontsize=12)
         ax.set_ylabel('Negative Log-Likelihood', fontsize=12)
-        if skip_zero_response and num_effective_detector_points != num_detector_points:
-            title_suffix = f' ({num_effective_detector_points}/{num_detector_points} effective detector points)'
+        title_suffix = f' ({num_effective_detector_points} effective detector points)'
         ax.set_title(f'NLL Landscape: {param_name}{title_suffix}', fontsize=14)
         if param_name == 'energy':
             ax.set_xscale('log')
@@ -5892,7 +7051,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             'true_event': true_event,
             'true_nll': true_nll_val,
             'detector_points': detector_points,
-            'num_detector_points': num_detector_points,
+            'eff_num_detector_points': num_effective_detector_points,
             'param_grid': param_values,
             'nll_grid': nll_values
         }
@@ -6104,6 +7263,38 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             
             ax.plot(true_lon, true_lat, 'r*', markersize=20, 
                    markeredgecolor='white', markeredgewidth=2, label='True values', zorder=5)
+
+            if plot_opposite_direction_true_params:
+                opp_param1_val = true_param1_val
+                opp_param2_val = true_param2_val
+                if param1_name == 'zenith' and opp_zenith is not None:
+                    opp_param1_val = opp_zenith
+                elif param1_name == 'azimuth' and opp_azimuth is not None:
+                    opp_param1_val = opp_azimuth
+                if param2_name == 'zenith' and opp_zenith is not None:
+                    opp_param2_val = opp_zenith
+                elif param2_name == 'azimuth' and opp_azimuth is not None:
+                    opp_param2_val = opp_azimuth
+
+                if np.isfinite(opp_param1_val) and np.isfinite(opp_param2_val):
+                    if param1_name == 'azimuth':
+                        opp_lon = opp_param1_val - np.pi
+                        opp_lat = np.pi/2 - opp_param2_val
+                    else:
+                        opp_lon = opp_param2_val - np.pi
+                        opp_lat = np.pi/2 - opp_param1_val
+
+                    if abs(float(opp_lon) - float(true_lon)) > 1e-12 or abs(float(opp_lat) - float(true_lat)) > 1e-12:
+                        ax.plot(
+                            opp_lon,
+                            opp_lat,
+                            'm*',
+                            markersize=16,
+                            markeredgecolor='white',
+                            markeredgewidth=1.5,
+                            label='Opposite true direction',
+                            zorder=5,
+                        )
             
             # Set custom tick labels in degrees
             # Azimuth: convert from [-π, π] to [0°, 360°]
@@ -6118,10 +7309,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             yticks_deg = [(np.pi/2 - y) * 180 / np.pi for y in yticks_rad]
             ax.set_yticklabels([f'{int(deg)}°' for deg in yticks_deg])
             
-            if skip_zero_response and num_effective_detector_points != num_detector_points:
-                title_suffix = f' ({num_effective_detector_points}/{num_detector_points} effective detector points)'
-            else:
-                title_suffix = f' ({num_detector_points} detector points)'
+            title_suffix = f' ({num_effective_detector_points} effective detector points)'
             ax.set_title(f'NLL Landscape{title_suffix}', fontsize=14)
             ax.legend()
             ax.grid(True, alpha=0.3)
@@ -6177,13 +7365,35 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                 
             ax.plot(true_param1_val, true_param2_val, 'r*', markersize=20, 
                    markeredgecolor='white', markeredgewidth=2, label='True values', zorder=5)
+
+            if plot_opposite_direction_true_params:
+                opp_param1_val = true_param1_val
+                opp_param2_val = true_param2_val
+                if param1_name == 'zenith' and opp_zenith is not None:
+                    opp_param1_val = opp_zenith
+                elif param1_name == 'azimuth' and opp_azimuth is not None:
+                    opp_param1_val = opp_azimuth
+                if param2_name == 'zenith' and opp_zenith is not None:
+                    opp_param2_val = opp_zenith
+                elif param2_name == 'azimuth' and opp_azimuth is not None:
+                    opp_param2_val = opp_azimuth
+
+                if np.isfinite(opp_param1_val) and np.isfinite(opp_param2_val):
+                    if abs(float(opp_param1_val) - float(true_param1_val)) > 1e-12 or abs(float(opp_param2_val) - float(true_param2_val)) > 1e-12:
+                        ax.plot(
+                            opp_param1_val,
+                            opp_param2_val,
+                            'm*',
+                            markersize=16,
+                            markeredgecolor='white',
+                            markeredgewidth=1.5,
+                            label='Opposite true direction',
+                            zorder=5,
+                        )
             
             ax.set_xlabel(param1_name.capitalize(), fontsize=12)
             ax.set_ylabel(param2_name.capitalize(), fontsize=12)
-            if skip_zero_response and num_effective_detector_points != num_detector_points:
-                title_suffix = f' ({num_effective_detector_points}/{num_detector_points} effective detector points)'
-            else:
-                title_suffix = f' ({num_detector_points} detector points)'
+            title_suffix = f' ({num_effective_detector_points} effective detector points)'
             ax.set_title(f'NLL Landscape: {param1_name} vs {param2_name}{title_suffix}', fontsize=14)
             if param1_name == 'energy':
                 ax.set_xscale('log')
@@ -6203,7 +7413,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             'true_nll': true_nll_val,
             'min_nll_params': {param1_name: min_param1_val, param2_name: min_param2_val},
             'detector_points': detector_points,
-            'num_detector_points': num_detector_points,
+            'eff_num_detector_points': num_effective_detector_points,
             'param_grid': (param1_grid, param2_grid),
             'nll_grid': nll_grid
         }

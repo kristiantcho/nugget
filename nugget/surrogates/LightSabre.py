@@ -12,7 +12,8 @@ class LightSabre(Surrogate):
     This model calculates Cherenkov light yield from muon tracks using a physically-motivated
     parametrization that accounts for distance-dependent attenuation and angular effects.
     
-    Reference: https://github.com/PLEnuM-group/neutrino-effective-area
+    Reference: https://github.com/PLEnuM-group/neutrino-effective-area (muons/lightsabre)
+    Reference: https://git.ecap.work/tu98saji/master-thesis-code (electron/cascade)
     """
     
     def __init__(self, device=None, dim=3, domain_size=2, 
@@ -60,6 +61,15 @@ class LightSabre(Surrogate):
         self.end_energy = self.kwargs.get('end_energy', 10) # GeV
         self.med_density = self.kwargs.get('med_density', 0.92) # g/cm^3 (default ice, 1.03 for water)
         self.use_max_energy_dist = self.kwargs.get('use_max_energy_dist', True)
+        self.n0A = self.kwargs.get('n0A', 63894457.33843762) # fit-value from photon_yield-notebook
+        self.particle_mode = self.kwargs.get('particle_mode', 'track') # 'track' or 'cascade'
+        self.scattering_tau = self.kwargs.get('scattering_tau', 0.924) # from ANTARES water measurements, tau =  <cos(theta_sca)>, where theta_sca is the scattering angle
+        self.poisson_rate_cap = float(self.kwargs.get('poisson_rate_cap', 1e8))
+
+    def _sanitize_rate_for_poisson(self, rate):
+        """Ensure Poisson rate is finite and non-negative to avoid CUDA kernel faults."""
+        rate = torch.nan_to_num(rate, nan=0.0, posinf=self.poisson_rate_cap, neginf=0.0)
+        return torch.clamp(rate, min=0.0, max=self.poisson_rate_cap)
     
     def lightsabre_photons_per_m(self, energy):
         """
@@ -104,6 +114,22 @@ class LightSabre(Surrogate):
         
         return total_lightyield
     
+    def lightyield_for_distance_cascade(self, r, rand_e):
+        """calculates photon yield for cascade event with energy rand_e at distance r"""
+        # constants for photon yield function
+        lamda_a = self.kwargs.get('lambda_abs', 44.7) # absorption length in m at 450 nm
+        lamda_e = self.kwargs.get('lambda_sca', 57.4)/(1-self.scattering_tau) # effective scattering length in m, considering isotropic scattering where lambda_s = effective scattering length, 
+        Zeta = np.exp(-lamda_e/lamda_a)
+        lamda_p = np.sqrt(lamda_a*lamda_e/3)/1.07 # characteristic propagation length with correction 1.07
+        lamda_c = lamda_e/(3*Zeta)
+        r_safe = torch.clamp(r, min=1e-6)
+        photon_yield = self.n0A * 1/(4*np.pi) * torch.exp(-r_safe/lamda_p) * 1/(lamda_c * r_safe * torch.tanh(r_safe/lamda_c))
+        photon_yield_resized = photon_yield * rand_e/3e5 # divide by 300TeV = 3e5 GeV
+        photon_yield_resized = torch.nan_to_num(photon_yield_resized, nan=0.0, posinf=self.poisson_rate_cap, neginf=0.0)
+        photon_yield_resized = torch.clamp(photon_yield_resized, min=0.0)
+        
+        return photon_yield_resized
+    
     def get_max_energy_dist(self, energy):
         """
         Calculate the maximum distance at which a given muon with intial energy can still produce detectable light.
@@ -145,7 +171,9 @@ class LightSabre(Surrogate):
             points = points.unsqueeze(0)
         
         # Normalize direction vector
-        track_dir = track_dir / torch.norm(track_dir, dim=-1, keepdim=True)
+        dir_norm = torch.norm(track_dir, dim=-1, keepdim=True).clamp_min(1e-12)
+        track_dir = track_dir / dir_norm
+        track_dir = torch.nan_to_num(track_dir, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Calculate cross product: (p - x0) × d
         diff = points - track_pos.unsqueeze(0)
@@ -183,22 +211,23 @@ class LightSabre(Surrogate):
         l0 = self.lightsabre_photons_per_m(energy)
         
         # Cherenkov angle for ice (n=1.33)
-        theta_c = torch.acos(torch.tensor(1.0/self.refractive_index, device=self.device))
+        theta_c = torch.acos(torch.tensor(1.0/self.refractive_index))
         sin_theta_c = torch.sin(theta_c)
         
-        # Optical parameters for ice
+        # Optical parameters for waterz
         lambda_abs = self.kwargs.get('lambda_abs', 44.7)  # Absorption length in meters
-        lambda_sca = self.kwargs.get('lambda_sca', 57.4)   # Scattering length in meters
+        lambda_sca = self.kwargs.get('lambda_sca', 57.4)/(1-self.scattering_tau)   # Scattering length in meters
         
         # Calculate effective photon propagation length
         lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
         
         # Scattering parameter
-        zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device))
+        zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device)).clamp_min(1e-12)
         lambda_c = lambda_sca / (3.0 * zeta)
         
         # Muon scattering effective length
         lambda_mu = (lambda_c / sin_theta_c**2 * 2.0 / (np.pi * lambda_p))
+        lambda_mu = torch.clamp(lambda_mu, min=1e-12)
         
         # Avoid division by zero
         distance_safe = torch.clamp(distance, min=1e-6)
@@ -209,8 +238,11 @@ class LightSabre(Surrogate):
         
         denominator = (torch.sqrt(lambda_mu * distance_safe) * 
                       torch.tanh(torch.sqrt(distance_safe / lambda_mu)))
+        denominator = torch.clamp(denominator, min=1e-12)
         
         light_yield = numerator / denominator
+        light_yield = torch.nan_to_num(light_yield, nan=0.0, posinf=self.poisson_rate_cap, neginf=0.0)
+        light_yield = torch.clamp(light_yield, min=0.0)
         
         return light_yield
     
@@ -273,11 +305,17 @@ class LightSabre(Surrogate):
             track_energy = track_energy.squeeze()
         
         # Calculate perpendicular distances from track to optical modules
-        distances = self.distance_to_line(om_positions, track_pos, track_dir)
-        
-        # Calculate light yield at each distance
-        light_yield = self.lightyield_for_distance(distances, track_energy)
-        
+        if self.particle_mode == 'track':
+            distances = self.distance_to_line(om_positions, track_pos, track_dir)
+            
+            # Calculate light yield at each distance
+            light_yield = self.lightyield_for_distance(distances, track_energy)
+        else:
+            # For cascade mode, calculate distance from cascade vertex and use cascade light yield
+            distances = torch.norm(om_positions - track_pos.unsqueeze(0), dim=1)
+            light_yield = self.lightyield_for_distance_cascade(distances, track_energy)
+        light_yield = torch.nan_to_num(light_yield, nan=0.0, posinf=self.poisson_rate_cap, neginf=0.0)
+        light_yield = torch.clamp(light_yield, min=0.0)
         return light_yield
     
     def light_yield_surrogate(self, **kwargs):
@@ -382,7 +420,7 @@ class LightSabre(Surrogate):
             om_positions=opt_point
         )
         if self.kwargs.get('use_poisson', False):
-            light_yield = torch.poisson(light_yield)
+            light_yield = torch.poisson(self._sanitize_rate_for_poisson(light_yield))
         
         return light_yield
     
@@ -452,10 +490,11 @@ class LightSabrePATD(LightSabre):
         opt_point = kwargs.get('opt_point', None)
         event_params = kwargs.get('event_params', None)
         max_photons = kwargs.get('max_photons', None)
+        get_patd_probs = kwargs.get('get_patd_probs', False)
         
         c = 0.299792458  # speed of light in m/ns
         v_mu = self.kwargs.get('v_mu', c)
-        num_track_points = self.kwargs.get('num_track_points', 1000)
+        num_track_points = max(int(self.kwargs.get('num_track_points', 1000)), 1)
         cpandel_params = self.kwargs.get('cpandel_params', {})
         
         if event_params is None or opt_point is None:
@@ -564,9 +603,8 @@ class LightSabrePATD(LightSabre):
         lambda_c = lambda_sca / (3.0 * zeta)
         lambda_mu = (lambda_c / sin_theta_c**2 * 2.0 / (np.pi * lambda_p))
         
-        # Avoid division by zero
-        # distances_safe = torch.clamp(distances, min=1e-6)
-        distances_safe = distances
+        # Avoid singularities when detector lies on/very near the sampled track.
+        distances_safe = torch.clamp(distances, min=1e-6)
         # Calculate weights (unnormalized probabilities)
         numerator = (1.0 / (2.0 * np.pi * sin_theta_c))
         numerator = numerator * torch.exp(-distances_safe / lambda_p)
@@ -575,9 +613,16 @@ class LightSabrePATD(LightSabre):
                       torch.tanh(torch.sqrt(distances_safe / lambda_mu)))
         
         weights = numerator / denominator
-        
-        # Normalize weights to create probability distribution
-        weights = weights / torch.sum(weights)
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        weights = torch.clamp(weights, min=0.0)
+
+        # Normalize weights to create probability distribution.
+        # If the formula degenerates numerically, fall back to uniform sampling.
+        weight_sum = torch.sum(weights)
+        if (not torch.isfinite(weight_sum)) or (weight_sum <= 0):
+            weights = torch.full_like(weights, 1.0 / weights.numel())
+        else:
+            weights = weights / weight_sum
         
         # Sample N points along the track according to weights
         # Convert N to int if it's a tensor, otherwise it's already a Python int
@@ -617,7 +662,10 @@ class LightSabrePATD(LightSabre):
         # to avoid creating an N×N matrix
         d_geom_numpy = d_geom.detach().cpu().numpy()
         t_residual_output = cpandel.rvs(d=d_geom_numpy, size=None)
-        
+        t_residual_probs = None
+        if get_patd_probs:
+            t_residual_probs = cpandel.pdf(t_residual_output, d=d_geom_numpy)
+            
         # Handle both torch tensor and numpy array outputs
         if isinstance(t_residual_output, torch.Tensor):
             t_residual = t_residual_output.float().to(self.device)
@@ -629,4 +677,4 @@ class LightSabrePATD(LightSabre):
         
         # need to think of a better return structure here
         
-        return {'hit_times': hit_times, 'num_photons': N, 'expected_photons': expected_N, 'residual_times': t_residual, 'geometric_times': t_geom, 't_geom_min': t_geom_min, 'd_geom': d_geom}
+        return {'hit_times': hit_times, 'num_photons': N, 'expected_photons': expected_N, 'residual_times': t_residual, 'geometric_times': t_geom, 't_geom_min': t_geom_min, 'd_geom': d_geom, 'patd_probs': t_residual_probs}

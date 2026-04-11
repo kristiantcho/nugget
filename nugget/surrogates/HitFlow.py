@@ -10,21 +10,23 @@ import time
 
 class LogTransform(Transform):
     """Log transform for photon arrival times."""
-    
+    def __init__(self, scale_fac=1.0):
+        super().__init__()
+        self.scale_fac = scale_fac
     def forward(self, x, context=None):
         # x > 0
-        y = torch.log10(x) / 5.0
-        # y = log10(x)/5 => dy/dx = 1 / (5 * ln(10) * x)
-        # log|det J| = sum_i [ -log(x_i) - log(5 * ln(10)) ]
-        log_scale = math.log(5.0 * math.log(10.0))
+        y = torch.log10(x) / self.scale_fac
+        # y = log10(x)/scale_fac => dy/dx = 1 / (scale_fac * ln(10) * x)
+        # log|det J| = sum_i [ -log(x_i) - log(scale_fac * ln(10)) ]
+        log_scale = math.log(self.scale_fac * math.log(10.0))
         log_det = -torch.log(x).sum(dim=-1) - x.shape[-1] * log_scale
         return y, log_det
 
     def inverse(self, y, context=None):
-        x = 10 ** (y * 5.0)
-        # dx/dy = 5 * ln(10) * x
-        # log|det J| = sum_i [ log(x_i) + log(5 * ln(10)) ]
-        log_scale = math.log(5.0 * math.log(10.0))
+        x = 10 ** (y * self.scale_fac)
+        # dx/dy = scale_fac * ln(10) * x
+        # log|det J| = sum_i [ log(x_i) + log(scale_fac * ln(10)) ]
+        log_scale = math.log(self.scale_fac * math.log(10.0))
         log_det = torch.log(x).sum(dim=-1) + y.shape[-1] * log_scale
         return x, log_det
 
@@ -75,6 +77,14 @@ class HitFlow(Surrogate):
         self.vary_cylinder = kwargs.get('vary_cylinder', False)
         self.min_domain_size = kwargs.get('min_domain_size', 1000)
         self.max_domain_size = kwargs.get('max_domain_size', 5000)
+        self.scale_fac = kwargs.get('scale_fac', 1.0)
+        self.use_min_hit_time = kwargs.get('use_min_hit_time', True)
+        self.shuffle_training_batches = kwargs.get('shuffle_training_batches', True)
+        self.reduce_lr_on_plateau = kwargs.get('reduce_lr_on_plateau', False)
+        self.lr_scheduler_factor = kwargs.get('lr_scheduler_factor', 0.5)
+        self.lr_scheduler_patience = kwargs.get('lr_scheduler_patience', 30)
+        self.lr_scheduler_threshold = kwargs.get('lr_scheduler_threshold', 1e-4)
+        self.lr_scheduler_min_lr = kwargs.get('lr_scheduler_min_lr', 1e-6)
         
         # Context features don't change with varying cylinder
         self.context_features = kwargs.get('context_features', 11)
@@ -90,7 +100,7 @@ class HitFlow(Surrogate):
         """Build the normalizing flow architecture."""
         base_dist = StandardNormal(shape=[1])
         
-        transforms = [LogTransform()]
+        transforms = [LogTransform(scale_fac=self.scale_fac)]
         
         for _ in range(self.num_layers):
             transforms.append(
@@ -169,9 +179,9 @@ class HitFlow(Surrogate):
         
         # Log of number of hits
         if isinstance(num_hits, torch.Tensor):
-            log_hits = torch.log10(num_hits.float())
+            log_hits = torch.log10(num_hits.float())/4.0
         else:
-            log_hits = torch.log10(torch.tensor(num_hits, dtype=torch.float32, device=self.device))/6.0
+            log_hits = torch.log10(torch.tensor(num_hits, dtype=torch.float32, device=self.device))/4.0
         
         # Build feature list
         feature_list = [energy, x, y, z, v_x, v_y, v_z, d_x, d_y, d_z, log_hits]
@@ -189,7 +199,10 @@ class HitFlow(Surrogate):
         return features
     
     def train_model(self, event_sampler, light_yield_surrogate_func, num_iterations=1000, sampling_timeout=None,
-                    epoch_size=800, batch_size=None, lr=1e-4, min_hits=10, max_hits_per_event=None, save_interval=100, verbose=True, save_path=None,):
+                    epoch_size=800, batch_size=None, lr=1e-4, min_hits=10, max_hits_per_event=None, save_interval=100,
+                    verbose=True, save_path=None, shuffle_training_batches=None, reduce_lr_on_plateau=None,
+                    lr_scheduler_factor=None, lr_scheduler_patience=None, lr_scheduler_threshold=None,
+                    lr_scheduler_min_lr=None):
         """
         Train the HitFlow model on randomly sampled events.
         
@@ -219,15 +232,52 @@ class HitFlow(Surrogate):
         sampling_timeout : int or None
             Maximum attempts to find an event with min_hits
         save_path : str or None
-            Path to save intermediate models (if None, no saving)    
+            Path to save intermediate models (if None, no saving)
+        shuffle_training_batches : bool or None
+            Whether to shuffle concatenated hits/features before mini-batching.
+            If None, uses the model configuration.
+        reduce_lr_on_plateau : bool or None
+            Whether to enable ReduceLROnPlateau on the optimizer.
+            If None, uses the model configuration.
+        lr_scheduler_factor : float or None
+            Multiplicative LR reduction factor for ReduceLROnPlateau.
+        lr_scheduler_patience : int or None
+            Number of epochs with no improvement before reducing LR.
+        lr_scheduler_threshold : float or None
+            Minimum loss improvement treated as progress by the scheduler.
+        lr_scheduler_min_lr : float or None
+            Lower bound for the learning rate when using ReduceLROnPlateau.
         Returns:
         --------
         list
             Training losses
         """
         self.flow.train()
+        if shuffle_training_batches is None:
+            shuffle_training_batches = self.shuffle_training_batches
+        if reduce_lr_on_plateau is None:
+            reduce_lr_on_plateau = self.reduce_lr_on_plateau
+        if lr_scheduler_factor is None:
+            lr_scheduler_factor = self.lr_scheduler_factor
+        if lr_scheduler_patience is None:
+            lr_scheduler_patience = self.lr_scheduler_patience
+        if lr_scheduler_threshold is None:
+            lr_scheduler_threshold = self.lr_scheduler_threshold
+        if lr_scheduler_min_lr is None:
+            lr_scheduler_min_lr = self.lr_scheduler_min_lr
+
         # Initialize optimizer
         self.optimizer = torch.optim.Adam(self.flow.parameters(), lr=lr)
+        scheduler = None
+        if reduce_lr_on_plateau:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=lr_scheduler_factor,
+                patience=lr_scheduler_patience,
+                threshold=lr_scheduler_threshold,
+                min_lr=lr_scheduler_min_lr,
+            )
         
         losses = []
         print("Starting HitFlow training...", flush=True)
@@ -278,7 +328,10 @@ class HitFlow(Surrogate):
                 
                 # Get hit times and shift to start near zero
                 hit_times = patd_dict['hit_times']
-                min_time = torch.min(hit_times)
+                if self.use_min_hit_time:
+                    min_time = torch.min(hit_times)
+                else:
+                    min_time = 0.0
                 if max_hits_per_event is not None and len(hit_times) > max_hits_per_event:
                     # randomly sample max_hits_per_event from hit_times
                     indices = torch.randperm(len(hit_times))[:max_hits_per_event]
@@ -306,6 +359,11 @@ class HitFlow(Surrogate):
             # Step 2: Concatenate all data
             all_hit_times_tensor = torch.cat(all_hit_times, dim=0)
             all_features_tensor = torch.cat(all_features, dim=0)
+
+            if shuffle_training_batches and len(all_hit_times_tensor) > 1:
+                permutation = torch.randperm(len(all_hit_times_tensor), device=all_hit_times_tensor.device)
+                all_hit_times_tensor = all_hit_times_tensor[permutation]
+                all_features_tensor = all_features_tensor[permutation]
             
             # Step 3: Train on batches
             total_loss = 0.0
@@ -371,6 +429,9 @@ class HitFlow(Surrogate):
             if verbose and ((iteration + 1) % save_interval == 0 or iteration == num_iterations - 1):
                 epoch_time = time.time() - epoch_start_time
                 print(f"Iteration {iteration+1}/{num_iterations}, Loss: {loss:.4f}, Time: {epoch_time:.2f}s", flush=True)
+
+            if scheduler is not None:
+                scheduler.step(loss)
                 
             if save_path is not None and ((iteration + 1) % save_interval == 0 or iteration == num_iterations - 1):
                 self.save_model(f"{save_path}")
@@ -419,9 +480,10 @@ class HitFlow(Surrogate):
         num_photons = int(light_yield.item()) if isinstance(light_yield, torch.Tensor) else int(light_yield)
         
         # Convert min_hit_time to tensor
-        if not isinstance(min_hit_time, torch.Tensor):
+        if (not isinstance(min_hit_time, torch.Tensor)) and self.use_min_hit_time:
             min_hit_time = torch.tensor(min_hit_time, dtype=torch.float32, device=self.device)
-        
+        elif not self.use_min_hit_time:
+            min_hit_time = 0.0
         # Ensure opt_point is on the correct device
         if isinstance(opt_point, torch.Tensor):
             opt_point = opt_point.to(self.device).squeeze()
@@ -480,6 +542,8 @@ class HitFlow(Surrogate):
             min_hit_time = torch.tensor(min(hit_times), dtype=torch.float32, device=self.device)
         elif not isinstance(min_hit_time, torch.Tensor):
             min_hit_time = torch.tensor(min_hit_time, dtype=torch.float32, device=self.device)
+        if not self.use_min_hit_time:
+            min_hit_time = 0.0
         
         # Ensure hit_times is on the correct device and has proper shape
         if isinstance(hit_times, torch.Tensor):
@@ -542,7 +606,9 @@ class HitFlow(Surrogate):
             'domain_size': self.domain_size,
             'vary_cylinder': self.vary_cylinder,
             'min_domain_size': self.min_domain_size,
-            'max_domain_size': self.max_domain_size
+            'max_domain_size': self.max_domain_size,
+            'scale_fac': self.scale_fac,
+            'use_min_hit_time': self.use_min_hit_time,
         }, filepath)
         
     def load_model(self, filepath):
@@ -563,6 +629,8 @@ class HitFlow(Surrogate):
         self.tail_bound = checkpoint['tail_bound']
         self.context_features = checkpoint['context_features']
         self.is_trained = checkpoint['is_trained']
+        self.scale_fac = checkpoint.get('scale_fac', 1.0)
+        self.use_min_hit_time = checkpoint.get('use_min_hit_time', True)
         
         # Load cylinder variation parameters if available
         # self.vary_cylinder = checkpoint.get('vary_cylinder', False)

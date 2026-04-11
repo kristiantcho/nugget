@@ -825,9 +825,9 @@ class LLRnet(Surrogate):
                 hit_times = hit_times - hit_times.min()  # Relative times from first hit
             
             if self.log_scale_ly:
-                hit_times_processed = torch.log10(torch.abs(hit_times) + 1e-4).view(-1, 1)
+                hit_times_processed = torch.log10(torch.abs(hit_times) + 1e-4).view(-1, 1)/4
             else:
-                hit_times_processed = hit_times.view(-1, 1)/1e5
+                hit_times_processed = hit_times.view(-1, 1)/1e4
                 
             hit_times_processed = hit_times_processed.sort(dim=0).values  # Sort hit times for better learning
             
@@ -1025,7 +1025,7 @@ class LLRnet(Surrogate):
                 
                 # Apply log scaling if needed
                 if self.log_scale_ly:
-                    responses = torch.log10(torch.abs(responses) + 1e-10)
+                    responses = torch.log10(torch.abs(responses) + 1e-10)/4
                 
                 all_detector_responses.append(responses)  # (n_points,)
             

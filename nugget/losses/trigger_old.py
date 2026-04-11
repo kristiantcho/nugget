@@ -11,20 +11,23 @@ class TriggerLoss(LossFunction):
     
     This loss evaluates detector efficiency by testing whether events will be detected
     given three cascading conditions:
-    1. Individual points must detect sufficient light yield (above threshold)
-    2. Minimum number of points must pass condition 1
-    3. Maximum distance along track for selected points must be below threshold
+    1. t1_i = point_weight_i x sigmoid(light_yield_i - threshold)
+    2. t2_ij = sigmoid(threshold - |point_i - point_j|) for all pairs i != j
+    3. t3 = sigmoid(sum_ij(t2_ij x t1_i x t1_j) - threshold) for unique pairs
     """
     
     def __init__(self, 
                  device=None, 
-                 light_yield_threshold=10.0,
-                 min_triggered_points=5,
-                 max_track_distance=500.0,
-                 light_yield_sigmoid_sharpness=1.0,
-                 distance_sigmoid_sharpness=0.01,
-                 softmax_temperature=10.0,
+                 light_yield_threshold=6.0,
+                 pairwise_distance_threshold=100.0,
+                 min_pairs_threshold=10.0,
+                 t1_temperature=1.0,
+                 t2_temperature=1.0,
+                 t3_temperature=1.0,
+                 t_temperature=1.0,
                  weight_sigmoid_sharpness=1.0,
+                 allow_clusters=False,
+                 min_clusters_size=2,
                  print_loss=False):
         """
         Initialize the trigger loss function.
@@ -34,17 +37,17 @@ class TriggerLoss(LossFunction):
         device : torch.device or None
             Device to use for computations.
         light_yield_threshold : float
-            Minimum light yield threshold for point detection.
-        min_triggered_points : int
-            Minimum number of points that must be triggered (N).
-        max_track_distance : float
-            Maximum distance along track for triggered point spread.
-        light_yield_sigmoid_sharpness : float
-            Sharpness parameter for light yield sigmoid (higher = sharper transition).
-        distance_sigmoid_sharpness : float
-            Sharpness parameter for distance sigmoid (higher = sharper transition).
-        softmax_temperature : float
-            Temperature parameter for softmax (higher = closer to max function).
+            Minimum light yield threshold for point detection (t1).
+        pairwise_distance_threshold : float
+            Maximum pairwise distance threshold (t2).
+        min_pairs_threshold : float
+            Minimum threshold for sum of pair contributions (t3).
+        t1_temperature : float
+            Temperature for t1 sigmoid (higher = sharper transition).
+        t2_temperature : float
+            Temperature for t2 sigmoid (higher = sharper transition).
+        t3_temperature : float
+            Temperature for t3 sigmoid (higher = sharper transition).
         weight_sigmoid_sharpness : float
             Sharpness parameter for string weight sigmoid (higher = sharper transition).
         print_loss : bool
@@ -53,13 +56,16 @@ class TriggerLoss(LossFunction):
         super().__init__(device)
         
         self.light_yield_threshold = light_yield_threshold
-        self.min_triggered_points = min_triggered_points
-        self.max_track_distance = max_track_distance
-        self.light_yield_sigmoid_sharpness = light_yield_sigmoid_sharpness
-        self.distance_sigmoid_sharpness = distance_sigmoid_sharpness
-        self.softmax_temperature = softmax_temperature
+        self.pairwise_distance_threshold = pairwise_distance_threshold
+        self.min_pairs_threshold = min_pairs_threshold
+        self.t1_temperature = t1_temperature
+        self.t2_temperature = t2_temperature
+        self.t3_temperature = t3_temperature
+        self.t_temperature = t_temperature
         self.weight_sigmoid_sharpness = weight_sigmoid_sharpness
         self.print_loss = print_loss
+        self.allow_clusters = allow_clusters
+        self.min_clusters_size = int(min_clusters_size)  # Minimum cluster size if clusters are allowed
     
     def map_string_weights_to_points(self, points_3d, string_xy, string_weights):
         """
@@ -102,49 +108,22 @@ class TriggerLoss(LossFunction):
             # Assign the string's weight to this point
             point_weights[i] = string_weights[closest_string_idx]
         
-        # Apply sigmoid to weights
-        point_weights_sigmoid = torch.sigmoid(point_weights)
+        # Apply sigmoid to weights (not controlled by temperature)
+        point_weights_sigmoid = torch.sigmoid(self.weight_sigmoid_sharpness * point_weights)
         
         return point_weights_sigmoid
     
-    def compute_track_projection(self, points, track_pos, track_dir):
+    def compute_pairwise_distances_along_track(self, points_3d, track_pos, track_dir):
         """
-        Compute projection of points onto the track line.
+        Compute pairwise distances between points along the track direction.
+        
+        This projects all points onto the track line and computes the absolute
+        difference between their projection positions.
         
         Parameters:
         -----------
-        points : torch.Tensor
+        points_3d : torch.Tensor
             Points, shape (n_points, 3)
-        track_pos : torch.Tensor
-            Point on track line, shape (3,)
-        track_dir : torch.Tensor
-            Track direction (normalized), shape (3,)
-            
-        Returns:
-        --------
-        torch.Tensor
-            Projection distances along track, shape (n_points,)
-        """
-        # Normalize direction
-        track_dir = track_dir / torch.norm(track_dir)
-        
-        # Calculate projection: (p - x0) · d
-        diff = points - track_pos.unsqueeze(0)
-        projections = torch.sum(diff * track_dir.unsqueeze(0), dim=1)
-        
-        return projections
-    
-    def max_distance_along_track(self, points, track_pos, track_dir):
-        """
-        Calculate maximum distance between neighboring points along the track line.
-        
-        This computes the projections of all points onto the track, sorts them,
-        and returns the maximum distance between consecutive points.
-        
-        Parameters:
-        -----------
-        points : torch.Tensor
-            Set of points, shape (n_points, 3)
         track_pos : torch.Tensor
             Point on track line, shape (3,)
         track_dir : torch.Tensor
@@ -153,22 +132,155 @@ class TriggerLoss(LossFunction):
         Returns:
         --------
         torch.Tensor
-            Maximum distance along track between consecutive neighboring points
+            Pairwise distances along track, shape (n_points, n_points)
         """
-        projections = self.compute_track_projection(points, track_pos, track_dir)
+        # Normalize direction
+        track_dir = track_dir / torch.norm(track_dir)
         
-        # Sort projections to get ordered positions along track
-        sorted_projections = torch.sort(projections)[0]
+        # Project all points onto the track: (p - x0) · d
+        diff = points_3d - track_pos.unsqueeze(0)
+        projections = torch.sum(diff * track_dir.unsqueeze(0), dim=1)  # Shape: (n_points,)
         
-        # Calculate distances between consecutive points
-        if len(sorted_projections) < 2:
-            return torch.tensor(0.0, device=self.device)
+        # Compute pairwise differences: |proj_i - proj_j|
+        # Using broadcasting: (n, 1) - (1, n) = (n, n)
+        pairwise_distances = torch.abs(projections.unsqueeze(1) - projections.unsqueeze(0))
         
-        consecutive_distances = sorted_projections[1:] - sorted_projections[:-1]
+        return pairwise_distances
+    
+    def compute_trigger_probability_batch_events(self,
+                                                 points_3d,
+                                                 event_params_list,
+                                                 surrogate_func,
+                                                 string_weights=None,
+                                                 precomputed_light_yield=None):
+        """
+        Compute trigger probability for all events in batch using vectorized operations.
         
-        # Return maximum distance between neighbors
-        max_dist = torch.max(consecutive_distances)
-        return max_dist
+        Parameters:
+        -----------
+        points_3d : torch.Tensor
+            Detector points, shape (n_points, 3)
+        event_params_list : list of dict
+            List of event parameters
+        surrogate_func : callable
+            Light yield surrogate function
+        string_weights : torch.Tensor or None
+            Weights for each point (after sigmoid), shape (n_points,)
+        precomputed_light_yield : torch.Tensor or None
+            Precomputed light yields, shape (n_events, n_points)
+            
+        Returns:
+        --------
+        torch.Tensor
+            Trigger probabilities for all events, shape (n_events,)
+        """
+        n_points = len(points_3d)
+        n_events = len(event_params_list)
+        
+        # Step 1: Compute t1 values (light yield condition) for all events
+        if precomputed_light_yield is not None:
+            light_yields = precomputed_light_yield  # Shape: (n_events, n_points)
+        else:
+            # Batch compute light yields for all events
+            light_yields = torch.zeros(n_events, n_points, device=points_3d.device)
+            for i, event_params in enumerate(event_params_list):
+                light_yields[i] = surrogate_func(opt_point=points_3d, event_params=event_params)
+        
+        # Default weights (if not provided, all points have weight 1)
+        if string_weights is None:
+            string_weights = torch.ones(n_points, device=points_3d.device)
+        
+        # t1_i = point_weight_i x sigmoid(light_yield_i - threshold)
+        # Shape: (n_events, n_points)
+        t1_sigmoid = torch.sigmoid(self.t1_temperature * (light_yields - self.light_yield_threshold))
+        t1_values = string_weights.unsqueeze(0) * t1_sigmoid  # Broadcast weights
+        
+        # Extract track parameters for all events
+        track_positions = []
+        track_directions = []
+        
+        for event_params in event_params_list:
+            track_pos = event_params.get('position')
+            zenith = event_params.get('zenith')
+            azimuth = event_params.get('azimuth')
+            
+            # Ensure track_pos is 1D with shape (3,)
+            if isinstance(track_pos, torch.Tensor):
+                track_pos = track_pos.flatten()
+            else:
+                track_pos = torch.tensor(track_pos, device=points_3d.device).flatten()
+            
+            # Convert to direction vector
+            if isinstance(zenith, torch.Tensor):
+                theta = zenith.squeeze()
+                phi = azimuth.squeeze()
+            else:
+                theta = torch.tensor(zenith, device=points_3d.device).squeeze()
+                phi = torch.tensor(azimuth, device=points_3d.device).squeeze()
+            
+            track_dir = torch.stack([
+                torch.sin(theta) * torch.cos(phi),
+                torch.sin(theta) * torch.sin(phi),
+                torch.cos(theta)
+            ])
+            
+            track_positions.append(track_pos)
+            track_directions.append(track_dir)
+        
+        # Stack into batched tensors
+        track_positions = torch.stack(track_positions)  # Shape: (n_events, 3)
+        track_directions = torch.stack(track_directions)  # Shape: (n_events, 3)
+        
+        # Normalize directions
+        track_directions = track_directions / torch.norm(track_directions, dim=1, keepdim=True)
+        
+        # Step 2: Compute t2 matrix (pairwise distance condition along track) for all events
+        # Batch compute projections: (points - track_pos) · track_dir
+        # Shape manipulations: points (n_points, 3) -> (1, n_points, 3)
+        #                     track_pos (n_events, 3) -> (n_events, 1, 3)
+        #                     result: (n_events, n_points, 3)
+        diff = points_3d.unsqueeze(0) - track_positions.unsqueeze(1)  # (n_events, n_points, 3)
+        
+        # Compute dot product with track direction
+        # (n_events, n_points, 3) * (n_events, 1, 3) -> sum over dim=2 -> (n_events, n_points)
+        projections = torch.sum(diff * track_directions.unsqueeze(1), dim=2)
+        
+        # Compute pairwise differences: |proj_i - proj_j| for each event
+        # (n_events, n_points, 1) - (n_events, 1, n_points) = (n_events, n_points, n_points)
+        pairwise_distances = torch.abs(projections.unsqueeze(2) - projections.unsqueeze(1))
+        
+        # Apply sigmoid: sigmoid(threshold - distance)
+        t2_matrix = torch.sigmoid(self.t2_temperature * (self.pairwise_distance_threshold - pairwise_distances))
+        
+        # Set diagonal to 0 (i != j condition) for all events
+        eye_mask = 1 - torch.eye(n_points, device=points_3d.device).unsqueeze(0)  # (1, n_points, n_points)
+        t2_matrix = t2_matrix * eye_mask  # Broadcast to (n_events, n_points, n_points)
+        
+        # Step 3: Compute t3 (overall trigger probability) for all events
+        # Compute t2_ij x t1_i x t1_j for all pairs and all events
+        # t1_outer: (n_events, n_points, 1) * (n_events, 1, n_points) = (n_events, n_points, n_points)
+        t1_outer = t1_values.unsqueeze(2) * t1_values.unsqueeze(1)
+        pair_contributions = t2_matrix * t1_outer  # (n_events, n_points, n_points)
+        
+        # Sum over upper triangle only (to avoid counting pairs twice)
+        upper_triangular_mask = torch.triu(torch.ones(n_points, n_points, device=points_3d.device), diagonal=1)
+        upper_triangular_mask = upper_triangular_mask.unsqueeze(0)  # (1, n_points, n_points)
+        pair_contributions_unique = pair_contributions * upper_triangular_mask
+        
+        if not self.allow_clusters:
+            # Sum all unique pair contributions for each event
+            pair_sums = torch.sum(pair_contributions_unique, dim=2)  # Shape: (n_events, n_points) sum over each points neighbours
+            
+            # Apply final sigmoid for all events
+            t3_values = torch.sigmoid(self.t3_temperature * (pair_sums - self.min_pairs_threshold))
+            
+            # Take softmax weighted sum to see if there exists 1 point with enough neighbours that fulfill the condition
+            t_values = torch.sum(t3_values*torch.softmax(t3_values*self.t_temperature, dim=1), dim=1)
+        else:
+            # If clusters are allowed, we can sum contributions across all points without softmax
+            pair_sums = torch.sum(pair_contributions_unique, dim=(1, 2))  # Shape: (n_events,)
+            t_values = torch.sigmoid(self.t3_temperature * (pair_sums - 2*self.min_pairs_threshold))
+        return t_values  # Shape: (n_events,)
     
     def compute_trigger_probability_single_event(self, 
                                                    points_3d, 
@@ -177,7 +289,7 @@ class TriggerLoss(LossFunction):
                                                    string_weights=None,
                                                    precomputed_light_yield=None):
         """
-        Compute trigger probability for a single event.
+        Compute trigger probability for a single event using three-step process.
         
         Parameters:
         -----------
@@ -188,122 +300,228 @@ class TriggerLoss(LossFunction):
         surrogate_func : callable
             Light yield surrogate function
         string_weights : torch.Tensor or None
-            Weights for each point, shape (n_points,)
+            Weights for each point (after sigmoid), shape (n_points,)
         precomputed_light_yield : torch.Tensor or None
             Precomputed light yields, shape (n_points,)
             
         Returns:
         --------
         dict
-            Contains 'weighted_sum' (for loss), 'max_prob' (for efficiency), 
-            't1_values', 't2_values', 't3_values'
+            Contains 't3' (trigger probability for this event), 't1_values', 't2_matrix', 'pair_sum'
         """
         n_points = len(points_3d)
-        time_start = time.time()
-        print("starting trigger computation...", flush=True)
-        # Step 1: Compute light yield condition (t1 values)
+        # time_start = time.time()
+        # print("starting trigger computation...", flush=True)
+        
+        # Step 1: Compute t1 values (light yield condition)
         if precomputed_light_yield is not None:
             light_yields = precomputed_light_yield
         else:
-            light_yields = surrogate_func(opt_point = points_3d, event_params=event_params)
-        print(f"Light yield computation time: {time.time() - time_start:.4f} s", flush=True)
-        time_start = time.time()
-        # Sigmoid of (light_yield - threshold)
-        t1 = torch.sigmoid(self.light_yield_sigmoid_sharpness * (light_yields - self.light_yield_threshold))
+            light_yields = surrogate_func(opt_point=points_3d, event_params=event_params)
         
-        # Default weights
+        # print(f"Light yield computation time: {time.time() - time_start:.4f} s", flush=True)
+        # time_start = time.time()
+        
+        # Default weights (if not provided, all points have weight 1)
         if string_weights is None:
-            string_weights = torch.ones(n_points, device=self.device)
+            string_weights = torch.ones(n_points, device=points_3d.device)
         
-        # Step 2: Compute all combinations of N points
-        N = self.min_triggered_points
+        # t1_i = point_weight_i x sigmoid(light_yield_i - threshold)
+        t1_sigmoid = torch.sigmoid(self.t1_temperature * (light_yields - self.light_yield_threshold))
+        t1_values = string_weights * t1_sigmoid
         
-        if N > n_points:
-            # Not enough points to trigger
-            return {
-                'weighted_sum': torch.tensor(0.0, device=self.device),
-                'max_prob': torch.tensor(0.0, device=self.device),
-                't1_values': t1,
-                't2_values': torch.tensor([], device=self.device),
-                't3_values': torch.tensor([], device=self.device)
-            }
+        # print(f"T1 computation time: {time.time() - time_start:.4f} s", flush=True)
+        # time_start = time.time()
         
-        # Generate all combinations of N points
-        point_indices = list(range(n_points))
-        all_combinations = list(combinations(point_indices, N))
-        n_combinations = len(all_combinations)
-        print(f'Number of combinations: {n_combinations}', flush=True)
-        # Calculate t2 values (weighted average of t1 for each combination)
-        print(f"T1 generation time: {time.time() - time_start:.4f} s", flush=True)
-        time_start = time.time()
-        t2_values = torch.zeros(n_combinations, device=self.device)
-        for i, combo in enumerate(all_combinations):
-            combo_indices = torch.tensor(combo, device=self.device)
-            combo_t1 = t1[combo_indices]
-            combo_weights = string_weights[combo_indices]
-            
-            # Weighted average
-            t2_values[i] = torch.sum(combo_t1 * combo_weights) / N
-        
-        # Step 3: Compute track distance condition (t3 values)
         # Extract track parameters
         track_pos = event_params.get('position')
         zenith = event_params.get('zenith')
         azimuth = event_params.get('azimuth')
+        
+        # Ensure track_pos is 1D with shape (3,)
+        if isinstance(track_pos, torch.Tensor):
+            track_pos = track_pos.flatten()
+        else:
+            track_pos = torch.tensor(track_pos, device=points_3d.device).flatten()
         
         # Convert to direction vector
         if isinstance(zenith, torch.Tensor):
             theta = zenith.squeeze()
             phi = azimuth.squeeze()
         else:
-            theta = torch.tensor(zenith, device=self.device).squeeze()
-            phi = torch.tensor(azimuth, device=self.device).squeeze()
+            theta = torch.tensor(zenith, device=points_3d.device).squeeze()
+            phi = torch.tensor(azimuth, device=points_3d.device).squeeze()
         
         track_dir = torch.stack([
             torch.sin(theta) * torch.cos(phi),
             torch.sin(theta) * torch.sin(phi),
             torch.cos(theta)
         ])
-        print(f"T2 generation time: {time.time() - time_start:.4f} s", flush=True)
-        time_start = time.time()
-        # Calculate t3 values
-        t3_values = torch.zeros(n_combinations, device=self.device)
-        for i, combo in enumerate(all_combinations):
-            combo_indices = torch.tensor(combo, device=self.device)
-            combo_points = points_3d[combo_indices]
-            
-            # Maximum distance along track
-            max_dist = self.max_distance_along_track(combo_points, track_pos, track_dir)
-            
-            # Sigmoid of (threshold - max_distance)
-            distance_sigmoid = torch.sigmoid(
-                self.distance_sigmoid_sharpness * (self.max_track_distance - max_dist)
-            )
-            
-            # Multiply with t2
-            t3_values[i] = t2_values[i] * distance_sigmoid
-        print(f"T3 generation time: {time.time() - time_start:.4f} s", flush=True)
-        # Calculate maximum (for efficiency)
-        max_prob = torch.max(t3_values) if len(t3_values) > 0 else torch.tensor(0.0, device=self.device)
         
-        # Calculate softmax weighted sum (for loss)
-        if len(t3_values) > 0:
-            softmax_weights = torch.softmax(self.softmax_temperature * t3_values, dim=0)
-            weighted_sum = torch.sum(softmax_weights * t3_values)
+        # Step 2: Compute t2 matrix (pairwise distance condition along track)
+        # t2_ij = sigmoid(threshold - |point_i - point_j|_track) where i != j
+        pairwise_distances = self.compute_pairwise_distances_along_track(points_3d, track_pos, track_dir)
+        
+        # Apply sigmoid: sigmoid(threshold - distance)
+        t2_matrix = torch.sigmoid(self.t2_temperature * (self.pairwise_distance_threshold - pairwise_distances))
+        
+        # Set diagonal to 0 (i != j condition)
+        t2_matrix = t2_matrix * (1 - torch.eye(n_points, device=points_3d.device))
+        
+        # print(f"T2 computation time: {time.time() - time_start:.4f} s", flush=True)
+        # time_start = time.time()
+        
+        # Step 3: Compute t3 (overall trigger probability)
+        # t3 = sigmoid(sum_ij(t2_ij x t1_i x t1_j) - threshold)
+        # where i != j and pairs are not repeated
+        
+        # Compute t2_ij x t1_i x t1_j for all pairs
+        # Using broadcasting: t1_i (n,1) * t1_j (1,n) * t2_ij (n,n)
+        t1_outer = t1_values.unsqueeze(1) * t1_values.unsqueeze(0)  # (n, n)
+        pair_contributions = t2_matrix * t1_outer  # (n, n)
+        
+        # Sum over upper triangle only (to avoid counting pairs twice)
+        # Create upper triangular mask (excluding diagonal)
+        upper_triangular_mask = torch.triu(torch.ones(n_points, n_points, device=points_3d.device), diagonal=1)
+        pair_contributions_unique = pair_contributions * upper_triangular_mask
+        if not self.allow_clusters:
+            # Sum all unique pair contributions
+            pair_sum = torch.sum(pair_contributions_unique, dim=1)  # Shape: (n_points,) sum over each points neighbours
+            
+            # Apply final sigmoid
+            t3 = torch.sigmoid(self.t3_temperature * (pair_sum - self.min_pairs_threshold))
+            
+            # print(f"T3 computation time: {time.time() - time_start:.4f} s", flush=True)
+            t_values = torch.sum(t3*torch.softmax(t3*self.t_temperature))
         else:
-            weighted_sum = torch.tensor(0.0, device=self.device)
-        
+            # If clusters are allowed, we can sum contributions across all points without softmax
+            pair_sum = torch.sum(pair_contributions_unique)  # Shape: scalar
+            t3 = torch.sigmoid(self.t3_temperature * (pair_sum - 2*self.min_pairs_threshold)) # 2* because of double counting pairs in this case
+            t_values = t3
         return {
-            'weighted_sum': weighted_sum,
-            'max_prob': max_prob,
-            't1_values': t1,
-            't2_values': t2_values,
-            't3_values': t3_values
+            't3_values': t3,
+            't1_values': t1_values,
+            't2_values': t2_matrix,
+            't_values': t_values
         }
+    
+    def compute_trigger_probability_single_event_alt(
+        self,
+        points_3d,
+        event_params,
+        surrogate_func,
+        string_weights=None,
+        precomputed_light_yield=None,
+                                    ):
+        """
+        Chain-based trigger:
+        checks for existence of a chain of k causally connected points.
+        """
+
+        n_points = len(points_3d)
+        k = int(self.min_pairs_threshold)
+
+        # -------------------------
+        # Step 1: t1 (same as before)
+        # -------------------------
+        if precomputed_light_yield is not None:
+            light_yields = precomputed_light_yield
+        else:
+            light_yields = surrogate_func(opt_point=points_3d, event_params=event_params)
+
+        if string_weights is None:
+            string_weights = torch.ones(n_points, device=points_3d.device)
+
+        t1 = string_weights * torch.sigmoid(
+            self.t1_temperature * (light_yields - self.light_yield_threshold)
+        )
+
+        # -------------------------
+        # Step 2: t2 (same as before)
+        # -------------------------
+        track_pos = event_params["position"]
+        zenith = event_params["zenith"]
+        azimuth = event_params["azimuth"]
+
+        if not isinstance(track_pos, torch.Tensor):
+            track_pos = torch.tensor(track_pos, device=points_3d.device)
+
+        theta = zenith if isinstance(zenith, torch.Tensor) else torch.tensor(zenith, device=points_3d.device)
+        phi   = azimuth if isinstance(azimuth, torch.Tensor) else torch.tensor(azimuth, device=points_3d.device)
+
+        track_dir = torch.stack([
+            torch.sin(theta) * torch.cos(phi),
+            torch.sin(theta) * torch.sin(phi),
+            torch.cos(theta),
+        ])
+        track_dir = track_dir / torch.norm(track_dir)
+
+        pairwise_distances = self.compute_pairwise_distances_along_track(
+            points_3d, track_pos, track_dir
+        )
+
+        t2 = torch.sigmoid(
+            self.t2_temperature * (self.pairwise_distance_threshold - pairwise_distances)
+        )
+        
+        direction_mask, ds = self.directional_cut_along_track(points_3d, track_pos, track_dir)
+        t2 = t2 * direction_mask # only allow connections in the correct direction along the track
+
+        # no self-edges
+        t2 = t2 * (1 - torch.eye(n_points, device=points_3d.device))
+
+        # -------------------------
+        # Step 3: chain DP
+        # -------------------------
+        # dp[j] = total weight of all chains ending at j
+        dp = t1.clone()  # chains of length 1
+
+        for _ in range(k - 1):
+            # message passing: dp_new[j] = t1[j] * sum_i dp[i] * t2[i,j]
+            dp = t1 * (dp @ t2)
+
+        # dp[j] now measures "how many k-chains end at j"
+        chain_strength = dp
+
+        # -------------------------
+        # Step 4: trigger aggregation
+        # -------------------------
+        t3_values = torch.sigmoid(
+            self.t3_temperature * (chain_strength - self.min_pairs_threshold)
+        )
+
+        # "exists at least one chain"
+        t_values = torch.sum(
+            t3_values * torch.softmax(t3_values * self.t_temperature, dim=0)
+        )
+
+        return {
+            "t3_values": t3_values,   # per-point chain strength
+            "t1_values": t1,
+            "t2_values": t2,
+            "t_values": t_values,
+        }
+        
+    def directional_cut_along_track(self, points_3d, track_pos, track_dir):
+        """
+        points_3d: (N, 3)
+        track_pos: (3,)
+        track_dir: (3,), normalized
+        """
+
+        # scalar projection along track
+        s = (points_3d - track_pos) @ track_dir  # (N,)
+
+        # s_j - s_i > 0
+        ds = s[None, :] - s[:, None]              # (N, N)
+
+        return (ds > 0).float(), ds
+
+  
     
     def __call__(self, geom_dict, **kwargs):
         """
-        Compute trigger loss for detector geometry.
+        Compute trigger loss for detector geometry (batched version).
         
         Parameters:
         -----------
@@ -344,9 +562,7 @@ class TriggerLoss(LossFunction):
         # Map string weights to point weights if string_xy is provided
         point_weights = None
         if string_weights is not None:
-            if string_xy is not None:
-                # If string_weights is provided without string_xy, assume it's already per-point
-                # and apply sigmoid
+            if string_xy is None:
                 # Get unique xy coordinates in order of first appearance
                 seen = set()
                 unique_indices = []
@@ -360,45 +576,33 @@ class TriggerLoss(LossFunction):
             
             point_weights = self.map_string_weights_to_points(points_3d, string_xy, string_weights)
         
-        n_events = len(event_params_list)
+        # Batch compute trigger probabilities for all events
+        if precomputed_light_yield is None:
+            precomputed_light_yield = torch.zeros((len(event_params_list), len(points_3d)), device=self.device)
+            for i, event_params in enumerate(event_params_list):
+                precomputed_light_yield[i] = surrogate_func(opt_point=points_3d, event_params=event_params)
         
-        # Process each event
-        total_weighted_sum = torch.tensor(0.0, device=self.device)
-        total_max_prob = torch.tensor(0.0, device=self.device)
+        t_values = self.compute_trigger_probability_batch_events(
+            points_3d=points_3d,
+            event_params_list=event_params_list,
+            surrogate_func=surrogate_func,
+            string_weights=point_weights,
+            precomputed_light_yield=precomputed_light_yield
+        )
         
-        for i, event_params in enumerate(event_params_list):
-            # Get precomputed light yield for this event if available
-            event_light_yield = None
-            if precomputed_light_yield is not None:
-                event_light_yield = precomputed_light_yield[i]
-            
-            result = self.compute_trigger_probability_single_event(
-                points_3d=points_3d,
-                event_params=event_params,
-                surrogate_func=surrogate_func,
-                string_weights=point_weights,  # Use mapped point weights
-                precomputed_light_yield=event_light_yield
-            )
-            
-            total_weighted_sum += result['weighted_sum']
-            total_max_prob += result['max_prob']
+        # Calculate detector efficiency: mean of t3 values
+        detector_efficiency = torch.mean(t_values)
         
-        # Calculate detector efficiency (using max)
-        detector_efficiency = total_max_prob / n_events
+        # Calculate loss: 1 - detector efficiency
+        trigger_loss = 1.0 - detector_efficiency
         
-        # Calculate loss (using softmax weighted sum)
-        trigger_loss = (n_events - total_weighted_sum) / n_events
-  
-        
-        # if self.print_loss:
-        #     print(f"Trigger Loss: {trigger_loss.item():.6f}")
-        #     print(f"Detector Efficiency: {detector_efficiency.item():.6f}")
-        #     print(f"Total Weighted Sum: {total_weighted_sum.item():.6f}")
-        #     print(f"Total Max Prob: {total_max_prob.item():.6f}")
+        if self.print_loss:
+            print(f"Trigger Loss: {trigger_loss.item():.6f}")
+            print(f"Detector Efficiency: {detector_efficiency.item():.6f}")
+            print(f"Mean T3: {detector_efficiency.item():.6f}")
         
         return {
             'trigger_loss': trigger_loss,
             'detector_efficiency': detector_efficiency,
-            'total_weighted_sum': total_weighted_sum,
-            'total_max_prob': total_max_prob
+            't_per_event': t_values
         }

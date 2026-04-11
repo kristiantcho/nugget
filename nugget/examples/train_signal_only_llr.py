@@ -1,20 +1,23 @@
-import torch
-import numpy as np
 import nugget  # Main NUGGET package for neutrino detector optimization
-import matplotlib.pyplot as plt
-import importlib
-import pickle
-import os
+import pickle 
 
-lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=2500)
+lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=1600, particle_mode='cascade')
 light_yield_surrogate = lightsabre.light_yield_surrogate
-signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(event_type='signal', domain_size=2500, E_min=1e2, E_max=1e8, energy_dist='log_uniform', find_exact_intersection=True)
+signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+            event_type='signal', 
+            domain_size=2000, 
+            E_min=1e2, 
+            E_max=1e8, 
+            energy_dist='log_uniform', 
+            find_exact_intersection=False, 
+            random_position_along_ray=True
+            )
 
 
 llr_net = nugget.surrogates.LLRnet.LLRnet(
-    domain_size=2500,  # Size of the detector domain
+    domain_size=2000,  # Size of the detector domain
     dim=3,  # 3D spatial coordinates
-    hidden_dims=[64, 64, 64, 64],  # Neural network architecture
+    hidden_dims=[64, 64, 64, 64, 64, 64],  # Neural network architecture
     use_fourier_features=False,  # Use Fourier features for better spatial encoding
     num_parallel_branches=1,  # Multiple branches for ensemble learning
     frequency_scales=[0.1, 0.4],  # Different frequency scales for fourier features
@@ -33,7 +36,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     add_distance_from_beam=False,  # Whether to include distance from beam as a feature
     reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
     lr_scheduler_patience=35,  # Patience for LR scheduler
-)
+    )
 
 train_dataloader = llr_net.create_signal_only_dataloader(
     signal_sampler=signal_sampler, 
@@ -45,19 +48,20 @@ train_dataloader = llr_net.create_signal_only_dataloader(
     shuffle=True,
     samples_per_event = 1,
     min_light_yield=0.1,         
-    max_resample_attempts=20,
-    vary_cylinder=True,
-    cylinder_sampler=nugget.samplers.cyl_sampler.CylinderSampler
-)
+    max_resample_attempts=30,
+    vary_cylinder=False,
+    # cylinder_sampler=nugget.samplers.cyl_sampler.CylinderSampler
+    )
 
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     # val_dataloader=val_dataloader,
-    epochs=700,  # Maximum number of training epochs
+    epochs=1000,  # Maximum number of training epochs
     # early_stopping_patience=30  # Stop if validation doesn't improve for 50 epochs
-)
+    )
+
 # Save the best model for later use
-llr_net.save_model('best_charge_llr_model_v2')
+llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('charge_llr_v2_training_history.pkl', 'wb'))
+pickle.dump(history, open('cascade_charge_llr_v1_training_history.pkl', 'wb'))
