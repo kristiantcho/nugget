@@ -2,50 +2,53 @@ import nugget  # Main NUGGET package for neutrino detector optimization
 import pickle
 import torch
 import numpy as np
-import os
-from nugget.losses.effective_area import get_bounding_cylinder
+# import os
+# from nugget.losses.effective_area import get_bounding_cylinder
 
-device = 'cuda:1'
-version = 'r600_50_1'
+device = 'cuda:3'
+num_events = 100000
+version = 'r600_50_5'
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
 center = [0,0,0]
 radius = 600
 height = 1000
-lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=2500)
+lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=1600)
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     device=None, 
                                                     event_type='signal', 
-                                                    domain_size=2500, 
+                                                    domain_size=1600, 
                                                     E_min=1e2, 
                                                     E_max=1e8, 
-                                                    find_exact_intersection=True,  
+                                                    find_exact_intersection=False,
+                                                    random_position_along_ray=True,  
                                                     energy_dist='log_uniform',
                                                     cylinder_center=center,
                                                     cylinder_radius=radius,
                                                     cylinder_height=height,
                                                     # point_towards_center=True,
-                                                    # cos_range=torch.tensor((np.cos(np.pi/2),np.cos(np.pi/2)))
+                                                    # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                     )
-signal_events = signal_sampler.sample_events(10000)
-    # signal_events = pickle.load(open('/u/kristiantcho/ptmp/nugget/nugget/examples/res_test/signal_events_10000_r800_1.pkl', 'rb'))
+signal_events = signal_sampler.sample_events(num_events)
+# signal_events = pickle.load(open(f'/u/kristiantcho/ptmp/nugget/nugget/examples/res_test/signal_events_{num_events}_{version}.pkl', 'rb'))
     # for event in signal_events:
     #     event['position'] = torch.tensor([0.0,0.0,0.0], device=device)  # Center events for testing
-events_file_name = f'res_test/signal_events_10000_{version}'
+events_file_name = f'res_test/signal_events_{num_events}_{version}'
 pickle.dump(signal_events, open(events_file_name +'.pkl', 'wb'))
 for i, signal_event in enumerate(signal_events):
     for key, value in signal_event.items():
         if isinstance(value, torch.Tensor):
             signal_events[i][key] = value.to(device)
-for geom_name in ['compact', 'default', 'expanded', 'modified', 'large', '102geom', '160geom', '600hexagon', '800main']:
+# for geom_name in ['800main']:
+for geom_name in ['800main_full_hex', '340grid']:
     print(f"Running fisher info calculations for geometry: {geom_name}")
-    if geom_name != '800main':
-        n_strings = 70
-        domain_size = 1200
-    else:
-        n_strings = 1000
-        domain_size = 1600
+    # if geom_name != '800main':
+    #     n_strings = 70
+    #     domain_size = 1200
+    # else:
+    n_strings = 1027 # number of strings for a complete hexagon with 18 rings
+    domain_size = 1600
     geometry = nugget.geometries.EvanescentString.EvanescentString(
         device=device,
     # geometry = nugget.geometries.SpaceString.SpaceString(
@@ -61,9 +64,9 @@ for geom_name in ['compact', 'default', 'expanded', 'modified', 'large', '102geo
         # custom_string_spacing=0.09  # Custom spacing between strings
         # starting_spacing=0.05
     )
-    if geom_name != '800main' and geom_name != '600hexagon':
+    if geom_name == '340grid':
         geom_dict = geometry.initialize_points(
-            {"string_xy": np.load(f'/u/kristiantcho/ptmp/other/{geom_name}_xy.npy')}
+            {"string_xy": np.load(f'/u/kristiantcho/ptmp/nugget/nugget/other/{geom_name}_xy.npy')}
         )
     else:
         geom_dict = geometry.initialize_points()
@@ -106,7 +109,8 @@ for geom_name in ['compact', 'default', 'expanded', 'modified', 'large', '102geo
         lr_scheduler_patience=35,  # Patience for LR scheduler
     )
 
-    llr_net.load_model('best_charge_llr_model_v2')
+    llr_net.load_model('best_charge_llr_model_v4')
+    # llr_net.load_model('best_cascade_charge_llr_model_v1')
 
 
     # for i in range(9):
@@ -127,7 +131,7 @@ for geom_name in ['compact', 'default', 'expanded', 'modified', 'large', '102geo
                 skip_zero_response=True,
                 verbose=True,
                 jacrev_chunk_size=50000,
-                point_chunk_size=7000,
+                point_chunk_size=11000,
                 grad_chunk_size=7,
                 llr_autodiff_mode='jvp'
                 )
@@ -141,8 +145,8 @@ for geom_name in ['compact', 'default', 'expanded', 'modified', 'large', '102geo
 
 
     
-    torch.save(fisher_info_per_string_per_event.cpu(), f'res_test/fisher_info_per_string_per_event_10000_{geom_name}_{version}.pt')
-    torch.save(precomputed_ly.cpu(), f'res_test/light_yield_per_string_10000_{geom_name}_{version}.pt')
+    torch.save(fisher_info_per_string_per_event.cpu(), f'res_test/fisher_info_per_string_per_event_{num_events}_{geom_name}_{version}.pt')
+    torch.save(precomputed_ly.cpu(), f'res_test/light_yield_per_string_{num_events}_{geom_name}_{version}.pt')
 
 
 # loss_params = {

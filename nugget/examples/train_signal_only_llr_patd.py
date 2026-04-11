@@ -4,15 +4,34 @@ import os
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
-light_yield_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(use_poisson=True, num_track_points=1000, domain_size=2500, use_max_energy_dist=True).light_yield_surrogate
-signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(event_type='signal', domain_size=2500, E_min=1e2, E_max=1e8, energy_dist='log_uniform', find_exact_intersection=True)
+
+device = None
+
+light_yield_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
+        device=device,
+        use_poisson=True, 
+        num_track_points=1000, 
+        domain_size=2500, 
+        use_max_energy_dist=True
+        ).light_yield_surrogate
+
+signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+        device=device,
+        event_type='signal', 
+        domain_size=2500, 
+        E_min=1e2, 
+        E_max=1e8, 
+        energy_dist='log_uniform', 
+        find_exact_intersection=True,
+        random_position_along_ray=True,
+        )
 
 
 llr_net = nugget.surrogates.LLRnet.LLRnet(
-    device='cuda:1',
+    device=device,
     domain_size=2500,  # Size of the detector domain
     dim=3,  # 3D spatial coordinates
-    hidden_dims=[64, 64, 64, 64, 64],  # Neural network architecture
+    hidden_dims=[64, 64, 64, 64, 64, 64, 64],  # Neural network architecture
     use_fourier_features=False,  # Use Fourier features for better spatial encoding
     num_parallel_branches=1,  # Multiple branches for ensemble learning
     frequency_scales=[0.1, 0.4],  # Different frequency scales for fourier features
@@ -23,7 +42,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     shared_mlp=False,  # Independent MLPs for each branch
     use_residual_connections=True,  # Skip connections for better training
     signal_noise_scale=0,  # Noise level for signal events
-    background_noise_scale=0.2,  # Noise level for background events
+    background_noise_scale=0,  # Noise level for background events
     add_relative_pos=False,  # Whether to include relative position features
     log_scale_ly=True,  # Whether to log-scale the light yield inputs
     norm_pos=True,  # Whether to normalize position inputs
@@ -32,8 +51,8 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
     lr_scheduler_patience=35,  # Patience for LR scheduler
     use_patd=True,
-    min_photons=5,  # Minimum number of photons to consider an event valid
-    num_photons_per_sample=1000,  # Number of photons to sample from each valid event
+    min_photons=1,  # Minimum number of photons to consider an event valid
+    num_photons_per_sample=None,  # Number of photons to sample from each valid event
     input_charge=False,
     rel_time=True,
 )
@@ -45,7 +64,7 @@ train_dataloader = llr_net.create_patd_dataloader(
     signal_surrogate_func=light_yield_surrogate,
     num_samples_per_epoch=3000,
     batch_size=300,       # Size of each batch (N pairs)
-    num_workers=4,
+    num_workers=8,
     event_labels=['position','energy', 'direction'],
     # shuffle=False,
     shuffle_photons=True,

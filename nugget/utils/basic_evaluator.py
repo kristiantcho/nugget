@@ -76,6 +76,7 @@ class Evaluator:
         self.geom_dict = self.geometry.initialize_points(initial_geometry=geom_dict)
 
         losses: Dict[str, float] = {}
+        deferred_messages = []
 
         with torch.no_grad():
             for loss_name, loss_func in loss_func_dict.items():
@@ -84,7 +85,7 @@ class Evaluator:
                 vis_kwargs.update(extra)
 
                 if loss_value is None:
-                    print(f"Warning: {loss_name} did not return a valid loss value.")
+                    deferred_messages.append(f"Warning: {loss_name} did not return a valid loss value.")
                     continue
 
                 losses[loss_name] = float(loss_value.detach().cpu().item())
@@ -106,6 +107,9 @@ class Evaluator:
         if self.visualizer is not None and visualize:
             vis_kwargs.update({"make_gif": bool(make_gif)})
             self.visualizer.visualize_progress(**vis_kwargs)
+
+        for msg in deferred_messages:
+            print(msg, flush=True)
             
         if print_result:
             if len(losses) == 0:
@@ -182,12 +186,15 @@ class Evaluator:
         if loss_params_dicts:
             ids = [id(v) for v in loss_params_dicts.values() if isinstance(v, dict)]
             if len(ids) != len(set(ids)):
-                print(
+                shared_dict_warning = (
                     "Warning: loss_params_dicts reuses the same dict object across geometries. "
                     "Make a per-geometry copy (e.g. dict(loss_params) or copy.deepcopy(loss_params)) "
-                    "to avoid applying the wrong precomputed inputs.",
-                    flush=True,
+                    "to avoid applying the wrong precomputed inputs."
                 )
+            else:
+                shared_dict_warning = None
+        else:
+            shared_dict_warning = None
 
         # Enforce that plot_types are shared across geometries (user-requested).
         shared_plot_types = vis_kwargs.get("plot_types", None)
@@ -212,6 +219,7 @@ class Evaluator:
 
         results: Dict[str, Any] = {}
         multi_vis_payload: Dict[str, Dict[str, Any]] = {}
+        deferred_messages = []
 
         for geom_name, geom_dict in geom_dicts.items():
             if loss_func_dicts is not None:
@@ -239,7 +247,9 @@ class Evaluator:
                     per_vis_kwargs.update(extra)
 
                     if loss_value is None:
-                        print(f"Warning: {geom_name}.{loss_name} did not return a valid loss value.")
+                        deferred_messages.append(
+                            f"Warning: {geom_name}.{loss_name} did not return a valid loss value."
+                        )
                         continue
 
                     losses[loss_name] = float(loss_value.detach().cpu().item())
@@ -264,17 +274,26 @@ class Evaluator:
 
             if print_result:
                 if len(losses) == 0:
-                    print(f"Eval[{geom_name}] | No valid losses returned.", flush=True)
+                    deferred_messages.append(f"Eval[{geom_name}] | No valid losses returned.")
                 else:
                     loss_str = " | ".join([f"{k}: {v:.6g}" for k, v in losses.items()])
-                    print(f"Eval[{geom_name}] | {loss_str}", flush=True)
+                    deferred_messages.append(f"Eval[{geom_name}] | {loss_str}")
 
         if self.visualizer is not None and visualize:
             if hasattr(self.visualizer, "visualize_multi_progress"):
+                multi_progress_kwargs: Dict[str, Any] = {}
+                for key in ("iteration", "slice_res", "multi_slice", "loss_type", "ratio_baseline_geometry"):
+                    if key in vis_kwargs:
+                        multi_progress_kwargs[key] = vis_kwargs[key]
+                for key in ("iteration", "slice_res", "multi_slice", "loss_type", "ratio_baseline_geometry"):
+                    if key in kwargs:
+                        multi_progress_kwargs[key] = kwargs[key]
+
                 self.visualizer.visualize_multi_progress(
                     geom_vis_kwargs=multi_vis_payload,
                     plot_types=shared_plot_types,
                     make_gif=bool(make_gif),
+                    **multi_progress_kwargs,
                 )
             else:
                 # Fallback: render each geometry separately.
@@ -282,5 +301,10 @@ class Evaluator:
                     per_vis_kwargs = dict(per_vis_kwargs)
                     per_vis_kwargs.setdefault("title", geom_name)
                     self.visualizer.visualize_progress(**per_vis_kwargs)
+
+        if shared_dict_warning is not None:
+            print(shared_dict_warning, flush=True)
+        for msg in deferred_messages:
+            print(msg, flush=True)
 
         return results

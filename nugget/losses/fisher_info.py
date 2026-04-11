@@ -7,6 +7,7 @@ import math
 import random
 import pickle
 import gc
+import os
 from torch.func import jacrev, jvp, vmap, linearize
 
 
@@ -41,6 +42,18 @@ def _pos_norm_divisor_from_domain_size(domain_size, *, device, dtype=torch.float
 
 def _llr_mask_from_true_ly(true_ly, *, threshold=0.5, sharpness=12.0):
     return torch.sigmoid((true_ly - threshold) * sharpness) + 1e-6
+
+
+def _fisher_chunk_cleanup(device):
+    """Release Python-side objects between chunks without forcing CUDA cache flushes.
+
+    Calling torch.cuda.empty_cache() in tight autodiff loops can surface asynchronous
+    CUDA faults at cache-flush points and usually hurts throughput. Keep cleanup to
+    Python GC and optional explicit synchronization for debugging.
+    """
+    gc.collect()
+    if device.type == 'cuda' and os.environ.get('NUGGET_FISHER_CUDA_SYNC', '0') == '1':
+        torch.cuda.synchronize(device)
 
 
 def _llr_out_single_point_all_iters(
@@ -86,6 +99,7 @@ def _fisher_one_point_jacrev(
     skip_zero_response,
     event_param_names,
     jacrev_chunk_size,
+    detach_fisher_tensors=True,
 ):
     def _theta_only_fn(*theta_vals):
         return _llr_out_single_point_all_iters(
@@ -107,11 +121,11 @@ def _fisher_one_point_jacrev(
         chunk_size=jacrev_chunk_size,
     )(*theta_tuple)
 
-    J = torch.cat([j.reshape(llr_iterations, -1) for j in J_tuple], dim=1).detach()
+    J = torch.cat([j.reshape(llr_iterations, -1) for j in J_tuple], dim=1)
     del J_tuple
     F = torch.einsum('li,lj->ij', J, J) / llr_iterations
     del J
-    return F
+    return F.detach() if detach_fisher_tensors else F
 
 
 def _unflatten_theta(theta_flat, *, fisher_info_params, theta_shapes, theta_numels, fixed_params):
@@ -304,6 +318,7 @@ def _fisher_points_all_iters_jvp(
     skip_zero_response,
     basis_chunk_size,
     device,
+    detach_fisher_tensors=True,
 ):
     can_cache_responses = not bool(getattr(llr_net, 'use_patd', False))
 
@@ -324,7 +339,8 @@ def _fisher_points_all_iters_jvp(
             llr_net=llr_net,
             device=device,
         )
-        cached_responses = cached_responses.detach()
+        if detach_fisher_tensors:
+            cached_responses = cached_responses.detach()
         cached_ly_true = cached_ly_true.detach()
 
         def _theta_only_fn(theta_flat):
@@ -390,13 +406,13 @@ def _fisher_points_all_iters_jvp(
     del cols_parts
     J = cols.permute(1, 2, 0).contiguous()  # (B, L, D)
     del cols
-    F = (torch.einsum('bld,ble->bde', J, J) / llr_iterations).detach()
+    F = torch.einsum('bld,ble->bde', J, J) / llr_iterations
     del J
 
     if can_cache_responses:
         del cached_responses, cached_ly_true
     del jvp_fn
-    return F
+    return F.detach() if detach_fisher_tensors else F
 
 
 def _compute_fisher_llr_over_points(
@@ -420,6 +436,7 @@ def _compute_fisher_llr_over_points(
     string_xy,
     sum_over_points,
     device,
+    detach_fisher_tensors=True,
 ):
     theta_tuple = tuple(event_params[p].detach().to(device) for p in fisher_info_params)
     pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
@@ -446,6 +463,7 @@ def _compute_fisher_llr_over_points(
                 skip_zero_response=skip_zero_response,
                 event_param_names=event_param_names,
                 jacrev_chunk_size=jacrev_chunk_size,
+                detach_fisher_tensors=detach_fisher_tensors,
             )
 
         for p_start in range(0, n_points, pt_chunk):
@@ -455,14 +473,14 @@ def _compute_fisher_llr_over_points(
                 fisher_chunk = vmap(_one, randomness='different')(pts)
             except Exception:
                 fisher_chunk = torch.stack([_one(pts[i]) for i in range(pts.shape[0])], dim=0)
-            fisher_chunk = fisher_chunk.detach()
+            if detach_fisher_tensors:
+                fisher_chunk = fisher_chunk.detach()
             if fisher_sum is not None:
                 fisher_sum.add_(fisher_chunk.sum(dim=0))
             else:
                 fisher_per_point[p_start:p_end] = fisher_chunk
             del fisher_chunk, pts
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
+            _fisher_chunk_cleanup(device)
 
         return fisher_sum, fisher_per_point
 
@@ -493,280 +511,281 @@ def _compute_fisher_llr_over_points(
             skip_zero_response=skip_zero_response,
             basis_chunk_size=basis_chunk_size,
             device=device,
-        ).detach()
+            detach_fisher_tensors=detach_fisher_tensors,
+        )
+        if detach_fisher_tensors:
+            fisher_chunk = fisher_chunk.detach()
         if fisher_sum is not None:
             fisher_sum.add_(fisher_chunk.sum(dim=0))
         else:
             fisher_per_point[p_start:p_end] = fisher_chunk
 
         del fisher_chunk, pts
-        gc.collect()
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+        _fisher_chunk_cleanup(device)
 
     return fisher_sum, fisher_per_point
 
-def compute_fisher_info_single_batched(fisher_info_params, point, event_params_list, surrogate_func, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, llr_iterations=1, string_xy=None, sum_over_points=True):
-    """
-    Compute the Fisher information matrix with batched processing of points, events, and LLR iterations.
+# def compute_fisher_info_single_batched(fisher_info_params, point, event_params_list, surrogate_func, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, llr_iterations=1, string_xy=None, sum_over_points=True):
+#     """
+#     Compute the Fisher information matrix with batched processing of points, events, and LLR iterations.
     
-    This function processes all combinations of (points × events × llr_iterations) simultaneously
-    with a single LLR network forward pass and batched gradient computation for maximum efficiency.
+#     This function processes all combinations of (points × events × llr_iterations) simultaneously
+#     with a single LLR network forward pass and batched gradient computation for maximum efficiency.
     
-    Parameters:
-    -----------
-    fisher_info_params : list of str
-        List of event parameters to compute Fisher information for.
-    point : torch.Tensor
-        The 3D point(s) to evaluate the Fisher information at. Can be:
-        - Single point: shape (3,)
-        - Multiple points: shape (n_points, 3)
-    event_params_list : list of dict
-        List of dictionaries containing event parameters.
-    surrogate_func : callable
-        Function that computes light yield from event parameters.
-    llr_net : optional
-        Neural network for computing log-likelihood ratios.
-    signal_noise_scale : float or None
-        Scale for adding noise to signal.
-    add_relative_pos : bool
-        Whether to add relative position features.
-    skip_zero_response : bool
-        Whether to skip points with zero response using soft masking.
-    event_param_names : list or None
-        Names of event parameters to use for LLR network.
-    llr_iterations : int
-        Number of LLR iterations to compute and average over for each event.
-    string_xy : list of torch.Tensor or None
-        Optional list of 2D string coordinates [(x1, y1), (x2, y2), ...].
-        If provided, points are grouped by strings and Fisher matrices are summed per string.
-    sum_over_points : bool
-        If True and string_xy is None, sum Fisher matrices over all points.
-        If False, return separate Fisher matrices for each point.
+#     Parameters:
+#     -----------
+#     fisher_info_params : list of str
+#         List of event parameters to compute Fisher information for.
+#     point : torch.Tensor
+#         The 3D point(s) to evaluate the Fisher information at. Can be:
+#         - Single point: shape (3,)
+#         - Multiple points: shape (n_points, 3)
+#     event_params_list : list of dict
+#         List of dictionaries containing event parameters.
+#     surrogate_func : callable
+#         Function that computes light yield from event parameters.
+#     llr_net : optional
+#         Neural network for computing log-likelihood ratios.
+#     signal_noise_scale : float or None
+#         Scale for adding noise to signal.
+#     add_relative_pos : bool
+#         Whether to add relative position features.
+#     skip_zero_response : bool
+#         Whether to skip points with zero response using soft masking.
+#     event_param_names : list or None
+#         Names of event parameters to use for LLR network.
+#     llr_iterations : int
+#         Number of LLR iterations to compute and average over for each event.
+#     string_xy : list of torch.Tensor or None
+#         Optional list of 2D string coordinates [(x1, y1), (x2, y2), ...].
+#         If provided, points are grouped by strings and Fisher matrices are summed per string.
+#     sum_over_points : bool
+#         If True and string_xy is None, sum Fisher matrices over all points.
+#         If False, return separate Fisher matrices for each point.
         
-    Returns:
-    --------
-    torch.Tensor
-        Fisher information matrices with shape depending on parameters:
-        - If string_xy provided: (n_strings, n_events, total_dims, total_dims)
-        - If string_xy is None and sum_over_points=True: (n_events, total_dims, total_dims)
-        - If string_xy is None and sum_over_points=False: (n_points, n_events, total_dims, total_dims)
-        where total_dims is the sum of dimensions of all parameters.
-        Each matrix is averaged over llr_iterations realizations.
-    """
-    if len(event_params_list) == 0:
-        return torch.tensor([])
+#     Returns:
+#     --------
+#     torch.Tensor
+#         Fisher information matrices with shape depending on parameters:
+#         - If string_xy provided: (n_strings, n_events, total_dims, total_dims)
+#         - If string_xy is None and sum_over_points=True: (n_events, total_dims, total_dims)
+#         - If string_xy is None and sum_over_points=False: (n_points, n_events, total_dims, total_dims)
+#         where total_dims is the sum of dimensions of all parameters.
+#         Each matrix is averaged over llr_iterations realizations.
+#     """
+#     if len(event_params_list) == 0:
+#         return torch.tensor([])
     
-    if llr_iterations <= 0:
-        llr_iterations = 1
+#     if llr_iterations <= 0:
+#         llr_iterations = 1
     
-    # Determine device
-    if isinstance(point, torch.Tensor):
-        device = point.device
-    else:
-        device = torch.device('cpu')
+#     # Determine device
+#     if isinstance(point, torch.Tensor):
+#         device = point.device
+#     else:
+#         device = torch.device('cpu')
     
-    # Handle point dimensions and string grouping
-    if point.dim() == 1:
-        point = point.unsqueeze(0)  # Convert to (1, 3)
-    n_points = point.shape[0]
+#     # Handle point dimensions and string grouping
+#     if point.dim() == 1:
+#         point = point.unsqueeze(0)  # Convert to (1, 3)
+#     n_points = point.shape[0]
     
-    # If string_xy is provided, create mapping from points to strings
-    point_to_string = None
-    n_strings = None
-    if string_xy is not None:
-        n_strings = len(string_xy)
-        point_to_string = torch.zeros(n_points, dtype=torch.long, device=device)
-        for s_idx in range(n_strings):
-            mask = (point[:, 0] == string_xy[s_idx][0]) & (point[:, 1] == string_xy[s_idx][1])
-            point_to_string[mask] = s_idx
+#     # If string_xy is provided, create mapping from points to strings
+#     point_to_string = None
+#     n_strings = None
+#     if string_xy is not None:
+#         n_strings = len(string_xy)
+#         point_to_string = torch.zeros(n_points, dtype=torch.long, device=device)
+#         for s_idx in range(n_strings):
+#             mask = (point[:, 0] == string_xy[s_idx][0]) & (point[:, 1] == string_xy[s_idx][1])
+#             point_to_string[mask] = s_idx
     
-    n_events = len(event_params_list)
+#     n_events = len(event_params_list)
     
-    # Determine dimensionality of each parameter
-    param_dims = []
-    param_names_expanded = []
-    for param_name in fisher_info_params:
-        param_value = event_params_list[0].get(param_name)
-        if param_value.dim() == 0 or (param_value.dim() == 1 and param_value.shape[0] == 1):
-            param_dims.append(1)
-            param_names_expanded.append(param_name)
-        else:
-            dim_size = param_value.numel()
-            param_dims.append(dim_size)
-            for i in range(dim_size):
-                param_names_expanded.append(f"{param_name}_{i}")
+#     # Determine dimensionality of each parameter
+#     param_dims = []
+#     param_names_expanded = []
+#     for param_name in fisher_info_params:
+#         param_value = event_params_list[0].get(param_name)
+#         if param_value.dim() == 0 or (param_value.dim() == 1 and param_value.shape[0] == 1):
+#             param_dims.append(1)
+#             param_names_expanded.append(param_name)
+#         else:
+#             dim_size = param_value.numel()
+#             param_dims.append(dim_size)
+#             for i in range(dim_size):
+#                 param_names_expanded.append(f"{param_name}_{i}")
     
-    total_dims = sum(param_dims)
+#     total_dims = sum(param_dims)
     
-    # Stack event parameters into batched tensors, replicated for points and llr_iterations
-    # Shape will be (n_points * n_events * llr_iterations, ...)
-    batched_grad_params = {}
-    batched_fixed_params = {}
+#     # Stack event parameters into batched tensors, replicated for points and llr_iterations
+#     # Shape will be (n_points * n_events * llr_iterations, ...)
+#     batched_grad_params = {}
+#     batched_fixed_params = {}
     
-    for param_name in fisher_info_params:
-        param_values = []
-        for _ in range(n_points):
-            for event_params in event_params_list:
-                param_value = event_params.get(param_name)
-                # Replicate this event's parameter llr_iterations times
-                for _ in range(llr_iterations):
-                    param_values.append(param_value)
-        # Stack and enable gradients
-        stacked = torch.stack(param_values).to(device)
-        batched_grad_params[param_name] = stacked.clone().detach().requires_grad_(True)
+#     for param_name in fisher_info_params:
+#         param_values = []
+#         for _ in range(n_points):
+#             for event_params in event_params_list:
+#                 param_value = event_params.get(param_name)
+#                 # Replicate this event's parameter llr_iterations times
+#                 for _ in range(llr_iterations):
+#                     param_values.append(param_value)
+#         # Stack and enable gradients
+#         stacked = torch.stack(param_values).to(device)
+#         batched_grad_params[param_name] = stacked.clone().detach().requires_grad_(True)
     
-    # Handle non-gradient parameters
-    all_param_names = set()
-    for event_params in event_params_list:
-        all_param_names.update(event_params.keys())
+#     # Handle non-gradient parameters
+#     all_param_names = set()
+#     for event_params in event_params_list:
+#         all_param_names.update(event_params.keys())
     
-    for param_name in all_param_names:
-        if param_name not in fisher_info_params:
-            param_values = []
-            for _ in range(n_points):
-                for event_params in event_params_list:
-                    param_value = event_params.get(param_name)
-                    for _ in range(llr_iterations):
-                        param_values.append(param_value)
-            batched_fixed_params[param_name] = torch.stack(param_values).to(device)
+#     for param_name in all_param_names:
+#         if param_name not in fisher_info_params:
+#             param_values = []
+#             for _ in range(n_points):
+#                 for event_params in event_params_list:
+#                     param_value = event_params.get(param_name)
+#                     for _ in range(llr_iterations):
+#                         param_values.append(param_value)
+#             batched_fixed_params[param_name] = torch.stack(param_values).to(device)
     
-    # Compute light yields for all points × events × iterations
-    n_total = n_points * n_events * llr_iterations  # Total number of samples
-    start_time = time.time()
-    if llr_net is None:
-        # Generate multiple samples with different noise for each point×event×iteration
-        light_yield_means = []
-        for point_idx in range(n_points):
-            for event_idx in range(n_events):
-                for iter_idx in range(llr_iterations):
-                    global_idx = point_idx * n_events * llr_iterations + event_idx * llr_iterations + iter_idx
-                    event_params_dict = {k: v[global_idx] for k, v in {**batched_grad_params, **batched_fixed_params}.items()}
-                    ly = surrogate_func(opt_point=point[point_idx], event_params=event_params_dict)
-                    if signal_noise_scale is not None:
-                        ly = torch.normal(0, signal_noise_scale) * ly + ly
-                    light_yield_means.append(ly)
-        light_yield_means = torch.stack(light_yield_means)  # Shape: (n_total,)
-    else:
-        # Use fully batched feature generation: process all points at once per event
-        # This is the most efficient approach as prepare_data_from_raw can handle batched points
-        features_list = []
-        ly_list = []
+#     # Compute light yields for all points × events × iterations
+#     n_total = n_points * n_events * llr_iterations  # Total number of samples
+#     start_time = time.time()
+#     if llr_net is None:
+#         # Generate multiple samples with different noise for each point×event×iteration
+#         light_yield_means = []
+#         for point_idx in range(n_points):
+#             for event_idx in range(n_events):
+#                 for iter_idx in range(llr_iterations):
+#                     global_idx = point_idx * n_events * llr_iterations + event_idx * llr_iterations + iter_idx
+#                     event_params_dict = {k: v[global_idx] for k, v in {**batched_grad_params, **batched_fixed_params}.items()}
+#                     ly = surrogate_func(opt_point=point[point_idx], event_params=event_params_dict)
+#                     if signal_noise_scale is not None:
+#                         ly = torch.normal(0, signal_noise_scale) * ly + ly
+#                     light_yield_means.append(ly)
+#         light_yield_means = torch.stack(light_yield_means)  # Shape: (n_total,)
+#     else:
+#         # Use fully batched feature generation: process all points at once per event
+#         # This is the most efficient approach as prepare_data_from_raw can handle batched points
+#         features_list = []
+#         ly_list = []
         
-        # Loop over events and process all points simultaneously for each event
-        for event_idx in range(n_events):
-            # Get event parameters for this event (first occurrence in batched params)
-            event_start_idx = event_idx * llr_iterations
-            event_params_dict = {k: v[event_start_idx] for k, v in {**batched_grad_params, **batched_fixed_params}.items()}
+#         # Loop over events and process all points simultaneously for each event
+#         for event_idx in range(n_events):
+#             # Get event parameters for this event (first occurrence in batched params)
+#             event_start_idx = event_idx * llr_iterations
+#             event_params_dict = {k: v[event_start_idx] for k, v in {**batched_grad_params, **batched_fixed_params}.items()}
             
-            # Generate features for ALL points for this event at once with llr_iterations samples each
-            # point shape: (n_points, 3)
-            # This will return features for all points with llr_iterations noise realizations each
-            features_batched, ly_batched = llr_net.prepare_data_from_raw(
-                point, event_params_dict, surrogate_func,
-                noise_scale=signal_noise_scale,
-                output_true_light_yield=True,
-                event_labels=fisher_info_params if event_param_names is None else event_param_names,
-                num_samples=llr_iterations
-            )
-            # features_batched shape: (n_points * llr_iterations, feature_dim) 
-            # ly_batched shape: (n_points * llr_iterations,)
+#             # Generate features for ALL points for this event at once with llr_iterations samples each
+#             # point shape: (n_points, 3)
+#             # This will return features for all points with llr_iterations noise realizations each
+#             features_batched, ly_batched = llr_net.prepare_data_from_raw(
+#                 point, event_params_dict, surrogate_func,
+#                 noise_scale=signal_noise_scale,
+#                 output_true_light_yield=True,
+#                 event_labels=fisher_info_params if event_param_names is None else event_param_names,
+#                 num_samples=llr_iterations
+#             )
+#             # features_batched shape: (n_points * llr_iterations, feature_dim) 
+#             # ly_batched shape: (n_points * llr_iterations,)
             
-            features_list.append(features_batched)
-            ly_list.append(ly_batched)
+#             features_list.append(features_batched)
+#             ly_list.append(ly_batched)
         
-        # Stack all features and light yields
-        all_features = torch.cat(features_list, dim=0)  # Shape: (n_total, feature_dim)
-        all_ly = torch.cat(ly_list, dim=0)  # Shape: (n_total,)
+#         # Stack all features and light yields
+#         all_features = torch.cat(features_list, dim=0)  # Shape: (n_total, feature_dim)
+#         all_ly = torch.cat(ly_list, dim=0)  # Shape: (n_total,)
         
-        # Compute LLR for all points×events×iterations in a single forward pass
-        light_yield_means = llr_net.predict_log_likelihood_ratio(all_features, epsilon=1e-5)
-        # light_yield_means shape: (n_total,)
+#         # Compute LLR for all points×events×iterations in a single forward pass
+#         light_yield_means = llr_net.predict_log_likelihood_ratio(all_features, epsilon=1e-5)
+#         # light_yield_means shape: (n_total,)
         
-        # Apply masking to entire batch
-        if skip_zero_response:
-            mask = torch.sigmoid((all_ly - 0.5) * 12.0) + 1e-6
-            light_yield_means = light_yield_means * mask
+#         # Apply masking to entire batch
+#         if skip_zero_response:
+#             mask = torch.sigmoid((all_ly - 0.5) * 12.0) + 1e-6
+#             light_yield_means = light_yield_means * mask
     
-    # Compute gradients for each parameter across all points×events×iterations in a single batched operation
-    # print(f"Computed {n_total} LLR evaluations in {time.time() - start_time:.2f} seconds")
-    start_time = time.time()
-    param_gradients = []
-    for param_name in fisher_info_params:
-        if param_name in batched_grad_params:
-            param_tensor = batched_grad_params[param_name]
-            param_size = param_tensor[0].numel()
+#     # Compute gradients for each parameter across all points×events×iterations in a single batched operation
+#     # print(f"Computed {n_total} LLR evaluations in {time.time() - start_time:.2f} seconds")
+#     start_time = time.time()
+#     param_gradients = []
+#     for param_name in fisher_info_params:
+#         if param_name in batched_grad_params:
+#             param_tensor = batched_grad_params[param_name]
+#             param_size = param_tensor[0].numel()
             
-            # Compute gradient for all samples at once using grad_outputs
-            # This computes ∂(light_yield_means[i])/∂(param_tensor[i]) for all i simultaneously
-            param_grad = torch.autograd.grad(
-                outputs=light_yield_means,
-                inputs=param_tensor,
-                grad_outputs=torch.ones_like(light_yield_means),
-                create_graph=False,
-                retain_graph=True,
-                only_inputs=True,
-                allow_unused=True
-            )[0]
+#             # Compute gradient for all samples at once using grad_outputs
+#             # This computes ∂(light_yield_means[i])/∂(param_tensor[i]) for all i simultaneously
+#             param_grad = torch.autograd.grad(
+#                 outputs=light_yield_means,
+#                 inputs=param_tensor,
+#                 grad_outputs=torch.ones_like(light_yield_means),
+#                 create_graph=False,
+#                 retain_graph=True,
+#                 only_inputs=True,
+#                 allow_unused=True
+#             )[0]
             
-            if param_grad is not None:
-                # Reshape to (n_total, param_size)
-                param_grad_batch = param_grad.view(n_total, param_size)
-            else:
-                # If gradient is None, create zero gradient
-                param_grad_batch = torch.zeros(n_total, param_size, device=device)
+#             if param_grad is not None:
+#                 # Reshape to (n_total, param_size)
+#                 param_grad_batch = param_grad.view(n_total, param_size)
+#             else:
+#                 # If gradient is None, create zero gradient
+#                 param_grad_batch = torch.zeros(n_total, param_size, device=device)
             
-            param_gradients.append(param_grad_batch)
+#             param_gradients.append(param_grad_batch)
     
-    # Compute Fisher Information matrices for all samples
-    # print(f"Computed gradients for {len(param_gradients)} parameters in {time.time() - start_time:.2f} seconds")
-    start_time = time.time()
-    if len(param_gradients) == len(fisher_info_params):
-        # Stack all parameter gradients: (n_total, total_dims)
-        all_gradients = torch.cat(param_gradients, dim=1)
+#     # Compute Fisher Information matrices for all samples
+#     # print(f"Computed gradients for {len(param_gradients)} parameters in {time.time() - start_time:.2f} seconds")
+#     start_time = time.time()
+#     if len(param_gradients) == len(fisher_info_params):
+#         # Stack all parameter gradients: (n_total, total_dims)
+#         all_gradients = torch.cat(param_gradients, dim=1)
         
-        # Vectorized computation using batched outer product
-        grad_outer = torch.bmm(
-            all_gradients.unsqueeze(-1),  # (n_total, total_dims, 1)
-            all_gradients.unsqueeze(-2)   # (n_total, 1, total_dims)
-        )  # Result: (n_total, total_dims, total_dims)
+#         # Vectorized computation using batched outer product
+#         grad_outer = torch.bmm(
+#             all_gradients.unsqueeze(-1),  # (n_total, total_dims, 1)
+#             all_gradients.unsqueeze(-2)   # (n_total, 1, total_dims)
+#         )  # Result: (n_total, total_dims, total_dims)
         
-        if llr_net is None:
-            # Divide by light yields
-            fisher_matrices_all = grad_outer / light_yield_means.view(n_total, 1, 1)
-        else:
-            fisher_matrices_all = grad_outer
+#         if llr_net is None:
+#             # Divide by light yields
+#             fisher_matrices_all = grad_outer / light_yield_means.view(n_total, 1, 1)
+#         else:
+#             fisher_matrices_all = grad_outer
         
-        # Reshape to (n_points, n_events, llr_iterations, total_dims, total_dims)
-        fisher_matrices_all = fisher_matrices_all.view(n_points, n_events, llr_iterations, total_dims, total_dims)
+#         # Reshape to (n_points, n_events, llr_iterations, total_dims, total_dims)
+#         fisher_matrices_all = fisher_matrices_all.view(n_points, n_events, llr_iterations, total_dims, total_dims)
         
-        # Average over llr_iterations: (n_points, n_events, total_dims, total_dims)
-        fisher_matrices = fisher_matrices_all.mean(dim=2)
+#         # Average over llr_iterations: (n_points, n_events, total_dims, total_dims)
+#         fisher_matrices = fisher_matrices_all.mean(dim=2)
         
-        # Handle string grouping or point summation
-        if string_xy is not None:
-            # Sum Fisher matrices by string: (n_strings, n_events, total_dims, total_dims)
-            fisher_by_string = torch.zeros(n_strings, n_events, total_dims, total_dims, device=device)
-            for s_idx in range(n_strings):
-                string_mask = point_to_string == s_idx
-                # Sum over points belonging to this string
-                fisher_by_string[s_idx] = fisher_matrices[string_mask].sum(dim=0)
-            # print(f"Computed Fisher matrices by string in {time.time() - start_time:.2f} seconds")
-            return fisher_by_string
-        elif sum_over_points:
-            # Sum over all points: (n_events, total_dims, total_dims)
-            return fisher_matrices.sum(dim=0)
-        else:
-            # Return per-point results: (n_points, n_events, total_dims, total_dims)
-            return fisher_matrices
-    else:
-        # No valid gradients
-        if string_xy is not None:
-            return torch.zeros(n_strings, n_events, total_dims, total_dims, device=device)
-        elif sum_over_points:
-            return torch.zeros(n_events, total_dims, total_dims, device=device)
-        else:
-            return torch.zeros(n_points, n_events, total_dims, total_dims, device=device)
+#         # Handle string grouping or point summation
+#         if string_xy is not None:
+#             # Sum Fisher matrices by string: (n_strings, n_events, total_dims, total_dims)
+#             fisher_by_string = torch.zeros(n_strings, n_events, total_dims, total_dims, device=device)
+#             for s_idx in range(n_strings):
+#                 string_mask = point_to_string == s_idx
+#                 # Sum over points belonging to this string
+#                 fisher_by_string[s_idx] = fisher_matrices[string_mask].sum(dim=0)
+#             # print(f"Computed Fisher matrices by string in {time.time() - start_time:.2f} seconds")
+#             return fisher_by_string
+#         elif sum_over_points:
+#             # Sum over all points: (n_events, total_dims, total_dims)
+#             return fisher_matrices.sum(dim=0)
+#         else:
+#             # Return per-point results: (n_points, n_events, total_dims, total_dims)
+#             return fisher_matrices
+#     else:
+#         # No valid gradients
+#         if string_xy is not None:
+#             return torch.zeros(n_strings, n_events, total_dims, total_dims, device=device)
+#         elif sum_over_points:
+#             return torch.zeros(n_events, total_dims, total_dims, device=device)
+#         else:
+#             return torch.zeros(n_points, n_events, total_dims, total_dims, device=device)
 
 
 def directional_resolution(F3, n):
@@ -877,7 +896,7 @@ def directional_resolution(F3, n):
         return r68
 
 
-def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev'):
+def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True):
     """
     Compute the Fisher information matrix averaged over multiple LLR iterations.
     
@@ -939,6 +958,10 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
         (point_chunk_size * llr_iterations) rather than (n_points * llr_iterations).
         This is the primary knob for OOM errors with many points. None (default)
         processes all points in a single call.
+    detach_fisher_tensors : bool
+        If True (default), detach Fisher tensors during chunk aggregation to save
+        memory and preserve historical behavior. Set False to keep graph
+        connectivity (e.g., gradients wrt geometry points/string_xy).
         
     Returns:
     --------
@@ -1044,7 +1067,10 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
                 if not isinstance(J, torch.Tensor):
                     J = torch.as_tensor(J, device=device)
                 J = J.reshape(B, total_dims_local)
-                ly_vals = _theta_only_fn(theta0_flat).detach().reshape(-1)
+                if detach_fisher_tensors:
+                    ly_vals = _theta_only_fn(theta0_flat).detach().reshape(-1)
+                else:
+                    ly_vals = _theta_only_fn(theta0_flat).reshape(-1)
 
             else:
                 # Forward-mode Jacobian via JVPs: linearize then apply to basis vectors.
@@ -1070,7 +1096,7 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
             # Per-point Fisher (Poisson mean): outer / lambda
             outer = torch.bmm(J.unsqueeze(-1), J.unsqueeze(-2))  # (B, D, D)
             outer = outer / ly_vals.clamp(min=1e-10).view(B, 1, 1)
-            fisher_per_point[p_start:p_end] = outer.detach()
+            fisher_per_point[p_start:p_end] = outer.detach() if detach_fisher_tensors else outer
             del J, outer, ly_vals, pts
 
     else:
@@ -1110,6 +1136,7 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
             string_xy=string_xy,
             sum_over_points=sum_over_points,
             device=device,
+            detach_fisher_tensors=detach_fisher_tensors,
         )
     # ---------------------------------------------- aggregate over points / strings
     if llr_net is not None and string_xy is None and sum_over_points:
@@ -1763,7 +1790,7 @@ class WeightedFisherInfoLoss(LossFunction):
         # self.background_event_params = background_event_params
         self.fisher_info_params = fisher_info_params # Default parameters for Fisher Info
 
-    def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False, skip_zero_response=True, verbose=False, event_batch_size=1, grad_chunk_size=10, jacrev_chunk_size=10000, point_chunk_size=None, llr_autodiff_mode='jacrev'):
+    def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False, skip_zero_response=True, verbose=False, event_batch_size=1, grad_chunk_size=10, jacrev_chunk_size=10000, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True):
         n_strings = len(string_xy)
         # n_params = len(self.fisher_info_params)
         param_dims = []
@@ -1782,56 +1809,57 @@ class WeightedFisherInfoLoss(LossFunction):
                     param_names_expanded.append(f"{param_name}_{i}")
         total_dims = sum(param_dims)
         fisher_per_string_per_event = torch.zeros(len(signal_event_params), n_strings, total_dims, total_dims, device=self.device)
-        if event_batch_size == 1:    
-            for i, signal_params in enumerate(signal_event_params):
-                # for s_idx in range(n_strings):
-                #     mask = (points_3d[:, 1] == string_xy[s_idx][1]) & (points_3d[:, 0] == string_xy[s_idx][0])
-                #     string_points = points_3d[mask]
-                #     fisher_matrix = torch.zeros(total_dims, total_dims, device=self.device)
-                #     # for point in string_points: 
-                #     # for _ in range(llr_iterations):    
-                #         # fisher_matrix += compute_fisher_info_single(self.fisher_info_params, string_points, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos, skip_zero_response=skip_zero_response)
-                #     # fisher_matrix = fisher_matrix/llr_iterations
-                #     fisher_matrix = compute_fisher_info_single_averaged(self.fisher_info_params, string_points, llr_iterations=llr_iterations, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos, skip_zero_response=skip_zero_response)
-                #     fisher_per_string_per_event[i, s_idx] += fisher_matrix
-                # Returns (n_strings, n_events, total_dims, total_dims), need to permute to (n_events, n_strings, ...)
-                fisher_matrices = compute_fisher_info_single_averaged(
-                            fisher_info_params=self.fisher_info_params, 
-                            point=points_3d, 
-                            event_params=signal_params, 
-                            surrogate_func=signal_surrogate_func, 
-                            llr_net=llr_net, 
-                            signal_noise_scale=signal_noise_scale, 
-                            add_relative_pos=add_relative_pos, 
-                            skip_zero_response=skip_zero_response, 
-                            llr_iterations=llr_iterations, 
-                            string_xy=string_xy,
-                            device=self.device,
-                            grad_chunk_size=grad_chunk_size,
-                            jacrev_chunk_size=jacrev_chunk_size,
-                            point_chunk_size=point_chunk_size,
-                            llr_autodiff_mode=llr_autodiff_mode
-                            )
-                fisher_per_string_per_event[i] += fisher_matrices.to(self.device)
-                if verbose and (i % 100 == 0 or i == len(signal_event_params)-1):
-                    print(f"Computed Fisher info for event {i+1}/{len(signal_event_params)}", flush=True)        
-        else:
-            for i in range(0, len(signal_event_params), event_batch_size):
-                batch_params = signal_event_params[i:i+event_batch_size]
-                # Returns (n_strings, n_events, total_dims, total_dims), need to permute to (n_events, n_strings, ...)
-                fisher_matrices = compute_fisher_info_single_batched(
-                            fisher_info_params=self.fisher_info_params, 
-                            point=points_3d, 
-                            event_params_list=batch_params, 
-                            surrogate_func=signal_surrogate_func, 
-                            llr_net=llr_net, 
-                            signal_noise_scale=signal_noise_scale, 
-                            add_relative_pos=add_relative_pos, 
-                            skip_zero_response=skip_zero_response, 
-                            llr_iterations=llr_iterations, 
-                            string_xy=string_xy
-                            )
-                fisher_per_string_per_event[i:i+event_batch_size] += fisher_matrices.permute(1, 0, 2, 3)   
+        # if event_batch_size == 1:    
+        for i, signal_params in enumerate(signal_event_params):
+            # for s_idx in range(n_strings):
+            #     mask = (points_3d[:, 1] == string_xy[s_idx][1]) & (points_3d[:, 0] == string_xy[s_idx][0])
+            #     string_points = points_3d[mask]
+            #     fisher_matrix = torch.zeros(total_dims, total_dims, device=self.device)
+            #     # for point in string_points: 
+            #     # for _ in range(llr_iterations):    
+            #         # fisher_matrix += compute_fisher_info_single(self.fisher_info_params, string_points, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos, skip_zero_response=skip_zero_response)
+            #     # fisher_matrix = fisher_matrix/llr_iterations
+            #     fisher_matrix = compute_fisher_info_single_averaged(self.fisher_info_params, string_points, llr_iterations=llr_iterations, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos, skip_zero_response=skip_zero_response)
+            #     fisher_per_string_per_event[i, s_idx] += fisher_matrix
+            # Returns (n_strings, n_events, total_dims, total_dims), need to permute to (n_events, n_strings, ...)
+            fisher_matrices = compute_fisher_info_single_averaged(
+                        fisher_info_params=self.fisher_info_params, 
+                        point=points_3d, 
+                        event_params=signal_params, 
+                        surrogate_func=signal_surrogate_func, 
+                        llr_net=llr_net, 
+                        signal_noise_scale=signal_noise_scale, 
+                        add_relative_pos=add_relative_pos, 
+                        skip_zero_response=skip_zero_response, 
+                        llr_iterations=llr_iterations, 
+                        string_xy=string_xy,
+                        device=self.device,
+                        grad_chunk_size=grad_chunk_size,
+                        jacrev_chunk_size=jacrev_chunk_size,
+                        point_chunk_size=point_chunk_size,
+                        llr_autodiff_mode=llr_autodiff_mode,
+                        detach_fisher_tensors=detach_fisher_tensors,
+                        )
+            fisher_per_string_per_event[i] += fisher_matrices.to(self.device)
+            if verbose and (i % 100 == 0 or i == len(signal_event_params)-1):
+                print(f"Computed Fisher info for event {i+1}/{len(signal_event_params)}", flush=True)        
+        # else:
+        #     for i in range(0, len(signal_event_params), event_batch_size):
+        #         batch_params = signal_event_params[i:i+event_batch_size]
+        #         # Returns (n_strings, n_events, total_dims, total_dims), need to permute to (n_events, n_strings, ...)
+        #         fisher_matrices = compute_fisher_info_single_batched(
+        #                     fisher_info_params=self.fisher_info_params, 
+        #                     point=points_3d, 
+        #                     event_params_list=batch_params, 
+        #                     surrogate_func=signal_surrogate_func, 
+        #                     llr_net=llr_net, 
+        #                     signal_noise_scale=signal_noise_scale, 
+        #                     add_relative_pos=add_relative_pos, 
+        #                     skip_zero_response=skip_zero_response, 
+        #                     llr_iterations=llr_iterations, 
+        #                     string_xy=string_xy
+        #                     )
+        #         fisher_per_string_per_event[i:i+event_batch_size] += fisher_matrices.permute(1, 0, 2, 3)   
             
 
         return fisher_per_string_per_event
@@ -2189,6 +2217,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         jacrev_chunk_size = kwargs.get('fisher_info_jacrev_chunk_size', 10000)
         point_chunk_size = kwargs.get('fisher_info_point_chunk_size', None)
         llr_autodiff_mode = kwargs.get('fisher_info_llr_autodiff_mode', 'jacrev')
+        detach_fisher_tensors = kwargs.get('fisher_info_detach_tensors', True)
         
         # New parameters for batched loading from files
         event_paths = kwargs.get('event_paths', None)
@@ -2207,7 +2236,23 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         
         # Compute or use precomputed Fisher info
         if precomputed_fisher_info_per_string_per_event is None:
-            fisher_info_per_string_per_event = self.compute_fisher_info_per_string_per_event(string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net, signal_noise_scale, llr_iterations, add_relative_pos, skip_zero_response=skip_zero_response, event_batch_size=event_batch_size, grad_chunk_size=grad_chunk_size, jacrev_chunk_size=jacrev_chunk_size, point_chunk_size=point_chunk_size, llr_autodiff_mode=llr_autodiff_mode)
+            fisher_info_per_string_per_event = self.compute_fisher_info_per_string_per_event(
+                string_xy,
+                points_3d,
+                signal_event_params,
+                signal_surrogate_func,
+                llr_net,
+                signal_noise_scale,
+                llr_iterations,
+                add_relative_pos,
+                skip_zero_response=skip_zero_response,
+                event_batch_size=event_batch_size,
+                grad_chunk_size=grad_chunk_size,
+                jacrev_chunk_size=jacrev_chunk_size,
+                point_chunk_size=point_chunk_size,
+                llr_autodiff_mode=llr_autodiff_mode,
+                detach_fisher_tensors=detach_fisher_tensors,
+            )
         else:
             fisher_info_per_string_per_event = precomputed_fisher_info_per_string_per_event.to(self.device)
         #sum over strings with weights but keep per event
@@ -2272,8 +2317,14 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     covar_zenith_azimuth = cov_matrix[i][zenith_idx, azimuth_idx]
                     angular_resolution_rad = torch.sqrt(var_zenith + torch.sin(zenith)*var_azimuth + 2*torch.sin(zenith)*torch.cos(zenith)*covar_zenith_azimuth)
                     resolution_per_event.append(angular_resolution_rad)
-            # resolution_per_event = torch.stack(resolution_per_event)
-            total_resolution = torch.nanmean(resolution_per_event)/max_angular_resolution
+                resolution_per_event = torch.stack(resolution_per_event)
+            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
+            if finite_mask.any():
+                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+            else:
+                # Keep optimization stable when all events are invalid/singular.
+                total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
             # finite_mask = torch.isfinite(resolution_per_event)
             # if finite_mask.any():
             #     total_resolution = torch.mean(resolution_per_event[finite_mask])
@@ -2310,9 +2361,12 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     energy_resolution = energy_resolution/params['energy'].to(self.device)
                 resolution_per_event.append(energy_resolution)
             resolution_per_event = torch.stack(resolution_per_event)
-            total_resolution = torch.mean(resolution_per_event[~torch.isnan(resolution_per_event)])
-            total_resolution = total_resolution/max_energy_resolution
-
+            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
+            if finite_mask.any():
+                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+            else:
+                total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
             return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
 
 class ResolutionLoss(FisherInfoLoss):
@@ -2470,9 +2524,13 @@ class ResolutionLoss(FisherInfoLoss):
                     angular_variance = var_zenith + torch.sin(zenith)*var_azimuth + 2*torch.sin(zenith)*torch.cos(zenith)*covar_zenith_azimuth
                     angular_resolution_rad = torch.sqrt(torch.clamp_min(angular_variance, 1e-10))  # Clamp to avoid sqrt of negative/zero
                     resolution_per_event.append(angular_resolution_rad)
-            # resolution_per_event = torch.stack(resolution_per_event)
-            total_resolution = torch.mean(resolution_per_event[torch.isfinite(resolution_per_event)])
-            total_resolution = total_resolution/max_angular_resolution
+            resolution_per_event = torch.stack(resolution_per_event)
+            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
+            if finite_mask.any():
+                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                total_resolution = 1 / torch.sqrt(torch.sum(1 / safe_res**2))
+            else:
+                total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
             return {'angular_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}
         elif self.resolution_type == 'energy':
             # Compute covariance matrix for energy resolution
@@ -2506,7 +2564,11 @@ class ResolutionLoss(FisherInfoLoss):
                     energy_resolution = energy_resolution/params['energy']
                 resolution_per_event.append(energy_resolution)
             resolution_per_event = torch.stack(resolution_per_event)
-            total_resolution = torch.mean(resolution_per_event[torch.isfinite(resolution_per_event)])
-            total_resolution = total_resolution/max_energy_resolution
+            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
+            if finite_mask.any():
+                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                total_resolution = 1 / torch.sqrt(torch.sum(1 / safe_res**2))
+            else:
+                total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
 
             return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}

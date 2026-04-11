@@ -76,9 +76,9 @@ class Optimizer():
     def _update_alm_parameters(self):
         """Update ALM parameters according to the algorithm"""
         for constraint_name in self.constraints_list:
-            if constraint_name in self.loss_dict and len(self.loss_dict[constraint_name]) > 0:
+            if constraint_name in self._current_uw_loss_dict:
                 # Get the latest constraint value C_i(θ)
-                constraint_value = self.loss_dict[constraint_name][-1].detach().item()
+                constraint_value = self._current_uw_loss_dict[constraint_name].detach().item()
                 # Update weighted moving average for lambda gradient 
                 lambda_grad_squared = constraint_value ** 2
                 self.alm_v_lambda[constraint_name] = (self.alm_alpha * self.alm_v_lambda[constraint_name] + 
@@ -105,8 +105,9 @@ class Optimizer():
                     self.alm_lambdas[constraint_name] = torch.clamp(self.alm_lambdas[constraint_name], max=self.alm_lambda_max)
     
     def loss_update_step(self):
-        
-        total_loss = torch.tensor(0.0, device=self.device)
+
+        # Track a scalar total loss for logging/selection; do not retain graphs here.
+        total_loss_value = 0.0
         if self.conflict_free:
             
             # Clear gradients first
@@ -120,13 +121,17 @@ class Optimizer():
                 optimizer.zero_grad()
                 grads = []              
                 # Compute gradients for each loss component separately
-                for loss_name, loss_fn in self.loss_dict.items():
-                    if self.loss_weights_dict.get(loss_name) == 0.0:
-                        continue
-                    
-                    loss_value = loss_fn[-1]
+                active_losses = [
+                    (loss_name, loss_value)
+                    for loss_name, loss_value in self._current_loss_dict.items()
+                    if self.loss_weights_dict.get(loss_name) != 0.0
+                ]
+                num_active_losses = len(active_losses)
+
+                for loss_idx, (loss_name, loss_value) in enumerate(active_losses):
+
                     if count == 1:    
-                        total_loss += loss_value.item()
+                        total_loss_value += float(loss_value.detach().item())
                     
                     # Apply ALM formulation for constraints or regular loss
                     # if self.use_alm and loss_name in self.constraints_list:
@@ -137,7 +142,8 @@ class Optimizer():
                     #     augmented_loss.backward(retain_graph=True)
                     # else:
                     #     # Regular loss handling
-                    loss_value.backward(retain_graph=True)
+                    keep_graph = loss_idx < (num_active_losses - 1)
+                    loss_value.backward(retain_graph=keep_graph)
             
                         # Extract gradients manually for string_weights
                     if geo_aspect.grad is not None:
@@ -170,12 +176,22 @@ class Optimizer():
             # Handle regular and (optionally) ALM-augmented losses.
             # Note: when ALM is enabled, constraint losses are expected to have been stored in
             # self.loss_dict already in augmented form (see optimize()).
-            for loss_name, loss_fn in self.loss_dict.items():
-                if self.loss_weights_dict.get(loss_name) != 0.0:
-                    loss_value = loss_fn[-1]
-                    total_loss += loss_value
-                    loss_value.backward(retain_graph=True)
-            # total_loss.backward()
+            active_losses = [
+                (loss_name, loss_value)
+                for loss_name, loss_value in self._current_loss_dict.items()
+                if self.loss_weights_dict.get(loss_name) != 0.0
+            ]
+            num_active_losses = len(active_losses)
+
+            for loss_idx, (loss_name, loss_value) in enumerate(active_losses):
+                total_loss_value += float(loss_value.detach().item())
+                keep_graph = loss_idx < (num_active_losses - 1)
+                try:
+                    loss_value.backward(retain_graph=keep_graph)
+                except Exception as e:
+                    print(f"Error during backward pass for loss '{loss_name}': {e}")
+                    raise e
+
             # Update parameters
             for key in self.optimizers.keys():
                 if self.alternate_freq is not None:
@@ -186,10 +202,8 @@ class Optimizer():
             # Update ALM parameters after parameter update
             if self.use_alm:
                 self._update_alm_parameters()
-                
-            total_loss = total_loss.item()
 
-        return total_loss
+        return total_loss_value
 
     def _snapshot_geom_dict(self):
         """Create a pickle-friendly snapshot of the current geometry.
@@ -205,8 +219,19 @@ class Optimizer():
                 snapshot[key] = value
         return snapshot
 
-    def optimize(self, loss_func_dict, loss_dict={}, uw_loss_dict={}, loss_weights_dict = {}, loss_params_dict={}, n_iter=100, print_freq=10, vis_freq=None, vis_kwargs={}, gif_freq=None, **kwargs):
+    def optimize(self, loss_func_dict, loss_dict=None, uw_loss_dict=None, loss_weights_dict=None, loss_params_dict=None, n_iter=100, print_freq=10, vis_freq=None, vis_kwargs=None, gif_freq=None, **kwargs):
         
+        if loss_dict is None:
+            loss_dict = {}
+        if uw_loss_dict is None:
+            uw_loss_dict = {}
+        if loss_weights_dict is None:
+            loss_weights_dict = {}
+        if loss_params_dict is None:
+            loss_params_dict = {}
+        if vis_kwargs is None:
+            vis_kwargs = {}
+
         self.loss_dict = loss_dict
         self.uw_loss_dict = uw_loss_dict
         self.vis_loss_dict = kwargs.get('vis_loss_dict', {})
@@ -282,6 +307,12 @@ class Optimizer():
                 self.vis_uw_loss_dict[key] = []
             if key not in self.loss_iterations_dict:
                 self.loss_iterations_dict[key] = []
+
+        # Keep graph-connected tensors only for the current iteration.
+        # Long-term history lists store detached scalar values to avoid graph retention.
+        self._current_loss_dict = {}
+        self._current_uw_loss_dict = {}
+
         self.total_loss = []
         if self.alternate_freq is not None:
             self.optimizer_phases = {}
@@ -290,6 +321,8 @@ class Optimizer():
         
         max_iter = max([len(v) for v in self.loss_iterations_dict.values()]) if len(self.loss_iterations_dict) > 0 else 0     
         for it in range(max_iter, max_iter+n_iter):
+            self._current_loss_dict = {}
+            self._current_uw_loss_dict = {}
             vis_kwargs.update({'iteration': it})
             if self.sample_every is not None:
                 if loss_params_dict.get('signal_sampler', None) is not None and it % self.sample_every == 0:
@@ -343,8 +376,10 @@ class Optimizer():
                             + 0.5 * self.alm_mus[loss_name] * weighted_loss ** 2
                         )
                     if weight != 0.0:
-                        self.loss_dict[loss_name].append(weighted_loss)
-                        self.uw_loss_dict[loss_name].append(loss_value)
+                        self._current_loss_dict[loss_name] = weighted_loss
+                        self._current_uw_loss_dict[loss_name] = loss_value
+                        self.loss_dict[loss_name].append(weighted_loss.detach().item())
+                        self.uw_loss_dict[loss_name].append(loss_value.detach().item())
                     self.vis_loss_dict[loss_name].append(weighted_loss.item())
                     self.vis_uw_loss_dict[loss_name].append(loss_value.item())
                 else:
@@ -388,7 +423,7 @@ class Optimizer():
             vis_kwargs.update(self.geom_dict)
             if it % print_freq == 0 or it == n_iter - 1:
                 # print('string weights:', self.geom_dict.get('string_weights'))
-                loss_str = ' | '.join([f'{key}: {loss_fn[-1]:.4f}' if self.loss_weights_dict.get(key) != 0.0 else '' for key, loss_fn in self.loss_dict.items()])
+                loss_str = ' | '.join([f'{key}: {loss_hist[-1]:.4f}' if self.loss_weights_dict.get(key) != 0.0 and len(loss_hist) > 0 else '' for key, loss_hist in self.loss_dict.items()])
                 print(f'Iter {it+1}/{n_iter}, Total Loss: {self.total_loss[-1]:.4f} | {loss_str}', flush=True)
             
             if self.visualizer is not None and vis_freq is not None:

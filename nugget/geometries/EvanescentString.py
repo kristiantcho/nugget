@@ -133,7 +133,7 @@ class EvanescentString(Geometry):
 
             if active_weights_mode:
                 old_string_weights = raw_weights
-                string_weights = 200 * (torch.sigmoid(old_string_weights) > threshold).to(dtype=torch.float32) - 100
+                string_weights = 2000 * (torch.sigmoid(old_string_weights) > threshold).to(dtype=torch.float32) - 1000
             else:
                 string_weights = raw_weights
                 old_string_weights = raw_weights
@@ -143,7 +143,7 @@ class EvanescentString(Geometry):
             raw_weights = _default_raw_weights(self.n_strings)
             if active_weights_mode:
                 old_string_weights = raw_weights
-                string_weights = 200 * (torch.sigmoid(old_string_weights) > threshold).to(dtype=torch.float32) - 100
+                string_weights = 2000 * (torch.sigmoid(old_string_weights) > threshold).to(dtype=torch.float32) - 1000
             else:
                 string_weights = raw_weights
                 old_string_weights = raw_weights

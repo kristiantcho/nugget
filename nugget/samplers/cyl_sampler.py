@@ -601,7 +601,7 @@ class CylinderSampler(Sampler):
         )
 
         # Build bias tensor (float32)
-        bias = torch.tensor([x_bias, y_bias, z_bias], device=self.device, dtype=torch.float32) * 1.0
+        # bias = torch.tensor([x_bias, y_bias, z_bias], device=self.device, dtype=torch.float32) * 1.0
 
         # Override directions if point_towards_center is enabled
         if self.point_towards_center:
@@ -625,7 +625,7 @@ class CylinderSampler(Sampler):
 
             azimuth_tensor = torch.tensor([phi.item()], device=self.device, dtype=torch.float32)
 
-            pos = positions[i].unsqueeze(0).to(torch.float32) + bias  # (1,3) float32
+            pos = positions[i].unsqueeze(0).to(torch.float32)  # (1,3) float32
 
             event_params = {
                 'energy': energies[i:i+1],          # (1,) float32

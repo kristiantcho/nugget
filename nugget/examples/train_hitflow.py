@@ -31,6 +31,10 @@ hitflow = nugget.surrogates.HitFlow.HitFlow(
     vary_cylinder=False,  # Vary cylinder size during training
     min_domain_size=2500*0.01,  # Minimum cylinder size
     max_domain_size=2500,  # Maximum cylinder size  
+    use_min_hit_time=False,  # Use minimum hit time as a feature
+    shuffle_training_batches=True,  # Shuffle training batches each epoch
+    reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
+    scale_fac=1.0,  # Scaling factor for hit times
 )
 
 history = hitflow.train_model(
@@ -38,7 +42,7 @@ history = hitflow.train_model(
     light_yield_surrogate_func=patd_surrogate,
     num_iterations=3000,
     batch_size=32,
-    epoch_size=3000,
+    epoch_size=5000,
     lr=1e-4,
     min_hits=10,  # Minimum number of hits to consider an event valid
     save_interval=100,
