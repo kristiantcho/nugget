@@ -189,7 +189,7 @@ class LLRnet(Surrogate):
                  num_frequencies=64, frequency_scale=1.0, learnable_frequencies=False,
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True,
-                 add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, 
+                 add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False,
                  lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False):
         """
         Initialize the LLRnet surrogate model.
@@ -284,6 +284,7 @@ class LLRnet(Surrogate):
         self.lr_scheduler_min_lr = lr_scheduler_min_lr
         self.use_patd = use_patd
         self.min_photons = min_photons
+        self.input_delta_time = input_delta_time
         self.num_photons_per_sample = num_photons_per_sample if num_photons_per_sample is not None else min_photons
         # Handle multiple branch configurations
         if num_parallel_branches > 1:
@@ -816,18 +817,41 @@ class LLRnet(Surrogate):
             hit_times = patd_result['hit_times']
             num_photons = patd_result['num_photons']
             
+            
             # Skip if no photons in this sample
             if num_photons == 0:
                 continue
             
             # Process hit times
-            if self.rel_time:
-                hit_times = hit_times - hit_times.min()  # Relative times from first hit
+            if self.rel_time or self.input_delta_time:
+                vertex_times = patd_result.get('vertex_times', None)
+                emmission_points = patd_result.get('emission_points', None)
+                if vertex_times is not None and emmission_points is not None:
+                    # Calculate expected arrival time based on direct path from emission point to detector
+                    # This gives us a more physical "relative time" that accounts for geometry and speed of light
+                    speed_of_light = 299792458.0/(1.3e9)  # m/ns
+                    emmission_points_tensor = torch.as_tensor(emmission_points, dtype=torch.float32, device=self.device)
+                    vertex_times_tensor = torch.as_tensor(vertex_times, dtype=torch.float32, device=self.device)
+                    
+                    # Calculate distance from emission points to detector point
+                    distances = torch.norm(emmission_points_tensor - point_tensor, dim=-1)  # (num_photons,)
+                    
+                    expected_arrival_times = vertex_times_tensor + distances / speed_of_light  # (num_photons,)
+                    if self.rel_time:
+                        hit_times = hit_times - expected_arrival_times  # Relative times from expected arrival
+                    elif self.input_delta_time:
+                        delta_times = hit_times - expected_arrival_times
             
             if self.log_scale_ly:
-                hit_times_processed = torch.log10(torch.abs(hit_times) + 1e-4).view(-1, 1)/4
+                # account 
+                # hit_times_processed = torch.log10(torch.abs(hit_times) + 1e-4).view(-1, 1)/4
+                hit_times_processed = torch.where(hit_times<0, -torch.log10(-hit_times)/4, torch.log10(hit_times)/4).view(-1, 1)
+                if self.input_delta_time:
+                    delta_times_processed = torch.where(delta_times<0, -torch.log10(-delta_times)/4, torch.log10(delta_times)/4).view(-1, 1)
             else:
                 hit_times_processed = hit_times.view(-1, 1)/1e4
+                if self.input_delta_time:
+                    delta_times_processed = delta_times.view(-1, 1)/1e4
                 
             hit_times_processed = hit_times_processed.sort(dim=0).values  # Sort hit times for better learning
             
@@ -841,7 +865,11 @@ class LLRnet(Surrogate):
             base_features_batch = base_features.unsqueeze(0).repeat(num_photons_int, 1)
             
             # Concatenate base features with hit times
-            features_batch = torch.cat([base_features_batch, hit_times_processed], dim=1)
+            if self.input_delta_time:
+                features_batch = torch.cat([base_features_batch, hit_times_processed, delta_times_processed], dim=1)
+            else:    
+                features_batch = torch.cat([base_features_batch, hit_times_processed], dim=1)
+            
             all_features_batches.append(features_batch)
             total_photons += num_photons_int
         

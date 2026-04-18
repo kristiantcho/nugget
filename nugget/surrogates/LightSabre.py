@@ -476,6 +476,10 @@ class LightSabrePATD(LightSabre):
             Maximum number of photons to sample. If provided, samples min(N, max_photons)
             where N is the expected light yield. This speeds up computation when only
             a limited number of photons are needed.
+        use_perpendicular_distance_only : bool
+            If True, bypasses along-track sampling and uses only the perpendicular
+            distance geometry (all photons emitted from the track foot point with
+            respect to the detector).
             
         Returns:
         --------
@@ -485,12 +489,20 @@ class LightSabrePATD(LightSabre):
             - 'num_photons': Number of photons actually sampled
             - 'expected_photons': Expected light yield N (before limiting)
             - 'residual_times': CPandel residual times
+                        - 'muon_emission_times': Time for muon to reach each sampled
+                            emission point along the track
+                        - 'emission_points': 3D point on the track where each photon is
+                            emitted
         """
         # Extract parameters
         opt_point = kwargs.get('opt_point', None)
         event_params = kwargs.get('event_params', None)
         max_photons = kwargs.get('max_photons', None)
         get_patd_probs = kwargs.get('get_patd_probs', False)
+        use_perpendicular_distance_only = kwargs.get(
+            'use_perpendicular_distance_only',
+            self.kwargs.get('use_perpendicular_distance_only', False)
+        )
         
         c = 0.299792458  # speed of light in m/ns
         v_mu = self.kwargs.get('v_mu', c)
@@ -561,93 +573,127 @@ class LightSabrePATD(LightSabre):
             N = expected_N
         
         if N <= 0:
-            return {'hit_times': torch.tensor([], device=self.device), 'num_photons': 0, 'expected_photons': expected_N, 'residual_times': torch.tensor([], device=self.device)}
+            return {
+                'hit_times': torch.tensor([], device=self.device),
+                'num_photons': 0,
+                'expected_photons': expected_N,
+                'residual_times': torch.tensor([], device=self.device),
+                'vertex_times': torch.tensor([], device=self.device),
+                'emission_points': torch.empty((0, 3), device=self.device)
+            }
         # Find the foot of the perpendicular from detector to track
         # Foot point is: track_pos + t_foot * track_dir where t_foot = (detector_pos - track_pos) · track_dir
         to_detector = detector_pos - track_pos
         t_foot = torch.dot(to_detector, track_dir) #distance along track to foot point
+        
+        # If t_foot < 0, detector is behind the track start; muon never travels toward it
+        if t_foot < 0:
+            return {
+                'hit_times': torch.tensor([], device=self.device),
+                'num_photons': 0,
+                'expected_photons': 0,
+                'residual_times': torch.tensor([], device=self.device),
+                'vertex_times': torch.tensor([], device=self.device),
+                'emission_points': torch.empty((0, 3), device=self.device),
+                't_geom_min': torch.tensor(1e-6, device=self.device),
+                'd_geom': torch.tensor([], device=self.device),
+                'patd_probs': None,
+            }
+        
         foot_length = torch.norm(torch.linalg.cross(to_detector, track_dir))/torch.norm(track_dir)
-        if not self.use_max_energy_dist:
-        # Get the maximum distance S along track from foot point in both directions
-            S = self.kwargs.get('track_segment_length', 200.0)  # Default 200m
-            
-            # Determine the range along the track:
-            # - Backwards from foot: [t_foot - S, t_foot]
-            # - Forwards from foot: [t_foot, t_foot + S]
-            # But must not extend backwards past the interaction vertex (t=0)
-            
-            t_min = torch.max(torch.tensor(0.0, device=self.device), t_foot - S)  # Don't go past vertex
-            t_max = t_foot + S
-        
-        else:
-            t_min = 0
-            t_max = self.get_max_energy_dist(energy).squeeze()
-        
-        # Sample points along the track from t_min to t_max
-        t_vals = torch.linspace(t_min, t_max, num_track_points, device=self.device)
-        track_points = track_pos.unsqueeze(0) + t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
-        
-        # Calculate distances from each track point to detector
-        distances = torch.norm(track_points - detector_pos.unsqueeze(0), dim=1)
-        # print(distances[::50])
-        
-        # Cherenkov angle for water
-        theta_c = torch.acos(torch.tensor(1.0/self.refractive_index, device=self.device))
-        sin_theta_c = torch.sin(theta_c)
-        
-        # Optical parameters for water from Tobias K.
-        lambda_abs = 44.7
-        lambda_sca = 57.4
-        lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
-        zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device))
-        lambda_c = lambda_sca / (3.0 * zeta)
-        lambda_mu = (lambda_c / sin_theta_c**2 * 2.0 / (np.pi * lambda_p))
-        
-        # Avoid singularities when detector lies on/very near the sampled track.
-        distances_safe = torch.clamp(distances, min=1e-6)
-        # Calculate weights (unnormalized probabilities)
-        numerator = (1.0 / (2.0 * np.pi * sin_theta_c))
-        numerator = numerator * torch.exp(-distances_safe / lambda_p)
-        
-        denominator = (torch.sqrt(lambda_mu * distances_safe) * 
-                      torch.tanh(torch.sqrt(distances_safe / lambda_mu)))
-        
-        weights = numerator / denominator
-        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-        weights = torch.clamp(weights, min=0.0)
-
-        # Normalize weights to create probability distribution.
-        # If the formula degenerates numerically, fall back to uniform sampling.
-        weight_sum = torch.sum(weights)
-        if (not torch.isfinite(weight_sum)) or (weight_sum <= 0):
-            weights = torch.full_like(weights, 1.0 / weights.numel())
-        else:
-            weights = weights / weight_sum
-        
-        # Sample N points along the track according to weights
         # Convert N to int if it's a tensor, otherwise it's already a Python int
         num_samples = int(N.item()) if isinstance(N, torch.Tensor) else int(N)
-        sampled_indices = torch.multinomial(weights, num_samples, replacement=True)
-        # sampled_track_points = track_points[sampled_indices]
-        sampled_t_vals = t_vals[sampled_indices]
-        sampled_track_points = track_pos.unsqueeze(0) + sampled_t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
-        # Calculate geometric distances for sampled points
-        d_geom = torch.norm(sampled_track_points - detector_pos.unsqueeze(0), dim=1)
+
+        if use_perpendicular_distance_only:
+            # Use the foot point only: no along-track re-sampling.
+            sampled_t_vals = torch.full((num_samples,), t_foot, device=self.device)
+            sampled_track_points = track_pos.unsqueeze(0) + sampled_t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
+            d_perp = torch.clamp(foot_length, min=1e-6)
+            d_geom = torch.full((num_samples,), d_perp, device=self.device)
+        else:
+            if not self.use_max_energy_dist:
+            # Get the maximum distance S along track from foot point in both directions
+                S = self.kwargs.get('track_segment_length', 200.0)  # Default 200m
+                
+                # Determine the range along the track:
+                # - Backwards from foot: [t_foot - S, t_foot]
+                # - Forwards from foot: [t_foot, t_foot + S]
+                # But must not extend backwards past the interaction vertex (t=0)
+                
+                t_min = torch.max(torch.tensor(0.0, device=self.device), t_foot - S)  # Don't go past vertex
+                t_max = t_foot + S
+            
+            else:
+                t_min = 0
+                t_max = self.get_max_energy_dist(energy).squeeze()
+            
+            # Sample points along the track from t_min to t_max
+            t_vals = torch.linspace(t_min, t_max, num_track_points, device=self.device)
+            track_points = track_pos.unsqueeze(0) + t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
+            
+            # Calculate distances from each track point to detector
+            distances = torch.norm(track_points - detector_pos.unsqueeze(0), dim=1)
+            # print(distances[::50])
+            
+            # Cherenkov angle for water
+            theta_c = torch.acos(torch.tensor(1.0/self.refractive_index, device=self.device))
+            sin_theta_c = torch.sin(theta_c)
+            
+            # Optical parameters for water from Tobias K.
+            lambda_abs = 44.7
+            lambda_sca = 57.4
+            lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
+            zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device))
+            lambda_c = lambda_sca / (3.0 * zeta)
+            lambda_mu = (lambda_c / sin_theta_c**2 * 2.0 / (np.pi * lambda_p))
+            
+            # Avoid singularities when detector lies on/very near the sampled track.
+            distances_safe = torch.clamp(distances, min=1e-6)
+            # Calculate weights (unnormalized probabilities)
+            numerator = (1.0 / (2.0 * np.pi * sin_theta_c))
+            numerator = numerator * torch.exp(-distances_safe / lambda_p)
+            
+            denominator = (torch.sqrt(lambda_mu * distances_safe) * 
+                          torch.tanh(torch.sqrt(distances_safe / lambda_mu)))
+            
+            weights = numerator / denominator
+            weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+            weights = torch.clamp(weights, min=0.0)
+
+            # Normalize weights to create probability distribution.
+            # If the formula degenerates numerically, fall back to uniform sampling.
+            weight_sum = torch.sum(weights)
+            if (not torch.isfinite(weight_sum)) or (weight_sum <= 0):
+                weights = torch.full_like(weights, 1.0 / weights.numel())
+            else:
+                weights = weights / weight_sum
+            
+            # Sample N points along the track according to weights
+            sampled_indices = torch.multinomial(weights, num_samples, replacement=True)
+            # sampled_track_points = track_points[sampled_indices]
+            sampled_t_vals = t_vals[sampled_indices]
+            sampled_track_points = track_pos.unsqueeze(0) + sampled_t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
+            # Calculate geometric distances for sampled points
+            d_geom = torch.norm(sampled_track_points - detector_pos.unsqueeze(0), dim=1)
         
         # Calculate distance along track from vertex (s)
         # sampled_t_vals represents distance from vertex along track direction
         s = sampled_t_vals
+        muon_emission_times = s / v_mu
         
         # Calculate geometric time: t_geom = d/(c/n) + s/v_mu
         t_geom = d_geom / (c / self.refractive_index) + s / v_mu
         # t_geom_foot = t_foot / (c / self.refractive_index) + foot_length / v_mu
         # t_geom_track = torch.norm(to_detector) / (c / self.refractive_index)
         # t_geom_min = min(t_geom_foot, t_geom_track)
-        if v_mu != c/self.refractive_index:
-            short_track = t_foot - ((c / self.refractive_index) * foot_length)/torch.sqrt(torch.tensor(v_mu**2 - (c / self.refractive_index)**2, device=self.device))
-            t_geom_min = (short_track / v_mu)  +  torch.sqrt((short_track-t_foot)**2 + foot_length**2) / (c / self.refractive_index)
+        if not use_perpendicular_distance_only:
+            if v_mu != c/self.refractive_index:
+                short_track = t_foot - ((c / self.refractive_index) * foot_length)/torch.sqrt(torch.tensor(v_mu**2 - (c / self.refractive_index)**2, device=self.device))
+                t_geom_min = (short_track / v_mu)  +  torch.sqrt((short_track-t_foot)**2 + foot_length**2) / (c / self.refractive_index)
+            else:
+                t_geom_min = torch.norm(to_detector) / (c / self.refractive_index)
         else:
-            t_geom_min = torch.norm(to_detector) / (c / self.refractive_index)
+            t_geom_min = foot_length / (c / self.refractive_index) + t_foot / v_mu
         # Initialize CPandel model
         cpandel = CPandel(
             tau=cpandel_params.get('tau', 557.),
@@ -677,4 +723,15 @@ class LightSabrePATD(LightSabre):
         
         # need to think of a better return structure here
         
-        return {'hit_times': hit_times, 'num_photons': N, 'expected_photons': expected_N, 'residual_times': t_residual, 'geometric_times': t_geom, 't_geom_min': t_geom_min, 'd_geom': d_geom, 'patd_probs': t_residual_probs}
+        return {
+            'hit_times': hit_times,
+            'num_photons': N,
+            'expected_photons': expected_N,
+            'residual_times': t_residual,
+            'geometric_times': t_geom,
+            'vertex_times': muon_emission_times,
+            'emission_points': sampled_track_points,
+            't_geom_min': t_geom_min,
+            'd_geom': d_geom,
+            'patd_probs': t_residual_probs,
+        }
