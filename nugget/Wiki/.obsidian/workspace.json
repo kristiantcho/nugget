@@ -185,6 +185,7 @@
   },
   "active": "a967183077d646f5",
   "lastOpenFiles": [
+    "CLAUDE.md",
     "modules/other.md",
     "modules/losses.md",
     "modules/geometries.md",
@@ -210,7 +211,6 @@
     "entities/example-uniform_rov_alm_test.md",
     "entities/geom-340grid.md",
     "entities/example-res_test.md",
-    "entities/example-test_evaluation.ipynb.md",
     "index.md.tmp.32312.1776501986434",
     "concepts/alm-optimization.md.tmp.32312.1776501958720",
     "concepts/hungarian-matching.md.tmp.32312.1776501948050",
