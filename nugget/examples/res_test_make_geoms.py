@@ -22,7 +22,7 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
 )
 version = '_e6_e8'
 use_rov = 'rov'
-folder_name = f'res_test/opt_geoms_10000_r600_50{version}_{use_rov}_1/'
+folder_name = f'res_test/opt_geoms_full_hex_10000_r600_50{version}_{use_rov}_1/'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -34,16 +34,16 @@ while os.path.exists(f'{folder_name}geom_{count}.pkl'):
     count += 1
 
 loss_params = {
-    'signal_event_params': pickle.load(open(f'res_test/signal_events_10000_r600_50{version}_1.pkl', 'rb'))[:],
+    'signal_event_params': pickle.load(open(f'res_test/signal_events_10000_r600_50{version}.pkl', 'rb'))[:],
     'num_events': 100,  # Number of events to sample per optimization step
     'boundary_range': 1200,  # Size of boundary region
     'skip_zero_response': True,
     'use_relative_energy': True,
-    'precomputed_signal_yield_per_string': torch.load(f'res_test/light_yield_per_string_10000_800main_r600_50{version}_1.pt')[:],
-    'precomputed_fisher_info_per_string_per_event': torch.load(f'res_test/fisher_info_per_string_per_event_10000_800main_r600_50{version}_1.pt')[:]
+    'precomputed_signal_yield_per_string': torch.load(f'res_test/light_yield_per_string_10000_800main_full_hex_r600_50{version}.pt')[:],
+    'precomputed_fisher_info_per_string_per_event': torch.load(f'res_test/fisher_info_per_string_per_event_10000_800main_full_hex_r600_50{version}.pt')[:]
     }
 loss_params.update({
-    'eva_min_num_strings': 71,  # Minimum number of active strings
+    'eva_min_num_strings': 70,  # Minimum number of active strings
     'max_radius': 80,  # Maximum radius for string placement
     'num_angles': 360,  # Number of angles (divided into 360 degrees) to test for rov
     'rov_alt_mode': True,  # Whether to use alternative mode for rov penalty (see rov_penalty.py for details)
@@ -121,7 +121,7 @@ for i in range(15):
             hex_type='hexagonal',
             domain_size=1600,  # Size of detector domain
             dim=3,  # 3D geometry
-            n_strings=1000,  # Initial number of detector strings
+            n_strings=1027,  # Initial number of detector strings
             points_per_string=20,  # Number of PMTs/sensors per string
             custom_z_spacing=50,
             random_weights=True

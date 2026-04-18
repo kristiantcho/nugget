@@ -22,7 +22,7 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
         E_min=1e2, 
         E_max=1e8, 
         energy_dist='log_uniform', 
-        find_exact_intersection=True,
+        find_exact_intersection=False,
         random_position_along_ray=True,
         )
 
@@ -52,9 +52,10 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     lr_scheduler_patience=35,  # Patience for LR scheduler
     use_patd=True,
     min_photons=1,  # Minimum number of photons to consider an event valid
-    num_photons_per_sample=None,  # Number of photons to sample from each valid event
+    num_photons_per_sample=1,  # Number of photons to sample from each valid event
     input_charge=False,
-    rel_time=True,
+    rel_time=False,
+    input_delta_time=True,
 )
 
 # llr_net.load_model('best_hit_llr_model_v3')
@@ -62,8 +63,8 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
 train_dataloader = llr_net.create_patd_dataloader(
     signal_sampler=signal_sampler, 
     signal_surrogate_func=light_yield_surrogate,
-    num_samples_per_epoch=3000,
-    batch_size=300,       # Size of each batch (N pairs)
+    num_samples_per_epoch=5000,
+    batch_size=16,       # Size of each batch (N pairs)
     num_workers=8,
     event_labels=['position','energy', 'direction'],
     # shuffle=False,
@@ -86,9 +87,9 @@ train_dataloader = llr_net.create_patd_dataloader(
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     # val_dataloader=val_dataloader,
-    epochs=400,  # Maximum number of training epochs
+    epochs=1000,  # Maximum number of training epochs
     # early_stopping_patience=30  # Stop if validation doesn't improve for 50 epochs
-    input_dim=11 # manually specify input dimension 
+    input_dim=12 # manually specify input dimension (11 features)
 )
 # Save the best model for later use
 llr_net.save_model('best_hit_llr_model_v3')

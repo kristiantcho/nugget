@@ -72,7 +72,7 @@ class cpandel_gen(rv_continuous):
     lambda_s : scattering length (length)
     lambda_a : absorption length (length)
     v : velocity (length/time)
-    s : jitter (gauss covolution width)
+    s : jitter (gauss convolution width)
     
     Notes:
     ------
