@@ -54,3 +54,7 @@ Append-only. Newest entries at the bottom. Format:
                             string-parameterization, detector-geometry,
                             hungarian-matching.
                           Total: 20 pages now carry Mermaid diagrams.
+2026-04-18 03:30  INIT    Root CLAUDE.md created at repo root pointing every
+                          future Claude session to Wiki/index.md + Wiki/CLAUDE.md.
+                          Makes "always read the wiki" load-bearing via
+                          Claude Code's auto-loaded CLAUDE.md mechanism.
