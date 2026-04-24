@@ -271,13 +271,28 @@ Surrogates are differentiable approximations of detector physics. All inherit fr
 Analytical photon arrival time / light yield model based on Cherenkov emission geometry.
 
 - `LightSabre` — basic light yield, outputs `light_yield` per detector point
-- `LightSabrePATD` — photon arrival time distribution, outputs `residual_times`, `d_geom`, `light_yield`
+- `LightSabrePATD` — photon arrival time distribution; supports single and batched detector positions
 
 **Constructor params:**
 - `use_poisson` — Poisson-sample photon counts
 - `num_track_points` — discretization of muon track
 - `domain_size` — detector domain radius
 - `particle_mode` — `'track'` (muon) or `'cascade'`
+- `use_perpendicular_distance_only` — skip along-track sampling, use foot-point geometry only
+
+**Batched calling convention:**
+- `opt_point` shape `(3,)` or `(1,3)` → returns a single `dict`
+- `opt_point` shape `(n_pts, 3)` → returns `list[dict]` of length `n_pts`
+
+Batch mode parallelises all geometry (`t_foot`, `foot_length`, `t_geom_min`, light yield, Poisson
+sampling, and the full `(T × n_pts)` track-weight matrix) before the per-detector CPandel loop.
+
+**Key internal methods:**
+- `_parse_event_params` — normalise event dict → `(track_pos, track_dir, energy)`
+- `_patd_single` — single-detector path (original logic)
+- `_patd_batch` — multi-detector path with vectorised geometry
+- `_compute_track_weights_batch` — `(T × n_pts)` emission-weight matrix (non-perp mode)
+- `_sample_cpandel` — shared CPandel rvs + optional pdf call
 
 **Usage:** Called per-event; fully differentiable wrt detector point positions and event parameters.
 
