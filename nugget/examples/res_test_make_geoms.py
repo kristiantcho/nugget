@@ -20,9 +20,9 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
     rov_height=159.9, 
     rov_tri_length=159.9
 )
-version = '_e6_e8'
+version = '_1_c'
 use_rov = 'rov'
-folder_name = f'res_test/opt_geoms_full_hex_10000_r600_50{version}_{use_rov}_1/'
+folder_name = f'res_test/opt_geoms_full_hex_10000_r600_50{version}_{use_rov}/'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -68,7 +68,7 @@ loss_params.update({
     })
 loss_weights_dict = {
     'angular_resolution_loss': 1e3,
-    # 'energy_resolution_loss': 0.5,
+    'energy_resolution_loss': 1e8,
     # 'fisher_loss': 0.005, 
     'signal_yield_loss': 0.01,        # High weight: maximize light collection
     # 'signal_llr_loss': 2.5,          # Moderate weight: good signal discrimination
@@ -84,7 +84,7 @@ loss_weights_dict = {
 
 loss_sigmoid_list = [
     'angular_resolution_loss',
-    # 'energy_resolution_loss',
+    'energy_resolution_loss',
     # 'fisher_loss', 
     # 'signal_yield_loss',        # High weight: maximize light collection
     # 'signal_llr_loss',
@@ -98,8 +98,8 @@ loss_sigmoid_list = [
     'rov_penalty'
 ]
 loss_func_dict = {
-    'angular_resolution_loss': weighted_angular_resolution_loss,
-    # 'energy_resolution_loss': weighted_energy_resolution_loss,
+    # 'angular_resolution_loss': weighted_angular_resolution_loss,
+    'energy_resolution_loss': weighted_energy_resolution_loss,
     # 'fisher_loss': fisher_info_loss_func, 
     # 'signal_yield_loss': signal_yield_loss_func,  # Maximize light collection
     # 'signal_llr_loss': signal_llr_loss_func,      # Maximize signal discrimination

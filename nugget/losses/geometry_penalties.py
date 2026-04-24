@@ -888,7 +888,7 @@ class ROVPenalty(LossFunction):
         # - detach_other_probs=True: do not backprop into blocking strings' weights
         soft_inside = kwargs.get('rov_soft_inside', False)
         inside_sharpness = float(kwargs.get('rov_inside_sharpness', 5.0))
-        angle_softmin_tau = float(kwargs.get('rov_angle_softmin_tau', 0.5))
+        angle_softmin_tau = float(kwargs.get('rov_angle_softmin_tau', 0.0))
         detach_other_probs = kwargs.get('detach_other_probs', True)
         alt_mode = bool(kwargs.get('rov_alt_mode', False))
 

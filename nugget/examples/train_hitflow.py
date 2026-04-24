@@ -17,7 +17,8 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
     E_min=1e2, 
     E_max=1e8, 
     energy_dist='log_uniform', 
-    find_exact_intersection=True
+    find_exact_intersection=False,
+    random_position_along_ray=True, 
 )
 
 
