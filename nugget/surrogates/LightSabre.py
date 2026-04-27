@@ -475,14 +475,19 @@ class LightSabrePATD(LightSabre):
             zenith = event_params.get('zenith', None)
             azimuth = event_params.get('azimuth', None)
             if zenith is None or azimuth is None:
-                raise ValueError("event_params must contain 'direction' or both 'zenith' and 'azimuth'")
-            theta = zenith.to(self.device).squeeze() if isinstance(zenith, torch.Tensor) else torch.tensor(zenith, dtype=torch.float32, device=self.device).squeeze()
-            phi = azimuth.to(self.device).squeeze() if isinstance(azimuth, torch.Tensor) else torch.tensor(azimuth, dtype=torch.float32, device=self.device).squeeze()
-            track_dir = torch.stack([
-                torch.sin(theta) * torch.cos(phi),
-                torch.sin(theta) * torch.sin(phi),
-                torch.cos(theta),
-            ])
+                if self.particle_mode == 'cascade':
+                    # Direction is irrelevant for cascade PATD geometry; keep a sane placeholder.
+                    track_dir = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
+                else:
+                    raise ValueError("event_params must contain 'direction' or both 'zenith' and 'azimuth'")
+            else:
+                theta = zenith.to(self.device).squeeze() if isinstance(zenith, torch.Tensor) else torch.tensor(zenith, dtype=torch.float32, device=self.device).squeeze()
+                phi = azimuth.to(self.device).squeeze() if isinstance(azimuth, torch.Tensor) else torch.tensor(azimuth, dtype=torch.float32, device=self.device).squeeze()
+                track_dir = torch.stack([
+                    torch.sin(theta) * torch.cos(phi),
+                    torch.sin(theta) * torch.sin(phi),
+                    torch.cos(theta),
+                ])
 
         track_dir = track_dir / torch.norm(track_dir).clamp_min(1e-12)
         return track_pos, track_dir, energy
@@ -501,7 +506,7 @@ class LightSabrePATD(LightSabre):
             'patd_probs': None,
         }
 
-    def _sample_cpandel(self, cpandel, d_geom_i, t_geom_i, s_i, track_pos, track_dir, v_mu, get_patd_probs):
+    def _sample_cpandel(self, cpandel, d_geom_i, t_geom_i, s_i, track_pos, track_dir, v_mu, get_patd_probs, cascade_mode=False):
         """Run CPandel sampling for one detector and return hit-level tensors."""
         d_geom_numpy = d_geom_i.detach().cpu().numpy()
         t_residual_output = cpandel.rvs(d=d_geom_numpy, size=None)
@@ -517,8 +522,13 @@ class LightSabrePATD(LightSabre):
             t_residual = torch.from_numpy(t_residual_output).float().to(self.device)
 
         hit_times = t_geom_i + t_residual
-        emission_points = track_pos.unsqueeze(0) + s_i.unsqueeze(1) * track_dir.unsqueeze(0)
-        return hit_times, t_residual, t_geom_i, s_i / v_mu, emission_points, t_residual_probs
+        if cascade_mode:
+            emission_points = track_pos.unsqueeze(0).expand(s_i.shape[0], -1)
+            vertex_times = torch.zeros_like(s_i)
+        else:
+            emission_points = track_pos.unsqueeze(0) + s_i.unsqueeze(1) * track_dir.unsqueeze(0)
+            vertex_times = s_i / v_mu
+        return hit_times, t_residual, t_geom_i, vertex_times, emission_points, t_residual_probs
 
     def _compute_track_weights(self, t_min, t_max, track_pos, track_dir, detector_pos):
         """
@@ -533,7 +543,7 @@ class LightSabrePATD(LightSabre):
 
         theta_c = torch.acos(torch.tensor(1.0 / self.refractive_index, device=self.device))
         sin_theta_c = torch.sin(theta_c)
-        lambda_abs, lambda_sca = 44.7, 57.4
+        lambda_abs, lambda_sca = 44.7, 57.4/(1-self.scattering_tau)
         lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
         zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device))
         lambda_c = lambda_sca / (3.0 * zeta)
@@ -564,7 +574,7 @@ class LightSabrePATD(LightSabre):
 
         theta_c = torch.acos(torch.tensor(1.0 / self.refractive_index, device=self.device))
         sin_theta_c = torch.sin(theta_c)
-        lambda_abs, lambda_sca = 44.7, 57.4
+        lambda_abs, lambda_sca = 44.7, 57.4/(1-self.scattering_tau)
         lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
         zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device))
         lambda_c = lambda_sca / (3.0 * zeta)
@@ -643,6 +653,7 @@ class LightSabrePATD(LightSabre):
         c = 0.299792458
         v_mu = self.kwargs.get('v_mu', c)
         cpandel_params = self.kwargs.get('cpandel_params', {})
+        is_cascade = self.particle_mode == 'cascade'
 
         track_pos, track_dir, energy = self._parse_event_params(event_params)
 
@@ -664,18 +675,21 @@ class LightSabrePATD(LightSabre):
 
         to_detector = detector_pos - track_pos
         t_foot = torch.dot(to_detector, track_dir)
-
-        if t_foot < 0:
-            return self._empty_patd_dict(expected_N)
-
         foot_length = torch.norm(torch.linalg.cross(to_detector, track_dir)) / torch.norm(track_dir)
+        d_vertex = torch.norm(to_detector)
         num_samples = int(N.item()) if isinstance(N, torch.Tensor) else int(N)
 
-        if use_perpendicular_distance_only:
+        if is_cascade:
+            s = torch.zeros((num_samples,), device=self.device)
+            d_geom = torch.full((num_samples,), d_vertex.clamp(min=1e-6).item(), device=self.device)
+            t_geom_min = d_vertex / (c / self.refractive_index)
+        elif use_perpendicular_distance_only:
             s = torch.full((num_samples,), t_foot.item(), device=self.device)
             d_geom = torch.full((num_samples,), foot_length.clamp(min=1e-6).item(), device=self.device)
             t_geom_min = foot_length / (c / self.refractive_index) + t_foot / v_mu
         else:
+            if t_foot < 0:
+                return self._empty_patd_dict(expected_N)
             if not self.use_max_energy_dist:
                 S = self.kwargs.get('track_segment_length', 200.0)
                 t_min = torch.max(torch.tensor(0.0, device=self.device), t_foot - S)
@@ -700,12 +714,15 @@ class LightSabrePATD(LightSabre):
         t_geom = d_geom / (c / self.refractive_index) + s / v_mu
 
         cpandel = CPandel(
-            tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 33.3),
-            lambda_a=cpandel_params.get('lambda_a', 98.), v=cpandel_params.get('v', 0.3 / 1.33),
+            tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 57.4),
+            lambda_a=cpandel_params.get('lambda_a', ), v=cpandel_params.get('v', 0.3 / 1.33),
             s=cpandel_params.get('s', 5.0)
         )
         hit_times, t_residual, t_geom, vertex_times, emission_points, t_residual_probs = \
-            self._sample_cpandel(cpandel, d_geom, t_geom, s, track_pos, track_dir, v_mu, get_patd_probs)
+            self._sample_cpandel(
+                cpandel, d_geom, t_geom, s, track_pos, track_dir, v_mu, get_patd_probs,
+                cascade_mode=is_cascade
+            )
 
         return {
             'hit_times': hit_times,
@@ -744,6 +761,7 @@ class LightSabrePATD(LightSabre):
         v_mu = self.kwargs.get('v_mu', c)
         cpandel_params = self.kwargs.get('cpandel_params', {})
         n_pts = detector_positions.shape[0]
+        is_cascade = self.particle_mode == 'cascade'
 
         track_pos, track_dir, energy = self._parse_event_params(event_params)
 
@@ -754,7 +772,8 @@ class LightSabrePATD(LightSabre):
             to_detector, track_dir.unsqueeze(0).expand(n_pts, 3)
         )
         foot_length = cross.norm(dim=1) / track_dir.norm().clamp_min(1e-12)            # (n_pts,)
-        valid_mask = t_foot >= 0                                                        # (n_pts,)
+        valid_mask = torch.ones_like(t_foot, dtype=torch.bool) if is_cascade else (t_foot >= 0)  # (n_pts,)
+        d_vertex = to_detector.norm(dim=1)                                              # (n_pts,)
 
         # ---- Vectorised light yield + Poisson ---------------------------
         if self.kwargs.get('input_photons', None) is None:
@@ -773,7 +792,9 @@ class LightSabrePATD(LightSabre):
 
         # ---- Vectorised t_geom_min --------------------------------------
         fl_safe = foot_length.clamp(min=1e-6)
-        if use_perpendicular_distance_only:
+        if is_cascade:
+            t_geom_min_batch = d_vertex.clamp(min=1e-6) / (c / self.refractive_index)  # (n_pts,)
+        elif use_perpendicular_distance_only:
             t_geom_min_batch = fl_safe / (c / self.refractive_index) + t_foot / v_mu  # (n_pts,)
         else:
             if v_mu != c / self.refractive_index:
@@ -787,7 +808,7 @@ class LightSabrePATD(LightSabre):
                 t_geom_min_batch = to_detector.norm(dim=1) / (c / self.refractive_index)
 
         # ---- Track-weight matrix (non-perp mode, computed once) ---------
-        if not use_perpendicular_distance_only:
+        if not is_cascade and not use_perpendicular_distance_only:
             if not self.use_max_energy_dist:
                 S = self.kwargs.get('track_segment_length', 200.0)
                 t_min = max(0.0, float(t_foot.min().item()) - S)
@@ -802,7 +823,7 @@ class LightSabrePATD(LightSabre):
 
         # ---- Build CPandel once -----------------------------------------
         cpandel = CPandel(
-            tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 33.3),
+            tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 57.4),
             lambda_a=cpandel_params.get('lambda_a', 98.), v=cpandel_params.get('v', 0.3 / 1.33),
             s=cpandel_params.get('s', 5.0)
         )
@@ -819,7 +840,10 @@ class LightSabrePATD(LightSabre):
                 results.append(self._empty_patd_dict(light_yield[i].item()))
                 continue
 
-            if use_perpendicular_distance_only:
+            if is_cascade:
+                s_i = torch.zeros((N_i,), device=self.device)
+                d_geom_i = torch.full((N_i,), d_vertex[i].clamp(min=1e-6).item(), device=self.device)
+            elif use_perpendicular_distance_only:
                 s_i = torch.full((N_i,), t_foot[i].item(), device=self.device)
                 d_geom_i = torch.full((N_i,), fl_safe[i].item(), device=self.device)
             else:
@@ -830,12 +854,15 @@ class LightSabrePATD(LightSabre):
             t_geom_i = d_geom_i / (c / self.refractive_index) + s_i / v_mu
 
             hit_times, t_residual, t_geom_i, vertex_times, emission_points, t_residual_probs = \
-                self._sample_cpandel(cpandel, d_geom_i, t_geom_i, s_i, track_pos, track_dir, v_mu, get_patd_probs)
+                self._sample_cpandel(
+                    cpandel, d_geom_i, t_geom_i, s_i, track_pos, track_dir, v_mu, get_patd_probs,
+                    cascade_mode=is_cascade
+                )
 
             results.append({
                 'hit_times': hit_times,
                 'num_photons': N_i,
-                'expected_photons': light_yield[i].item(),
+                'charge': light_yield[i].item(),
                 'residual_times': t_residual,
                 'geometric_times': t_geom_i,
                 'vertex_times': vertex_times,
@@ -846,3 +873,53 @@ class LightSabrePATD(LightSabre):
             })
 
         return results
+
+    def eval_patd_log_probs(self, t_residuals_fixed, opt_point, event_params):
+        """
+        Re-evaluate CPandel log-pdf at pre-sampled residual times with gradient-enabled geometry.
+
+        Computes foot_length (perpendicular distance from track to detector) from event_params
+        with full gradient support. Exact for use_perpendicular_distance_only=True; a
+        differentiable perpendicular-distance approximation for the general mode.
+
+        Parameters
+        ----------
+        t_residuals_fixed : Tensor, shape (N_hits,)
+            Pre-sampled residual times, treated as fixed constants for grad computation.
+        opt_point : Tensor, shape (3,)
+            Detector position.
+        event_params : dict
+            Must contain 'position' and 'direction' (or 'zenith'/'azimuth'). Parameters
+            may carry requires_grad=True for Fisher info Jacobian computation.
+
+        Returns
+        -------
+        Tensor, shape (N_hits,)
+            log(CPandel.pdf(t_residuals, d=foot_length(theta))).
+        """
+        track_pos, track_dir, _ = self._parse_event_params(event_params)
+
+        if not isinstance(opt_point, torch.Tensor):
+            opt_point = torch.tensor(opt_point, dtype=torch.float32, device=self.device)
+        opt_point = opt_point.float().to(self.device)
+
+        if not isinstance(t_residuals_fixed, torch.Tensor):
+            t_residuals_fixed = torch.tensor(t_residuals_fixed, dtype=torch.float32, device=self.device)
+        t_residuals_fixed = t_residuals_fixed.float().to(self.device)
+
+        to_detector = opt_point - track_pos
+        cross = torch.linalg.cross(to_detector, track_dir)
+        foot_length = cross.norm() / track_dir.norm().clamp_min(1e-12)
+        d_geom = foot_length.clamp(min=1e-6).expand(t_residuals_fixed.shape[0])
+
+        cpandel_params = self.kwargs.get('cpandel_params', {})
+        cpandel = CPandel(
+            tau=cpandel_params.get('tau', 557.),
+            lambda_s=cpandel_params.get('lambda_s', 57.4),
+            lambda_a=cpandel_params.get('lambda_a', 98.),
+            v=cpandel_params.get('v', 0.3 / 1.33),
+            s=cpandel_params.get('s', 5.0),
+        )
+
+        probs = cpandel.pdf(t_residuals_fixed, d=d_geom)
+        return torch.log(probs.clamp(min=1e-40))

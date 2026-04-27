@@ -896,7 +896,7 @@ def directional_resolution(F3, n):
         return r68
 
 
-def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True):
+def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False):
     """
     Compute the Fisher information matrix averaged over multiple LLR iterations.
     
@@ -962,7 +962,18 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
         If True (default), detach Fisher tensors during chunk aggregation to save
         memory and preserve historical behavior. Set False to keep graph
         connectivity (e.g., gradients wrt geometry points/string_xy).
-        
+    use_patd : bool
+        If True, use the photon arrival time distribution path instead of the
+        Poisson-mean or LLR-network paths. Requires surrogate_func to be a
+        LightSabrePATD instance (must have eval_patd_log_probs). llr_net is
+        ignored when use_patd=True.
+
+        Fisher info per detector: F_i = mean_charge_i * (1/N) sum_hits (d log p/dtheta)^2
+        where p(t|theta) = CPandel.pdf(t_residual, d=foot_length(theta)).
+        mean_charge_i is the average of num_photons over llr_iterations surrogate calls.
+        N hits are collected by sampling the surrogate until llr_iterations total
+        residual times are accumulated per detector.
+
     Returns:
     --------
     torch.Tensor
@@ -1007,7 +1018,139 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
     fixed_params = {k: v.detach().to(device) for k, v in event_params.items() if k not in fisher_info_params}
 
     # -----------------------------------------------------------------------
-    if llr_net is None:
+    if use_patd:
+        # ---- PATD path -----------------------------------------------
+        # Fisher info via photon arrival time distribution:
+        #   F_i = mean_charge_i * (1/N_hits) Σ_hits (∂ log p(t|θ) / ∂θ)^T (∂ log p(t|θ) / ∂θ)
+        # where p(t|θ) = CPandel.pdf(t_residual, d=foot_length(θ)) evaluated
+        # at pre-sampled (fixed) residual times.
+        #
+        # Phase 1 — no-grad sampling:
+        #   charge: call surrogate llr_iterations times, average num_photons per detector
+        #   hits:   keep calling until each detector has >= llr_iterations residual times
+        # Phase 2 — jacrev or jvp over eval_patd_log_probs (CPandel PDF with grad-enabled foot_length)
+
+        if not hasattr(surrogate_func, 'eval_patd_log_probs'):
+            raise AttributeError(
+                "use_patd=True requires surrogate_func to have 'eval_patd_log_probs'. "
+                "Use LightSabrePATD."
+            )
+
+        patd_autodiff_mode = (llr_autodiff_mode or 'jacrev').lower()
+        if patd_autodiff_mode not in {'jacrev', 'jvp'}:
+            raise ValueError(
+                f"Unsupported llr_autodiff_mode={llr_autodiff_mode!r} for PATD path; "
+                "expected 'jacrev' or 'jvp'."
+            )
+
+        theta_shapes_patd = [event_params[p].detach().to(device).shape for p in fisher_info_params]
+        theta_numels_patd = [event_params[p].detach().to(device).numel() for p in fisher_info_params]
+        theta0_flat_patd = torch.cat([
+            event_params[p].detach().to(device).reshape(-1) for p in fisher_info_params
+        ])
+        all_params_detached = {k: v.detach().to(device) for k, v in event_params.items()}
+
+        t_residuals_per_pt = [[] for _ in range(n_points)]
+        charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            # Charge: llr_iterations calls
+            for _ in range(llr_iterations):
+                if n_points == 1:
+                    res = surrogate_func(opt_point=point[0], event_params=all_params_detached)
+                    if isinstance(res, dict):
+                        charge_sums[0] += float(res.get('num_photons', res.get('expected_photons', 0)))
+                    else:
+                        charge_sums[0] += float(res.item() if isinstance(res, torch.Tensor) else float(res))
+                else:
+                    results = surrogate_func(opt_point=point, event_params=all_params_detached)
+                    if isinstance(results, list):
+                        for _i, res in enumerate(results):
+                            charge_sums[_i] += float(res.get('num_photons', res.get('expected_photons', 0)))
+                    elif isinstance(results, torch.Tensor):
+                        charge_sums += results.detach().float().reshape(-1)[:n_points]
+
+            mean_charges = charge_sums / max(llr_iterations, 1)
+
+            # Hits: sample until each detector has >= llr_iterations residual times
+            _max_calls = llr_iterations * 200
+            _call_count = 0
+            while _call_count < _max_calls:
+                if all(
+                    sum(len(_rt) for _rt in t_residuals_per_pt[_i]) >= llr_iterations
+                    for _i in range(n_points)
+                ):
+                    break
+                _call_count += 1
+                if n_points == 1:
+                    res = surrogate_func(opt_point=point[0], event_params=all_params_detached)
+                    if isinstance(res, dict):
+                        _rt = res.get('residual_times', None)
+                        if _rt is not None and _rt.numel() > 0:
+                            t_residuals_per_pt[0].append(_rt.detach().cpu())
+                else:
+                    results = surrogate_func(opt_point=point, event_params=all_params_detached)
+                    if isinstance(results, list):
+                        for _i, res in enumerate(results):
+                            _rt = res.get('residual_times', None)
+                            if _rt is not None and _rt.numel() > 0:
+                                t_residuals_per_pt[_i].append(_rt.detach().cpu())
+
+        # Compile and truncate to llr_iterations hits per detector
+        t_residuals_compiled = []
+        for _i in range(n_points):
+            _parts = t_residuals_per_pt[_i]
+            if _parts:
+                _all_rt = torch.cat(_parts, dim=0)[:llr_iterations]
+            else:
+                _all_rt = torch.tensor([], dtype=torch.float32)
+            t_residuals_compiled.append(_all_rt.to(device))
+
+        # Grad phase: per-detector Fisher via jacrev or jvp
+        fisher_per_point = torch.zeros(n_points, total_dims, total_dims, device=device)
+        for _i in range(n_points):
+            _t_res = t_residuals_compiled[_i]
+            if _t_res.numel() == 0:
+                continue
+            _n_hits = int(_t_res.shape[0])
+            _t_fixed = _t_res
+            _pt_fixed = point[_i]
+
+            def _patd_log_probs_fn(_theta_flat, _t=_t_fixed, _pt=_pt_fixed):
+                _params = _unflatten_theta(
+                    _theta_flat, fisher_info_params=fisher_info_params,
+                    theta_shapes=theta_shapes_patd, theta_numels=theta_numels_patd,
+                    fixed_params=fixed_params,
+                )
+                return surrogate_func.eval_patd_log_probs(
+                    t_residuals_fixed=_t, opt_point=_pt, event_params=_params,
+                )
+
+            if patd_autodiff_mode == 'jacrev':
+                _J = jacrev(_patd_log_probs_fn, chunk_size=jacrev_chunk_size)(theta0_flat_patd)
+                _J = _J.reshape(_n_hits, total_dims)
+            else:
+                # Forward-mode via JVPs: linearize then apply basis vectors
+                _basis_chunk = grad_chunk_size if grad_chunk_size is not None else total_dims
+                _ly0, _jvp_fn = linearize(_patd_log_probs_fn, theta0_flat_patd)
+                _cols_parts = []
+                for _d_start in range(0, total_dims, _basis_chunk):
+                    _d_end = min(_d_start + _basis_chunk, total_dims)
+                    _k = _d_end - _d_start
+                    _bvecs = torch.zeros(_k, total_dims, device=device, dtype=theta0_flat_patd.dtype)
+                    _bvecs[torch.arange(_k, device=device), torch.arange(_d_start, _d_end, device=device)] = 1
+                    _cols_parts.append(vmap(_jvp_fn)(_bvecs))  # (k, N_hits)
+                _J = torch.cat(_cols_parts, dim=0).permute(1, 0).contiguous()  # (N_hits, D)
+                del _cols_parts, _jvp_fn, _ly0
+
+            _F = torch.einsum('li,lj->ij', _J, _J) / _n_hits
+            fisher_per_point[_i] = _F.detach() if detach_fisher_tensors else _F
+            _fisher_chunk_cleanup(device)
+
+        # Scale each detector's Fisher by its mean photon count
+        fisher_per_point = fisher_per_point * mean_charges.view(n_points, 1, 1)
+
+    elif llr_net is None:
         # ---- surrogate-only path -----------------------------------------------
         # The surrogate directly returns the Poisson mean λ.
         # We mirror the LLR-mode principle: build a Jacobian J of the vector output
