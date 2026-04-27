@@ -1,6 +1,6 @@
 import torch
-from torch import tensor
-from torch.special import gammainc, gammaln
+# from scipy.special import  gammainc, gammaincinv, gamma, gammaln, hyp1f1
+from torch.special import gammaln, gammainc
 import numpy as np
 import scipy
 
@@ -87,7 +87,7 @@ class Pandel():
         t, d = torch.as_tensor(t), torch.as_tensor(d)
         xi = d / self.lambda_s
 
-        return xi * torch.log(tensor(self.rho)) - gammaln(xi) + (xi - 1) * torch.log(t) - t * self.rho
+        return xi * torch.log(torch.tensor(self.rho)) - gammaln(xi) + (xi - 1) * torch.log(t) - t * self.rho
 
     def cdf(self, t, d):
         return gammainc(d / self.lambda_s, t * self.rho)
@@ -153,7 +153,7 @@ class CPandel():
         # fully analytic region
         rho, s = self.rho, self.s
         term1 = hyp1f1(0.5 * xi, 0.5, 0.5 * eta**2) / torch.exp(gammaln(0.5 * (xi + 1)))
-        term2 = torch.sqrt(tensor(2.)) * eta * hyp1f1(0.5 * (xi + 1), 1.5, 0.5 * eta**2) / torch.exp(gammaln(0.5 * xi))
+        term2 = torch.sqrt(torch.tensor(2.)) * eta * hyp1f1(0.5 * (xi + 1), 1.5, 0.5 * eta**2) / torch.exp(gammaln(0.5 * xi))
 
         pref = rho**xi * s**(xi - 1) * torch.exp(-t**2 / (2 * s**2)) / (2 ** ((1 + xi) / 2))
         return pref * (term1 - term2)
@@ -177,10 +177,10 @@ class CPandel():
             - xi/2 + 1/4
             + k * (2*xi - 1)
             - 0.25 * torch.log(1 + z**2)
-            - xi/2 * torch.log(tensor(2.0))
+            - xi/2 * torch.log(torch.tensor(2.0))
             + (xi - 1)/2 * torch.log(2*xi - 1)
-            + xi * torch.log(tensor(self.rho))
-            + (xi - 1) * torch.log(tensor(self.s))
+            + xi * torch.log(torch.tensor(self.rho))
+            + (xi - 1) * torch.log(torch.tensor(self.s))
         )
 
         return torch.exp(alpha) / torch.exp(gammaln(xi)) * Phi
@@ -200,7 +200,7 @@ class CPandel():
             self.rho**xi
             * self.s**(xi - 1)
             * torch.exp(-t**2 / (2*self.s**2) + eta**2/4)
-            / torch.sqrt(tensor(2*torch.pi))
+            / torch.sqrt(torch.tensor(2*torch.pi))
             * U
             * torch.exp(-k * (2*xi - 1))
             * (1 + z**2)**(-0.25)
@@ -210,7 +210,7 @@ class CPandel():
     def f5(self, xi, t, eta):
         return (
             (self.rho * self.s)**xi
-            / torch.sqrt(tensor(2 * torch.pi * self.s**2))
+            / torch.sqrt(torch.tensor(2 * torch.pi * self.s**2))
             * eta**(-xi)
             * torch.exp(-t**2 / (2 * self.s**2))
         )
