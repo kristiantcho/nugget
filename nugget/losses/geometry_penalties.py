@@ -1,5 +1,7 @@
 import torch
+from scipy.optimize import linear_sum_assignment
 from torch.nn import functional as F
+
 from nugget.losses.base_loss import LossFunction
 
 class BoundaryPenalty(LossFunction):
@@ -1040,5 +1042,153 @@ class ROVPenalty(LossFunction):
             'rov_least_blocked_angle_per_string': least_blocked_angle_per_string,
         }
 
-            
+class DiversityPenalty(LossFunction):
+    """Loss function for diversity penalty to encourage diversity among optimal geometries."""
+    def __init__(self, device=None):
+        """
+        Initialize the diversity penalty loss function.
         
+        Parameters:
+        -----------
+        device : torch.device or None
+            Device to use for computations. If None, uses cuda if available, else cpu.
+        """
+        super().__init__(device)
+
+    def _geometry_distance(self, geometry_a, geometry_b, use_hungarian=False):
+        """Compute a distance between two geometries.
+
+        Default behavior assumes both geometries use the same string ordering and
+        compares the weight tensors directly. Optional Hungarian matching can be
+        enabled to align nearby strings first and then compare their strengths.
+        """
+        string_xy_a = geometry_a.get('string_xy', None)
+        string_xy_b = geometry_b.get('string_xy', None)
+        string_weights_a = geometry_a.get('string_weights', None)
+        string_weights_b = geometry_b.get('string_weights', None)
+
+        if string_weights_a is None or string_weights_b is None:
+            return None
+
+        weights_a = torch.sigmoid(string_weights_a)
+        weights_b = torch.sigmoid(string_weights_b)
+
+        if weights_a.shape == weights_b.shape and not use_hungarian:
+            return torch.mean((weights_a - weights_b) ** 2)
+
+        if not use_hungarian:
+            min_len = min(weights_a.shape[0], weights_b.shape[0])
+            if min_len == 0:
+                return torch.tensor(0.0, device=weights_a.device)
+            matched_distance = torch.mean((weights_a[:min_len] - weights_b[:min_len]) ** 2)
+            if weights_a.shape[0] > min_len:
+                matched_distance = matched_distance + torch.mean(weights_a[min_len:] ** 2)
+            if weights_b.shape[0] > min_len:
+                matched_distance = matched_distance + torch.mean(weights_b[min_len:] ** 2)
+            return matched_distance
+
+        if string_xy_a is None or string_xy_b is None or string_xy_a.numel() == 0 or string_xy_b.numel() == 0:
+            min_len = min(weights_a.shape[0], weights_b.shape[0])
+            if min_len == 0:
+                return torch.tensor(0.0, device=weights_a.device)
+            return torch.mean((weights_a[:min_len] - weights_b[:min_len]) ** 2)
+
+        xy_cost = torch.cdist(string_xy_a, string_xy_b, p=2)
+        weight_cost = torch.cdist(weights_a.unsqueeze(1), weights_b.unsqueeze(1), p=2)
+        cost_matrix = xy_cost + weight_cost
+        row_indices, col_indices = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
+        row_indices = torch.as_tensor(row_indices, device=weights_a.device, dtype=torch.long)
+        col_indices = torch.as_tensor(col_indices, device=weights_b.device, dtype=torch.long)
+
+        if row_indices.numel() == 0:
+            return torch.tensor(0.0, device=weights_a.device)
+
+        matched_distance = torch.mean((weights_a[row_indices] - weights_b[col_indices]) ** 2)
+
+        if weights_a.shape[0] != weights_b.shape[0]:
+            mask_a = torch.ones(weights_a.shape[0], dtype=torch.bool, device=weights_a.device)
+            mask_b = torch.ones(weights_b.shape[0], dtype=torch.bool, device=weights_b.device)
+            mask_a[row_indices] = False
+            mask_b[col_indices] = False
+
+            if torch.any(mask_a):
+                matched_distance = matched_distance + torch.mean(weights_a[mask_a] ** 2)
+            if torch.any(mask_b):
+                matched_distance = matched_distance + torch.mean(weights_b[mask_b] ** 2)
+
+        return matched_distance
+
+    def _to_device_geometry(self, geometry):
+        """Move supported geometry tensors onto the loss device."""
+        if geometry is None:
+            return {}
+
+        moved_geometry = dict(geometry)
+        for key in ('string_xy', 'string_weights'):
+            value = moved_geometry.get(key, None)
+            if value is None:
+                continue
+            if not isinstance(value, torch.Tensor):
+                value = torch.as_tensor(value, device=self.device, dtype=torch.float32)
+            elif value.device != self.device:
+                value = value.to(self.device)
+            moved_geometry[key] = value
+
+        return moved_geometry
+
+    def __call__(self, geom_dict, **kwargs):
+        """
+        Compute diversity penalty for the current geometry against prior geometries.
+        
+        Parameters:
+        -----------
+        geom_dict : dict
+            Geometry dictionary containing 'string_xy' and optionally 'string_weights' keys.
+        **kwargs
+            Additional keyword arguments including 'max_radius', 'min_dist', 'domain_size', and 'ignore_border'.
+            
+        Returns:
+        --------
+        torch.Tensor
+            The diversity penalty value (weighted).
+        """
+        other_geoms = kwargs.get('other_geoms', None)
+        diversity_min = kwargs.get('diversity_min', 20)
+        use_hungarian = kwargs.get('diversity_use_hungarian', False)
+
+        if other_geoms is None:
+            zero = torch.tensor(0.0, device=self.device)
+            return {'diversity_penalty': zero, 'diversity_score': zero}
+
+        if isinstance(other_geoms, dict):
+            other_geoms = [other_geoms]
+
+        other_geoms = [self._to_device_geometry(geometry) for geometry in other_geoms if geometry is not geom_dict]
+        if len(other_geoms) == 0:
+            zero = torch.tensor(0.0, device=self.device)
+            return {'diversity_penalty': zero, 'diversity_score': zero}
+
+        current_geometry = self._to_device_geometry(geom_dict)
+
+        pairwise_distances = []
+        for other_geometry in other_geoms:
+            pair_distance = self._geometry_distance(current_geometry, other_geometry, use_hungarian=use_hungarian)
+            if pair_distance is not None:
+                pairwise_distances.append(pair_distance)
+
+        if len(pairwise_distances) == 0:
+            zero = torch.tensor(0.0, device=self.device)
+            return {'diversity_penalty': zero, 'diversity_score': zero}
+
+        pairwise_distances = torch.stack(pairwise_distances)
+        diversity_score = torch.min(pairwise_distances)
+        diversity_threshold = torch.as_tensor(diversity_min, device=diversity_score.device, dtype=diversity_score.dtype)
+        diversity_penalty = torch.clamp(diversity_threshold - diversity_score, min=0.0)
+
+        return {
+            'diversity_penalty': diversity_penalty,
+            'diversity_score': diversity_score,
+            'diversity_min_distance_to_others': pairwise_distances,
+        }
+
+
