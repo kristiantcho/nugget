@@ -667,7 +667,7 @@ class LightSabrePATD(LightSabre):
         else:
             light_yield = torch.tensor(self.kwargs.get('input_photons'), device=self.device)
 
-        expected_N = torch.round(light_yield).int().item()
+        expected_N = torch.round(light_yield).int().detach().cpu().item()
         N = min(expected_N, max_photons) if (max_photons is not None and max_photons < expected_N) else expected_N
 
         if N <= 0:
@@ -715,7 +715,7 @@ class LightSabrePATD(LightSabre):
 
         cpandel = CPandel(
             tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 57.4),
-            lambda_a=cpandel_params.get('lambda_a', ), v=cpandel_params.get('v', 0.3 / 1.33),
+            lambda_a=cpandel_params.get('lambda_a', 44.7), v=cpandel_params.get('v', 0.3 / 1.33),
             s=cpandel_params.get('s', 5.0)
         )
         hit_times, t_residual, t_geom, vertex_times, emission_points, t_residual_probs = \
@@ -727,7 +727,7 @@ class LightSabrePATD(LightSabre):
         return {
             'hit_times': hit_times,
             'num_photons': N,
-            'expected_photons': expected_N,
+            'expected_photons': light_yield,
             'residual_times': t_residual,
             'geometric_times': t_geom,
             'vertex_times': vertex_times,
@@ -824,7 +824,7 @@ class LightSabrePATD(LightSabre):
         # ---- Build CPandel once -----------------------------------------
         cpandel = CPandel(
             tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 57.4),
-            lambda_a=cpandel_params.get('lambda_a', 98.), v=cpandel_params.get('v', 0.3 / 1.33),
+            lambda_a=cpandel_params.get('lambda_a', 44.7), v=cpandel_params.get('v', 0.3 / 1.33),
             s=cpandel_params.get('s', 5.0)
         )
 
@@ -862,7 +862,7 @@ class LightSabrePATD(LightSabre):
             results.append({
                 'hit_times': hit_times,
                 'num_photons': N_i,
-                'charge': light_yield[i].item(),
+                'expected_photons': light_yield[i],
                 'residual_times': t_residual,
                 'geometric_times': t_geom_i,
                 'vertex_times': vertex_times,
