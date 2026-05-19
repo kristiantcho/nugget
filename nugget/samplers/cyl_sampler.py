@@ -220,7 +220,8 @@ def get_intersection_box(center, domain_size, position, direction):
 def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]), 
                        n_samples= 1, device = None, find_exact_intersection = False,
                        random_position_within_cylinder = False, 
-                       random_position_within_cubic_domain = False, domain_size = 2.0):
+                       random_position_within_cubic_domain = False, domain_size = 2.0,
+                       uniform_zenith_sampling = False):
     """
     Sample multiple (position, direction) pairs in a vectorized manner.
 
@@ -244,6 +245,9 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
         If True, randomly sample a position along the ray within a cubic domain of size domain_size.
     domain_size : float
         Size of the cubic domain for random_position_within_cubic_domain option.
+    uniform_zenith_sampling : bool
+        If True, sample zenith angles uniformly over the requested range instead
+        of using the projected-area rejection sampler.
         
     Returns:
     --------
@@ -257,34 +261,45 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
     
     dtype = torch.get_default_dtype()
     max_area = maximum_proj_area(cyl)
-    cos_min, cos_max = cos_range[0], cos_range[1]
+    cos_min = torch.as_tensor(cos_range[0], device=device, dtype=dtype)
+    cos_max = torch.as_tensor(cos_range[1], device=device, dtype=dtype)
     fixed_costheta = (torch.abs(cos_min - cos_max) < 1e-15)
 
-    # Rejection sample cos_theta for all samples
-    cos_theta_list = []
-    needed = n_samples
-    while needed > 0:
+    if uniform_zenith_sampling:
+        theta_min = torch.acos(torch.clamp(cos_max, -1.0, 1.0))
+        theta_max = torch.acos(torch.clamp(cos_min, -1.0, 1.0))
         if fixed_costheta:
-            cand = torch.full((needed,), cos_min, dtype=dtype, device=device)
-            cos_theta_list.append(cand)
-            break
+            theta = torch.full((n_samples,), theta_min, dtype=dtype, device=device)
         else:
-            # Sample more than needed to reduce iterations
-            batch_size = needed * 3
-            u = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
-            cand = cos_min + u * (cos_max - cos_min)
-            q = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
-            
-            # Vectorized acceptance
-            proj_areas = torch.tensor([projected_area(cyl, c) for c in cand], 
-                                      dtype=dtype, device=device)
-            accepted = q * max_area <= proj_areas
-            accepted_cands = cand[accepted][:needed]
-            
-            cos_theta_list.append(accepted_cands)
-            needed -= len(accepted_cands)
-    
-    cos_theta = torch.cat(cos_theta_list)[:n_samples]
+            u = torch.rand(n_samples, generator=rng, device=device, dtype=dtype)
+            theta = theta_min + u * (theta_max - theta_min)
+        cos_theta = torch.cos(theta)
+    else:
+        # Rejection sample cos_theta for all samples
+        cos_theta_list = []
+        needed = n_samples
+        while needed > 0:
+            if fixed_costheta:
+                cand = torch.full((needed,), cos_min, dtype=dtype, device=device)
+                cos_theta_list.append(cand)
+                break
+            else:
+                # Sample more than needed to reduce iterations
+                batch_size = needed * 3
+                u = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
+                cand = cos_min + u * (cos_max - cos_min)
+                q = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
+                
+                # Vectorized acceptance
+                proj_areas = torch.tensor([projected_area(cyl, c) for c in cand], 
+                                          dtype=dtype, device=device)
+                accepted = q * max_area <= proj_areas
+                accepted_cands = cand[accepted][:needed]
+                
+                cos_theta_list.append(accepted_cands)
+                needed -= len(accepted_cands)
+        
+        cos_theta = torch.cat(cos_theta_list)[:n_samples]
     
     # Sample phi
     phi = torch.rand(n_samples, generator=rng, device=device, dtype=dtype) * 2.0 * torch.pi
@@ -499,6 +514,9 @@ class CylinderSampler(Sampler):
         
         # Option to randomly sample position along ray within cubic domain
         self.random_position_within_cubic_domain = kwargs.get('random_position_within_cubic_domain', False)
+
+        # Option to sample zenith uniformly instead of using the projected-area sampler
+        self.uniform_zenith_sampling = kwargs.get('uniform_zenith_sampling', False)
         
         # Option to force events to point towards cylinder center
         self.point_towards_center = kwargs.get('point_towards_center', False)
@@ -597,7 +615,8 @@ class CylinderSampler(Sampler):
             find_exact_intersection=self.find_exact_intersection,
             random_position_within_cylinder=self.random_position_along_ray,
             random_position_within_cubic_domain=self.random_position_within_cubic_domain,
-            domain_size=self.domain_size
+            domain_size=self.domain_size,
+            uniform_zenith_sampling=self.uniform_zenith_sampling
         )
 
         # Build bias tensor (float32)

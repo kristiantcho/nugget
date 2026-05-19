@@ -1095,6 +1095,12 @@ class DiversityPenalty(LossFunction):
 
         xy_cost = torch.cdist(string_xy_a, string_xy_b, p=2)
         weight_cost = torch.cdist(weights_a.unsqueeze(1), weights_b.unsqueeze(1), p=2)
+        # Normalize spatial cost so it doesn't dominate weight cost.
+        # Align the means of the two cost matrices (with safety clamps).
+        mean_xy = torch.mean(xy_cost)
+        mean_w = torch.mean(weight_cost)
+        scale = mean_w / mean_xy
+        xy_cost = xy_cost * scale
         cost_matrix = xy_cost + weight_cost
         row_indices, col_indices = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
         row_indices = torch.as_tensor(row_indices, device=weights_a.device, dtype=torch.long)

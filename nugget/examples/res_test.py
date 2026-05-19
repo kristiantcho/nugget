@@ -5,15 +5,15 @@ import numpy as np
 # import os
 # from nugget.losses.effective_area import get_bounding_cylinder
 
-device = 'cuda:3'
-num_events = 100000
-version = 'r600_50_5'
+device = 'cuda:1'
+num_events = 30000
+version = 'r600_50_u_1'
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
 center = [0,0,0]
 radius = 600
 height = 1000
-lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=1600)
+lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=1600, particle_mode = 'track')
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     device=None, 
@@ -23,10 +23,12 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     E_max=1e8, 
                                                     find_exact_intersection=False,
                                                     random_position_along_ray=True,  
-                                                    energy_dist='log_uniform',
+                                                    energy_dist='uniform',
                                                     cylinder_center=center,
                                                     cylinder_radius=radius,
                                                     cylinder_height=height,
+                                                    uniform_zenith_sampling=True,
+                                                    cos_range=torch.tensor([0,1]),
                                                     # point_towards_center=True,
                                                     # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                     )
