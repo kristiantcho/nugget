@@ -1159,7 +1159,7 @@ class DiversityPenalty(LossFunction):
         C_w  = (wa.unsqueeze(1) - wb.unsqueeze(0)) ** 2                  # (n, m)
         mean_xy = C_xy.mean().clamp(min=1e-10)
         mean_w  = C_w.mean().clamp(min=1e-10)
-        C = C_xy + (mean_xy / mean_w) * C_w
+        C = ((mean_w / mean_xy) * C_xy) + C_w
 
         # Uniform marginals: weights already enter via the cost, so using them
         # as marginals too would double-count their influence.
@@ -1167,24 +1167,27 @@ class DiversityPenalty(LossFunction):
         a = torch.ones(n, device=string_xy_a.device, dtype=string_xy_a.dtype) / n
         b = torch.ones(m, device=string_xy_b.device, dtype=string_xy_b.dtype) / m
 
-        # Log-domain Sinkhorn for numerical stability.
-        # Dual variables f (n,) and g (m,) satisfy the optimality conditions:
-        #   f_i = ε log(a_i) - ε logsumexp_j((g_j - C_ij) / ε)
-        #   g_j = ε log(b_j) - ε logsumexp_i((f_i - C_ij) / ε)
+        # Log-domain Sinkhorn — iterations run under no_grad to avoid building
+        # a depth-niter compute graph.  At convergence the gradient of the OT
+        # cost w.r.t. C is exactly P (envelope theorem), so one final forward
+        # pass with C in the graph recovers the correct gradient cheaply.
         log_a = torch.log(a + 1e-40)
         log_b = torch.log(b + 1e-40)
+        C_detached = C.detach()
         f = torch.zeros_like(a)
         g = torch.zeros_like(b)
 
-        for _ in range(niter):
-            f = epsilon * log_a - epsilon * torch.logsumexp(
-                (g.unsqueeze(0) - C) / epsilon, dim=1
-            )
-            g = epsilon * log_b - epsilon * torch.logsumexp(
-                (f.unsqueeze(1) - C) / epsilon, dim=0
-            )
+        with torch.no_grad():
+            for _ in range(niter):
+                f = epsilon * log_a - epsilon * torch.logsumexp(
+                    (g.unsqueeze(0) - C_detached) / epsilon, dim=1
+                )
+                g = epsilon * log_b - epsilon * torch.logsumexp(
+                    (f.unsqueeze(1) - C_detached) / epsilon, dim=0
+                )
 
-        # Primal transport plan and OT cost.
+        # One forward pass with C in the graph: f and g are fixed-point
+        # constants here, so autograd only sees this single exp + dot product.
         log_P = (f.unsqueeze(1) + g.unsqueeze(0) - C) / epsilon
         P = torch.exp(log_P)
         return (P * C).sum()
