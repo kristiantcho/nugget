@@ -1192,6 +1192,51 @@ class DiversityPenalty(LossFunction):
         P = torch.exp(log_P)
         return (P * C).sum()
 
+    def _mmd_distance(self, geometry_a, geometry_b, kernel_sigma=None):
+        """Differentiable MMD² between two string distributions.
+
+        Treats sigmoid(string_weights) as distribution masses and string
+        positions as support points.  Uses a Gaussian kernel on positions —
+        three kernel-matrix evaluations, no iterations, no matching.
+
+        kernel_sigma : squared bandwidth of the Gaussian kernel k(x,y)=exp(-D/σ).
+                       Defaults to the median heuristic (median of all pairwise
+                       squared distances across both geometries).
+        """
+        string_xy_a = geometry_a.get('string_xy', None)
+        string_xy_b = geometry_b.get('string_xy', None)
+        string_weights_a = geometry_a.get('string_weights', None)
+        string_weights_b = geometry_b.get('string_weights', None)
+
+        if string_weights_a is None or string_weights_b is None:
+            return None
+
+        wa = torch.sigmoid(string_weights_a)
+        wa = wa / (wa.sum() + 1e-10)   # (n,) normalized
+        wb = torch.sigmoid(string_weights_b)
+        wb = wb / (wb.sum() + 1e-10)   # (m,) normalized
+
+        if string_xy_a is None or string_xy_b is None or string_xy_a.numel() == 0 or string_xy_b.numel() == 0:
+            min_len = min(wa.shape[0], wb.shape[0])
+            if min_len == 0:
+                return torch.tensor(0.0, device=wa.device)
+            return torch.mean((wa[:min_len] - wb[:min_len]) ** 2)
+
+        D_aa = torch.cdist(string_xy_a, string_xy_a, p=2) ** 2   # (n, n)
+        D_ab = torch.cdist(string_xy_a, string_xy_b, p=2) ** 2   # (n, m)
+        D_bb = torch.cdist(string_xy_b, string_xy_b, p=2) ** 2   # (m, m)
+
+        if kernel_sigma is None:
+            all_sq_dists = torch.cat([D_aa.reshape(-1), D_ab.reshape(-1), D_bb.reshape(-1)])
+            kernel_sigma = torch.median(all_sq_dists).clamp(min=1e-10)
+
+        K_aa = torch.exp(-D_aa / kernel_sigma)
+        K_ab = torch.exp(-D_ab / kernel_sigma)
+        K_bb = torch.exp(-D_bb / kernel_sigma)
+
+        # MMD² = wᵀK_aa w  −  2 wᵀK_ab v  +  vᵀK_bb v
+        return wa @ K_aa @ wa - 2.0 * (wa @ K_ab @ wb) + wb @ K_bb @ wb
+
     def _to_device_geometry(self, geometry):
         """Move supported geometry tensors onto the loss device."""
         if geometry is None:
@@ -1232,6 +1277,8 @@ class DiversityPenalty(LossFunction):
         use_sinkhorn = kwargs.get('diversity_use_sinkhorn', False)
         sinkhorn_epsilon = kwargs.get('sinkhorn_epsilon', 0.01)
         sinkhorn_niter = kwargs.get('sinkhorn_niter', 100)
+        use_mmd = kwargs.get('diversity_use_mmd', False)
+        mmd_kernel_sigma = kwargs.get('mmd_kernel_sigma', None)
 
         if other_geoms is None:
             zero = torch.tensor(0.0, device=self.device)
@@ -1253,6 +1300,11 @@ class DiversityPenalty(LossFunction):
                 pair_distance = self._sinkhorn_distance(
                     current_geometry, other_geometry,
                     epsilon=sinkhorn_epsilon, niter=sinkhorn_niter,
+                )
+            elif use_mmd:
+                pair_distance = self._mmd_distance(
+                    current_geometry, other_geometry,
+                    kernel_sigma=mmd_kernel_sigma,
                 )
             else:
                 pair_distance = self._geometry_distance(current_geometry, other_geometry, use_hungarian=use_hungarian)
