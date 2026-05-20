@@ -31,7 +31,7 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                     )
 # signal_events = signal_sampler.sample_events(num_events)
-signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/signal_events_{num_events}_{version}.pt')
+signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_{version}.pt')
 # signal_events = pickle.load(open(f'/u/kristiantcho/ptmp/nugget/nugget/examples/res_test/signal_events_{num_events}_{version}.pkl', 'rb'))
     # for event in signal_events:
     #     event['position'] = torch.tensor([0.0,0.0,0.0], device=device)  # Center events for testing
