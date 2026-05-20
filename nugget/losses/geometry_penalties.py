@@ -1124,6 +1124,71 @@ class DiversityPenalty(LossFunction):
 
         return matched_distance
 
+    def _sinkhorn_distance(self, geometry_a, geometry_b, epsilon=0.01, niter=100):
+        """Differentiable regularized OT distance via Sinkhorn iterations (log-domain).
+
+        String weights (after sigmoid) define the transport marginals; string
+        positions define the squared-Euclidean ground cost.  Both are in the
+        compute graph, so gradients flow to positions *and* weights.
+
+        Falls back to unmatched weight MSE when positions are unavailable in
+        either geometry.
+        """
+        string_xy_a = geometry_a.get('string_xy', None)
+        string_xy_b = geometry_b.get('string_xy', None)
+        string_weights_a = geometry_a.get('string_weights', None)
+        string_weights_b = geometry_b.get('string_weights', None)
+
+        if string_weights_a is None or string_weights_b is None:
+            return None
+
+        if string_xy_a is None or string_xy_b is None or string_xy_a.numel() == 0 or string_xy_b.numel() == 0:
+            # No positions: fall back to weight-only MSE (no matching needed)
+            min_len = min(string_weights_a.shape[0], string_weights_b.shape[0])
+            if min_len == 0:
+                return torch.tensor(0.0, device=string_weights_a.device)
+            wa = torch.sigmoid(string_weights_a)
+            wb = torch.sigmoid(string_weights_b)
+            return torch.mean((wa[:min_len] - wb[:min_len]) ** 2)
+
+        # Augmented cost: positions + weight differences, auto-normalized so
+        # neither term dominates the other.
+        wa = torch.sigmoid(string_weights_a)          # (n,)
+        wb = torch.sigmoid(string_weights_b)          # (m,)
+        C_xy = torch.cdist(string_xy_a, string_xy_b, p=2) ** 2          # (n, m)
+        C_w  = (wa.unsqueeze(1) - wb.unsqueeze(0)) ** 2                  # (n, m)
+        mean_xy = C_xy.mean().clamp(min=1e-10)
+        mean_w  = C_w.mean().clamp(min=1e-10)
+        C = C_xy + (mean_xy / mean_w) * C_w
+
+        # Uniform marginals: weights already enter via the cost, so using them
+        # as marginals too would double-count their influence.
+        n, m = string_xy_a.shape[0], string_xy_b.shape[0]
+        a = torch.ones(n, device=string_xy_a.device, dtype=string_xy_a.dtype) / n
+        b = torch.ones(m, device=string_xy_b.device, dtype=string_xy_b.dtype) / m
+
+        # Log-domain Sinkhorn for numerical stability.
+        # Dual variables f (n,) and g (m,) satisfy the optimality conditions:
+        #   f_i = ε log(a_i) - ε logsumexp_j((g_j - C_ij) / ε)
+        #   g_j = ε log(b_j) - ε logsumexp_i((f_i - C_ij) / ε)
+        log_a = torch.log(a + 1e-40)
+        log_b = torch.log(b + 1e-40)
+        f = torch.zeros_like(a)
+        g = torch.zeros_like(b)
+
+        for _ in range(niter):
+            f = epsilon * log_a - epsilon * torch.logsumexp(
+                (g.unsqueeze(0) - C) / epsilon, dim=1
+            )
+            g = epsilon * log_b - epsilon * torch.logsumexp(
+                (f.unsqueeze(1) - C) / epsilon, dim=0
+            )
+
+        # Primal transport plan and OT cost.
+        log_P = (f.unsqueeze(1) + g.unsqueeze(0) - C) / epsilon
+        P = torch.exp(log_P)
+        return (P * C).sum()
+
     def _to_device_geometry(self, geometry):
         """Move supported geometry tensors onto the loss device."""
         if geometry is None:
@@ -1161,6 +1226,9 @@ class DiversityPenalty(LossFunction):
         other_geoms = kwargs.get('other_geoms', None)
         diversity_min = kwargs.get('diversity_min', 20)
         use_hungarian = kwargs.get('diversity_use_hungarian', False)
+        use_sinkhorn = kwargs.get('diversity_use_sinkhorn', False)
+        sinkhorn_epsilon = kwargs.get('sinkhorn_epsilon', 0.01)
+        sinkhorn_niter = kwargs.get('sinkhorn_niter', 100)
 
         if other_geoms is None:
             zero = torch.tensor(0.0, device=self.device)
@@ -1178,7 +1246,13 @@ class DiversityPenalty(LossFunction):
 
         pairwise_distances = []
         for other_geometry in other_geoms:
-            pair_distance = self._geometry_distance(current_geometry, other_geometry, use_hungarian=use_hungarian)
+            if use_sinkhorn:
+                pair_distance = self._sinkhorn_distance(
+                    current_geometry, other_geometry,
+                    epsilon=sinkhorn_epsilon, niter=sinkhorn_niter,
+                )
+            else:
+                pair_distance = self._geometry_distance(current_geometry, other_geometry, use_hungarian=use_hungarian)
             if pair_distance is not None:
                 pairwise_distances.append(pair_distance)
 
