@@ -6,14 +6,14 @@ import numpy as np
 # from nugget.losses.effective_area import get_bounding_cylinder
 
 device = 'cuda:3'
-num_events = 10000
-version = 'r600_50_1_c'
+num_events = 30000
+version = 'r600_50_pl_1'
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
 center = [0,0,0]
 radius = 600
 height = 1000
-lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=1600, particle_mode = 'cascade')
+lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=1600, particle_mode = 'track')
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     device=None, 
@@ -31,8 +31,8 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                     )
 # signal_events = signal_sampler.sample_events(num_events)
-
-signal_events = pickle.load(open(f'/u/kristiantcho/ptmp/nugget/nugget/examples/res_test/signal_events_{num_events}_{version}.pkl', 'rb'))
+signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/signal_events_{num_events}_{version}.pt')
+# signal_events = pickle.load(open(f'/u/kristiantcho/ptmp/nugget/nugget/examples/res_test/signal_events_{num_events}_{version}.pkl', 'rb'))
     # for event in signal_events:
     #     event['position'] = torch.tensor([0.0,0.0,0.0], device=device)  # Center events for testing
 # events_file_name = f'res_test/signal_events_{num_events}_{version}'
@@ -102,8 +102,8 @@ for string_spacing in np.linspace(25,200,20):
         lr_scheduler_patience=35,  # Patience for LR scheduler
     )
 
-    # llr_net.load_model('best_charge_llr_model_v4')
-    llr_net.load_model('best_cascade_charge_llr_model_v1')
+    llr_net.load_model('best_charge_llr_model_v4')
+    # llr_net.load_model('best_cascade_charge_llr_model_v1')
 
 
     # for i in range(9):
