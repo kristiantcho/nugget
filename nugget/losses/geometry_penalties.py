@@ -1,6 +1,13 @@
+import math
+
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch.nn import functional as F
+
+try:
+    from geomloss import SamplesLoss
+except ImportError:
+    SamplesLoss = None
 
 from nugget.losses.base_loss import LossFunction
 
@@ -1054,6 +1061,20 @@ class DiversityPenalty(LossFunction):
             Device to use for computations. If None, uses cuda if available, else cpu.
         """
         super().__init__(device)
+        self._sinkhorn_loss_cache = {}
+
+    def _get_sinkhorn_loss(self, blur):
+        if SamplesLoss is None:
+            raise ImportError(
+                "geomloss is required for diversity_use_sinkhorn=True. Install geomloss to enable this path."
+            )
+
+        blur = float(blur)
+        sinkhorn_loss = self._sinkhorn_loss_cache.get(blur)
+        if sinkhorn_loss is None:
+            sinkhorn_loss = SamplesLoss(loss="sinkhorn", p=2, blur=blur)
+            self._sinkhorn_loss_cache[blur] = sinkhorn_loss
+        return sinkhorn_loss
 
     def _geometry_distance(self, geometry_a, geometry_b, use_hungarian=False):
         """Compute a distance between two geometries.
@@ -1109,8 +1130,10 @@ class DiversityPenalty(LossFunction):
         if row_indices.numel() == 0:
             return torch.tensor(0.0, device=weights_a.device)
 
-        matched_distance = torch.mean((weights_a[row_indices] - weights_b[col_indices]) ** 2)
-
+        # matched_distance = torch.mean((weights_a[row_indices] - weights_b[col_indices]) ** 2)
+        # distance should use cost matrix values to reflect both spatial and weight differences, not just weight differences
+        matched_distance = torch.mean(cost_matrix[row_indices, col_indices] ** 2)
+        
         if weights_a.shape[0] != weights_b.shape[0]:
             mask_a = torch.ones(weights_a.shape[0], dtype=torch.bool, device=weights_a.device)
             mask_b = torch.ones(weights_b.shape[0], dtype=torch.bool, device=weights_b.device)
@@ -1125,11 +1148,11 @@ class DiversityPenalty(LossFunction):
         return matched_distance
 
     def _sinkhorn_distance(self, geometry_a, geometry_b, epsilon=0.01, niter=100):
-        """Differentiable regularized OT distance via Sinkhorn iterations (log-domain).
+        """Differentiable regularized OT distance via GeomLoss Sinkhorn loss.
 
-        String weights (after sigmoid) define the transport marginals; string
-        positions define the squared-Euclidean ground cost.  Both are in the
-        compute graph, so gradients flow to positions *and* weights.
+        String weights (after sigmoid) define the transport masses and string
+        positions define the sample support. Both remain in the compute graph,
+        so gradients flow to positions and weights.
 
         Falls back to unmatched weight MSE when positions are unavailable in
         either geometry.
@@ -1151,46 +1174,36 @@ class DiversityPenalty(LossFunction):
             wb = torch.sigmoid(string_weights_b)
             return torch.mean((wa[:min_len] - wb[:min_len]) ** 2)
 
-        # Augmented cost: positions + weight differences, auto-normalized so
-        # neither term dominates the other.
-        wa = torch.sigmoid(string_weights_a)          # (n,)
-        wb = torch.sigmoid(string_weights_b)          # (m,)
-        C_xy = torch.cdist(string_xy_a, string_xy_b, p=2) ** 2          # (n, m)
-        C_w  = (wa.unsqueeze(1) - wb.unsqueeze(0)) ** 2                  # (n, m)
-        mean_xy = C_xy.mean().clamp(min=1e-10)
-        mean_w  = C_w.mean().clamp(min=1e-10)
-        C = ((mean_w / mean_xy) * C_xy) + C_w
+        weights_a = torch.sigmoid(string_weights_a)
+        weights_b = torch.sigmoid(string_weights_b)
 
-        # Uniform marginals: weights already enter via the cost, so using them
-        # as marginals too would double-count their influence.
-        n, m = string_xy_a.shape[0], string_xy_b.shape[0]
-        a = torch.ones(n, device=string_xy_a.device, dtype=string_xy_a.dtype) / n
-        b = torch.ones(m, device=string_xy_b.device, dtype=string_xy_b.dtype) / m
+        # Compute a shared, robust scale from both geometries so distances
+        # are compared on the same normalized domain. Use median pairwise
+        # distance across the combined support (robust to outliers).
+        def _robust_scale(xy1, xy2):
+            xy = torch.cat([xy1.reshape(-1, xy1.shape[-1]), xy2.reshape(-1, xy2.shape[-1])], dim=0)
+            if xy.shape[0] < 2:
+                return torch.tensor(1.0, device=xy.device, dtype=xy.dtype)
+            d = torch.cdist(xy, xy, p=2)
+            d = d.reshape(-1)
+            d = d[d > 0]
+            if d.numel() == 0:
+                return torch.tensor(1.0, device=xy.device, dtype=xy.dtype)
+            return torch.median(d).clamp(min=1e-6)
 
-        # Log-domain Sinkhorn — iterations run under no_grad to avoid building
-        # a depth-niter compute graph.  At convergence the gradient of the OT
-        # cost w.r.t. C is exactly P (envelope theorem), so one final forward
-        # pass with C in the graph recovers the correct gradient cheaply.
-        log_a = torch.log(a + 1e-40)
-        log_b = torch.log(b + 1e-40)
-        C_detached = C.detach()
-        f = torch.zeros_like(a)
-        g = torch.zeros_like(b)
+        scale = _robust_scale(string_xy_a, string_xy_b)
 
-        with torch.no_grad():
-            for _ in range(niter):
-                f = epsilon * log_a - epsilon * torch.logsumexp(
-                    (g.unsqueeze(0) - C_detached) / epsilon, dim=1
-                )
-                g = epsilon * log_b - epsilon * torch.logsumexp(
-                    (f.unsqueeze(1) - C_detached) / epsilon, dim=0
-                )
+        # Center both point clouds and normalize by the shared scale so the
+        # Sinkhorn distance measures shape similarity rather than absolute
+        # size/position. We keep absolute translation by centering both with
+        # the combined mean to preserve relative alignment.
+        combined_mean = torch.cat([string_xy_a, string_xy_b], dim=0).mean(dim=0)
+        norm_xy_a = (string_xy_a - combined_mean) / scale
+        norm_xy_b = (string_xy_b - combined_mean) / scale
 
-        # One forward pass with C in the graph: f and g are fixed-point
-        # constants here, so autograd only sees this single exp + dot product.
-        log_P = (f.unsqueeze(1) + g.unsqueeze(0) - C) / epsilon
-        P = torch.exp(log_P)
-        return (P * C).sum()
+        blur = math.sqrt(max(float(epsilon), 1e-12))
+        sinkhorn_loss = self._get_sinkhorn_loss(blur=blur)
+        return sinkhorn_loss(weights_a, norm_xy_a, weights_b, norm_xy_b)
 
     def _mmd_distance(self, geometry_a, geometry_b, kernel_sigma=None):
         """Differentiable MMD² between two string distributions.
@@ -1318,8 +1331,8 @@ class DiversityPenalty(LossFunction):
         pairwise_distances = torch.stack(pairwise_distances)
         diversity_score = torch.min(pairwise_distances)
         diversity_threshold = torch.as_tensor(diversity_min, device=diversity_score.device, dtype=diversity_score.dtype)
-        diversity_penalty = torch.clamp(diversity_threshold - diversity_score, min=0.0)
-
+        diversity_penalty = diversity_threshold - diversity_score
+        print(f"Diversity score: {diversity_score.item():.4f}, penalty: {diversity_penalty.item():.4f}")
         return {
             'diversity_penalty': diversity_penalty,
             'diversity_score': diversity_score,
