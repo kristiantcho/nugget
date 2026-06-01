@@ -6586,7 +6586,7 @@ class Visualizer:
                 print(f"Error cleaning up temporary directory: {e}")
         print("GIF temporary files cleanup completed.")
 
-def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func, 
+def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        param_names=None, param_ranges=None, n_points=50,
                        event_labels=['position', 'energy', 'zenith', 'azimuth'],
                        true_event=None, detector_point=None, figsize=(10, 8),
@@ -6594,7 +6594,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        use_mollweide=False, skip_zero_response=False, use_patd=False,
                        num_detector_points=1, min_detector_points=1,
                        min_detector_response=0.0, max_detector_resample_attempts=1000,
-                       plot_opposite_direction_true_params=False):
+                       plot_opposite_direction_true_params=False,
+                       use_rich_features=False):
     """
     Plot negative log-likelihood landscape for a trained signal-only LLRnet.
     
@@ -6669,7 +6670,11 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         If True, uses PATD (Photon Arrival Time Distribution) mode with evaluate_patd_likelihood
         method. The likelihoods from all photon hits across all detector points are summed.
         (default: False)
-        
+    use_rich_features : bool
+        If True, passes use_rich_features=True to evaluate_patd_likelihood, which uses
+        prepare_features_patd instead of prepare_data_from_raw_patd. Must match the flag
+        used during training. Only relevant when use_patd=True. (default: False)
+
    """
 
     
@@ -6862,7 +6867,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                     point=det_point,
                     event_data=true_event,
                     signal_surrogate_func=signal_surrogate_func,
-                    event_labels=event_labels
+                    event_labels=event_labels,
+                    use_rich_features=use_rich_features,
                 )
                 true_llr_sum += llr_result['joint_log_likelihood']
         else:
@@ -6950,7 +6956,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                             point=det_point,
                             event_data=modified_event,
                             signal_surrogate_func=signal_surrogate_func,
-                            event_labels=event_labels
+                            event_labels=event_labels,
+                            use_rich_features=use_rich_features,
                         )
                         llr_sum += llr_result['joint_log_likelihood']
                     else:
@@ -6963,11 +6970,11 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                             event_labels=event_labels,
                             noise_scale=0.0,  # No noise for evaluation
                         )
-                        
+
                         # Predict LLR and add to sum
                         llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
                         llr_sum += llr
-            
+
             # Store raw NLL (will normalize later)
             nll = -llr_sum
             nll_values.append(nll)
@@ -7162,7 +7169,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                                 point=det_point,
                                 event_data=modified_event,
                                 signal_surrogate_func=signal_surrogate_func,
-                                event_labels=event_labels
+                                event_labels=event_labels,
+                                use_rich_features=use_rich_features,
                             )
                             llr_sum += llr_result['joint_log_likelihood']
                         else:
@@ -7175,7 +7183,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                                 event_labels=event_labels,
                                 noise_scale=0.0,
                             )
-                            
+
                             # Predict LLR and add to sum
                             llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
                             llr_sum += llr

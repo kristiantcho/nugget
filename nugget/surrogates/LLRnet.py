@@ -1682,62 +1682,78 @@ class LLRnet(Surrogate):
             prob_clamped = torch.clamp(probabilities, epsilon, 1 - epsilon)
             return torch.log(prob_clamped / (1 - prob_clamped))
 
-    def evaluate_patd_likelihood(self, point, event_data, signal_surrogate_func, 
-                                 event_labels=['position', 'energy', 'zenith', 'azimuth']):
+    def evaluate_patd_likelihood(self, point, event_data, signal_surrogate_func,
+                                 event_labels=['position', 'energy', 'zenith', 'azimuth'],
+                                 use_rich_features=False):
         """
         Evaluate joint log-likelihood for all photon hits at a detector position.
-        
-        This method computes the sum of log-likelihoods for all individual photon hits,
-        which gives the joint log-likelihood under the assumption of independent hits.
-        
-        Parameters:
-        -----------
+
+        Computes the sum of per-photon log-likelihood ratios log(p/(1-p)), which equals
+        the joint log-LLR under the assumption of independent hits.
+
+        Parameters
+        ----------
         point : torch.Tensor or np.ndarray
-            Detector point coordinates
+            Detector point coordinates.
         event_data : dict
-            Event parameters (hypothesis)
+            Event parameters (hypothesis).
         signal_surrogate_func : callable
-            Function to calculate PATD
+            Function to calculate PATD.  Called once as
+            ``signal_surrogate_func(opt_point=point, event_params=event_data)``.
         event_labels : list
-            List of event parameter keys
-            
-        Returns:
-        --------
-        dict
-            Dictionary containing:
-            - 'joint_log_likelihood': Sum of log-likelihoods for all hits
-            - 'num_photons': Number of photon hits
-            - 'individual_llrs': Tensor of individual log-likelihood ratios for each hit
+            Event parameter keys passed to prepare_data_from_raw_patd.
+            Ignored when use_rich_features=True.
+        use_rich_features : bool
+            If True, uses prepare_features_patd (14-feature geometry-rich builder).
+            Must match the flag used during training.
+
+        Returns
+        -------
+        dict with keys:
+            'joint_log_likelihood' : scalar Tensor, sum of per-photon log-LLRs
+            'num_photons'          : int
+            'individual_llrs'      : Tensor of shape (num_photons,)
         """
         if not self.use_patd:
             raise ValueError("evaluate_patd_likelihood can only be used when use_patd=True")
-        
-        # Prepare features for all hits (this also calls the surrogate function internally)
-        features_batch, num_photons = self.prepare_data_from_raw(
-            point=point,
-            event_data=event_data,
-            surrogate_func=signal_surrogate_func,
-            event_labels=event_labels
-        )
-        
-        # Handle case when no photons were detected
+
+        if use_rich_features:
+            # Call surrogate once and pass the raw result to the rich feature builder.
+            if isinstance(point, np.ndarray):
+                point_t = torch.tensor(point, device=self.device, dtype=torch.float32)
+            else:
+                point_t = point.float().to(self.device)
+
+            with torch.no_grad():
+                patd_result = signal_surrogate_func(opt_point=point_t, event_params=event_data)
+
+            features_batch, num_photons = self.prepare_features_patd(
+                point=point_t,
+                event_data=event_data,
+                patd_result=patd_result,
+            )
+        else:
+            features_batch, num_photons = self.prepare_data_from_raw_patd(
+                point=point,
+                event_data=event_data,
+                surrogate_func=signal_surrogate_func,
+                event_labels=event_labels,
+            )
+
         if num_photons == 0 or features_batch is None:
             return {
                 'joint_log_likelihood': torch.tensor(0.0, device=self.device),
                 'num_photons': 0,
-                'individual_llrs': torch.tensor([], device=self.device)
+                'individual_llrs': torch.tensor([], device=self.device),
             }
-        
-        # Get log-likelihood ratios for all hits
+
         individual_llrs = self.predict_log_likelihood_ratio(features_batch)
-        
-        # Sum to get joint log-likelihood
         joint_log_likelihood = torch.sum(individual_llrs)
-        
+
         return {
             'joint_log_likelihood': joint_log_likelihood,
             'num_photons': num_photons,
-            'individual_llrs': individual_llrs
+            'individual_llrs': individual_llrs,
         }
     
     def predict_log_likelihood_ratio(self, features, epsilon=1e-7):
