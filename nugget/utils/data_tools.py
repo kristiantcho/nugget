@@ -255,3 +255,29 @@ def select_event_indices(
 			selected_indices.append(event_index)
 
 	return selected_indices
+
+
+def select_events(
+	events: Sequence[Mapping[str, Any]],
+	limits: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+	"""Return the filtered events in the same order they appear in `events`.
+
+	This uses the same limit semantics as :func:`select_event_indices`.
+	"""
+	selected_events: list[dict[str, Any]] = []
+
+	for event in events:
+		matches = True
+		for key, limit_value in limits.items():
+			if key not in event:
+				matches = False
+				break
+			if not _matches_limit(event[key], limit_value):
+				matches = False
+				break
+
+		if matches:
+			selected_events.append(dict(event))
+
+	return selected_events

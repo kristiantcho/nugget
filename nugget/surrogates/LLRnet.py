@@ -770,12 +770,12 @@ class LLRnet(Surrogate):
         cos_angle = torch.dot(direction, rel) / (torch.norm(direction) * vert_dist + 1e-8)
 
         # --- t_geom_min: minimum geometric photon arrival time ---
-        t_geom_min = patd_result['t_geom_min']
-        if isinstance(t_geom_min, np.ndarray):
-            t_geom_min = torch.tensor(t_geom_min, device=self.device, dtype=torch.float32)
-        else:
-            t_geom_min = t_geom_min.float().to(self.device)
-        t_geom_min_scalar = t_geom_min.squeeze().mean() / 1e5  # scalar
+        # t_geom_min = patd_result['t_geom_min']
+        # if isinstance(t_geom_min, np.ndarray):
+        #     t_geom_min = torch.tensor(t_geom_min, device=self.device, dtype=torch.float32)
+        # else:
+        #     t_geom_min = t_geom_min.float().to(self.device)
+        # t_geom_min_scalar = t_geom_min.squeeze().mean() / 1e5  # scalar
 
         # --- assemble the 13 event-level context features ---
         event_features = torch.stack([
@@ -785,7 +785,7 @@ class LLRnet(Surrogate):
             log_energy,
             vert_dist,
             cos_angle,
-            t_geom_min_scalar,
+            # t_geom_min_scalar,
         ])  # (13,)
 
         # --- per-photon hit times: log-sign scaled ---
@@ -1364,7 +1364,8 @@ class LLRnet(Surrogate):
         
     def train_with_dataloader(self, train_dataloader, val_dataloader=None, epochs=100,
                              verbose=True, early_stopping_patience=10, input_dim=None,
-                             grad_clip=None):
+                             grad_clip=None, save_every_n_epochs=None,
+                             checkpoint_path=None):
         """
         Train the LLR network using PyTorch DataLoader with balanced signal/background events.
         
@@ -1385,11 +1386,21 @@ class LLRnet(Surrogate):
             Whether to print training progress
         early_stopping_patience : int
             Number of epochs to wait for improvement before early stopping
+        save_every_n_epochs : int or None
+            If set, save a checkpoint every N epochs during training.
+        checkpoint_path : str or None
+            File path to overwrite on each periodic save. Required when
+            save_every_n_epochs is set.
             
         Returns:
         --------
         dict : Training history with 'train_loss' and 'val_loss' keys
         """
+        if save_every_n_epochs is not None and save_every_n_epochs <= 0:
+            raise ValueError("save_every_n_epochs must be a positive integer or None")
+        if save_every_n_epochs is not None and checkpoint_path is None:
+            raise ValueError("checkpoint_path must be provided when save_every_n_epochs is set")
+
         # Build network if not already built
         # We need to get a sample to determine the feature dimension
         if self.mlp_branches is None and self.shared_branch_mlp is None:
@@ -1550,6 +1561,12 @@ class LLRnet(Surrogate):
                     for i, fourier_layer in enumerate(self.fourier_features_list):
                         fourier_layer.load_state_dict(self.best_state_dict['fourier_features_list'][i])
                 break
+
+            if save_every_n_epochs is not None and ((epoch + 1) % save_every_n_epochs == 0 or (epoch+1) == epochs):
+                checkpoint_dirname = os.path.dirname(checkpoint_path)
+                if checkpoint_dirname:
+                    os.makedirs(checkpoint_dirname, exist_ok=True)
+                self._save_model_state(checkpoint_path)
         
         self.is_trained = True
         
@@ -1883,11 +1900,7 @@ class LLRnet(Surrogate):
         plt.grid(True, alpha=0.3)
         plt.show()
     
-    def save_model(self, filepath):
-        """Save the trained model."""
-        if not self.is_trained:
-            raise RuntimeError("Model must be trained before saving.")
-        
+    def _save_model_state(self, filepath):
         save_dict = {
             'mlp_branches_state_dict': [branch.state_dict() for branch in self.mlp_branches] if not self.shared_mlp else None,
             'shared_branch_mlp_state_dict': self.shared_branch_mlp.state_dict() if self.shared_mlp else None,
@@ -1919,8 +1932,14 @@ class LLRnet(Surrogate):
             save_dict['fourier_features_list_state_dict'] = [fourier.state_dict() for fourier in self.fourier_features_list]
         else:
             save_dict['fourier_features_list_state_dict'] = None
-            
+
         torch.save(save_dict, filepath)
+
+    def save_model(self, filepath):
+        """Save the trained model."""
+        if not self.is_trained:
+            raise RuntimeError("Model must be trained before saving.")
+        self._save_model_state(filepath)
     
     def load_model(self, filepath):
         """Load a saved model."""
@@ -2704,28 +2723,43 @@ class LLRnet(Surrogate):
             matched_labels = torch.ones(num_matched_photons, dtype=torch.float32, device=self.llrnet.device)
 
             # Generate MISMATCHED sample: observation from a different event, hypothesis from matched event.
-            event_params_obs, _, patd_result_obs = self._generate_event_with_photons(detector_point)
+            # event_params_obs, _, patd_result_obs = self._generate_event_with_photons(detector_point)
+
+            # if self.use_rich_features:
+            #     # Hypothesis features come from event_params_matched; observation times from patd_result_obs.
+            #     # prepare_features_patd only takes one event_data dict, so we build a merged view:
+            #     # keep all params from matched (hypothesis) but swap in the obs hit_times via patd_result_obs.
+            #     mismatched_features_batch, _ = self.llrnet.prepare_features_patd(
+            #         point=detector_point,
+            #         event_data=event_params_matched,   # hypothesis: position, energy, direction from matched
+            #         patd_result=patd_result_obs,        # observation: photon times from a different event
+            #     )
+            # else:
+            #     # event_data drives the surrogate call (provides photon times via patd_result_obs),
+            #     # signal_event_data provides the hypothesis features (position, energy, direction).
+            #     mismatched_features_batch, _ = self.llrnet.prepare_data_from_raw_patd(
+            #         point=detector_point,
+            #         event_data=event_params_obs,            # observation: photon times from a different event
+            #         surrogate_func=lambda **kwargs: patd_result_obs,
+            #         signal_event_data=event_params_matched, # hypothesis: parameters from matched event
+            #         event_labels=self.event_labels,
+            #     )
+            event_params_hypothesis_mismatch = self.signal_sampler.sample_events(1)[0]
 
             if self.use_rich_features:
-                # Hypothesis features come from event_params_matched; observation times from patd_result_obs.
-                # prepare_features_patd only takes one event_data dict, so we build a merged view:
-                # keep all params from matched (hypothesis) but swap in the obs hit_times via patd_result_obs.
                 mismatched_features_batch, _ = self.llrnet.prepare_features_patd(
                     point=detector_point,
-                    event_data=event_params_matched,   # hypothesis: position, energy, direction from matched
-                    patd_result=patd_result_obs,        # observation: photon times from a different event
+                    event_data=event_params_hypothesis_mismatch,  # hypothesis: parameters from different event
+                    patd_result=patd_result_matched,              # observation: same hit times as matched
                 )
             else:
-                # event_data drives the surrogate call (provides photon times via patd_result_obs),
-                # signal_event_data provides the hypothesis features (position, energy, direction).
                 mismatched_features_batch, _ = self.llrnet.prepare_data_from_raw_patd(
                     point=detector_point,
-                    event_data=event_params_obs,            # observation: photon times from a different event
-                    surrogate_func=lambda **kwargs: patd_result_obs,
-                    signal_event_data=event_params_matched, # hypothesis: parameters from matched event
+                    event_data=event_params_matched,               # observation: same hit times as matched
+                    surrogate_func=lambda **kwargs: patd_result_matched,
+                    signal_event_data=event_params_hypothesis_mismatch,  # hypothesis: from different event
                     event_labels=self.event_labels,
                 )
-            
             # Create labels for all mismatched photons (all are class 0)
             num_mismatched_photons = mismatched_features_batch.shape[0]
             mismatched_labels = torch.zeros(num_mismatched_photons, dtype=torch.float32, device=self.llrnet.device)

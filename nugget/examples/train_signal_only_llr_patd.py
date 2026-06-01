@@ -34,7 +34,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     device=device,
     domain_size=2500,
     dim=3,
-    hidden_dims=[128, 128, 128, 128, 128],
+    hidden_dims=[64, 64, 64, 64, 64, 64],
     use_fourier_features=False,
     num_parallel_branches=1,
     learnable_frequencies=False,
@@ -57,7 +57,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     lr_scheduler_min_lr=1e-6,
     use_patd=True,
     min_photons=1,
-    num_photons_per_sample=None,
+    num_photons_per_sample=64,
     input_charge=False,
     rel_time=False,
     input_delta_time=False,  # residual time is baked into prepare_features_patd as t_geom_min
@@ -66,9 +66,9 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
 train_dataloader = llr_net.create_patd_dataloader(
     signal_sampler=signal_sampler,
     signal_surrogate_func=light_yield_surrogate,
-    num_samples_per_epoch=2048,
+    num_samples_per_epoch=1024,
     batch_size=32,
-    num_workers=8,
+    num_workers=4,
     shuffle_photons=True,
     use_rich_features=True,  # use prepare_features_patd: 14-feature geometry-rich vectors
 )
@@ -77,9 +77,11 @@ train_dataloader = llr_net.create_patd_dataloader(
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     epochs=500,
-    input_dim=14,
+    input_dim=13,
     grad_clip=None,
+    save_every_n_epochs=20,
+    checkpoint_path='best_hit_llr_model_v4.pt',
 )
 
-llr_net.save_model('best_hit_llr_model_v4')
+# llr_net.save_model('best_hit_llr_model_v4')
 pickle.dump(history, open('hit_llr_v4_training_history.pkl', 'wb'))
