@@ -1332,7 +1332,7 @@ class DiversityPenalty(LossFunction):
         diversity_score = torch.min(pairwise_distances)
         diversity_threshold = torch.as_tensor(diversity_min, device=diversity_score.device, dtype=diversity_score.dtype)
         diversity_penalty = diversity_threshold - diversity_score
-        print(f"Diversity score: {diversity_score.item():.4f}, penalty: {diversity_penalty.item():.4f}")
+        # print(f"Diversity score: {diversity_score.item():.4f}, penalty: {diversity_penalty.item():.4f}")
         return {
             'diversity_penalty': diversity_penalty,
             'diversity_score': diversity_score,

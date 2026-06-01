@@ -4,7 +4,7 @@ import json
 import importlib
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Sequence
-
+from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 import torch
@@ -173,3 +173,85 @@ def iter_signal_events_parquet(input_path: str | Path, batch_size: int = 10000) 
 	for batch in parquet_file.iter_batches(batch_size=batch_size):
 		dataframe = batch.to_pandas()
 		yield _decode_events_from_dataframe(dataframe, metadata)
+
+def _as_flat_tensor(value: Any) -> torch.Tensor:
+	if isinstance(value, torch.Tensor):
+		return value.detach().reshape(-1)
+	return torch.as_tensor(value).reshape(-1)
+
+
+def _matches_limit(event_value: Any, limit_value: Any) -> bool:
+	event_tensor = _as_flat_tensor(event_value)
+
+	if isinstance(limit_value, torch.Tensor):
+		limit_value = limit_value.detach().cpu().tolist()
+
+	if isinstance(limit_value, Sequence) and not isinstance(limit_value, (str, bytes)):
+		if len(limit_value) == 2 and not any(
+			isinstance(item, Sequence) and not isinstance(item, (str, bytes))
+			for item in limit_value
+		):
+			lower = torch.as_tensor(limit_value[0], dtype=event_tensor.dtype)
+			upper = torch.as_tensor(limit_value[1], dtype=event_tensor.dtype)
+			return bool(torch.all(event_tensor >= lower) and torch.all(event_tensor <= upper))
+
+		if len(limit_value) == event_tensor.numel():
+			for event_item, item_limit in zip(event_tensor, limit_value):
+				if isinstance(item_limit, Sequence) and not isinstance(item_limit, (str, bytes)):
+					if len(item_limit) != 2:
+						raise ValueError(
+							"Per-component limits must be length-2 sequences of (min, max)."
+						)
+					lower = torch.as_tensor(item_limit[0], dtype=event_tensor.dtype)
+					upper = torch.as_tensor(item_limit[1], dtype=event_tensor.dtype)
+					if not bool((event_item >= lower) and (event_item <= upper)):
+						return False
+				else:
+					if not bool(torch.isclose(event_item, torch.as_tensor(item_limit, dtype=event_tensor.dtype))):
+						return False
+			return True
+
+	limit_tensor = _as_flat_tensor(limit_value).to(dtype=event_tensor.dtype)
+	if limit_tensor.numel() == 1:
+		return bool(torch.all(event_tensor == limit_tensor.item()))
+	return bool(torch.equal(event_tensor, limit_tensor))
+
+
+def select_event_indices(
+	events: Sequence[Mapping[str, Any]],
+	limits: Mapping[str, Any],
+) -> list[int]:
+	"""Return the indices of events that satisfy all provided limits.
+
+	Parameters
+	----------
+	events:
+		List of event dictionaries, such as the dictionaries returned by
+		:class:`~nugget.samplers.cyl_sampler.CylinderSampler`.
+	limits:
+		Mapping from event keys to either exact values or inclusive bounds.
+		Scalars may be given as ``[min, max]`` or ``(min, max)``. Vector values
+		can use either a shared ``[min, max]`` bound for every component or a
+		per-component sequence of ``[(min, max), ...]``.
+
+	Returns
+	-------
+	list[int]
+		Indices of the events that match the requested limits.
+	"""
+	selected_indices: list[int] = []
+
+	for event_index, event in enumerate(events):
+		matches = True
+		for key, limit_value in limits.items():
+			if key not in event:
+				matches = False
+				break
+			if not _matches_limit(event[key], limit_value):
+				matches = False
+				break
+
+		if matches:
+			selected_indices.append(event_index)
+
+	return selected_indices

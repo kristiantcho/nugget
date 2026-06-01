@@ -5,8 +5,8 @@ import numpy as np
 # import os
 # from nugget.losses.effective_area import get_bounding_cylinder
 
-device = 'cuda:1'
-num_events = 30000
+device = 'cuda:0'
+num_events = 50000
 version = 'r600_50_u_1'
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
@@ -23,7 +23,7 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     E_max=1e8, 
                                                     find_exact_intersection=False,
                                                     random_position_along_ray=True,  
-                                                    energy_dist='uniform',
+                                                    energy_dist='log_uniform',
                                                     cylinder_center=center,
                                                     cylinder_radius=radius,
                                                     cylinder_height=height,
