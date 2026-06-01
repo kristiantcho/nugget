@@ -1684,7 +1684,7 @@ class LLRnet(Surrogate):
 
     def evaluate_patd_likelihood(self, point, event_data, signal_surrogate_func,
                                  event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                                 use_rich_features=False):
+                                 use_rich_features=False, patd_result=None):
         """
         Evaluate joint log-likelihood for all photon hits at a detector position.
 
@@ -1699,13 +1699,21 @@ class LLRnet(Surrogate):
             Event parameters (hypothesis).
         signal_surrogate_func : callable
             Function to calculate PATD.  Called once as
-            ``signal_surrogate_func(opt_point=point, event_params=event_data)``.
+            ``signal_surrogate_func(opt_point=point, event_params=event_data)``
+            unless patd_result is provided.
         event_labels : list
             Event parameter keys passed to prepare_data_from_raw_patd.
             Ignored when use_rich_features=True.
         use_rich_features : bool
             If True, uses prepare_features_patd (14-feature geometry-rich builder).
             Must match the flag used during training.
+        patd_result : dict or None
+            Pre-computed surrogate result dict (with 'hit_times', 'num_photons',
+            't_geom_min', ...).  When provided the surrogate is NOT called and
+            these fixed photon times are used as the observation — event_data is
+            used only for the hypothesis features.  This is the correct mode for
+            NLL landscape evaluation where the observation must be held fixed while
+            only the hypothesis parameters change.
 
         Returns
         -------
@@ -1717,28 +1725,35 @@ class LLRnet(Surrogate):
         if not self.use_patd:
             raise ValueError("evaluate_patd_likelihood can only be used when use_patd=True")
 
+        if isinstance(point, np.ndarray):
+            point_t = torch.tensor(point, device=self.device, dtype=torch.float32)
+        else:
+            point_t = point.float().to(self.device)
+
         if use_rich_features:
-            # Call surrogate once and pass the raw result to the rich feature builder.
-            if isinstance(point, np.ndarray):
-                point_t = torch.tensor(point, device=self.device, dtype=torch.float32)
-            else:
-                point_t = point.float().to(self.device)
-
-            with torch.no_grad():
-                patd_result = signal_surrogate_func(opt_point=point_t, event_params=event_data)
-
+            if patd_result is None:
+                with torch.no_grad():
+                    patd_result = signal_surrogate_func(opt_point=point_t, event_params=event_data)
             features_batch, num_photons = self.prepare_features_patd(
                 point=point_t,
                 event_data=event_data,
                 patd_result=patd_result,
             )
         else:
-            features_batch, num_photons = self.prepare_data_from_raw_patd(
-                point=point,
-                event_data=event_data,
-                surrogate_func=signal_surrogate_func,
-                event_labels=event_labels,
-            )
+            if patd_result is not None:
+                features_batch, num_photons = self.prepare_data_from_raw_patd(
+                    point=point_t,
+                    event_data=event_data,
+                    surrogate_func=lambda **kwargs: patd_result,
+                    event_labels=event_labels,
+                )
+            else:
+                features_batch, num_photons = self.prepare_data_from_raw_patd(
+                    point=point_t,
+                    event_data=event_data,
+                    surrogate_func=signal_surrogate_func,
+                    event_labels=event_labels,
+                )
 
         if num_photons == 0 or features_batch is None:
             return {

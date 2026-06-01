@@ -6864,31 +6864,49 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                     param_ranges[param_name] = (0.0, 1.0)
     
     # Calculate true detector response for all detector points (fixed for all parameter variations).
-    # Reuse responses computed during resampling when available.
+    # In PATD mode we also store the full surrogate result so that the same photon times
+    # are reused for every hypothesis in the grid — matching the non-PATD behaviour where
+    # the true light yield is held fixed while only the hypothesis parameters change.
+    true_patd_results = None  # list of raw surrogate dicts, only populated when use_patd=True
     if true_detector_responses is None:
         true_detector_responses = []
+        if use_patd:
+            true_patd_results = []
         for det_point in detector_points:
             response = signal_surrogate_func(
                 opt_point=det_point,
                 event_params=true_event
             )
             true_detector_responses.append(_extract_response_scalar(response))
-    
+            if use_patd:
+                true_patd_results.append(response)  # store full dict for later reuse
+    elif use_patd:
+        # responses were pre-computed during resampling (scalar only); call surrogate again
+        # to get the full PATD dicts.  This is one surrogate call per detector point, done
+        # once before the grid loop, which is the same cost as the non-PATD resampling path.
+        true_patd_results = []
+        for det_point in detector_points:
+            true_patd_results.append(
+                signal_surrogate_func(opt_point=det_point, event_params=true_event)
+            )
+
     # Count effective detector points (non-zero response)
     num_effective_detector_points = sum(1 for resp in true_detector_responses if resp != 0.0)
-    
+
     # Get true event features for all detector points and sum their log-likelihoods
     true_llr_sum = 0.0
     with torch.no_grad():
         if use_patd:
-            # In PATD mode, sum likelihoods across all photon hits from all detector points
-            for det_point in detector_points:
+            # In PATD mode, sum likelihoods across all photon hits from all detector points.
+            # Pass the pre-computed patd_result so the surrogate is not called again.
+            for det_point, true_patd in zip(detector_points, true_patd_results):
                 llr_result = llrnet.evaluate_patd_likelihood(
                     point=det_point,
                     event_data=true_event,
                     signal_surrogate_func=signal_surrogate_func,
                     event_labels=event_labels,
                     use_rich_features=use_rich_features,
+                    patd_result=true_patd,
                 )
                 true_llr_sum += llr_result['joint_log_likelihood']
         else:
@@ -6964,22 +6982,24 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             # Sum log-likelihoods across all detector points
             llr_sum = 0.0
             filtered_true_event = {k: v for k, v in true_event.items() if k in event_labels}
-            
-            for det_point, true_response in zip(detector_points, true_detector_responses):
+
+            patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
+            for det_point, true_response, true_patd in zip(detector_points, true_detector_responses, patd_iter):
                 # Skip if response is zero and skip_zero_response is True
                 if skip_zero_response and true_response == 0.0:
                     continue
-                
+
                 with torch.no_grad():
                     if use_patd:
-                        # In PATD mode, evaluate likelihood based on photon arrival times
-                        # The modified_event represents the hypothesis parameters
+                        # Pass the pre-computed true patd_result so the fixed observation
+                        # (photon times from the true event) is reused for every hypothesis.
                         llr_result = llrnet.evaluate_patd_likelihood(
                             point=det_point,
                             event_data=modified_event,
                             signal_surrogate_func=signal_surrogate_func,
                             event_labels=event_labels,
                             use_rich_features=use_rich_features,
+                            patd_result=true_patd,
                         )
                         llr_sum += llr_result['joint_log_likelihood']
                     else:
@@ -7185,22 +7205,24 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                 # Sum log-likelihoods across all detector points
                 llr_sum = 0.0
                 filtered_true_event = {k: v for k, v in true_event.items() if k in event_labels}
-                
-                for det_point, true_response in zip(detector_points, true_detector_responses):
+
+                patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
+                for det_point, true_response, true_patd in zip(detector_points, true_detector_responses, patd_iter):
                     # Skip if response is zero and skip_zero_response is True
                     if skip_zero_response and true_response == 0.0:
                         continue
-                    
+
                     with torch.no_grad():
                         if use_patd:
-                            # In PATD mode, evaluate likelihood based on photon arrival times
-                            # The modified_event represents the hypothesis parameters
+                            # Pass the pre-computed true patd_result so the fixed observation
+                            # (photon times from the true event) is reused for every hypothesis.
                             llr_result = llrnet.evaluate_patd_likelihood(
                                 point=det_point,
                                 event_data=modified_event,
                                 signal_surrogate_func=signal_surrogate_func,
                                 event_labels=event_labels,
                                 use_rich_features=use_rich_features,
+                                patd_result=true_patd,
                             )
                             llr_sum += llr_result['joint_log_likelihood']
                         else:
