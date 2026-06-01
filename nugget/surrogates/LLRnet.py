@@ -1364,7 +1364,7 @@ class LLRnet(Surrogate):
         
     def train_with_dataloader(self, train_dataloader, val_dataloader=None, epochs=100,
                              verbose=True, early_stopping_patience=10, input_dim=None,
-                             grad_clip=1.0):
+                             grad_clip=None):
         """
         Train the LLR network using PyTorch DataLoader with balanced signal/background events.
         

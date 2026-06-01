@@ -13,7 +13,8 @@ light_yield_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
         use_poisson=True,
         num_track_points=1000,
         domain_size=2500,
-        use_max_energy_dist=True
+        use_max_energy_dist=True,
+        use_perpendicular_distance_only=True
         ).light_yield_surrogate
 
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
@@ -25,6 +26,7 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
         energy_dist='log_uniform',
         find_exact_intersection=False,
         random_position_along_ray=True,
+        uniform_zenith_sampling=True,
         )
 
 
@@ -64,8 +66,8 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
 train_dataloader = llr_net.create_patd_dataloader(
     signal_sampler=signal_sampler,
     signal_surrogate_func=light_yield_surrogate,
-    num_samples_per_epoch=5000,
-    batch_size=512,
+    num_samples_per_epoch=2048,
+    batch_size=32,
     num_workers=8,
     shuffle_photons=True,
     use_rich_features=True,  # use prepare_features_patd: 14-feature geometry-rich vectors
@@ -76,7 +78,7 @@ history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     epochs=500,
     input_dim=14,
-    grad_clip=1.0,
+    grad_clip=None,
 )
 
 llr_net.save_model('best_hit_llr_model_v4')
