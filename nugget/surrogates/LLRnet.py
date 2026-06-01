@@ -802,6 +802,100 @@ class LLRnet(Surrogate):
 
         return features.clone().detach(), num_photons
 
+    def prepare_features_charge(self, point, event_data, light_yield):
+        """
+        Build a feature vector for the charge (non-PATD) LLR network from a
+        pre-computed light yield value.
+
+        This is the charge analogue of prepare_features_patd.  It uses the same
+        rich geometry as the notebook's create_event_features — adding vert_dist
+        and cos_angle instead of raw relative position — and takes a pre-computed
+        light yield so that the observation can be held fixed while only the
+        hypothesis parameters change (needed for correct NLL landscape evaluation).
+
+        Feature layout (10 features total):
+          [det_x, det_y, det_z,       normalised detector position    (3)
+           v_x,   v_y,   v_z,         normalised vertex position       (3)
+           d_x,   d_y,   d_z,         unit direction vector            (3)
+           log10(E)/8,                log-scaled energy                (1)
+           vert_dist,                 L2(detector - vertex) normalised (1)
+           cos_angle,                 cos(direction ∠ vertex→detector) (1)
+           log_ly]                    log-scaled light yield           (1)
+                                                               total = 13
+
+        Normalisation uses self.domain_size via _pos_norm_divisor().
+
+        Parameters
+        ----------
+        point : torch.Tensor or np.ndarray
+            Detector position, shape (3,) or (1, 3).
+        event_data : dict
+            Event parameters. Must contain 'position', 'energy', 'direction'.
+        light_yield : torch.Tensor or float
+            Pre-computed light yield scalar (the observation).
+
+        Returns
+        -------
+        features : torch.Tensor, shape (13,)
+        """
+        if isinstance(point, np.ndarray):
+            point = torch.tensor(point, device=self.device, dtype=torch.float32)
+        else:
+            point = point.float().to(self.device)
+        point = point.squeeze()  # (3,)
+
+        norm = self._pos_norm_divisor()  # scalar or (3,) tensor
+
+        # --- detector and vertex positions, normalised ---
+        det = point / norm  # (3,)
+
+        vert = event_data['position']
+        if isinstance(vert, np.ndarray):
+            vert = torch.tensor(vert, device=self.device, dtype=torch.float32)
+        else:
+            vert = vert.float().to(self.device)
+        vert = vert.squeeze() / norm  # (3,)
+
+        # --- direction (already a unit vector) ---
+        direction = event_data['direction']
+        if isinstance(direction, np.ndarray):
+            direction = torch.tensor(direction, device=self.device, dtype=torch.float32)
+        else:
+            direction = direction.float().to(self.device)
+        direction = direction.squeeze()  # (3,)
+
+        # --- log-scaled energy ---
+        energy = event_data['energy']
+        if isinstance(energy, np.ndarray):
+            energy = torch.tensor(energy, device=self.device, dtype=torch.float32)
+        else:
+            energy = energy.float().to(self.device)
+        log_energy = torch.log10(energy.squeeze() + 1e-10) / 8.0  # scalar
+
+        # --- derived geometric scalars ---
+        rel = det - vert
+        vert_dist = torch.norm(rel)
+        cos_angle = torch.dot(direction, rel) / (torch.norm(direction) * vert_dist + 1e-8)
+
+        # --- log-scaled light yield ---
+        if not isinstance(light_yield, torch.Tensor):
+            light_yield = torch.tensor(light_yield, device=self.device, dtype=torch.float32)
+        else:
+            light_yield = light_yield.float().to(self.device)
+        log_ly = torch.log10(torch.abs(light_yield.squeeze()) + 1e-10) / 4.0  # scalar
+
+        features = torch.stack([
+            det[0], det[1], det[2],
+            vert[0], vert[1], vert[2],
+            direction[0], direction[1], direction[2],
+            log_energy,
+            vert_dist,
+            cos_angle,
+            log_ly,
+        ])  # (13,)
+
+        return features.clone().detach()
+
     def prepare_data_from_raw_patd(self, point, event_data, surrogate_func, event_labels=['position', 'energy', 'zenith', 'azimuth'], signal_event_data=None, num_samples=1, input_photons=None):
         """
         Prepare training data from raw neutrino event data in PATD mode.
@@ -2333,8 +2427,13 @@ class LLRnet(Surrogate):
                     Useful when surrogate_func includes randomness (e.g., Poisson sampling).
                     Default is 1 (no resampling). If > 1, each unique event/detector pair
                     will be sampled multiple times with different random realizations.
+                use_rich_features : bool, optional (default False)
+                    If True, uses prepare_features_charge instead of prepare_data_from_raw.
+                    Produces a 13-feature vector per event with richer geometry:
+                    det(3) + vertex(3) + dir(3) + log_E(1) + vert_dist(1) + cos_angle(1)
+                    + log_ly(1).  event_labels is ignored in this mode.
             """
-            
+
             self.llrnet = llrnet_instance
             self.signal_sampler = signal_sampler
             self.signal_surrogate_func = signal_surrogate_func
@@ -2344,8 +2443,9 @@ class LLRnet(Surrogate):
             self.presampled_events = kwargs.get('presampled_events', None)
             self.presampled_detector_points = kwargs.get('presampled_detector_points', None)
             self.samples_per_event = kwargs.get('samples_per_event', 1)
-            self.vary_cylinder= kwargs.get('vary_cylinder', False)
+            self.vary_cylinder = kwargs.get('vary_cylinder', False)
             self.cylinder_sampler = kwargs.get('cylinder_sampler', None)
+            self.use_rich_features = kwargs.get('use_rich_features', False)
             self.domain_size = llrnet_instance.domain_size
             # Resampling configuration: discard near-zero light yield pairs (uninformative)
             # min_light_yield: if provided, pairs where BOTH matched & mismatched light yields have
@@ -2438,93 +2538,79 @@ class LLRnet(Surrogate):
             matched_label = torch.tensor(1.0, device=self.llrnet.device)
             mismatched_label = torch.tensor(0.0, device=self.llrnet.device)
 
-            # Generate multiple samples if samples_per_event > 1
+            def _build_pair(event_for_params_m, event_for_ly_m,
+                            event_for_params_mm, event_for_ly_mm):
+                """Return (matched_features, matched_true_ly, mismatched_features, mismatched_true_ly).
+                matched_true_ly / mismatched_true_ly are None when not requested."""
+                if self.use_rich_features:
+                    with torch.no_grad():
+                        ly_m = self.signal_surrogate_func(
+                            opt_point=detector_point, event_params=event_for_ly_m
+                        )
+                        ly_mm = self.signal_surrogate_func(
+                            opt_point=detector_point, event_params=event_for_ly_mm
+                        )
+                    f_m = self.llrnet.prepare_features_charge(
+                        detector_point, event_for_params_m, ly_m
+                    )
+                    f_mm = self.llrnet.prepare_features_charge(
+                        detector_point, event_for_params_mm, ly_mm
+                    )
+                    true_ly_m = ly_m if self.output_true_light_yield else None
+                    true_ly_mm = ly_mm if self.output_true_light_yield else None
+                else:
+                    if self.output_true_light_yield:
+                        f_m, true_ly_m = self.llrnet.prepare_data_from_raw(
+                            detector_point, event_for_ly_m, self.signal_surrogate_func,
+                            self.event_labels, self.llrnet.signal_noise_scale,
+                            event_for_params_m, output_true_light_yield=True,
+                        )
+                        f_mm, true_ly_mm = self.llrnet.prepare_data_from_raw(
+                            detector_point, event_for_ly_mm, self.signal_surrogate_func,
+                            self.event_labels, self.llrnet.signal_noise_scale,
+                            event_for_params_mm, output_true_light_yield=True,
+                        )
+                    else:
+                        f_m = self.llrnet.prepare_data_from_raw(
+                            detector_point, event_for_ly_m, self.signal_surrogate_func,
+                            self.event_labels, self.llrnet.signal_noise_scale,
+                            event_for_params_m,
+                        )
+                        f_mm = self.llrnet.prepare_data_from_raw(
+                            detector_point, event_for_ly_mm, self.signal_surrogate_func,
+                            self.event_labels, self.llrnet.signal_noise_scale,
+                            event_for_params_mm,
+                        )
+                        true_ly_m = true_ly_mm = None
+                return f_m, true_ly_m, f_mm, true_ly_mm
+
             if self.samples_per_event > 1:
                 all_samples = []
-                for sample_idx in range(self.samples_per_event):
-                    if not self.output_true_light_yield:
-                        matched_features = self.llrnet.prepare_data_from_raw(
-                            detector_point,
-                            event_for_light_yield_matched,
-                            self.signal_surrogate_func,
-                            self.event_labels,
-                            self.llrnet.signal_noise_scale,
-                            event_for_params_matched
-                        )
-
-                        mismatched_features = self.llrnet.prepare_data_from_raw(
-                            detector_point,
-                            event_for_light_yield_mismatched,      # LY from different event
-                            self.signal_surrogate_func,
-                            self.event_labels,
-                            self.llrnet.signal_noise_scale,
-                            event_for_params_mismatched            # Θ from event1
-                        )
-
-                        all_samples.append(((matched_features, matched_label), (mismatched_features, mismatched_label)))
+                for _ in range(self.samples_per_event):
+                    f_m, tly_m, f_mm, tly_mm = _build_pair(
+                        event_for_params_matched, event_for_light_yield_matched,
+                        event_for_params_mismatched, event_for_light_yield_mismatched,
+                    )
+                    if self.output_true_light_yield:
+                        all_samples.append((
+                            (f_m, matched_label, tly_m),
+                            (f_mm, mismatched_label, tly_mm),
+                        ))
                     else:
-                        matched_features, matched_true_ly = self.llrnet.prepare_data_from_raw(
-                            detector_point,
-                            event_for_light_yield_matched,
-                            self.signal_surrogate_func,
-                            self.event_labels,
-                            self.llrnet.signal_noise_scale,
-                            event_for_params_matched,
-                            output_true_light_yield=True
-                        )
-                        mismatched_features, mismatched_true_ly = self.llrnet.prepare_data_from_raw(
-                            detector_point,
-                            event_for_light_yield_mismatched,
-                            self.signal_surrogate_func,
-                            self.event_labels,
-                            self.llrnet.signal_noise_scale,
-                            event_for_params_mismatched,
-                            output_true_light_yield=True
-                        )
-                        all_samples.append(((matched_features, matched_label, matched_true_ly), (mismatched_features, mismatched_label, mismatched_true_ly)))
+                        all_samples.append((
+                            (f_m, matched_label),
+                            (f_mm, mismatched_label),
+                        ))
                 return all_samples
             else:
-                # Original behavior for samples_per_event=1
-                if not self.output_true_light_yield:
-                    matched_features = self.llrnet.prepare_data_from_raw(
-                        detector_point,
-                        event_for_light_yield_matched,
-                        self.signal_surrogate_func,
-                        self.event_labels,
-                        self.llrnet.signal_noise_scale,
-                        event_for_params_matched
-                    )
-
-                    mismatched_features = self.llrnet.prepare_data_from_raw(
-                        detector_point,
-                        event_for_light_yield_mismatched,      # LY from different event
-                        self.signal_surrogate_func,
-                        self.event_labels,
-                        self.llrnet.signal_noise_scale,
-                        event_for_params_mismatched            # Θ from event1
-                    )
-
-                    return (matched_features, matched_label), (mismatched_features, mismatched_label)
+                f_m, tly_m, f_mm, tly_mm = _build_pair(
+                    event_for_params_matched, event_for_light_yield_matched,
+                    event_for_params_mismatched, event_for_light_yield_mismatched,
+                )
+                if self.output_true_light_yield:
+                    return (f_m, matched_label, tly_m), (f_mm, mismatched_label, tly_mm)
                 else:
-                    matched_features, matched_true_ly = self.llrnet.prepare_data_from_raw(
-                        detector_point,
-                        event_for_light_yield_matched,
-                        self.signal_surrogate_func,
-                        self.event_labels,
-                        self.llrnet.signal_noise_scale,
-                        event_for_params_matched,
-                        output_true_light_yield=True
-                    )
-                    mismatched_features, mismatched_true_ly = self.llrnet.prepare_data_from_raw(
-                        detector_point,
-                        event_for_light_yield_mismatched,
-                        self.signal_surrogate_func,
-                        self.event_labels,
-                        self.llrnet.signal_noise_scale,
-                        event_for_params_mismatched,
-                        output_true_light_yield=True
-                    )
-                    return (matched_features, matched_label, matched_true_ly), (mismatched_features, mismatched_label, mismatched_true_ly)
+                    return (f_m, matched_label), (f_mm, mismatched_label)
         
         def __len__(self):
             """Return the number of individual events per epoch (2 * num_samples_per_epoch * samples_per_event)."""
@@ -3257,7 +3343,7 @@ class LLRnet(Surrogate):
                                      num_samples_per_epoch=1000, batch_size=32,
                                      shuffle=True, num_workers=0, output_true_light_yield=False,
                                      event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                                     **other_kwargs):
+                                     use_rich_features=False, **other_kwargs):
         """
         Create a DataLoader for signal-only training with matched/mismatched light yields.
         
@@ -3317,9 +3403,8 @@ class LLRnet(Surrogate):
             num_samples_per_epoch=num_samples_per_epoch,
             event_labels=event_labels,
             output_true_light_yield=output_true_light_yield,
+            use_rich_features=use_rich_features,
             **other_kwargs
-            # **dataset_kwargs
-            # presampled_detector_points=presampled_detector_points
         )
         
         dataloader = DataLoader(

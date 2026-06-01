@@ -1,7 +1,7 @@
 import nugget  # Main NUGGET package for neutrino detector optimization
 import pickle 
 
-lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=1600, particle_mode='cascade')
+lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=2000, particle_mode='track')
 light_yield_surrogate = lightsabre.light_yield_surrogate
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
             event_type='signal', 
@@ -10,7 +10,8 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
             E_max=1e8, 
             energy_dist='log_uniform', 
             find_exact_intersection=False, 
-            random_position_along_ray=True
+            random_position_along_ray=True,
+            uniform_zenith_sampling=True
             )
 
 
@@ -50,18 +51,21 @@ train_dataloader = llr_net.create_signal_only_dataloader(
     min_light_yield=0.1,         
     max_resample_attempts=30,
     vary_cylinder=False,
+    use_rich_features=True
     # cylinder_sampler=nugget.samplers.cyl_sampler.CylinderSampler
     )
 
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
-    # val_dataloader=val_dataloader,
-    epochs=1000,  # Maximum number of training epochs
-    # early_stopping_patience=30  # Stop if validation doesn't improve for 50 epochs
-    )
+    epochs=1000,
+    input_dim=13,
+    grad_clip=None,
+    save_every_n_epochs=20,
+    checkpoint_path='best_charge_llr_model_v5.pt',
+)
 
 # Save the best model for later use
-llr_net.save_model('best_cascade_charge_llr_model_v1')
+# llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('cascade_charge_llr_v1_training_history.pkl', 'wb'))
+pickle.dump(history, open('charge_llr_v5_training_history.pkl', 'wb'))

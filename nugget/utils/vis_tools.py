@@ -6910,15 +6910,26 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                 )
                 true_llr_sum += llr_result['joint_log_likelihood']
         else:
-            # Standard mode using light yield features
+            # Standard mode using light yield features.
+            # Pre-compute true light yields once so the observation is held fixed
+            # across the grid (same semantics as the PATD path above).
+            true_light_yields = []
             for det_point in detector_points:
-                true_features = llrnet.prepare_data_from_raw(
-                    point=det_point,
-                    event_data=true_event,
-                    surrogate_func=signal_surrogate_func,
-                    event_labels=event_labels,
-                    noise_scale=llrnet.signal_noise_scale,
-                )
+                with torch.no_grad():
+                    ly = signal_surrogate_func(opt_point=det_point, event_params=true_event)
+                true_light_yields.append(ly)
+
+            for det_point, true_ly in zip(detector_points, true_light_yields):
+                if use_rich_features:
+                    true_features = llrnet.prepare_features_charge(det_point, true_event, true_ly)
+                else:
+                    true_features = llrnet.prepare_data_from_raw(
+                        point=det_point,
+                        event_data=true_event,
+                        surrogate_func=signal_surrogate_func,
+                        event_labels=event_labels,
+                        noise_scale=llrnet.signal_noise_scale,
+                    )
                 true_llr_sum += llrnet.predict_log_likelihood_ratio(true_features.unsqueeze(0)).item()
     
     # Create parameter grids
@@ -6984,7 +6995,10 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             filtered_true_event = {k: v for k, v in true_event.items() if k in event_labels}
 
             patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
-            for det_point, true_response, true_patd in zip(detector_points, true_detector_responses, patd_iter):
+            ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
+            for det_point, true_response, true_patd, true_ly in zip(
+                detector_points, true_detector_responses, patd_iter, ly_iter
+            ):
                 # Skip if response is zero and skip_zero_response is True
                 if skip_zero_response and true_response == 0.0:
                     continue
@@ -7002,20 +7016,23 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                             patd_result=true_patd,
                         )
                         llr_sum += llr_result['joint_log_likelihood']
+                    elif use_rich_features:
+                        # Rich features: fixed true light yield, varied hypothesis params.
+                        features = llrnet.prepare_features_charge(
+                            det_point, modified_event, true_ly
+                        )
+                        llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
                     else:
                         # Standard mode: create features with modified parameters but TRUE detector response
                         features = llrnet.prepare_data_from_raw(
                             point=det_point,
-                            event_data=modified_event,  # Full event for surrogate (if called)
+                            event_data=modified_event,
                             surrogate_func=signal_surrogate_func,
-                            signal_event_data=true_event,  # Filtered for feature extraction
+                            signal_event_data=true_event,
                             event_labels=event_labels,
-                            noise_scale=0.0,  # No noise for evaluation
+                            noise_scale=0.0,
                         )
-
-                        # Predict LLR and add to sum
-                        llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
-                        llr_sum += llr
+                        llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
 
             # Store raw NLL (will normalize later)
             nll = -llr_sum
@@ -7207,7 +7224,10 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                 filtered_true_event = {k: v for k, v in true_event.items() if k in event_labels}
 
                 patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
-                for det_point, true_response, true_patd in zip(detector_points, true_detector_responses, patd_iter):
+                ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
+                for det_point, true_response, true_patd, true_ly in zip(
+                    detector_points, true_detector_responses, patd_iter, ly_iter
+                ):
                     # Skip if response is zero and skip_zero_response is True
                     if skip_zero_response and true_response == 0.0:
                         continue
@@ -7225,20 +7245,23 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                                 patd_result=true_patd,
                             )
                             llr_sum += llr_result['joint_log_likelihood']
+                        elif use_rich_features:
+                            # Rich features: fixed true light yield, varied hypothesis params.
+                            features = llrnet.prepare_features_charge(
+                                det_point, modified_event, true_ly
+                            )
+                            llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
                         else:
                             # Standard mode: create features with TRUE detector response
                             features = llrnet.prepare_data_from_raw(
                                 point=det_point,
-                                event_data=modified_event,  # Full event for surrogate (if called)
+                                event_data=modified_event,
                                 surrogate_func=signal_surrogate_func,
-                                signal_event_data=filtered_true_event,  # Filtered for feature extraction
+                                signal_event_data=filtered_true_event,
                                 event_labels=event_labels,
                                 noise_scale=0.0,
                             )
-
-                            # Predict LLR and add to sum
-                            llr = llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
-                            llr_sum += llr
+                            llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
                 
                 # Store raw NLL (will normalize later)
                 nll_grid[i, j] = -llr_sum
