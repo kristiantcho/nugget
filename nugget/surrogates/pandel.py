@@ -1,6 +1,6 @@
 import torch
-from torch import tensor
-from torch.special import gammainc, gammaln
+# from scipy.special import  gammainc, gammaincinv, gamma, gammaln, hyp1f1
+from torch.special import gammaln, gammainc
 import numpy as np
 import scipy
 
@@ -40,6 +40,58 @@ class Hyp1f1Function(torch.autograd.Function):
         
         # For simplicity, we don't compute gradients w.r.t. a and b (typically constant parameters)
         return None, None, grad_z
+
+    @staticmethod
+    def jvp(ctx, tangents_a, tangents_b, tangents_z):
+        """
+        Forward-mode JVP implementation for Hyp1f1Function.
+
+        We support tangents only for `z` (the variable). Gradients w.r.t. `a` and `b`
+        are not implemented in backward, so we likewise return None for their
+        tangents (represented as zeros). If tangents for `a` or `b` are provided
+        we ignore them and focus on z since the analytic derivative used is
+        d/dz hyp1f1(a,b,z) = (a/b) * hyp1f1(a+1,b+1,z).
+        """
+        # Extract saved tensors (primal inputs)
+        try:
+            a, b, z = ctx.saved_tensors
+        except Exception:
+            # If saved_tensors not available (functorch path), treat inputs as provided
+            a = None
+            b = None
+            z = None
+
+        # If we have primals in ctx, use them; otherwise the tangents arguments
+        # will be tuples of (primal, tangent) when called from functorch internals.
+        # However, functorch's jvp path passes raw tangents here; we need only the
+        # tangents for z and the primals a,b,z will be available via ctx.saved_tensors
+
+        # If ctx.saved_tensors didn't exist, we cannot compute; raise for clarity
+        if a is None or b is None or z is None:
+            raise RuntimeError("Hyp1f1Function.jvp requires saved primals in ctx")
+
+        # Ensure tensors are floats
+        a_f = a
+        b_f = b
+        z_f = z
+
+        # Tangent for z (may be None)
+        tz = tangents_z
+        if tz is None:
+            # No tangent: output tangent is zero
+            out_tangent = torch.zeros_like(z_f)
+        else:
+            # Compute derivative w.r.t z: (a/b) * hyp1f1(a+1, b+1, z)
+            # Use the same Hyp1f1Function.apply to compute hyp1f1 for (a+1, b+1, z)
+            a1 = a_f + 1.0
+            b1 = b_f + 1.0
+            # Compute hyp1f1(a+1, b+1, z) using the forward path (calls SciPy)
+            h = Hyp1f1Function.apply(a1, b1, z_f)
+            deriv_z = (a_f / b_f) * h
+            out_tangent = tz * deriv_z
+
+        # Return tangents for a, b, z respectively. We don't support a/b tangents so return None
+        return None, None, out_tangent
 
 def hyp1f1(a, b, z):
     """
@@ -87,7 +139,7 @@ class Pandel():
         t, d = torch.as_tensor(t), torch.as_tensor(d)
         xi = d / self.lambda_s
 
-        return xi * torch.log(tensor(self.rho)) - gammaln(xi) + (xi - 1) * torch.log(t) - t * self.rho
+        return xi * torch.log(torch.tensor(self.rho)) - gammaln(xi) + (xi - 1) * torch.log(t) - t * self.rho
 
     def cdf(self, t, d):
         return gammainc(d / self.lambda_s, t * self.rho)
@@ -153,7 +205,7 @@ class CPandel():
         # fully analytic region
         rho, s = self.rho, self.s
         term1 = hyp1f1(0.5 * xi, 0.5, 0.5 * eta**2) / torch.exp(gammaln(0.5 * (xi + 1)))
-        term2 = torch.sqrt(tensor(2.)) * eta * hyp1f1(0.5 * (xi + 1), 1.5, 0.5 * eta**2) / torch.exp(gammaln(0.5 * xi))
+        term2 = torch.sqrt(torch.tensor(2.)) * eta * hyp1f1(0.5 * (xi + 1), 1.5, 0.5 * eta**2) / torch.exp(gammaln(0.5 * xi))
 
         pref = rho**xi * s**(xi - 1) * torch.exp(-t**2 / (2 * s**2)) / (2 ** ((1 + xi) / 2))
         return pref * (term1 - term2)
@@ -177,10 +229,10 @@ class CPandel():
             - xi/2 + 1/4
             + k * (2*xi - 1)
             - 0.25 * torch.log(1 + z**2)
-            - xi/2 * torch.log(tensor(2.0))
+            - xi/2 * torch.log(torch.tensor(2.0))
             + (xi - 1)/2 * torch.log(2*xi - 1)
-            + xi * torch.log(tensor(self.rho))
-            + (xi - 1) * torch.log(tensor(self.s))
+            + xi * torch.log(torch.tensor(self.rho))
+            + (xi - 1) * torch.log(torch.tensor(self.s))
         )
 
         return torch.exp(alpha) / torch.exp(gammaln(xi)) * Phi
@@ -200,7 +252,7 @@ class CPandel():
             self.rho**xi
             * self.s**(xi - 1)
             * torch.exp(-t**2 / (2*self.s**2) + eta**2/4)
-            / torch.sqrt(tensor(2*torch.pi))
+            / torch.sqrt(torch.tensor(2*torch.pi))
             * U
             * torch.exp(-k * (2*xi - 1))
             * (1 + z**2)**(-0.25)
@@ -210,7 +262,7 @@ class CPandel():
     def f5(self, xi, t, eta):
         return (
             (self.rho * self.s)**xi
-            / torch.sqrt(tensor(2 * torch.pi * self.s**2))
+            / torch.sqrt(torch.tensor(2 * torch.pi * self.s**2))
             * eta**(-xi)
             * torch.exp(-t**2 / (2 * self.s**2))
         )

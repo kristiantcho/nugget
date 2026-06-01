@@ -426,16 +426,16 @@ class LightSabre(Surrogate):
     
     
 class LightSabrePATD(LightSabre):
-    
+
     """
     LightSabrePATD extends LightSabre to generate photon arrival time distributions
     using the CPandel model.
     """
-    
+
     def __init__(self, device=None, dim=3, domain_size=2, **kwargs):
         """
         Initialize the LightSabrePATD surrogate model.
-        
+
         Parameters:
         -----------
         device : torch.device
@@ -445,293 +445,481 @@ class LightSabrePATD(LightSabre):
         domain_size : int
             Length of the domain
         """
-        super().__init__(device=device, dim=dim, domain_size=domain_size, **kwargs)    
-    
-    
-    
+        super().__init__(device=device, dim=dim, domain_size=domain_size, **kwargs)
+
+    def _parse_event_params(self, event_params):
+        """Return (track_pos, track_dir, energy) as normalized device tensors."""
+        track_pos = event_params.get('position', None)
+        energy = event_params.get('energy', None)
+        angular_dir = event_params.get('direction', None)
+
+        if track_pos is None or energy is None:
+            raise ValueError("event_params must contain 'position' and 'energy'")
+
+        if isinstance(track_pos, torch.Tensor):
+            track_pos = track_pos.to(self.device).squeeze()
+        else:
+            track_pos = torch.tensor(track_pos, dtype=torch.float32, device=self.device).squeeze()
+
+        if isinstance(energy, torch.Tensor):
+            energy = energy.to(self.device).squeeze()
+        else:
+            energy = torch.tensor(energy, dtype=torch.float32, device=self.device).squeeze()
+
+        if angular_dir is not None:
+            if isinstance(angular_dir, torch.Tensor):
+                track_dir = angular_dir.to(self.device).squeeze()
+            else:
+                track_dir = torch.tensor(angular_dir, dtype=torch.float32, device=self.device).squeeze()
+        else:
+            zenith = event_params.get('zenith', None)
+            azimuth = event_params.get('azimuth', None)
+            if zenith is None or azimuth is None:
+                if self.particle_mode == 'cascade':
+                    # Direction is irrelevant for cascade PATD geometry; keep a sane placeholder.
+                    track_dir = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
+                else:
+                    raise ValueError("event_params must contain 'direction' or both 'zenith' and 'azimuth'")
+            else:
+                theta = zenith.to(self.device).squeeze() if isinstance(zenith, torch.Tensor) else torch.tensor(zenith, dtype=torch.float32, device=self.device).squeeze()
+                phi = azimuth.to(self.device).squeeze() if isinstance(azimuth, torch.Tensor) else torch.tensor(azimuth, dtype=torch.float32, device=self.device).squeeze()
+                track_dir = torch.stack([
+                    torch.sin(theta) * torch.cos(phi),
+                    torch.sin(theta) * torch.sin(phi),
+                    torch.cos(theta),
+                ])
+
+        track_dir = track_dir / torch.norm(track_dir).clamp_min(1e-12)
+        return track_pos, track_dir, energy
+
+    def _empty_patd_dict(self, expected_N=0):
+        return {
+            'hit_times': torch.tensor([], device=self.device),
+            'num_photons': 0,
+            'expected_photons': expected_N,
+            'residual_times': torch.tensor([], device=self.device),
+            'geometric_times': torch.tensor([], device=self.device),
+            'vertex_times': torch.tensor([], device=self.device),
+            'emission_points': torch.empty((0, 3), device=self.device),
+            't_geom_min': torch.tensor(1e-6, device=self.device),
+            'd_geom': torch.tensor([], device=self.device),
+            'patd_probs': None,
+        }
+
+    def _sample_cpandel(self, cpandel, d_geom_i, t_geom_i, s_i, track_pos, track_dir, v_mu, get_patd_probs, cascade_mode=False):
+        """Run CPandel sampling for one detector and return hit-level tensors."""
+        d_geom_numpy = d_geom_i.detach().cpu().numpy()
+        t_residual_output = cpandel.rvs(d=d_geom_numpy, size=None)
+        t_residual_probs = None
+        if get_patd_probs:
+            t_residual_probs = cpandel.pdf(t_residual_output, d=d_geom_numpy)
+            if isinstance(t_residual_probs, np.ndarray):
+                t_residual_probs = torch.from_numpy(t_residual_probs).float().to(self.device)
+
+        if isinstance(t_residual_output, torch.Tensor):
+            t_residual = t_residual_output.float().to(self.device)
+        else:
+            t_residual = torch.from_numpy(t_residual_output).float().to(self.device)
+
+        hit_times = t_geom_i + t_residual
+        if cascade_mode:
+            emission_points = track_pos.unsqueeze(0).expand(s_i.shape[0], -1)
+            vertex_times = torch.zeros_like(s_i)
+        else:
+            emission_points = track_pos.unsqueeze(0) + s_i.unsqueeze(1) * track_dir.unsqueeze(0)
+            vertex_times = s_i / v_mu
+        return hit_times, t_residual, t_geom_i, vertex_times, emission_points, t_residual_probs
+
+    def _compute_track_weights(self, t_min, t_max, track_pos, track_dir, detector_pos):
+        """
+        Compute per-track-point emission weights for a single detector position.
+        Returns (t_vals, sampled_t_vals, d_geom) after multinomial sampling.
+        """
+        num_track_points = max(int(self.kwargs.get('num_track_points', 1000)), 1)
+        t_vals = torch.linspace(float(t_min), float(t_max), num_track_points, device=self.device)
+        track_points = track_pos.unsqueeze(0) + t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
+
+        distances = torch.norm(track_points - detector_pos.unsqueeze(0), dim=1)
+
+        theta_c = torch.acos(torch.tensor(1.0 / self.refractive_index, device=self.device))
+        sin_theta_c = torch.sin(theta_c)
+        lambda_abs, lambda_sca = 44.7, 57.4/(1-self.scattering_tau)
+        lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
+        zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device))
+        lambda_c = lambda_sca / (3.0 * zeta)
+        lambda_mu = (lambda_c / sin_theta_c ** 2 * 2.0 / (np.pi * lambda_p)).clamp_min(1e-12)
+
+        d_safe = distances.clamp(min=1e-6)
+        w = (torch.exp(-d_safe / lambda_p) / (2.0 * np.pi * sin_theta_c)) / \
+            (torch.sqrt(lambda_mu * d_safe) * torch.tanh(torch.sqrt(d_safe / lambda_mu))).clamp_min(1e-12)
+        w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        w_sum = w.sum()
+        if not torch.isfinite(w_sum) or w_sum <= 0:
+            w = torch.full_like(w, 1.0 / w.numel())
+        else:
+            w = w / w_sum
+        return t_vals, w, distances
+
+    def _compute_track_weights_batch(self, t_min, t_max, track_pos, track_dir, detector_positions):
+        """
+        Compute emission weights for all detectors simultaneously.
+        Returns t_vals (T,), weights (T, n_pts), distances (T, n_pts).
+        """
+        num_track_points = max(int(self.kwargs.get('num_track_points', 1000)), 1)
+        t_vals = torch.linspace(float(t_min), float(t_max), num_track_points, device=self.device)  # (T,)
+        track_points = track_pos.unsqueeze(0) + t_vals.unsqueeze(1) * track_dir.unsqueeze(0)       # (T, 3)
+
+        # distances[i, j] = distance from track point i to detector j
+        dists = (track_points.unsqueeze(1) - detector_positions.unsqueeze(0)).norm(dim=2)           # (T, n_pts)
+
+        theta_c = torch.acos(torch.tensor(1.0 / self.refractive_index, device=self.device))
+        sin_theta_c = torch.sin(theta_c)
+        lambda_abs, lambda_sca = 44.7, 57.4/(1-self.scattering_tau)
+        lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
+        zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device))
+        lambda_c = lambda_sca / (3.0 * zeta)
+        lambda_mu = (lambda_c / sin_theta_c ** 2 * 2.0 / (np.pi * lambda_p)).clamp_min(1e-12)
+
+        d_safe = dists.clamp(min=1e-6)
+        w = (torch.exp(-d_safe / lambda_p) / (2.0 * np.pi * sin_theta_c)) / \
+            (torch.sqrt(lambda_mu * d_safe) * torch.tanh(torch.sqrt(d_safe / lambda_mu))).clamp_min(1e-12)
+        w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)   # (T, n_pts)
+
+        w_sums = w.sum(dim=0, keepdim=True)  # (1, n_pts)
+        bad = ~torch.isfinite(w_sums) | (w_sums <= 0)
+        w = torch.where(bad.expand_as(w), torch.full_like(w, 1.0 / num_track_points), w / w_sums.clamp_min(1e-12))
+        return t_vals, w, dists
+
     def light_yield_surrogate(self, **kwargs):
         """
-        Generate photon arrival time distribution using CPandel model.
-        
-        This method samples photon hit times by:
-        1. Using light_yield_surrogate to get expected photon count N
-        2. Sampling N points along the track weighted by light yield
-        3. Computing geometric time and residual time using CPandel
-        
-        Parameters:
-        -----------
+        Generate photon arrival time distribution(s) using the CPandel model.
+
+        When opt_point is a single detector position (shape (3,) or (1, 3)), returns a
+        single dict.  When opt_point is a batch of positions (shape (n_pts, 3) with
+        n_pts > 1), returns a list of n_pts dicts, with all geometry parallelised across
+        detectors before the per-detector CPandel sampling loop.
+
+        Parameters
+        ----------
         event_params : dict
-            Contains 'position', 'zenith', 'azimuth', 'energy'
-        opt_point : torch.Tensor
-            Detector position (single point)
-        n_refraction : float
-            Refractive index (default: 1.3)
-        v_mu : float
-            Muon velocity in m/ns (default: speed of light c)
-        num_track_points : int
-            Number of points to sample along track (default: 1000)
-        cpandel_params : dict
-            Parameters for CPandel (tau, lambda_s, lambda_a, v, s)
+            Contains 'position', 'energy', and either 'direction' or 'zenith'/'azimuth'.
+        opt_point : Tensor, shape (3,) | (1, 3) | (n_pts, 3)
+            Detector position(s).
         max_photons : int or None
-            Maximum number of photons to sample. If provided, samples min(N, max_photons)
-            where N is the expected light yield. This speeds up computation when only
-            a limited number of photons are needed.
+            Cap on photons sampled per detector.
+        get_patd_probs : bool
+            If True, also return CPandel PDF values for each residual time.
         use_perpendicular_distance_only : bool
-            If True, bypasses along-track sampling and uses only the perpendicular
-            distance geometry (all photons emitted from the track foot point with
-            respect to the detector).
-            
-        Returns:
-        --------
-        dict
-            Dictionary containing:
-            - 'hit_times': Array of photon hit times
-            - 'num_photons': Number of photons actually sampled
-            - 'expected_photons': Expected light yield N (before limiting)
-            - 'residual_times': CPandel residual times
-                        - 'muon_emission_times': Time for muon to reach each sampled
-                            emission point along the track
-                        - 'emission_points': 3D point on the track where each photon is
-                            emitted
+            Use only foot-point geometry (no along-track resampling).
+
+        Returns
+        -------
+        dict  — single detector input
+        list[dict]  — multi-detector input (one dict per detector, same keys as single)
         """
-        # Extract parameters
         opt_point = kwargs.get('opt_point', None)
         event_params = kwargs.get('event_params', None)
+
+        if event_params is None or opt_point is None:
+            raise ValueError("event_params and opt_point must be provided")
+
+        # Normalise opt_point to a float32 device tensor
+        if not isinstance(opt_point, torch.Tensor):
+            opt_point = torch.tensor(opt_point, dtype=torch.float32, device=self.device)
+        else:
+            opt_point = opt_point.to(self.device).float()
+
+        # Strip already-extracted keys so they aren't double-passed as kwargs
+        rest = {k: v for k, v in kwargs.items() if k not in ('opt_point', 'event_params')}
+
+        # Dispatch: single point → dict, multiple points → list[dict]
+        squeezed = opt_point.squeeze()
+        if squeezed.dim() == 1:
+            return self._patd_single(squeezed, event_params, **rest)
+        else:
+            pts = squeezed if squeezed.dim() == 2 else opt_point.view(-1, 3)
+            return self._patd_batch(pts, event_params, **rest)
+
+    # ------------------------------------------------------------------
+    # Single-detector path (original logic, unchanged behaviour)
+    # ------------------------------------------------------------------
+    def _patd_single(self, detector_pos, event_params, **kwargs):
         max_photons = kwargs.get('max_photons', None)
         get_patd_probs = kwargs.get('get_patd_probs', False)
         use_perpendicular_distance_only = kwargs.get(
             'use_perpendicular_distance_only',
             self.kwargs.get('use_perpendicular_distance_only', False)
         )
-        
-        c = 0.299792458  # speed of light in m/ns
+        c = 0.299792458
         v_mu = self.kwargs.get('v_mu', c)
-        num_track_points = max(int(self.kwargs.get('num_track_points', 1000)), 1)
         cpandel_params = self.kwargs.get('cpandel_params', {})
-        
-        if event_params is None or opt_point is None:
-            raise ValueError("event_params and opt_point must be provided")
-        
-        # Extract event parameters
-        track_pos = event_params.get('position', None)
-        zenith = event_params.get('zenith', None)
-        azimuth = event_params.get('azimuth', None)
-        energy = event_params.get('energy', None)
-        angular_dir = event_params.get('direction', None)
-        
-        # Convert to tensors
-        if isinstance(track_pos, torch.Tensor):
-            track_pos = track_pos.to(self.device).squeeze()
-        else:
-            track_pos = torch.tensor(track_pos, device=self.device).squeeze()
-        
-        if isinstance(opt_point, torch.Tensor):
-            detector_pos = opt_point.to(self.device).squeeze()
-        else:
-            detector_pos = torch.tensor(opt_point, device=self.device).squeeze()
-        
-        # Convert spherical angles to Cartesian direction
-        if isinstance(zenith, torch.Tensor):
-            theta = zenith.squeeze()
-            phi = azimuth.squeeze()
-        else:
-            theta = torch.tensor(zenith, device=self.device).squeeze()
-            phi = torch.tensor(azimuth, device=self.device).squeeze()
-        if angular_dir is not None:
-            if isinstance(angular_dir, torch.Tensor):
-                track_dir = angular_dir.to(self.device).squeeze()
-            else:
-                track_dir = torch.tensor(angular_dir, device=self.device).squeeze()
-        else:
-            track_dir = torch.stack([
-                torch.sin(theta) * torch.cos(phi),
-                torch.sin(theta) * torch.sin(phi),
-                torch.cos(theta)
-            ])
-            track_dir = track_dir / torch.norm(track_dir)  # Normalize
-        
-        # Get expected number of photons at detector
+        is_cascade = self.particle_mode == 'cascade'
+
+        track_pos, track_dir, energy = self._parse_event_params(event_params)
+
         if self.kwargs.get('input_photons', None) is None:
             light_yield = self.__call__(
-                track_pos=track_pos,
-                track_dir=track_dir,
-                track_energy=energy,
-                om_positions=opt_point
+                track_pos=track_pos, track_dir=track_dir,
+                track_energy=energy, om_positions=detector_pos.unsqueeze(0)
             )
             if self.kwargs.get('use_poisson', False):
-                light_yield = torch.poisson(light_yield)
+                light_yield = torch.poisson(self._sanitize_rate_for_poisson(light_yield))
         else:
-            light_yield = torch.tensor(self.kwargs.get('input_photons', None), device=self.device)   
-        
-        expected_N = torch.round(light_yield).int().item()
-  
-        
-        # Limit sampling if max_photons is provided
-        if max_photons is not None and max_photons < expected_N:
-            N = max_photons
-        else:
-            N = expected_N
-        
+            light_yield = torch.tensor(self.kwargs.get('input_photons'), device=self.device)
+
+        expected_N = torch.round(light_yield).int().detach().cpu().item()
+        N = min(expected_N, max_photons) if (max_photons is not None and max_photons < expected_N) else expected_N
+
         if N <= 0:
-            return {
-                'hit_times': torch.tensor([], device=self.device),
-                'num_photons': 0,
-                'expected_photons': expected_N,
-                'residual_times': torch.tensor([], device=self.device),
-                'vertex_times': torch.tensor([], device=self.device),
-                'emission_points': torch.empty((0, 3), device=self.device)
-            }
-        # Find the foot of the perpendicular from detector to track
-        # Foot point is: track_pos + t_foot * track_dir where t_foot = (detector_pos - track_pos) · track_dir
+            return self._empty_patd_dict(expected_N)
+
         to_detector = detector_pos - track_pos
-        t_foot = torch.dot(to_detector, track_dir) #distance along track to foot point
-        
-        # If t_foot < 0, detector is behind the track start; muon never travels toward it
-        if t_foot < 0:
-            return {
-                'hit_times': torch.tensor([], device=self.device),
-                'num_photons': 0,
-                'expected_photons': 0,
-                'residual_times': torch.tensor([], device=self.device),
-                'vertex_times': torch.tensor([], device=self.device),
-                'emission_points': torch.empty((0, 3), device=self.device),
-                't_geom_min': torch.tensor(1e-6, device=self.device),
-                'd_geom': torch.tensor([], device=self.device),
-                'patd_probs': None,
-            }
-        
-        foot_length = torch.norm(torch.linalg.cross(to_detector, track_dir))/torch.norm(track_dir)
-        # Convert N to int if it's a tensor, otherwise it's already a Python int
+        t_foot = torch.dot(to_detector, track_dir)
+        foot_length = torch.norm(torch.linalg.cross(to_detector, track_dir)) / torch.norm(track_dir)
+        d_vertex = torch.norm(to_detector)
         num_samples = int(N.item()) if isinstance(N, torch.Tensor) else int(N)
 
-        if use_perpendicular_distance_only:
-            # Use the foot point only: no along-track re-sampling.
-            sampled_t_vals = torch.full((num_samples,), t_foot, device=self.device)
-            sampled_track_points = track_pos.unsqueeze(0) + sampled_t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
-            d_perp = torch.clamp(foot_length, min=1e-6)
-            d_geom = torch.full((num_samples,), d_perp, device=self.device)
+        if is_cascade:
+            s = torch.zeros((num_samples,), device=self.device)
+            d_geom = torch.full((num_samples,), d_vertex.clamp(min=1e-6).item(), device=self.device)
+            t_geom_min = d_vertex / (c / self.refractive_index)
+        elif use_perpendicular_distance_only:
+            s = torch.full((num_samples,), t_foot.item(), device=self.device)
+            d_geom = torch.full((num_samples,), foot_length.clamp(min=1e-6).item(), device=self.device)
+            t_geom_min = foot_length / (c / self.refractive_index) + t_foot / v_mu
         else:
+            if t_foot < 0:
+                return self._empty_patd_dict(expected_N)
             if not self.use_max_energy_dist:
-            # Get the maximum distance S along track from foot point in both directions
-                S = self.kwargs.get('track_segment_length', 200.0)  # Default 200m
-                
-                # Determine the range along the track:
-                # - Backwards from foot: [t_foot - S, t_foot]
-                # - Forwards from foot: [t_foot, t_foot + S]
-                # But must not extend backwards past the interaction vertex (t=0)
-                
-                t_min = torch.max(torch.tensor(0.0, device=self.device), t_foot - S)  # Don't go past vertex
+                S = self.kwargs.get('track_segment_length', 200.0)
+                t_min = torch.max(torch.tensor(0.0, device=self.device), t_foot - S)
                 t_max = t_foot + S
-            
             else:
                 t_min = 0
                 t_max = self.get_max_energy_dist(energy).squeeze()
-            
-            # Sample points along the track from t_min to t_max
-            t_vals = torch.linspace(t_min, t_max, num_track_points, device=self.device)
-            track_points = track_pos.unsqueeze(0) + t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
-            
-            # Calculate distances from each track point to detector
-            distances = torch.norm(track_points - detector_pos.unsqueeze(0), dim=1)
-            # print(distances[::50])
-            
-            # Cherenkov angle for water
-            theta_c = torch.acos(torch.tensor(1.0/self.refractive_index, device=self.device))
-            sin_theta_c = torch.sin(theta_c)
-            
-            # Optical parameters for water from Tobias K.
-            lambda_abs = 44.7
-            lambda_sca = 57.4
-            lambda_p = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
-            zeta = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device))
-            lambda_c = lambda_sca / (3.0 * zeta)
-            lambda_mu = (lambda_c / sin_theta_c**2 * 2.0 / (np.pi * lambda_p))
-            
-            # Avoid singularities when detector lies on/very near the sampled track.
-            distances_safe = torch.clamp(distances, min=1e-6)
-            # Calculate weights (unnormalized probabilities)
-            numerator = (1.0 / (2.0 * np.pi * sin_theta_c))
-            numerator = numerator * torch.exp(-distances_safe / lambda_p)
-            
-            denominator = (torch.sqrt(lambda_mu * distances_safe) * 
-                          torch.tanh(torch.sqrt(distances_safe / lambda_mu)))
-            
-            weights = numerator / denominator
-            weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-            weights = torch.clamp(weights, min=0.0)
 
-            # Normalize weights to create probability distribution.
-            # If the formula degenerates numerically, fall back to uniform sampling.
-            weight_sum = torch.sum(weights)
-            if (not torch.isfinite(weight_sum)) or (weight_sum <= 0):
-                weights = torch.full_like(weights, 1.0 / weights.numel())
-            else:
-                weights = weights / weight_sum
-            
-            # Sample N points along the track according to weights
+            t_vals, weights, distances = self._compute_track_weights(t_min, t_max, track_pos, track_dir, detector_pos)
             sampled_indices = torch.multinomial(weights, num_samples, replacement=True)
-            # sampled_track_points = track_points[sampled_indices]
-            sampled_t_vals = t_vals[sampled_indices]
-            sampled_track_points = track_pos.unsqueeze(0) + sampled_t_vals.unsqueeze(1) * track_dir.unsqueeze(0)
-            # Calculate geometric distances for sampled points
-            d_geom = torch.norm(sampled_track_points - detector_pos.unsqueeze(0), dim=1)
-        
-        # Calculate distance along track from vertex (s)
-        # sampled_t_vals represents distance from vertex along track direction
-        s = sampled_t_vals
-        muon_emission_times = s / v_mu
-        
-        # Calculate geometric time: t_geom = d/(c/n) + s/v_mu
-        t_geom = d_geom / (c / self.refractive_index) + s / v_mu
-        # t_geom_foot = t_foot / (c / self.refractive_index) + foot_length / v_mu
-        # t_geom_track = torch.norm(to_detector) / (c / self.refractive_index)
-        # t_geom_min = min(t_geom_foot, t_geom_track)
-        if not use_perpendicular_distance_only:
-            if v_mu != c/self.refractive_index:
-                short_track = t_foot - ((c / self.refractive_index) * foot_length)/torch.sqrt(torch.tensor(v_mu**2 - (c / self.refractive_index)**2, device=self.device))
-                t_geom_min = (short_track / v_mu)  +  torch.sqrt((short_track-t_foot)**2 + foot_length**2) / (c / self.refractive_index)
+            s = t_vals[sampled_indices]
+            d_geom = distances[sampled_indices]
+
+            if v_mu != c / self.refractive_index:
+                short_track = t_foot - ((c / self.refractive_index) * foot_length) / \
+                    torch.sqrt(torch.tensor(v_mu ** 2 - (c / self.refractive_index) ** 2, device=self.device))
+                t_geom_min = short_track / v_mu + \
+                    torch.sqrt((short_track - t_foot) ** 2 + foot_length ** 2) / (c / self.refractive_index)
             else:
                 t_geom_min = torch.norm(to_detector) / (c / self.refractive_index)
-        else:
-            t_geom_min = foot_length / (c / self.refractive_index) + t_foot / v_mu
-        # Initialize CPandel model
+
+        t_geom = d_geom / (c / self.refractive_index) + s / v_mu
+
         cpandel = CPandel(
-            tau=cpandel_params.get('tau', 557.),
-            lambda_s=cpandel_params.get('lambda_s', 33.3),
-            lambda_a=cpandel_params.get('lambda_a', 98.),
-            v=cpandel_params.get('v', 0.3/1.33),
+            tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 57.4),
+            lambda_a=cpandel_params.get('lambda_a', 44.7), v=cpandel_params.get('v', 0.3 / 1.33),
             s=cpandel_params.get('s', 5.0)
         )
-        
-        # Sample residual times using CPandel for all geometric distances at once (vectorized)
-        # When d is already an array of N distances, don't pass size parameter
-        # to avoid creating an N×N matrix
-        d_geom_numpy = d_geom.detach().cpu().numpy()
-        t_residual_output = cpandel.rvs(d=d_geom_numpy, size=None)
-        t_residual_probs = None
-        if get_patd_probs:
-            t_residual_probs = cpandel.pdf(t_residual_output, d=d_geom_numpy)
-            
-        # Handle both torch tensor and numpy array outputs
-        if isinstance(t_residual_output, torch.Tensor):
-            t_residual = t_residual_output.float().to(self.device)
-        else:
-            t_residual = torch.from_numpy(t_residual_output).float().to(self.device)
-        
-        # Total hit time = geometric time + residual time
-        hit_times = t_geom + t_residual
-        
-        # need to think of a better return structure here
-        
+        hit_times, t_residual, t_geom, vertex_times, emission_points, t_residual_probs = \
+            self._sample_cpandel(
+                cpandel, d_geom, t_geom, s, track_pos, track_dir, v_mu, get_patd_probs,
+                cascade_mode=is_cascade
+            )
+
         return {
             'hit_times': hit_times,
             'num_photons': N,
-            'expected_photons': expected_N,
+            'expected_photons': light_yield,
             'residual_times': t_residual,
             'geometric_times': t_geom,
-            'vertex_times': muon_emission_times,
-            'emission_points': sampled_track_points,
+            'vertex_times': vertex_times,
+            'emission_points': emission_points,
             't_geom_min': t_geom_min,
             'd_geom': d_geom,
             'patd_probs': t_residual_probs,
         }
+
+    # ------------------------------------------------------------------
+    # Multi-detector path: geometry parallelised, CPandel loop per det.
+    # ------------------------------------------------------------------
+    def _patd_batch(self, detector_positions, event_params, **kwargs):
+        """
+        Compute PATD for n_pts detector positions simultaneously.
+
+        All geometry (foot lengths, t_geom_min, light yield, Poisson sampling, and
+        the full (T × n_pts) track-weight matrix for the non-perp mode) is computed
+        in parallel.  Only the CPandel rvs call loops over detectors because each
+        detector has a different number of photons N_i.
+
+        Returns list[dict] of length n_pts.
+        """
+        max_photons = kwargs.get('max_photons', None)
+        get_patd_probs = kwargs.get('get_patd_probs', False)
+        use_perpendicular_distance_only = kwargs.get(
+            'use_perpendicular_distance_only',
+            self.kwargs.get('use_perpendicular_distance_only', False)
+        )
+        c = 0.299792458
+        v_mu = self.kwargs.get('v_mu', c)
+        cpandel_params = self.kwargs.get('cpandel_params', {})
+        n_pts = detector_positions.shape[0]
+        is_cascade = self.particle_mode == 'cascade'
+
+        track_pos, track_dir, energy = self._parse_event_params(event_params)
+
+        # ---- Vectorised geometry ----------------------------------------
+        to_detector = detector_positions - track_pos.unsqueeze(0)                      # (n_pts, 3)
+        t_foot = (to_detector * track_dir.unsqueeze(0)).sum(dim=1)                     # (n_pts,)
+        cross = torch.linalg.cross(
+            to_detector, track_dir.unsqueeze(0).expand(n_pts, 3)
+        )
+        foot_length = cross.norm(dim=1) / track_dir.norm().clamp_min(1e-12)            # (n_pts,)
+        valid_mask = torch.ones_like(t_foot, dtype=torch.bool) if is_cascade else (t_foot >= 0)  # (n_pts,)
+        d_vertex = to_detector.norm(dim=1)                                              # (n_pts,)
+
+        # ---- Vectorised light yield + Poisson ---------------------------
+        if self.kwargs.get('input_photons', None) is None:
+            light_yield = self.__call__(
+                track_pos=track_pos, track_dir=track_dir,
+                track_energy=energy, om_positions=detector_positions
+            )                                                                           # (n_pts,)
+            if self.kwargs.get('use_poisson', False):
+                light_yield = torch.poisson(self._sanitize_rate_for_poisson(light_yield))
+        else:
+            light_yield = torch.full((n_pts,), float(self.kwargs.get('input_photons')), device=self.device)
+
+        N_samples = torch.round(light_yield).int()                                     # (n_pts,)
+        if max_photons is not None:
+            N_samples = N_samples.clamp(max=int(max_photons))
+
+        # ---- Vectorised t_geom_min --------------------------------------
+        fl_safe = foot_length.clamp(min=1e-6)
+        if is_cascade:
+            t_geom_min_batch = d_vertex.clamp(min=1e-6) / (c / self.refractive_index)  # (n_pts,)
+        elif use_perpendicular_distance_only:
+            t_geom_min_batch = fl_safe / (c / self.refractive_index) + t_foot / v_mu  # (n_pts,)
+        else:
+            if v_mu != c / self.refractive_index:
+                denom = torch.sqrt(
+                    torch.tensor(v_mu ** 2 - (c / self.refractive_index) ** 2, device=self.device)
+                )
+                short_track = t_foot - (c / self.refractive_index) * fl_safe / denom
+                t_geom_min_batch = short_track / v_mu + \
+                    torch.sqrt((short_track - t_foot) ** 2 + fl_safe ** 2) / (c / self.refractive_index)
+            else:
+                t_geom_min_batch = to_detector.norm(dim=1) / (c / self.refractive_index)
+
+        # ---- Track-weight matrix (non-perp mode, computed once) ---------
+        if not is_cascade and not use_perpendicular_distance_only:
+            if not self.use_max_energy_dist:
+                S = self.kwargs.get('track_segment_length', 200.0)
+                t_min = max(0.0, float(t_foot.min().item()) - S)
+                t_max = float(t_foot.max().item()) + S
+            else:
+                t_min = 0.0
+                t_max = float(self.get_max_energy_dist(energy).squeeze().item())
+
+            t_vals, weights_matrix, dists_matrix = self._compute_track_weights_batch(
+                t_min, t_max, track_pos, track_dir, detector_positions
+            )                                          # (T,), (T, n_pts), (T, n_pts)
+
+        # ---- Build CPandel once -----------------------------------------
+        cpandel = CPandel(
+            tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 57.4),
+            lambda_a=cpandel_params.get('lambda_a', 44.7), v=cpandel_params.get('v', 0.3 / 1.33),
+            s=cpandel_params.get('s', 5.0)
+        )
+
+        # ---- Per-detector CPandel loop (all geometry already done) ------
+        results = []
+        for i in range(n_pts):
+            if not valid_mask[i].item():
+                results.append(self._empty_patd_dict(light_yield[i].item()))
+                continue
+
+            N_i = int(N_samples[i].item())
+            if N_i <= 0:
+                results.append(self._empty_patd_dict(light_yield[i].item()))
+                continue
+
+            if is_cascade:
+                s_i = torch.zeros((N_i,), device=self.device)
+                d_geom_i = torch.full((N_i,), d_vertex[i].clamp(min=1e-6).item(), device=self.device)
+            elif use_perpendicular_distance_only:
+                s_i = torch.full((N_i,), t_foot[i].item(), device=self.device)
+                d_geom_i = torch.full((N_i,), fl_safe[i].item(), device=self.device)
+            else:
+                sampled_idx = torch.multinomial(weights_matrix[:, i], N_i, replacement=True)
+                s_i = t_vals[sampled_idx]
+                d_geom_i = dists_matrix[sampled_idx, i]
+
+            t_geom_i = d_geom_i / (c / self.refractive_index) + s_i / v_mu
+
+            hit_times, t_residual, t_geom_i, vertex_times, emission_points, t_residual_probs = \
+                self._sample_cpandel(
+                    cpandel, d_geom_i, t_geom_i, s_i, track_pos, track_dir, v_mu, get_patd_probs,
+                    cascade_mode=is_cascade
+                )
+
+            results.append({
+                'hit_times': hit_times,
+                'num_photons': N_i,
+                'expected_photons': light_yield[i],
+                'residual_times': t_residual,
+                'geometric_times': t_geom_i,
+                'vertex_times': vertex_times,
+                'emission_points': emission_points,
+                't_geom_min': t_geom_min_batch[i],
+                'd_geom': d_geom_i,
+                'patd_probs': t_residual_probs,
+            })
+
+        return results
+
+    def eval_patd_log_probs(self, t_residuals_fixed, opt_point, event_params):
+        """
+        Re-evaluate CPandel log-pdf at pre-sampled residual times with gradient-enabled geometry.
+
+        Computes foot_length (perpendicular distance from track to detector) from event_params
+        with full gradient support. Exact for use_perpendicular_distance_only=True; a
+        differentiable perpendicular-distance approximation for the general mode.
+
+        Parameters
+        ----------
+        t_residuals_fixed : Tensor, shape (N_hits,)
+            Pre-sampled residual times, treated as fixed constants for grad computation.
+        opt_point : Tensor, shape (3,)
+            Detector position.
+        event_params : dict
+            Must contain 'position' and 'direction' (or 'zenith'/'azimuth'). Parameters
+            may carry requires_grad=True for Fisher info Jacobian computation.
+
+        Returns
+        -------
+        Tensor, shape (N_hits,)
+            log(CPandel.pdf(t_residuals, d=foot_length(theta))).
+        """
+        track_pos, track_dir, _ = self._parse_event_params(event_params)
+
+        if not isinstance(opt_point, torch.Tensor):
+            opt_point = torch.tensor(opt_point, dtype=torch.float32, device=self.device)
+        opt_point = opt_point.float().to(self.device)
+
+        if not isinstance(t_residuals_fixed, torch.Tensor):
+            t_residuals_fixed = torch.tensor(t_residuals_fixed, dtype=torch.float32, device=self.device)
+        t_residuals_fixed = t_residuals_fixed.float().to(self.device)
+
+        to_detector = opt_point - track_pos
+        cross = torch.linalg.cross(to_detector, track_dir)
+        foot_length = cross.norm() / track_dir.norm().clamp_min(1e-12)
+        d_geom = foot_length.clamp(min=1e-6).expand(t_residuals_fixed.shape[0])
+
+        cpandel_params = self.kwargs.get('cpandel_params', {})
+        cpandel = CPandel(
+            tau=cpandel_params.get('tau', 557.),
+            lambda_s=cpandel_params.get('lambda_s', 57.4),
+            lambda_a=cpandel_params.get('lambda_a', 98.),
+            v=cpandel_params.get('v', 0.3 / 1.33),
+            s=cpandel_params.get('s', 5.0),
+        )
+
+        probs = cpandel.pdf(t_residuals_fixed, d=d_geom)
+        return torch.log(probs.clamp(min=1e-40))

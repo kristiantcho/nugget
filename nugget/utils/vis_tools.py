@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from matplotlib.colors import Normalize
 from matplotlib.ticker import MaxNLocator, FuncFormatter
-from IPython.display import clear_output, display
 import math
 import re # Added for regex pattern matching in GIF frame sorting
 from typing import List, Dict, Union, Tuple, Optional, Any, Callable
@@ -15,6 +14,17 @@ import os # Added for file management
 import tempfile # Added for temporary directory management
 import glob # Added for file pattern matching
 import shutil # Added for directory operations
+
+# IPython is optional. In some HPC/CLI environments, importing IPython can fail
+# due to missing native runtime symbols (e.g. sqlite/libstdc++ ABI issues).
+try:
+    from IPython.display import clear_output, display
+except Exception:
+    def clear_output(wait=False):
+        return None
+
+    def display(*args, **kwargs):
+        return None
 
 # Try importing plotly for interactive 3D plotting, but don't fail if not available
 try:

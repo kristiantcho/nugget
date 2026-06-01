@@ -5,9 +5,9 @@ import numpy as np
 # import os
 # from nugget.losses.effective_area import get_bounding_cylinder
 
-device = 'cuda:1'
+device = 'cuda:3'
 num_events = 30000
-version = 'r600_50_u_1'
+version = 'r600_50_pl_1'
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
 center = [0,0,0]
@@ -23,57 +23,46 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     E_max=1e8, 
                                                     find_exact_intersection=False,
                                                     random_position_along_ray=True,  
-                                                    energy_dist='uniform',
+                                                    energy_dist='log_uniform',
                                                     cylinder_center=center,
                                                     cylinder_radius=radius,
                                                     cylinder_height=height,
-                                                    uniform_zenith_sampling=True,
-                                                    cos_range=torch.tensor([0,1]),
                                                     # point_towards_center=True,
                                                     # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                     )
-signal_events = signal_sampler.sample_events(num_events)
-
+# signal_events = signal_sampler.sample_events(num_events)
+signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_{version}.pt')
 # signal_events = pickle.load(open(f'/u/kristiantcho/ptmp/nugget/nugget/examples/res_test/signal_events_{num_events}_{version}.pkl', 'rb'))
     # for event in signal_events:
     #     event['position'] = torch.tensor([0.0,0.0,0.0], device=device)  # Center events for testing
 # events_file_name = f'res_test/signal_events_{num_events}_{version}'
 # pickle.dump(signal_events, open(events_file_name +'.pkl', 'wb'))
-nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'res_test/signal_events_{num_events}_{version}.pt')
+# signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_{version}.pt')
 for i, signal_event in enumerate(signal_events):
     for key, value in signal_event.items():
         if isinstance(value, torch.Tensor):
             signal_events[i][key] = value.to(device)
 # for geom_name in ['800main']:
-for geom_name in ['800main_full_hex', '340grid']:
-    print(f"Running fisher info calculations for geometry: {geom_name}")
+for string_spacing in np.linspace(25,200,20):
+    print(f"Running fisher info calculations for string spacing: {string_spacing}m")
     # if geom_name != '800main':
     #     n_strings = 70
     #     domain_size = 1200
     # else:
-    n_strings = 1027 # number of strings for a complete hexagon with 18 rings
-    domain_size = 1600
-    geometry = nugget.geometries.EvanescentString.EvanescentString(
-        device=device,
-    # geometry = nugget.geometries.SpaceString.SpaceString(
-    #     hex_type='hexagonal',
-        domain_size=domain_size,  # Size of detector domain
-        # device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),  # Use GPU if available
-        dim=3,  # 3D geometry
-        n_strings=n_strings,  # Initial number of detector strings
-        points_per_string=20,  # Number of PMTs/sensors per string
-        # random_weights=True,
-        custom_z_spacing=50,
-        starting_weight=6
-        # custom_string_spacing=0.09  # Custom spacing between strings
-        # starting_spacing=0.05
-    )
-    if geom_name == '340grid':
-        geom_dict = geometry.initialize_points(
-            {"string_xy": np.load(f'/u/kristiantcho/ptmp/nugget/nugget/other/{geom_name}_xy.npy')}
+    geometry = nugget.geometries.SpaceString.SpaceString(
+            hex_type='hexagonal',
+            domain_size=2500,  # Size of detector domain
+            # device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),  # Use GPU if available
+            dim=3,  # 3D geometry
+            n_strings=61,  # Initial number of detector strings
+            points_per_string=20,  # Number of PMTs/sensors per string
+            # starting_weight=-0.5,  # Initial weight for each string (controls visibility)
+            # custom_string_spacing=0.09  # Custom spacing between strings
+            starting_spacing=string_spacing,
+            starting_z_spacing=50
         )
-    else:
-        geom_dict = geometry.initialize_points()
+    geom_dict = geometry.initialize_points()
+    
 
     # center, radius, height = get_bounding_cylinder(geom_dict['points_3d'])
     # print(f"Bounding cylinder center: {center}, radius: {radius}, height: {height}")
@@ -140,17 +129,17 @@ for geom_name in ['800main_full_hex', '340grid']:
                 llr_autodiff_mode='jvp'
                 )
 
-    precomputed_ly = signal_yield_loss_func.light_yield_per_string(
-                surrogate_func=light_yield_surrogate,
-                event_params=signal_events,
-                string_xy=geom_dict['string_xy'],
-                points_3d=geom_dict['points_3d']
-                )
+    # precomputed_ly = signal_yield_loss_func.light_yield_per_string(
+    #             surrogate_func=light_yield_surrogate,
+    #             event_params=signal_events,
+    #             string_xy=geom_dict['string_xy'],
+    #             points_3d=geom_dict['points_3d']
+    #             )
 
 
     
-    torch.save(fisher_info_per_string_per_event.cpu(), f'res_test/fisher_info_per_string_per_event_{num_events}_{geom_name}_{version}.pt')
-    torch.save(precomputed_ly.cpu(), f'res_test/light_yield_per_string_{num_events}_{geom_name}_{version}.pt')
+    torch.save(fisher_info_per_string_per_event.cpu(), f'res_test/space_test/fisher_info_per_string_per_event_{num_events}_{int(string_spacing)}_{version}.pt')
+    # torch.save(precomputed_ly.cpu(), f'res_test/space_test/light_yield_per_string_{num_events}_{geom_name}_{version}.pt')
 
 
 # loss_params = {

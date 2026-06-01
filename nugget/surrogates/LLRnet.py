@@ -683,6 +683,125 @@ class LLRnet(Surrogate):
             
     #     return features
     
+    def prepare_features_patd(self, point, event_data, patd_result):
+        """
+        Build per-photon feature vectors from a pre-computed PATD surrogate result.
+
+        This is an alternative to prepare_data_from_raw_patd that mirrors the feature
+        engineering used in the NSF notebook (create_event_features / sample_detector_features).
+        It exposes richer geometric features that are strong discriminators for the
+        hit-time LLR classifier:
+
+          [det_x, det_y, det_z,           normalised detector position        (3)
+           v_x,   v_y,   v_z,             normalised vertex position           (3)
+           d_x,   d_y,   d_z,             unit direction vector                (3)
+           log10(E)/8,                    log-scaled energy                    (1)
+           vert_dist,                     L2(detector - vertex) normalised     (1)
+           cos_angle,                     cos(direction ∠ vertex→detector)     (1)
+           t_geom_min / 1e5,              min geometric arrival time           (1)
+           t_hit (log-sign scaled)]       per-photon arrival time              (1)
+                                                                           total = 14
+
+        The first 13 entries are the same for every photon in the event and are
+        replicated across rows.  Only the last column varies per photon.
+
+        Normalisation uses self.domain_size via _pos_norm_divisor(), so it is
+        consistent with the rest of LLRnet regardless of detector geometry.
+
+        Parameters
+        ----------
+        point : torch.Tensor or np.ndarray
+            Detector position, shape (3,) or (1, 3).
+        event_data : dict
+            Event parameters.  Must contain 'position', 'energy', 'direction'.
+        patd_result : dict
+            Output of the PATD surrogate.  Must contain 'hit_times', 'num_photons',
+            and 't_geom_min'.
+
+        Returns
+        -------
+        features : torch.Tensor, shape (num_photons, 14)
+            Per-photon feature matrix, or None if num_photons == 0.
+        num_photons : int
+        """
+        num_photons = patd_result['num_photons']
+        if isinstance(num_photons, torch.Tensor):
+            num_photons = int(num_photons.item())
+        if num_photons == 0:
+            return None, 0
+
+        if isinstance(point, np.ndarray):
+            point = torch.tensor(point, device=self.device, dtype=torch.float32)
+        else:
+            point = point.float().to(self.device)
+        point = point.squeeze()  # (3,)
+
+        norm = self._pos_norm_divisor()  # scalar or (3,) tensor
+
+        # --- detector and vertex positions, normalised ---
+        det = point / norm  # (3,)
+
+        vert = event_data['position']
+        if isinstance(vert, np.ndarray):
+            vert = torch.tensor(vert, device=self.device, dtype=torch.float32)
+        else:
+            vert = vert.float().to(self.device)
+        vert = vert.squeeze() / norm  # (3,)
+
+        # --- direction (already a unit vector) ---
+        direction = event_data['direction']
+        if isinstance(direction, np.ndarray):
+            direction = torch.tensor(direction, device=self.device, dtype=torch.float32)
+        else:
+            direction = direction.float().to(self.device)
+        direction = direction.squeeze()  # (3,)
+
+        # --- log-scaled energy ---
+        energy = event_data['energy']
+        if isinstance(energy, np.ndarray):
+            energy = torch.tensor(energy, device=self.device, dtype=torch.float32)
+        else:
+            energy = energy.float().to(self.device)
+        log_energy = torch.log10(energy.squeeze() + 1e-10) / 8.0  # scalar
+
+        # --- derived geometric scalars ---
+        rel = det - vert  # detector relative to vertex, in normalised coords
+        vert_dist = torch.norm(rel)
+        cos_angle = torch.dot(direction, rel) / (torch.norm(direction) * vert_dist + 1e-8)
+
+        # --- t_geom_min: minimum geometric photon arrival time ---
+        t_geom_min = patd_result['t_geom_min']
+        if isinstance(t_geom_min, np.ndarray):
+            t_geom_min = torch.tensor(t_geom_min, device=self.device, dtype=torch.float32)
+        else:
+            t_geom_min = t_geom_min.float().to(self.device)
+        t_geom_min_scalar = t_geom_min.squeeze().mean() / 1e5  # scalar
+
+        # --- assemble the 13 event-level context features ---
+        event_features = torch.stack([
+            det[0], det[1], det[2],
+            vert[0], vert[1], vert[2],
+            direction[0], direction[1], direction[2],
+            log_energy,
+            vert_dist,
+            cos_angle,
+            t_geom_min_scalar,
+        ])  # (13,)
+
+        # --- per-photon hit times: log-sign scaled ---
+        hit_times = patd_result['hit_times'].float().to(self.device)  # (N,)
+        t_scaled = torch.where(
+            hit_times < 0,
+            -torch.log10(-hit_times + 1e-4) / 4.0,
+            torch.log10(hit_times + 1e-4) / 4.0,
+        )  # (N,)
+
+        # --- replicate event features and append per-photon time ---
+        event_features_batch = event_features.unsqueeze(0).expand(num_photons, -1)  # (N, 13)
+        features = torch.cat([event_features_batch, t_scaled.unsqueeze(1)], dim=1)  # (N, 14)
+
+        return features.clone().detach(), num_photons
+
     def prepare_data_from_raw_patd(self, point, event_data, surrogate_func, event_labels=['position', 'energy', 'zenith', 'azimuth'], signal_event_data=None, num_samples=1, input_photons=None):
         """
         Prepare training data from raw neutrino event data in PATD mode.
@@ -1244,7 +1363,8 @@ class LLRnet(Surrogate):
                 return features
         
     def train_with_dataloader(self, train_dataloader, val_dataloader=None, epochs=100,
-                             verbose=True, early_stopping_patience=10, input_dim = None):
+                             verbose=True, early_stopping_patience=10, input_dim=None,
+                             grad_clip=1.0):
         """
         Train the LLR network using PyTorch DataLoader with balanced signal/background events.
         
@@ -1334,7 +1454,12 @@ class LLRnet(Surrogate):
             
                 loss = self.loss_fn(outputs, batch_labels)
                 loss.backward()
-               
+                if grad_clip is not None:
+                    all_params = (
+                        list(self.shared_branch_mlp.parameters()) if self.shared_mlp
+                        else [p for branch in self.mlp_branches for p in branch.parameters()]
+                    ) + list(self.final_mlp.parameters())
+                    torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
                 self.optimizer.step()
                 
                 train_loss += loss.item()
@@ -2490,6 +2615,13 @@ class LLRnet(Surrogate):
                     If True, randomly vary cylinder dimensions for each pair
                 cylinder_sampler : callable, optional
                     Function to create new sampler with varied cylinder dimensions
+                use_rich_features : bool, optional (default False)
+                    If True, uses prepare_features_patd instead of prepare_data_from_raw_patd.
+                    This produces a 14-feature vector per photon with richer geometry:
+                    det(3) + vertex(3) + dir(3) + log_E(1) + vert_dist(1) + cos_angle(1)
+                    + t_geom_min(1) + t_hit_scaled(1).
+                    Requires the surrogate to return 't_geom_min' in its result dict.
+                    event_labels is ignored in this mode.
             """
             super().__init__()
             self.signal_sampler = signal_sampler
@@ -2502,7 +2634,8 @@ class LLRnet(Surrogate):
             self.shuffle_photons = shuffle_photons
             self.vary_cylinder = kwargs.get('vary_cylinder', False)
             self.cylinder_sampler = kwargs.get('cylinder_sampler', None)
-            self.domain_size = llrnet_instance.domain_size 
+            self.use_rich_features = kwargs.get('use_rich_features', False)
+            self.domain_size = llrnet_instance.domain_size
         
         def _generate_event_with_photons(self, detector_pos=None):
             """Generate an event that produces at least min_photons hits."""
@@ -2552,30 +2685,46 @@ class LLRnet(Surrogate):
             event_params_matched, _, patd_result_matched = self._generate_event_with_photons(detector_point)
             
             # Create feature vectors for all photon hits
-            matched_features_batch, _ = self.llrnet.prepare_data_from_raw_patd(
-                point=detector_point,
-                event_data=event_params_matched,
-                surrogate_func=lambda **kwargs: patd_result_matched,
-                event_labels=self.event_labels
-            )
-            
+            if self.use_rich_features:
+                matched_features_batch, _ = self.llrnet.prepare_features_patd(
+                    point=detector_point,
+                    event_data=event_params_matched,
+                    patd_result=patd_result_matched,
+                )
+            else:
+                matched_features_batch, _ = self.llrnet.prepare_data_from_raw_patd(
+                    point=detector_point,
+                    event_data=event_params_matched,
+                    surrogate_func=lambda **kwargs: patd_result_matched,
+                    event_labels=self.event_labels,
+                )
+
             # Create labels for all matched photons (all are class 1)
             num_matched_photons = matched_features_batch.shape[0]
             matched_labels = torch.ones(num_matched_photons, dtype=torch.float32, device=self.llrnet.device)
-            
-            # Generate MISMATCHED sample (hypothesis from one event, observation from another)
-            # event_params_hyp = self.signal_sampler.sample_events(1)[0]
+
+            # Generate MISMATCHED sample: observation from a different event, hypothesis from matched event.
             event_params_obs, _, patd_result_obs = self._generate_event_with_photons(detector_point)
-            
-            # Create features using hypothesis params but observation PATD
-            mismatched_features_batch, _ = self.llrnet.prepare_data_from_raw_patd(
-                point=detector_point,
-                # event_data=event_params_hyp,
-                event_data=event_params_matched,
-                surrogate_func=lambda **kwargs: patd_result_obs,
-                signal_event_data=event_params_obs,
-                event_labels=self.event_labels
-            )
+
+            if self.use_rich_features:
+                # Hypothesis features come from event_params_matched; observation times from patd_result_obs.
+                # prepare_features_patd only takes one event_data dict, so we build a merged view:
+                # keep all params from matched (hypothesis) but swap in the obs hit_times via patd_result_obs.
+                mismatched_features_batch, _ = self.llrnet.prepare_features_patd(
+                    point=detector_point,
+                    event_data=event_params_matched,   # hypothesis: position, energy, direction from matched
+                    patd_result=patd_result_obs,        # observation: photon times from a different event
+                )
+            else:
+                # event_data drives the surrogate call (provides photon times via patd_result_obs),
+                # signal_event_data provides the hypothesis features (position, energy, direction).
+                mismatched_features_batch, _ = self.llrnet.prepare_data_from_raw_patd(
+                    point=detector_point,
+                    event_data=event_params_obs,            # observation: photon times from a different event
+                    surrogate_func=lambda **kwargs: patd_result_obs,
+                    signal_event_data=event_params_matched, # hypothesis: parameters from matched event
+                    event_labels=self.event_labels,
+                )
             
             # Create labels for all mismatched photons (all are class 0)
             num_mismatched_photons = mismatched_features_batch.shape[0]
@@ -2800,520 +2949,12 @@ class LLRnet(Surrogate):
             
             return X, y
 
-    def pregenerate_training_data(self, signal_sampler, signal_surrogate_func, 
-                                  num_events, output_filepath,
-                                  event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                                  min_photons=1, max_photons=None):
-        """
-        Pregenerate training data and save to HDF5 for efficient random access.
-        
-        This function generates events and saves them in HDF5 format, allowing
-        random access to individual events without loading the entire dataset.
-        Works for both photon count mode (use_patd=False) and PATD mode (use_patd=True).
-        
-        Parameters:
-        -----------
-        signal_sampler : Sampler
-            Sampler for generating signal events
-        signal_surrogate_func : callable
-            Function to calculate detector response (light yield or PATD)
-        num_events : int
-            Number of events to generate
-        output_filepath : str
-            Path to save HDF5 file
-        event_labels : list
-            List of event parameter keys
-        min_photons : int
-            Minimum number of photons required for valid events (PATD mode only)
-        max_photons : int or None
-            Maximum number of photons to sample per event (PATD mode only)
-            
-        Returns:
-        --------
-        dict
-            Statistics about the generated dataset
-        """
-        
-        
-        print(f"Pregenerating {num_events} events...")
-        print(f"Mode: {'PATD' if self.use_patd else 'Photon Count'}")
-        print(f"Output: {output_filepath}")
-        
-        start_time = time.time()
-        
-        # Create HDF5 file
-        with h5py.File(output_filepath, 'w') as f:
-            # Create datasets (will resize as we add data)
-            events_generated = 0
-            total_photons = 0
-            
-            if self.use_patd:
-                # PATD mode: Store event data, PATD results, and precomputed features
-                # Each event is stored in its own folder with features as regular datasets
-                
-                feature_dim = None  # Will be set from first event
-                
-                while events_generated < num_events:
-                    # Generate event
-                    event_params = signal_sampler.sample_events(1)[0]
-                    detector_pos = signal_sampler.sample_detector_points(1)
-                    
-                    # Get PATD
-                    patd_kwargs = {'opt_point': detector_pos, 'event_params': event_params}
-                    if max_photons is not None:
-                        patd_kwargs['max_photons'] = max_photons
-                    patd_result = signal_surrogate_func(**patd_kwargs)
-                    
-                    num_photons = patd_result['num_photons']
-                    
-                    # Only keep events with sufficient photons
-                    if num_photons < min_photons:
-                        continue
-                    
-                    # Compute features for this event
-                    # This creates features for all photon hits in the event
-                    event_features, _ = self.prepare_data_from_raw(
-                        point=detector_pos,
-                        event_data=event_params,
-                        surrogate_func=lambda **kwargs: patd_result,
-                        event_labels=event_labels
-                    )
-                    
-                    # Limit features to max_photons if specified
-                    if max_photons is not None and event_features.shape[0] > max_photons:
-                        # Randomly sample max_photons from the available photons
-                        indices = torch.randperm(event_features.shape[0])[:max_photons]
-                        event_features = event_features[indices]
-                        # Also update the hit_times and num_photons to match
-                        patd_result['hit_times'] = patd_result['hit_times'][indices]
-                        num_photons = max_photons
-                    
-                    # Set feature_dim from first event
-                    if feature_dim is None:
-                        feature_dim = event_features.shape[1]
-                    
-                    # Create a group for this event
-                    event_group = f.create_group(f'event_{events_generated}')
-                    
-                    # Store event parameters
-                    for key, value in event_params.items():
-                        if torch.is_tensor(value):
-                            value = value.cpu().numpy()
-                        event_group.create_dataset(key, data=value)
-                    
-                    # Store detector position
-                    event_group.create_dataset('detector_pos', data=detector_pos.squeeze().cpu().numpy())
-                    
-                    # Store PATD results
-                    event_group.create_dataset('hit_times', data=patd_result['hit_times'].cpu().numpy())
-                    event_group.create_dataset('num_photons', data=num_photons)
-                    event_group.create_dataset('expected_photons', data=patd_result.get('expected_photons', num_photons))
-                    
-                    # Store precomputed features as regular dataset (num_photons, feature_dim)
-                    event_group.create_dataset('features', data=event_features.cpu().numpy())
-                    
-                    events_generated += 1
-                    total_photons += num_photons
-                    
-                    if events_generated % (num_events // 20) == 0:
-                        print(f"Generated {events_generated}/{num_events} events, avg photons: {total_photons/events_generated:.1f}", flush=True)
-                
-                # Store metadata
-                f.attrs['mode'] = 'patd'
-                f.attrs['num_events'] = num_events
-                f.attrs['min_photons'] = min_photons
-                f.attrs['max_photons'] = max_photons if max_photons is not None else -1
-                f.attrs['event_labels'] = event_labels
-                f.attrs['total_photons'] = total_photons
-                f.attrs['avg_photons_per_event'] = total_photons / num_events
-                f.attrs['feature_dim'] = feature_dim
-                
-            else:
-                # Photon count mode: Precompute features directly
-                features_list = []
-                
-                for i in range(num_events):
-                    # Generate event
-                    event_params = signal_sampler.sample_events(1)[0]
-                    detector_pos = signal_sampler.sample_detector_points(1)
-                    
-                    # Compute features
-                    features = self.prepare_data_from_raw(
-                        point=detector_pos,
-                        event_data=event_params,
-                        surrogate_func=signal_surrogate_func,
-                        event_labels=event_labels
-                    )
-                    
-                    features_list.append(features.cpu().numpy())
-                    
-                    if (i + 1) % 100 == 0:
-                        print(f"Generated {i+1}/{num_events} events")
-                
-                # Write features to HDF5
-                features_array = np.array(features_list)
-                f.create_dataset('features', data=features_array)
-                
-                # Store metadata
-                f.attrs['mode'] = 'photon_count'
-                f.attrs['num_events'] = num_events
-                f.attrs['event_labels'] = event_labels
-                f.attrs['feature_dim'] = features_array.shape[1]
-        
-        elapsed_time = time.time() - start_time
-        print(f"\nPregeneration complete!")
-        print(f"Time elapsed: {elapsed_time:.1f}s ({elapsed_time/num_events:.3f}s per event)")
-        print(f"File saved: {output_filepath}")
-        
-        stats = {
-            'num_events': num_events,
-            'elapsed_time': elapsed_time,
-            'mode': 'patd' if self.use_patd else 'photon_count'
-        }
-        
-        if self.use_patd:
-            stats['total_photons'] = total_photons
-            stats['avg_photons_per_event'] = total_photons / num_events
-        
-        return stats
-    
-    
-    class PregeneratedPATDDataset(Dataset):
-        """
-        Dataset that loads pregenerated PATD data from HDF5 file.
-        
-        This dataset loads event data and PATD results from a pregenerated HDF5 file,
-        allowing efficient training without expensive online surrogate calls.
-        
-        For matched samples (label=1), uses the same event's parameters and precomputed features.
-        For mismatched samples (label=0), uses features from one event but with a different
-        event's hit times swapped in (using the pregenerated data directly).
-        
-        Photon caching: Each __getitem__ call returns ONE photon's features. When an event is loaded,
-        all its photons are cached and served one at a time in subsequent calls.
-        """
-        
-        def __init__(self, h5_filepath, llrnet_instance, num_events_per_epoch=1000,
-                     max_photons_per_event=None, event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                     keep_file_open=True, preload_to_memory=False):
-            """
-            Initialize pregenerated PATD dataset.
-            
-            Parameters:
-            -----------
-            h5_filepath : str
-                Path to HDF5 file with pregenerated data
-            llrnet_instance : LLRnet
-                LLRnet instance (kept for compatibility but not used for feature computation)
-            num_events_per_epoch : int
-                Number of individual photon samples per epoch (not number of events).
-                Since each __getitem__ returns a single photon, this controls the epoch size.
-            max_photons_per_event : int or None
-                Maximum number of photons to use per event. If None, uses all available photons.
-            event_labels : list
-                List of event parameter keys
-            keep_file_open : bool
-                If True, keeps HDF5 file open for faster access (recommended).
-                If False, opens and closes file for each access (slower but lower memory).
-                Ignored if preload_to_memory=True.
-            preload_to_memory : bool
-                If True, loads ALL events into RAM at initialization for maximum speed.
-                This eliminates HDF5 I/O overhead completely, matching SignalOnlyDataset performance.
-                Warning: Requires sufficient RAM to hold all event data (~GB for large datasets).
-            """
-            import h5py
-            
-            self.h5_filepath = h5_filepath
-            self.llrnet = llrnet_instance
-            self.num_samples_per_epoch = num_events_per_epoch  # Renamed for clarity
-            self.event_labels = event_labels
-            self.keep_file_open = keep_file_open
-            self.preload_to_memory = preload_to_memory
-            self.h5_file = None
-            self.preloaded_events = None  # Will store events in memory if preload_to_memory=True
-            
-            # Photon caches for matched and mismatched samples
-            self.matched_photon_cache = []
-            self.mismatched_photon_cache = []
-            
-            # Load metadata
-            with h5py.File(h5_filepath, 'r') as f:
-                self.num_events = f.attrs['num_events']
-                self.min_photons = f.attrs['min_photons']
-                stored_mode = f.attrs['mode']
-                
-                if stored_mode != 'patd':
-                    raise ValueError(f"HDF5 file mode is '{stored_mode}', expected 'patd'")
-                
-                # Load event parameter keys from first event
-                first_event = f['event_0']
-                self.event_param_keys = [key for key in first_event.keys() 
-                                        if key not in ['detector_pos', 'hit_times', 'num_photons', 
-                                                      'expected_photons', 'features']]
-            
-            # Preload events into memory if requested (eliminates HDF5 I/O completely)
-            if self.preload_to_memory:
-                print(f"Preloading all {self.num_events} events into memory...")
-                import time
-                start_time = time.time()
-                self.preloaded_events = {}
-                
-                with h5py.File(h5_filepath, 'r') as f:
-                    for event_idx in range(self.num_events):
-                        event_group = f[f'event_{event_idx}']
-                        
-                        # Load all data for this event into tensors (detached from HDF5)
-                        event_data = {
-                            'features': torch.tensor(event_group['features'][()], device=self.llrnet.device, dtype=torch.float32),
-                        }
-                        
-                        # Optionally load other fields if needed
-                        # event_data['detector_pos'] = torch.tensor(event_group['detector_pos'][()], device=self.llrnet.device)
-                        # event_data['num_photons'] = event_group['num_photons'][()]
-                        
-                        self.preloaded_events[event_idx] = event_data
-                        
-                        if (event_idx + 1) % max(1, self.num_events // 10) == 0:
-                            print(f"  Loaded {event_idx + 1}/{self.num_events} events...")
-                
-                elapsed = time.time() - start_time
-                print(f"  Preloading complete in {elapsed:.1f}s ({elapsed/self.num_events*1000:.1f}ms per event)")
-            # Keep file open if not preloading to memory
-            elif self.keep_file_open:
-                self.h5_file = h5py.File(h5_filepath, 'r')
-            
-            self.max_photons_per_event = max_photons_per_event if max_photons_per_event is not None else float('inf')
-            
-            print(f"Loaded pregenerated dataset: {h5_filepath}")
-            print(f"  Total events in file: {self.num_events}")
-            print(f"  Photon samples per epoch: {self.num_samples_per_epoch}")
-            print(f"  Max photons per event: {self.max_photons_per_event if self.max_photons_per_event != float('inf') else 'unlimited'}")
-            if self.preload_to_memory:
-                print(f"  Mode: In-memory (no HDF5 I/O during training)")
-            else:
-                print(f"  Mode: HDF5 file access (keep_file_open={self.keep_file_open})")
-        
-        def __len__(self):
-            """Return total number of individual photon samples per epoch."""
-            return self.num_samples_per_epoch
-        
-        def _load_event_data(self, event_idx):
-            """Load event data and precomputed features from HDF5 file or memory."""
-            import h5py
-            
-            # Use preloaded data if available (fastest - no I/O)
-            if self.preloaded_events is not None:
-                event_data = self.preloaded_events[event_idx]
-                features = event_data['features']
-                # Return minimal tuple - we only need features for cached photon serving
-                return None, None, None, features
-            
-            # Use persistent file handle if available, otherwise open temporarily
-            if self.h5_file is not None:
-                f = self.h5_file
-                # Access the event group
-                event_group = f[f'event_{event_idx}']
-                
-                # Load event parameters
-                event_params = {}
-                for key in self.event_param_keys:
-                    value = event_group[key][()]
-                    event_params[key] = torch.tensor(value, dtype=torch.float32, device=self.llrnet.device)
-                
-                # Load detector position
-                detector_pos = torch.tensor(
-                    event_group['detector_pos'][()],
-                    dtype=torch.float32,
-                    device=self.llrnet.device
-                )
-                
-                # Load PATD results
-                hit_times = torch.tensor(
-                    event_group['hit_times'][()],
-                    dtype=torch.float32,
-                    device=self.llrnet.device
-                )
-                num_photons = int(event_group['num_photons'][()])
-                expected_photons = int(event_group['expected_photons'][()])
-                
-                patd_result = {
-                    'hit_times': hit_times,
-                    'num_photons': num_photons,
-                    'expected_photons': expected_photons,
-                    'residual_times': hit_times  # For compatibility
-                }
-                
-                # Load precomputed features (already in correct shape)
-                features = torch.tensor(
-                    event_group['features'][()],
-                    dtype=torch.float32,
-                    device=self.llrnet.device
-                )
-            else:
-                # Open file temporarily for this access
-                with h5py.File(self.h5_filepath, 'r') as f:
-                    # Access the event group
-                    event_group = f[f'event_{event_idx}']
-                    
-                    # Load event parameters
-                    event_params = {}
-                    for key in self.event_param_keys:
-                        value = event_group[key][()]
-                        event_params[key] = torch.tensor(value, dtype=torch.float32, device=self.llrnet.device)
-                    
-                    # Load detector position
-                    detector_pos = torch.tensor(
-                        event_group['detector_pos'][()],
-                        dtype=torch.float32,
-                        device=self.llrnet.device
-                    )
-                    
-                    # Load PATD results
-                    hit_times = torch.tensor(
-                        event_group['hit_times'][()],
-                        dtype=torch.float32,
-                        device=self.llrnet.device
-                    )
-                    num_photons = int(event_group['num_photons'][()])
-                    expected_photons = int(event_group['expected_photons'][()])
-                    
-                    patd_result = {
-                        'hit_times': hit_times,
-                        'num_photons': num_photons,
-                        'expected_photons': expected_photons,
-                        'residual_times': hit_times  # For compatibility
-                    }
-                    
-                    # Load precomputed features (already in correct shape)
-                    features = torch.tensor(
-                        event_group['features'][()],
-                        dtype=torch.float32,
-                        device=self.llrnet.device
-                    )
-            
-            return event_params, detector_pos, patd_result, features
-        
-        def __getitem__(self, idx):
-            """
-            Get a single photon's features from cache.
-            
-            Uses idx to determine matched vs mismatched for balanced classes.
-            Even indices return matched samples, odd indices return mismatched samples.
-            
-            For mismatched case, swaps the last feature (hit times) from one event with
-            the rest of the features from another event.
-            
-            When cache is empty, loads new event(s) and populates the cache.
-            
-            Returns:
-            --------
-            features : torch.Tensor
-                Feature vector for a single photon hit, shape (feature_dim,)
-            label : torch.Tensor
-                Label for this hit, scalar tensor (1.0 for matched, 0.0 for mismatched)
-            """
-            # Use idx to ensure exact class balance (even=matched, odd=mismatched)
-            is_matched = (idx % 2 == 0)
-            
-            # Select appropriate cache
-            cache = self.matched_photon_cache if is_matched else self.mismatched_photon_cache
-            
-            # If cache is empty, load new event(s) and populate cache
-            if len(cache) == 0:
-                # Randomly select event(s) from the pregenerated pool
-                event_idx_1 = np.random.randint(0, self.num_events)
-                
-                if is_matched:
-                    # Matched case: use event's precomputed features directly
-                    _, _, _, features = self._load_event_data(event_idx_1)
-                    
-                    # Limit to max_photons_per_event with random sampling
-                    num_photons = min(features.shape[0], int(self.max_photons_per_event))
-                    if features.shape[0] > num_photons:
-                        # Randomly sample photons
-                        indices = torch.randperm(features.shape[0], device=self.llrnet.device)[:num_photons]
-                        features = features[indices]
-                    else:
-                        features = features[:num_photons]
-                    
-                    # Add all photons to cache with label 1.0
-                    label = torch.tensor(1.0, dtype=torch.float32, device=self.llrnet.device)
-                    for i in range(features.shape[0]):
-                        self.matched_photon_cache.append((features[i], label))
-                    
-                else:
-                    # Mismatched case: swap hit times (last feature) between two events
-                    # Load two different events
-                    event_idx_2 = np.random.randint(0, self.num_events)
-                    while event_idx_2 == event_idx_1:
-                        event_idx_2 = np.random.randint(0, self.num_events)
-                    
-                    _, _, _, features_1 = self._load_event_data(event_idx_1)
-                    _, _, _, features_2 = self._load_event_data(event_idx_2)
-                    
-                    # Use minimum number of photons from both events
-                    num_photons = min(
-                        features_1.shape[0],
-                        features_2.shape[0],
-                        int(self.max_photons_per_event)
-                    )
-                    
-                    # Randomly sample photons if needed
-                    if features_1.shape[0] > num_photons:
-                        indices_1 = torch.randperm(features_1.shape[0], device=self.llrnet.device)[:num_photons]
-                        features_1 = features_1[indices_1]
-                    else:
-                        features_1 = features_1[:num_photons]
-                        
-                    if features_2.shape[0] > num_photons:
-                        indices_2 = torch.randperm(features_2.shape[0], device=self.llrnet.device)[:num_photons]
-                        features_2 = features_2[indices_2]
-                    else:
-                        features_2 = features_2[:num_photons]
-                    
-                    # Create mismatched features by combining:
-                    # - Detector position from event2 (first 3 features)
-                    # - Event parameters from event1 (middle features)
-                    # - Hit times from event2 (last feature)
-                    # features shape: (num_photons, feature_dim)
-                    # Feature structure from prepare_data_from_raw:
-                    # [detector_pos (0:3), ...event_params..., hit_time (-1)]
-                    mismatched_features = torch.cat([
-                        features_2[:, :3],      # Detector position from event2
-                        features_1[:, 3:-1],    # Event parameters from event1
-                        features_2[:, -1:]      # Hit times from event2
-                    ], dim=1)
-                    
-                    # Add all photons to cache with label 0.0
-                    label = torch.tensor(0.0, dtype=torch.float32, device=self.llrnet.device)
-                    for i in range(mismatched_features.shape[0]):
-                        self.mismatched_photon_cache.append((mismatched_features[i], label))
-            
-            # Pop one photon from cache
-            if len(cache) > 0:
-                features, label = cache.pop(0)
-            else:
-                # Emergency fallback: shouldn't happen but handle gracefully
-                event_idx = np.random.randint(0, self.num_events)
-                _, _, _, event_features = self._load_event_data(event_idx)
-                features = event_features[0] if event_features.shape[0] > 0 else torch.zeros(event_features.shape[1], device=self.llrnet.device)
-                label = torch.tensor(1.0 if is_matched else 0.0, dtype=torch.float32, device=self.llrnet.device)
-            
-            return features, label
-        
-        def __del__(self):
-            """Close HDF5 file when dataset is destroyed."""
-            if self.h5_file is not None:
-                try:
-                    self.h5_file.close()
-                except:
-                    pass  # Ignore errors during cleanup
 
     def create_patd_dataloader(self, signal_sampler, signal_surrogate_func,
                               num_samples_per_epoch=1000, batch_size=32,
                               num_workers=0,
                               event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                              shuffle_photons=False, other_kwargs={}):
+                              shuffle_photons=False, use_rich_features=False, other_kwargs={}):
         """
         Create a DataLoader for PATD training using IterableDataset.
         
@@ -3436,6 +3077,7 @@ class LLRnet(Surrogate):
             min_photons=self.min_photons,
             num_photons_per_sample=self.num_photons_per_sample,
             shuffle_photons=shuffle_photons,
+            use_rich_features=use_rich_features,
             **other_kwargs
         )
         
@@ -3449,102 +3091,6 @@ class LLRnet(Surrogate):
         
         return dataloader
     
-    def create_pregenerated_patd_dataloader(self, h5_filepath, num_samples_per_epoch=1000, 
-                                           batch_size=32, shuffle=True, num_workers=0, keep_file_open=True,
-                                           preload_to_memory=False, event_labels=['position', 'energy', 'zenith', 'azimuth']):
-        """
-        Create a DataLoader for pregenerated PATD training data.
-        
-        This method creates a dataloader that loads pregenerated events from an HDF5 file,
-        avoiding expensive online surrogate calls during training.
-        
-        Parameters:
-        -----------
-        h5_filepath : str
-            Path to HDF5 file with pregenerated data
-        num_samples_per_epoch : int
-            Number of samples per epoch. This determines how many individual photon
-            samples are drawn from the pregenerated pool per epoch.
-        batch_size : int
-            Number of individual photon samples per batch
-        shuffle : bool
-            Whether to shuffle the data
-        num_workers : int
-            Number of worker processes for data loading
-        keep_file_open : bool
-            Whether to keep HDF5 file open for duration of dataset (ignored if preload_to_memory=True)
-        preload_to_memory : bool
-            If True, loads all events into RAM at initialization for maximum speed (recommended).
-            Eliminates HDF5 I/O overhead completely. Requires sufficient RAM.
-        event_labels : list
-            List of event parameter keys
-            
-        Returns:
-        --------
-        DataLoader
-            PyTorch DataLoader for pregenerated PATD training. Each batch will have shape:
-            - features: (batch_size, feature_dim)
-            - labels: (batch_size,)
-            
-        Example:
-        --------
-        # First pregenerate data
-        llrnet.pregenerate_training_data(
-            signal_sampler=sampler,
-            signal_surrogate_func=surrogate,
-            num_events=10000,
-            output_filepath='patd_data.h5'
-        )
-        
-        # Then create dataloader
-        train_loader = llrnet.create_pregenerated_patd_dataloader(
-            h5_filepath='patd_data.h5',
-            num_samples_per_epoch=5000,  # 5000 individual photons per epoch
-            batch_size=128  # 128 photons per batch
-        )
-        """
-        if not self.use_patd:
-            raise ValueError("create_pregenerated_patd_dataloader can only be used when use_patd=True")
-        
-        def patd_collate_fn(batch):
-            """
-            Simple collate function for single photon samples.
-            
-            Each item in batch is (features, label) where:
-            - features: (feature_dim,)
-            - label: scalar
-            
-            Output:
-            - batch_features: (batch_size, feature_dim)
-            - batch_labels: (batch_size,)
-            """
-            features_list = [item[0] for item in batch]
-            labels_list = [item[1] for item in batch]
-            
-            batch_features = torch.stack(features_list, dim=0)
-            batch_labels = torch.stack(labels_list, dim=0)
-            
-            return batch_features, batch_labels
-        
-        dataset = self.PregeneratedPATDDataset(
-            h5_filepath=h5_filepath,
-            llrnet_instance=self,
-            num_events_per_epoch=num_samples_per_epoch,
-            max_photons_per_event=self.num_photons_per_sample,
-            event_labels=event_labels,
-            keep_file_open=keep_file_open,
-            preload_to_memory=preload_to_memory
-        )
-        
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            collate_fn=patd_collate_fn
-        )
-        
-        return dataloader
     
     def create_batch_signal_only_dataloader(self, signal_sampler, signal_surrogate_func,
                                            num_batches=1000, batch_size=128, num_workers=0,

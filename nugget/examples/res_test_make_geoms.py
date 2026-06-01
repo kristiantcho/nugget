@@ -20,9 +20,10 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
     rov_height=159.9, 
     rov_tri_length=159.9
 )
-version = '_e6_e8'
-use_rov = 'rov'
-folder_name = f'res_test/opt_geoms_full_hex_10000_r600_50{version}_{use_rov}_1/'
+version = '_pl_1'
+use_rov = 'no_rov'
+num_events = 30000
+folder_name = f'res_test/opt_geoms_full_hex_{num_events}_r600_50{version}_{use_rov}/'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -34,13 +35,14 @@ while os.path.exists(f'{folder_name}geom_{count}.pkl'):
     count += 1
 
 loss_params = {
-    'signal_event_params': pickle.load(open(f'res_test/signal_events_10000_r600_50{version}.pkl', 'rb'))[:],
-    'num_events': 100,  # Number of events to sample per optimization step
+    # 'signal_event_params': pickle.load(open(f'res_test/signal_events_{num_events}_r600_50{version}.pkl', 'rb'))[:],
+    'signal_event_params': nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_r600_50{version}.pt')[:],
+    'num_events': 300,  # Number of events to sample per optimization step
     'boundary_range': 1200,  # Size of boundary region
     'skip_zero_response': True,
     'use_relative_energy': True,
-    'precomputed_signal_yield_per_string': torch.load(f'res_test/light_yield_per_string_10000_800main_full_hex_r600_50{version}.pt')[:],
-    'precomputed_fisher_info_per_string_per_event': torch.load(f'res_test/fisher_info_per_string_per_event_10000_800main_full_hex_r600_50{version}.pt')[:]
+    'precomputed_signal_yield_per_string': torch.load(f'res_test/light_yield_per_string_{num_events}_800main_full_hex_r600_50{version}.pt')[:],
+    'precomputed_fisher_info_per_string_per_event': torch.load(f'res_test/fisher_info_per_string_per_event_{num_events}_800main_full_hex_r600_50{version}.pt')[:]
     }
 loss_params.update({
     'eva_min_num_strings': 70,  # Minimum number of active strings
@@ -68,7 +70,7 @@ loss_params.update({
     })
 loss_weights_dict = {
     'angular_resolution_loss': 1e3,
-    # 'energy_resolution_loss': 0.5,
+    'energy_resolution_loss': 1e8,
     # 'fisher_loss': 0.005, 
     'signal_yield_loss': 0.01,        # High weight: maximize light collection
     # 'signal_llr_loss': 2.5,          # Moderate weight: good signal discrimination
@@ -84,7 +86,7 @@ loss_weights_dict = {
 
 loss_sigmoid_list = [
     'angular_resolution_loss',
-    # 'energy_resolution_loss',
+    'energy_resolution_loss',
     # 'fisher_loss', 
     # 'signal_yield_loss',        # High weight: maximize light collection
     # 'signal_llr_loss',
