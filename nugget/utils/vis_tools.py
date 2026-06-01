@@ -6595,7 +6595,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        num_detector_points=1, min_detector_points=1,
                        min_detector_response=0.0, max_detector_resample_attempts=1000,
                        plot_opposite_direction_true_params=False,
-                       use_rich_features=False):
+                       use_rich_features=False,
+                       progress_print_every_n_points=None):
     """
     Plot negative log-likelihood landscape for a trained signal-only LLRnet.
     
@@ -6674,6 +6675,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         If True, passes use_rich_features=True to evaluate_patd_likelihood, which uses
         prepare_features_patd instead of prepare_data_from_raw_patd. Must match the flag
         used during training. Only relevant when use_patd=True. (default: False)
+    progress_print_every_n_points : int or None
+        If set to a positive integer, print progress every N processed landscape points.
 
    """
 
@@ -6696,6 +6699,23 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     # Sample true event and detector point if not provided
     if true_event is None:
         true_event = signal_sampler.sample_events(1)[0]
+
+    progress_print_every_n_points = (
+        int(progress_print_every_n_points)
+        if progress_print_every_n_points is not None
+        else None
+    )
+    if progress_print_every_n_points is not None and progress_print_every_n_points <= 0:
+        progress_print_every_n_points = None
+
+    def _maybe_print_landscape_progress(processed_points, total_points, landscape_name):
+        if progress_print_every_n_points is None:
+            return
+        if processed_points % progress_print_every_n_points != 0 and processed_points != total_points:
+            return
+        print(
+            f"{landscape_name}: processed {processed_points}/{total_points} landscape points"
+        )
 
     def _extract_response_scalar(response_obj):
         """Convert surrogate response to a float for thresholding/filtering."""
@@ -6896,6 +6916,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         
         # Calculate NLL for each parameter value (summed across detector points)
         nll_values = []
+        processed_landscape_points = 0
+        total_landscape_points = len(param_values)
         
         for param_val in param_values:
             # Create modified event with varied parameter
@@ -6978,6 +7000,12 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             # Store raw NLL (will normalize later)
             nll = -llr_sum
             nll_values.append(nll)
+            processed_landscape_points += 1
+            _maybe_print_landscape_progress(
+                processed_landscape_points,
+                total_landscape_points,
+                f"NLL landscape ({param_name})",
+            )
         
         nll_values = np.array(nll_values)
         
@@ -7096,6 +7124,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         
         param1_grid, param2_grid = np.meshgrid(param1_values, param2_values)
         nll_grid = np.zeros_like(param1_grid)
+        processed_landscape_points = 0
+        total_landscape_points = n_points * n_points
         
         # Calculate NLL for each parameter combination (summed across detector points)
         for i in range(n_points):
@@ -7190,6 +7220,12 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                 
                 # Store raw NLL (will normalize later)
                 nll_grid[i, j] = -llr_sum
+                processed_landscape_points += 1
+                _maybe_print_landscape_progress(
+                    processed_landscape_points,
+                    total_landscape_points,
+                    f"NLL landscape ({param1_name} vs {param2_name})",
+                )
         
         # Normalize to minimum NLL value
         min_nll = np.min(nll_grid)
