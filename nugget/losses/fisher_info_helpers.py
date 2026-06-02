@@ -649,17 +649,8 @@ def _fisher_points_all_iters_jvp(
         det_const = (pts_3.float().to(device) / norm_const).detach()
 
         _t0 = time.time()
-        log_ly_const = torch.stack([
-            torch.stack([
-                torch.log10(torch.abs(
-                    cached_obs[l][b].float().to(device).squeeze()
-                    if isinstance(cached_obs[l][b], torch.Tensor)
-                    else torch.tensor(float(cached_obs[l][b]), device=device)
-                ) + 1e-10) / 4.0
-                for b in range(B)
-            ])
-            for l in range(L)
-        ]).unsqueeze(-1).detach()
+        # cached_ly_true is already (L, B) — use it directly, no Python loop needed.
+        log_ly_const = (torch.log10(cached_ly_true.abs() + 1e-10) / 4.0).unsqueeze(-1).detach()  # (L, B, 1)
         print(f"[rich/jvp] log_ly build:  {time.time()-_t0:.3f}s", flush=True)
 
         def _theta_only_fn(theta_flat):
