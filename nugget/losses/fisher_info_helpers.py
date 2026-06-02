@@ -656,7 +656,7 @@ def _fisher_points_all_iters_jvp(
         cols_idx = torch.arange(d_start, d_end, device=device)
         basis_chunk[rows, cols_idx] = 1
 
-        cols_chunk = vmap(jvp_fn, randomness='different')(basis_chunk)  # (k, B, L)
+        cols_chunk = vmap(jvp_fn, randomness='same')(basis_chunk)  # (k, B, L)
         cols_parts.append(cols_chunk)
         del basis_chunk, cols_chunk
 
@@ -1323,7 +1323,7 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
                     rows = torch.arange(k, device=device)
                     cols_idx = torch.arange(d_start, d_end, device=device)
                     basis_chunk[rows, cols_idx] = 1
-                    cols_chunk = vmap(jvp_fn, randomness='different')(basis_chunk)  # (k, B)
+                    cols_chunk = vmap(jvp_fn, randomness='same')(basis_chunk)  # (k, B)
                     cols_parts.append(cols_chunk)
 
                 cols = torch.cat(cols_parts, dim=0)  # (D, B)
