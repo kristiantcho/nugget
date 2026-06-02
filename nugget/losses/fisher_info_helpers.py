@@ -1426,8 +1426,15 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
     fixed_params = {k: v.detach().to(device) for k, v in event_params.items() if k not in fisher_info_params}
 
     # -----------------------------------------------------------------------
-    if use_patd:
-        # ---- PATD path -----------------------------------------------
+    if use_patd_quadrature:
+        # ---- PATD quadrature path (via LLR net, no CPandel needed) ----------
+        # Handled inside _compute_fisher_llr_over_points — falls through to the
+        # llr_net else branch below, which calls _compute_fisher_llr_over_points
+        # with use_patd_quadrature=True. eval_patd_log_probs is not required.
+        pass
+
+    if use_patd and not use_patd_quadrature:
+        # ---- PATD path (CPandel sampling) ----------------------------
         # Fisher info via photon arrival time distribution:
         #   F_i = mean_charge_i * (1/N_hits) Σ_hits (∂ log p(t|θ) / ∂θ)^T (∂ log p(t|θ) / ∂θ)
         # where p(t|θ) = CPandel.pdf(t_residual, d=foot_length(θ)) evaluated
