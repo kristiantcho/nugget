@@ -14,7 +14,8 @@ light_yield_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
         num_track_points=1000,
         domain_size=2500,
         use_max_energy_dist=True,
-        use_perpendicular_distance_only=True
+        use_perpendicular_distance_only=True,
+        particle_mode='cascade',
         ).light_yield_surrogate
 
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
@@ -80,8 +81,8 @@ history = llr_net.train_with_dataloader(
     input_dim=13,
     grad_clip=None,
     save_every_n_epochs=20,
-    checkpoint_path='best_hit_llr_model_v4.pt',
+    checkpoint_path='best_cascade_hit_llr_model_v1.pt',
 )
 
-# llr_net.save_model('best_hit_llr_model_v4')
-pickle.dump(history, open('hit_llr_v4_training_history.pkl', 'wb'))
+# llr_net.save_model('best_cascade_hit_llr_model_v4')
+pickle.dump(history, open('cascade_hit_llr_v1_training_history.pkl', 'wb'))

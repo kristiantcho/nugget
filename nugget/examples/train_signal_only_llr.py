@@ -1,7 +1,7 @@
 import nugget  # Main NUGGET package for neutrino detector optimization
 import pickle 
 
-lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=2000, particle_mode='track')
+lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=2000, particle_mode='cascade')
 light_yield_surrogate = lightsabre.light_yield_surrogate
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
             event_type='signal', 
@@ -57,15 +57,15 @@ train_dataloader = llr_net.create_signal_only_dataloader(
 
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
-    epochs=1000,
+    epochs=700,
     input_dim=13,
     grad_clip=None,
     save_every_n_epochs=20,
-    checkpoint_path='best_charge_llr_model_v5.pt',
+    checkpoint_path='best_cascade_charge_llr_model_v2.pt',
 )
 
 # Save the best model for later use
 # llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('charge_llr_v5_training_history.pkl', 'wb'))
+pickle.dump(history, open('cascade_charge_llr_v2_training_history.pkl', 'wb'))

@@ -135,7 +135,7 @@ for geom_name in ['800main_full_hex', '340grid']:
                 skip_zero_response=True,
                 verbose=True,
                 jacrev_chunk_size=50000,
-                point_chunk_size=10000,
+                point_chunk_size=12000,
                 grad_chunk_size=7,
                 llr_autodiff_mode='jvp',
                 use_rich_features=True

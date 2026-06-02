@@ -916,7 +916,7 @@ class LightSabrePATD(LightSabre):
         cpandel = CPandel(
             tau=cpandel_params.get('tau', 557.),
             lambda_s=cpandel_params.get('lambda_s', 57.4),
-            lambda_a=cpandel_params.get('lambda_a', 98.),
+            lambda_a=cpandel_params.get('lambda_a', 44.7),
             v=cpandel_params.get('v', 0.3 / 1.33),
             s=cpandel_params.get('s', 5.0),
         )
