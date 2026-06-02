@@ -446,7 +446,7 @@ def _build_rich_features_from_cached_obs(
     L = len(cached_obs)
     is_patd = bool(getattr(llr_net, 'use_patd', False))
 
-    # --- differentiable hypothesis features (same for all observations) ---
+    # --- differentiable hypothesis features — computed ONCE over B, then broadcast ---
     norm = llr_net._pos_norm_divisor()
 
     vert = params.get('position', params.get('vertex', None))
@@ -454,31 +454,66 @@ def _build_rich_features_from_cached_obs(
         raise KeyError("'position' not found in params for rich feature builder")
     if isinstance(vert, np.ndarray):
         vert = torch.tensor(vert, device=device, dtype=torch.float32)
-    vert = vert.float().to(device).squeeze() / norm  # (3,)
+    vert = vert.float().to(device).reshape(1, 3) / norm  # (1, 3)
 
     direction = params.get('direction')
     if direction is None:
         raise KeyError("'direction' not found in params for rich feature builder")
     if isinstance(direction, np.ndarray):
         direction = torch.tensor(direction, device=device, dtype=torch.float32)
-    direction = direction.float().to(device).squeeze()  # (3,)
+    direction = direction.float().to(device).reshape(1, 3)  # (1, 3)
+    dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)  # (1, 1)
 
     energy = params.get('energy')
     if energy is None:
         raise KeyError("'energy' not found in params for rich feature builder")
     if isinstance(energy, np.ndarray):
         energy = torch.tensor(energy, device=device, dtype=torch.float32)
-    log_energy = torch.log10(energy.float().to(device).squeeze() + 1e-10) / 8.0
+    log_energy = torch.log10(energy.float().to(device).squeeze() + 1e-10) / 8.0  # scalar
 
-    all_features = []
-    for l in range(L):
-        for b in range(B):
-            det = pts_3[b] / norm  # (3,)
-            rel = det - vert
-            vert_dist = torch.norm(rel)
-            cos_angle = torch.dot(direction, rel) / (torch.norm(direction) * vert_dist + 1e-8)
+    # Batched geometry over B points — one operation, not B scalar calls
+    det = pts_3 / norm                                      # (B, 3)
+    rel = det - vert                                        # (B, 3)
+    vert_dist = torch.norm(rel, dim=-1, keepdim=True)      # (B, 1)
+    cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (dir_norm * vert_dist.clamp(min=1e-8))  # (B, 1)
 
-            if is_patd:
+    # Hypothesis context: (B, ctx_dim) — does NOT depend on l
+    log_energy_expanded = log_energy.expand(B, 1)          # (B, 1)
+    ctx = torch.cat([
+        det,                    # (B, 3)
+        vert.expand(B, -1),     # (B, 3)
+        direction.expand(B, -1),# (B, 3)
+        log_energy_expanded,    # (B, 1)
+        vert_dist,              # (B, 1)
+        cos_angle,              # (B, 1)
+    ], dim=-1)  # (B, 12) for charge or (B, 12) for PATD
+
+    if not is_patd:
+        # Charge path: one scalar observation per (l, b) → (L, B, 1)
+        # Build observation tensor from cache: shape (L, B, 1)
+        obs_rows = []
+        for l in range(L):
+            obs_b = []
+            for b in range(B):
+                ly_raw = cached_obs[l][b]
+                if isinstance(ly_raw, torch.Tensor):
+                    val = ly_raw.float().to(device).squeeze()
+                else:
+                    val = torch.tensor(float(ly_raw), dtype=torch.float32, device=device)
+                obs_b.append(torch.log10(torch.abs(val) + 1e-10) / 4.0)
+            obs_rows.append(torch.stack(obs_b))          # (B,)
+        log_ly = torch.stack(obs_rows).unsqueeze(-1)     # (L, B, 1) — detached constants
+
+        # Broadcast ctx across L, append observation: (L, B, 13)
+        ctx_expanded = ctx.unsqueeze(0).expand(L, -1, -1)   # (L, B, 12)
+        features_batched = torch.cat([ctx_expanded, log_ly], dim=-1)  # (L, B, 13)
+        return features_batched.reshape(L * B, -1)
+    else:
+        # PATD path: variable number of hits per (l, b) — must loop over (l, b)
+        # but geometry is read from pre-computed ctx rows, not recomputed each time.
+        all_features = []
+        for l in range(L):
+            for b in range(B):
                 raw = cached_obs[l][b]
                 hit_times = raw['hit_times'].float().to(device)
                 t_scaled = torch.where(
@@ -486,33 +521,11 @@ def _build_rich_features_from_cached_obs(
                     -torch.log10(-hit_times + 1e-4) / 4.0,
                     torch.log10(hit_times + 1e-4) / 4.0,
                 )  # (N_hits,)
-
-                ctx = torch.stack([
-                    det[0], det[1], det[2],
-                    vert[0], vert[1], vert[2],
-                    direction[0], direction[1], direction[2],
-                    log_energy, vert_dist, cos_angle,
-                ])  # (12,)
-                ctx_batch = ctx.unsqueeze(0).expand(t_scaled.shape[0], -1)
-                feat = torch.cat([ctx_batch, t_scaled.unsqueeze(1)], dim=1)  # (N_hits, 13)
-            else:
-                ly_raw = cached_obs[l][b]
-                if isinstance(ly_raw, torch.Tensor):
-                    ly_raw = ly_raw.float().to(device).squeeze()
-                else:
-                    ly_raw = torch.tensor(float(ly_raw), device=device, dtype=torch.float32)
-                log_ly = torch.log10(torch.abs(ly_raw) + 1e-10) / 4.0
-
-                feat = torch.stack([
-                    det[0], det[1], det[2],
-                    vert[0], vert[1], vert[2],
-                    direction[0], direction[1], direction[2],
-                    log_energy, vert_dist, cos_angle, log_ly,
-                ]).unsqueeze(0)  # (1, 13)
-
-            all_features.append(feat)
-
-    return torch.cat(all_features, dim=0)  # (L*B or L*B*N_hits, feat_dim)
+                # ctx[b] is already computed — just expand and append hit times
+                ctx_rep = ctx[b].unsqueeze(0).expand(t_scaled.shape[0], -1)  # (N_hits, 12)
+                feat = torch.cat([ctx_rep, t_scaled.unsqueeze(1)], dim=1)    # (N_hits, 13)
+                all_features.append(feat)
+        return torch.cat(all_features, dim=0)  # (total_hits, 13)
 
 
 def _fisher_points_all_iters_jvp(
