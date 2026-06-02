@@ -4,6 +4,7 @@ import numpy as np
 import gc
 import os
 import math
+import time
 from torch.func import jacrev, jvp, vmap, linearize
 
 
@@ -622,8 +623,6 @@ def _fisher_points_all_iters_jvp(
                 llr_out = llr_out * _llr_mask_from_true_ly(cached_ly_true)
             return llr_out.transpose(0, 1).contiguous()  # (B, L)
     elif use_rich_features:
-        # Pre-sample observations outside linearize so the surrogate is called
-        # exactly once — not once per JVP direction.
         params0 = _unflatten_theta(
             theta0_flat,
             fisher_info_params=fisher_info_params,
@@ -631,6 +630,8 @@ def _fisher_points_all_iters_jvp(
             theta_numels=theta_numels,
             fixed_params=fixed_params,
         )
+
+        _t0 = time.time()
         cached_obs, cached_ly_true = _sample_rich_observations(
             pts_3,
             surrogate_func=surrogate_func,
@@ -639,16 +640,15 @@ def _fisher_points_all_iters_jvp(
             llr_net=llr_net,
             device=device,
         )
-        cached_ly_true = cached_ly_true.detach()  # (L, B)
+        cached_ly_true = cached_ly_true.detach()
+        print(f"[rich/jvp] sampling:      {time.time()-_t0:.3f}s  (L={llr_iterations}, B={pts_3.shape[0]})", flush=True)
 
-        # Pre-compute everything that does NOT depend on theta outside the trace.
-        # Only vert, direction, log_energy (and derived vert_dist, cos_angle) vary with theta.
         B = pts_3.shape[0]
         L = llr_iterations
         norm_const = llr_net._pos_norm_divisor()
-        det_const = (pts_3.float().to(device) / norm_const).detach()  # (B, 3) — constant
+        det_const = (pts_3.float().to(device) / norm_const).detach()
 
-        # Observation column: (L, B, 1) — constant, built once here not inside the trace
+        _t0 = time.time()
         log_ly_const = torch.stack([
             torch.stack([
                 torch.log10(torch.abs(
@@ -659,7 +659,8 @@ def _fisher_points_all_iters_jvp(
                 for b in range(B)
             ])
             for l in range(L)
-        ]).unsqueeze(-1).detach()  # (L, B, 1)
+        ]).unsqueeze(-1).detach()
+        print(f"[rich/jvp] log_ly build:  {time.time()-_t0:.3f}s", flush=True)
 
         def _theta_only_fn(theta_flat):
             params = _unflatten_theta(
@@ -669,36 +670,34 @@ def _fisher_points_all_iters_jvp(
                 theta_numels=theta_numels,
                 fixed_params=fixed_params,
             )
-            # Hypothesis features — theta-dependent parts only
-            vert = params['position'].float().to(device).reshape(1, 3) / norm_const  # (1, 3)
-            direction = params['direction'].float().to(device).reshape(1, 3)          # (1, 3)
+            vert = params['position'].float().to(device).reshape(1, 3) / norm_const
+            direction = params['direction'].float().to(device).reshape(1, 3)
             dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
             energy = params['energy'].float().to(device).squeeze()
             log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
 
-            rel = det_const - vert                                                    # (B, 3)
-            vert_dist = torch.norm(rel, dim=-1, keepdim=True)                        # (B, 1)
+            rel = det_const - vert
+            vert_dist = torch.norm(rel, dim=-1, keepdim=True)
             cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
-                dir_norm * vert_dist.clamp(min=1e-8))                                 # (B, 1)
+                dir_norm * vert_dist.clamp(min=1e-8))
 
             ctx = torch.cat([
-                det_const,               # (B, 3) — constant but needs to be in graph for cat
-                vert.expand(B, -1),      # (B, 3)
-                direction.expand(B, -1), # (B, 3)
-                log_energy,              # (B, 1)
-                vert_dist,               # (B, 1)
-                cos_angle,               # (B, 1)
-            ], dim=-1)  # (B, 12)
+                det_const,
+                vert.expand(B, -1),
+                direction.expand(B, -1),
+                log_energy,
+                vert_dist,
+                cos_angle,
+            ], dim=-1)
 
-            # Broadcast ctx over L and append constant log_ly
-            ctx_exp = ctx.unsqueeze(0).expand(L, -1, -1)              # (L, B, 12)
-            features = torch.cat([ctx_exp, log_ly_const], dim=-1)     # (L, B, 13)
-            features = features.reshape(L * B, -1)                     # (L*B, 13)
+            ctx_exp = ctx.unsqueeze(0).expand(L, -1, -1)
+            features = torch.cat([ctx_exp, log_ly_const], dim=-1)
+            features = features.reshape(L * B, -1)
 
             llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(L, B)
             if skip_zero_response:
                 llr_out = llr_out * _llr_mask_from_true_ly(cached_ly_true)
-            return llr_out.transpose(0, 1).contiguous()  # (B, L)
+            return llr_out.transpose(0, 1).contiguous()
     else:
         # PATD path (non-rich): call surrogate inside the trace (no caching possible).
         def _theta_only_fn(theta_flat):
@@ -725,10 +724,14 @@ def _fisher_points_all_iters_jvp(
                 llr_out = llr_out * _llr_mask_from_true_ly(ly)
             return llr_out.transpose(0, 1).contiguous()
 
+    _label = 'rich' if use_rich_features else 'std'
+    _t0 = time.time()
     y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
     del y0
+    print(f"[{_label}/jvp] linearize:    {time.time()-_t0:.3f}s  (D={total_dims})", flush=True)
 
     cols_parts = []
+    _jvp_total = 0.0
     for d_start in range(0, total_dims, basis_chunk_size):
         d_end = min(d_start + basis_chunk_size, total_dims)
         k = d_end - d_start
@@ -738,9 +741,12 @@ def _fisher_points_all_iters_jvp(
         cols_idx = torch.arange(d_start, d_end, device=device)
         basis_chunk[rows, cols_idx] = 1
 
+        _t0 = time.time()
         cols_chunk = vmap(jvp_fn, randomness='same')(basis_chunk)  # (k, B, L)
+        _jvp_total += time.time() - _t0
         cols_parts.append(cols_chunk)
         del basis_chunk, cols_chunk
+    print(f"[{_label}/jvp] vmap(jvp_fn): {_jvp_total:.3f}s total ({total_dims} dirs, chunk={basis_chunk_size})", flush=True)
 
     cols = torch.cat(cols_parts, dim=0)
     del cols_parts
