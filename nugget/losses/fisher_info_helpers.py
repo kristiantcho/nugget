@@ -4,7 +4,6 @@ import numpy as np
 import gc
 import os
 import math
-import time
 from torch.func import jacrev, jvp, vmap, linearize
 
 
@@ -632,7 +631,6 @@ def _fisher_points_all_iters_jvp(
             fixed_params=fixed_params,
         )
 
-        _t0 = time.time()
         cached_obs, cached_ly_true = _sample_rich_observations(
             pts_3,
             surrogate_func=surrogate_func,
@@ -642,17 +640,14 @@ def _fisher_points_all_iters_jvp(
             device=device,
         )
         cached_ly_true = cached_ly_true.detach()
-        print(f"[rich/jvp] sampling:      {time.time()-_t0:.3f}s  (L={llr_iterations}, B={pts_3.shape[0]})", flush=True)
 
         B = pts_3.shape[0]
         L = llr_iterations
         norm_const = llr_net._pos_norm_divisor()
         det_const = (pts_3.float().to(device) / norm_const).detach()
 
-        _t0 = time.time()
         # cached_ly_true is already (L, B) — use it directly, no Python loop needed.
         log_ly_const = (torch.log10(cached_ly_true.abs() + 1e-10) / 4.0).unsqueeze(-1).detach()  # (L, B, 1)
-        print(f"[rich/jvp] log_ly build:  {time.time()-_t0:.3f}s", flush=True)
 
         def _theta_only_fn(theta_flat):
             params = _unflatten_theta(
@@ -716,14 +711,10 @@ def _fisher_points_all_iters_jvp(
                 llr_out = llr_out * _llr_mask_from_true_ly(ly)
             return llr_out.transpose(0, 1).contiguous()
 
-    _label = 'rich' if use_rich_features else 'std'
-    _t0 = time.time()
     y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
     del y0
-    print(f"[{_label}/jvp] linearize:    {time.time()-_t0:.3f}s  (D={total_dims})", flush=True)
 
     cols_parts = []
-    _jvp_total = 0.0
     for d_start in range(0, total_dims, basis_chunk_size):
         d_end = min(d_start + basis_chunk_size, total_dims)
         k = d_end - d_start
@@ -733,12 +724,9 @@ def _fisher_points_all_iters_jvp(
         cols_idx = torch.arange(d_start, d_end, device=device)
         basis_chunk[rows, cols_idx] = 1
 
-        _t0 = time.time()
         cols_chunk = vmap(jvp_fn, randomness='same')(basis_chunk)  # (k, B, L)
-        _jvp_total += time.time() - _t0
         cols_parts.append(cols_chunk)
         del basis_chunk, cols_chunk
-    print(f"[{_label}/jvp] vmap(jvp_fn): {_jvp_total:.3f}s total ({total_dims} dirs, chunk={basis_chunk_size})", flush=True)
 
     cols = torch.cat(cols_parts, dim=0)
     del cols_parts
