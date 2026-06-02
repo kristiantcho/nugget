@@ -641,20 +641,61 @@ def _fisher_points_all_iters_jvp(
         )
         cached_ly_true = cached_ly_true.detach()  # (L, B)
 
+        # Pre-compute everything that does NOT depend on theta outside the trace.
+        # Only vert, direction, log_energy (and derived vert_dist, cos_angle) vary with theta.
+        B = pts_3.shape[0]
+        L = llr_iterations
+        norm_const = llr_net._pos_norm_divisor()
+        det_const = (pts_3.float().to(device) / norm_const).detach()  # (B, 3) — constant
+
+        # Observation column: (L, B, 1) — constant, built once here not inside the trace
+        log_ly_const = torch.stack([
+            torch.stack([
+                torch.log10(torch.abs(
+                    cached_obs[l][b].float().to(device).squeeze()
+                    if isinstance(cached_obs[l][b], torch.Tensor)
+                    else torch.tensor(float(cached_obs[l][b]), device=device)
+                ) + 1e-10) / 4.0
+                for b in range(B)
+            ])
+            for l in range(L)
+        ]).unsqueeze(-1).detach()  # (L, B, 1)
+
         def _theta_only_fn(theta_flat):
-            B = pts_3.shape[0]
-            features = _build_rich_features_from_cached_obs(
-                pts_3,
-                theta_flat=theta_flat,
-                cached_obs=cached_obs,
-                llr_net=llr_net,
+            params = _unflatten_theta(
+                theta_flat,
                 fisher_info_params=fisher_info_params,
                 theta_shapes=theta_shapes,
                 theta_numels=theta_numels,
                 fixed_params=fixed_params,
-                device=device,
             )
-            llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(llr_iterations, B)
+            # Hypothesis features — theta-dependent parts only
+            vert = params['position'].float().to(device).reshape(1, 3) / norm_const  # (1, 3)
+            direction = params['direction'].float().to(device).reshape(1, 3)          # (1, 3)
+            dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+            energy = params['energy'].float().to(device).squeeze()
+            log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
+
+            rel = det_const - vert                                                    # (B, 3)
+            vert_dist = torch.norm(rel, dim=-1, keepdim=True)                        # (B, 1)
+            cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
+                dir_norm * vert_dist.clamp(min=1e-8))                                 # (B, 1)
+
+            ctx = torch.cat([
+                det_const,               # (B, 3) — constant but needs to be in graph for cat
+                vert.expand(B, -1),      # (B, 3)
+                direction.expand(B, -1), # (B, 3)
+                log_energy,              # (B, 1)
+                vert_dist,               # (B, 1)
+                cos_angle,               # (B, 1)
+            ], dim=-1)  # (B, 12)
+
+            # Broadcast ctx over L and append constant log_ly
+            ctx_exp = ctx.unsqueeze(0).expand(L, -1, -1)              # (L, B, 12)
+            features = torch.cat([ctx_exp, log_ly_const], dim=-1)     # (L, B, 13)
+            features = features.reshape(L * B, -1)                     # (L*B, 13)
+
+            llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(L, B)
             if skip_zero_response:
                 llr_out = llr_out * _llr_mask_from_true_ly(cached_ly_true)
             return llr_out.transpose(0, 1).contiguous()  # (B, L)
