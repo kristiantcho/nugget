@@ -791,38 +791,104 @@ def _compute_fisher_llr_over_points(
 
     llr_autodiff_mode = (llr_autodiff_mode or 'jacrev').lower()
     if llr_autodiff_mode == 'jacrev':
-        def _one(pt_3):
-            return _fisher_one_point_jacrev(
-                pt_3,
-                theta_tuple=theta_tuple,
-                fisher_info_params=fisher_info_params,
-                fixed_params=fixed_params,
-                llr_net=llr_net,
+        if use_rich_features:
+            # Pre-sample observations for all points BEFORE the per-point loop so
+            # that _sample_rich_observations (which has Python control flow) never
+            # runs inside vmap.  Each point gets its own list of L cached observations.
+            params0 = {fisher_info_params[i]: theta_tuple[i].detach() for i in range(len(fisher_info_params))}
+            params0.update(fixed_params)
+            all_cached_obs, all_cached_ly = _sample_rich_observations(
+                point,  # all n_points at once
                 surrogate_func=surrogate_func,
+                params_for_sampling=params0,
                 llr_iterations=llr_iterations,
-                signal_noise_scale=signal_noise_scale,
-                skip_zero_response=skip_zero_response,
-                event_param_names=event_param_names,
-                jacrev_chunk_size=jacrev_chunk_size,
-                detach_fisher_tensors=detach_fisher_tensors,
-                use_rich_features=use_rich_features,
+                llr_net=llr_net,
+                device=device,
             )
+            # all_cached_obs[l][b] for b in 0..n_points, all_cached_ly: (L, n_points)
 
-        for p_start in range(0, n_points, pt_chunk):
-            p_end = min(p_start + pt_chunk, n_points)
-            pts = point[p_start:p_end]
-            try:
-                fisher_chunk = vmap(_one, randomness='different')(pts)
-            except Exception:
-                fisher_chunk = torch.stack([_one(pts[i]) for i in range(pts.shape[0])], dim=0)
-            if detach_fisher_tensors:
-                fisher_chunk = fisher_chunk.detach()
-            if fisher_sum is not None:
-                fisher_sum.add_(fisher_chunk.sum(dim=0))
-            else:
-                fisher_per_point[p_start:p_end] = fisher_chunk
-            del fisher_chunk, pts
-            _fisher_chunk_cleanup(device)
+            def _one_rich(pt_3, pt_idx):
+                # Extract per-point cache — pure Python indexing, outside jacrev trace.
+                pt_cached_obs = [[all_cached_obs[l][pt_idx]] for l in range(llr_iterations)]
+                pt_cached_ly = all_cached_ly[:, pt_idx].reshape(-1)  # (L,)
+                augmented_fixed = dict(fixed_params)
+                augmented_fixed['_cached_rich_obs'] = pt_cached_obs
+                augmented_fixed['_cached_rich_ly'] = pt_cached_ly
+
+                def _theta_only_fn(*theta_vals):
+                    return _llr_out_single_point_all_iters(
+                        pt_3,
+                        theta_vals=theta_vals,
+                        fisher_info_params=fisher_info_params,
+                        fixed_params=augmented_fixed,
+                        llr_net=llr_net,
+                        surrogate_func=surrogate_func,
+                        llr_iterations=llr_iterations,
+                        signal_noise_scale=signal_noise_scale,
+                        skip_zero_response=skip_zero_response,
+                        event_param_names=event_param_names,
+                        use_rich_features=use_rich_features,
+                    )
+
+                J_tuple = jacrev(
+                    _theta_only_fn,
+                    argnums=tuple(range(len(fisher_info_params))),
+                    chunk_size=jacrev_chunk_size,
+                )(*theta_tuple)
+                J = torch.cat([j.reshape(llr_iterations, -1) for j in J_tuple], dim=1)
+                del J_tuple
+                F = torch.einsum('li,lj->ij', J, J) / llr_iterations
+                del J
+                return F.detach() if detach_fisher_tensors else F
+
+            for p_start in range(0, n_points, pt_chunk):
+                p_end = min(p_start + pt_chunk, n_points)
+                pts = point[p_start:p_end]
+                # Sequential loop — vmap not possible due to Python-indexed cache
+                fisher_chunk = torch.stack(
+                    [_one_rich(pts[i], p_start + i) for i in range(pts.shape[0])], dim=0
+                )
+                if detach_fisher_tensors:
+                    fisher_chunk = fisher_chunk.detach()
+                if fisher_sum is not None:
+                    fisher_sum.add_(fisher_chunk.sum(dim=0))
+                else:
+                    fisher_per_point[p_start:p_end] = fisher_chunk
+                del fisher_chunk, pts
+                _fisher_chunk_cleanup(device)
+        else:
+            def _one(pt_3):
+                return _fisher_one_point_jacrev(
+                    pt_3,
+                    theta_tuple=theta_tuple,
+                    fisher_info_params=fisher_info_params,
+                    fixed_params=fixed_params,
+                    llr_net=llr_net,
+                    surrogate_func=surrogate_func,
+                    llr_iterations=llr_iterations,
+                    signal_noise_scale=signal_noise_scale,
+                    skip_zero_response=skip_zero_response,
+                    event_param_names=event_param_names,
+                    jacrev_chunk_size=jacrev_chunk_size,
+                    detach_fisher_tensors=detach_fisher_tensors,
+                    use_rich_features=False,
+                )
+
+            for p_start in range(0, n_points, pt_chunk):
+                p_end = min(p_start + pt_chunk, n_points)
+                pts = point[p_start:p_end]
+                try:
+                    fisher_chunk = vmap(_one, randomness='different')(pts)
+                except Exception:
+                    fisher_chunk = torch.stack([_one(pts[i]) for i in range(pts.shape[0])], dim=0)
+                if detach_fisher_tensors:
+                    fisher_chunk = fisher_chunk.detach()
+                if fisher_sum is not None:
+                    fisher_sum.add_(fisher_chunk.sum(dim=0))
+                else:
+                    fisher_per_point[p_start:p_end] = fisher_chunk
+                del fisher_chunk, pts
+                _fisher_chunk_cleanup(device)
 
         return fisher_sum, fisher_per_point
 
