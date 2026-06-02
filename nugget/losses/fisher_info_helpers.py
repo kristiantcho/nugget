@@ -382,25 +382,26 @@ def _sample_rich_observations(
     cached_obs = []
     ly_rows = []
 
+    # For the non-PATD charge case we only need the light yield values as a tensor —
+    # cached_obs (list of lists) is only needed for PATD where hit_times vary per call.
+    ly_tensor_rows = []  # collect (B,) tensors directly, no Python float conversion
+
     with torch.no_grad():
         for _ in range(llr_iterations):
-            # Call surrogate once for all B points together (matches _sample_detector_responses_batched).
-            # Fall back to per-point loop only if the surrogate doesn't support batched points.
             try:
                 batch_raw = surrogate_func(opt_point=pts_3, event_params=params_for_sampling)
                 if is_patd:
-                    # Batched PATD returns a list of dicts, one per point
                     if not isinstance(batch_raw, (list, tuple)) or len(batch_raw) != B:
                         raise TypeError
                     obs_row = list(batch_raw)
-                    ly_row = [
-                        float(r.get('num_photons', 0).item()
-                              if isinstance(r.get('num_photons', 0), torch.Tensor)
-                              else r.get('num_photons', 0))
-                        for r in obs_row
-                    ]
+                    ly_row_t = torch.tensor(
+                        [float(r.get('num_photons', 0).item()
+                               if isinstance(r.get('num_photons', 0), torch.Tensor)
+                               else r.get('num_photons', 0))
+                         for r in obs_row],
+                        dtype=torch.float32, device=device,
+                    )
                 else:
-                    # Batched charge returns a (B,) tensor
                     if isinstance(batch_raw, dict):
                         batch_raw = batch_raw.get('light_yield', next(iter(batch_raw.values())))
                     if not isinstance(batch_raw, torch.Tensor):
@@ -408,17 +409,16 @@ def _sample_rich_observations(
                     batch_raw = batch_raw.detach().float().reshape(-1)
                     if batch_raw.numel() != B:
                         raise ValueError
-                    obs_row = [batch_raw[b] for b in range(B)]
-                    ly_row = [float(v.item()) for v in obs_row]
+                    obs_row = batch_raw          # keep as tensor, no per-element Python loop
+                    ly_row_t = batch_raw
             except Exception:
-                # Fall back: call surrogate per point
                 obs_row = []
-                ly_row = []
+                ly_vals = []
                 for b in range(B):
                     raw = surrogate_func(opt_point=pts_3[b], event_params=params_for_sampling)
                     if is_patd:
                         n = raw.get('num_photons', 0)
-                        ly_val = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                        ly_vals.append(float(n.item()) if isinstance(n, torch.Tensor) else float(n))
                     else:
                         if isinstance(raw, dict):
                             raw = raw.get('light_yield', next(iter(raw.values())))
@@ -426,13 +426,14 @@ def _sample_rich_observations(
                             raw = raw.detach().float()
                         else:
                             raw = torch.tensor(float(raw), dtype=torch.float32, device=device)
-                        ly_val = float(raw.item())
+                        ly_vals.append(float(raw.item()))
                     obs_row.append(raw)
-                    ly_row.append(ly_val)
-            cached_obs.append(obs_row)
-            ly_rows.append(ly_row)
+                ly_row_t = torch.tensor(ly_vals, dtype=torch.float32, device=device)
 
-    cached_ly_true = torch.tensor(ly_rows, dtype=torch.float32, device=device)  # (L, B)
+            cached_obs.append(obs_row)
+            ly_tensor_rows.append(ly_row_t)
+
+    cached_ly_true = torch.stack(ly_tensor_rows, dim=0)  # (L, B) — no Python float conversion
     return cached_obs, cached_ly_true
 
 
