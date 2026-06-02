@@ -741,6 +741,240 @@ def _fisher_points_all_iters_jvp(
     return F.detach() if detach_fisher_tensors else F
 
 
+def _fisher_points_patd_quadrature(
+    pts_3,
+    *,
+    llr_net,
+    surrogate_func,
+    fisher_info_params,
+    fixed_params,
+    theta0_flat,
+    theta_shapes,
+    theta_numels,
+    total_dims,
+    n_quadrature,
+    t_offset_ns,
+    t_max_ns,
+    llr_autodiff_mode,
+    jacrev_chunk_size,
+    grad_chunk_size,
+    device,
+    detach_fisher_tensors=True,
+):
+    """
+    Deterministic quadrature-based Fisher information for the PATD LLR network.
+
+    Instead of Monte Carlo over sampled hit times, integrates over a fixed
+    log-spaced time grid using the Riemann sum:
+
+        F_b(θ) = λ(θ,b) × Σ_n Δt_n × p̃(t_n|θ,b) × [∂ log p̃(t_n|θ,b)/∂θ]²
+
+    where p̃ = r / Z is the self-normalised LLR network output (r = exp(LLR)),
+    Z = Σ_n r(t_n) Δt_n is the Riemann-sum partition function, and the score
+    ∂ log p̃/∂θ = ∂LLR/∂θ − Σ_n softmax_n × ∂LLR(t_n)/∂θ integrates to zero.
+
+    Parameters
+    ----------
+    pts_3          : (B, 3) detector positions
+    surrogate_func : returns a PATD dict (must contain 't_geom_min' and
+                     'num_photons' or 'expected_photons') OR a scalar tensor λ.
+    n_quadrature   : number of log-spaced quadrature points (= llr_iterations)
+    t_offset_ns    : subtracted from t_geom_min to set the grid start (ns)
+    t_max_ns       : upper limit of the time grid (ns)
+
+    Returns
+    -------
+    (B, D, D) Fisher matrices
+    """
+    B = pts_3.shape[0]
+    pts_3 = pts_3.float().to(device)
+
+    params0 = _unflatten_theta(
+        theta0_flat,
+        fisher_info_params=fisher_info_params,
+        theta_shapes=theta_shapes,
+        theta_numels=theta_numels,
+        fixed_params=fixed_params,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Phase 1: pre-compute everything that does NOT depend on θ           #
+    # ------------------------------------------------------------------ #
+    norm_const = llr_net._pos_norm_divisor()
+    det_const = (pts_3 / norm_const).detach()  # (B, 3)
+
+    # Call surrogate once per point to get t_geom_min and λ
+    t_geom_min_per_pt = torch.zeros(B, device=device)
+    lambda_per_pt = torch.zeros(B, device=device)
+
+    with torch.no_grad():
+        # Try batched call first
+        try:
+            raw_batch = surrogate_func(opt_point=pts_3, event_params=params0)
+            if isinstance(raw_batch, (list, tuple)) and len(raw_batch) == B:
+                for b, r in enumerate(raw_batch):
+                    if isinstance(r, dict):
+                        tgm = r.get('t_geom_min', torch.tensor(0.0))
+                        tgm = tgm.float().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
+                        t_geom_min_per_pt[b] = tgm
+                        n = r.get('expected_photons', r.get('num_photons', 0))
+                        lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                    else:
+                        t_geom_min_per_pt[b] = 0.0
+                        lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
+            elif isinstance(raw_batch, dict):
+                raise TypeError  # dict means single-point; fall through to loop
+            elif isinstance(raw_batch, torch.Tensor):
+                # scalar surrogate: no t_geom_min available, default to 0
+                lambda_per_pt = raw_batch.detach().float().reshape(-1)[:B]
+            else:
+                raise TypeError
+        except Exception:
+            for b in range(B):
+                r = surrogate_func(opt_point=pts_3[b], event_params=params0)
+                if isinstance(r, dict):
+                    tgm = r.get('t_geom_min', torch.tensor(0.0))
+                    tgm = tgm.float().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
+                    t_geom_min_per_pt[b] = tgm
+                    n = r.get('expected_photons', r.get('num_photons', 0))
+                    lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                else:
+                    ly = r.item() if isinstance(r, torch.Tensor) else float(r)
+                    lambda_per_pt[b] = ly
+
+    # Log-spaced time grids: one per detector point, shape (B, N)
+    # t_start_b = max(t_geom_min_b - t_offset_ns, 1e-3)  — clamp to positive
+    t_start = (t_geom_min_per_pt - t_offset_ns).clamp(min=1.0)   # (B,) ns
+    t_end = torch.full((B,), t_max_ns, device=device)             # (B,) ns
+
+    # log-spaced points: (B, N)
+    log_t_start = torch.log10(t_start)
+    log_t_end = torch.log10(t_end)
+    # linspace in log space for each point — vectorised
+    alpha = torch.linspace(0.0, 1.0, n_quadrature, device=device)  # (N,)
+    log_t_grid = log_t_start.unsqueeze(1) + alpha.unsqueeze(0) * (
+        log_t_end - log_t_start).unsqueeze(1)    # (B, N)
+    t_grid = torch.pow(10.0, log_t_grid)          # (B, N) actual times in ns
+
+    # Log-space Riemann widths Δt_n (using midpoints of log intervals)
+    # Δlog_t is constant = (log_t_end - log_t_start) / (N-1)
+    delta_log_t = (log_t_end - log_t_start) / max(n_quadrature - 1, 1)  # (B,)
+    # Δt_n = t_n * ln(10) * Δlog_t   (from d(10^x)/dx = 10^x * ln10)
+    dt_grid = t_grid * (math.log(10.0) * delta_log_t.unsqueeze(1))       # (B, N)
+
+    # Pre-compute log-sign scaled times — constants, no θ dependence
+    t_scaled = torch.where(
+        t_grid < 0,
+        -torch.log10(-t_grid + 1e-4) / 4.0,
+        torch.log10(t_grid + 1e-4) / 4.0,
+    )  # (B, N)
+    # Flatten to (B*N, 1) for easy feature construction
+    t_scaled_flat = t_scaled.reshape(B * n_quadrature, 1).detach()
+    dt_flat = dt_grid.reshape(B * n_quadrature).detach()           # (B*N,)
+
+    # ------------------------------------------------------------------ #
+    # Phase 2: differentiable θ-dependent features + network + Fisher    #
+    # ------------------------------------------------------------------ #
+    basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims
+
+    def _theta_only_fn(theta_flat):
+        params = _unflatten_theta(
+            theta_flat,
+            fisher_info_params=fisher_info_params,
+            theta_shapes=theta_shapes,
+            theta_numels=theta_numels,
+            fixed_params=fixed_params,
+        )
+        # Hypothesis geometry — θ-dependent, computed once for all (b, n)
+        vert = params['position'].float().to(device).reshape(1, 3) / norm_const  # (1, 3)
+        direction = params['direction'].float().to(device).reshape(1, 3)
+        dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+        energy = params['energy'].float().to(device).squeeze()
+        log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
+
+        rel = det_const - vert                                     # (B, 3)
+        vert_dist = torch.norm(rel, dim=-1, keepdim=True)         # (B, 1)
+        cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
+            dir_norm * vert_dist.clamp(min=1e-8))                  # (B, 1)
+
+        ctx = torch.cat([
+            det_const,
+            vert.expand(B, -1),
+            direction.expand(B, -1),
+            log_energy,
+            vert_dist,
+            cos_angle,
+        ], dim=-1)  # (B, 12)
+
+        # Repeat ctx for each quadrature point: (B*N, 12)
+        ctx_rep = ctx.unsqueeze(1).expand(B, n_quadrature, -1).reshape(B * n_quadrature, -1)
+        features = torch.cat([ctx_rep, t_scaled_flat], dim=-1)    # (B*N, 13)
+
+        # LLR values: (B*N,)
+        llr_vals = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-10)
+
+        # r(t_n) = exp(LLR), shape (B, N)
+        r_vals = torch.exp(llr_vals).reshape(B, n_quadrature)
+
+        # Partition function Z_b = Σ_n r(t_n) * Δt_n, shape (B,)
+        Z = (r_vals * dt_grid).sum(dim=1, keepdim=True).clamp(min=1e-20)  # (B, 1)
+
+        # Self-normalised log-density: log p̃ = LLR - log Z
+        # We return the LLR vector (B*N,) — the normalisation is applied
+        # in the score via the chain rule below.
+        # Return shape (B, N) so the Jacobian is (B, N, D).
+        # The score ∂log p̃/∂θ = ∂LLR/∂θ - softmax_n · ∂LLR/∂θ
+        # is computed automatically when we differentiate log(r/Z).
+        log_r_norm = llr_vals.reshape(B, n_quadrature) - torch.log(Z)  # (B, N)
+        return log_r_norm  # (B, N)
+
+    # ------------------------------------------------------------------ #
+    # Phase 3: Jacobian ∂ log p̃(t_n|θ) / ∂θ via jacrev or jvp          #
+    # ------------------------------------------------------------------ #
+    if llr_autodiff_mode == 'jacrev':
+        # J shape: (B, N, D)
+        J_raw = jacrev(_theta_only_fn, chunk_size=jacrev_chunk_size)(theta0_flat)
+        J = J_raw.reshape(B, n_quadrature, total_dims)
+        del J_raw
+    else:
+        # JVP path: linearize then apply D basis vectors
+        y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
+        del y0
+        cols_parts = []
+        for d_start in range(0, total_dims, basis_chunk_size):
+            d_end = min(d_start + basis_chunk_size, total_dims)
+            k = d_end - d_start
+            bvecs = torch.zeros(k, total_dims, device=device, dtype=theta0_flat.dtype)
+            bvecs[torch.arange(k, device=device), torch.arange(d_start, d_end, device=device)] = 1
+            cols_parts.append(vmap(jvp_fn, randomness='same')(bvecs))  # (k, B, N)
+        del jvp_fn
+        cols = torch.cat(cols_parts, dim=0)   # (D, B, N)
+        J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
+        del cols, cols_parts
+
+    # ------------------------------------------------------------------ #
+    # Phase 4: weighted Fisher sum  F_b = λ_b × Σ_n Δt_n p̃_n J_n J_n^T #
+    # ------------------------------------------------------------------ #
+    with torch.no_grad():
+        # p̃_n = softmax weights from r and Δt
+        log_r_norm_vals = _theta_only_fn(theta0_flat)           # (B, N) — reuse trace
+        r_vals2 = torch.exp(log_r_norm_vals)                    # (B, N)
+        Z2 = (r_vals2 * dt_grid).sum(dim=1, keepdim=True).clamp(min=1e-20)
+        p_tilde = (r_vals2 * dt_grid / Z2).detach()             # (B, N) — normalised weights
+
+    # Fisher: F_b = λ_b × Σ_n p̃_n × J_n J_n^T
+    # J: (B, N, D), p_tilde: (B, N)
+    # weighted_J[b,n,:] = sqrt(p̃_n) * J_n  → F = weighted_J^T weighted_J
+    weighted_J = J * p_tilde.unsqueeze(-1)                      # (B, N, D)
+    F_per_point = torch.einsum('bnd,bne->bde', weighted_J, J)   # (B, D, D)
+    del J, weighted_J
+
+    # Scale by mean photon count λ_b
+    F_per_point = F_per_point * lambda_per_pt.view(B, 1, 1)
+
+    return F_per_point.detach() if detach_fisher_tensors else F_per_point
+
+
 def _compute_fisher_llr_over_points(
     *,
     point,
@@ -764,8 +998,14 @@ def _compute_fisher_llr_over_points(
     device,
     detach_fisher_tensors=True,
     use_rich_features=False,
+    use_patd_quadrature=False,
+    t_offset_ns=100.0,
+    t_max_ns=10000.0,
 ):
     theta_tuple = tuple(event_params[p].detach().to(device) for p in fisher_info_params)
+    theta_shapes = [event_params[p].detach().to(device).shape for p in fisher_info_params]
+    theta_numels = [int(event_params[p].detach().to(device).numel()) for p in fisher_info_params]
+    theta0_flat = torch.cat([event_params[p].detach().to(device).reshape(-1) for p in fisher_info_params], dim=0)
     pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
 
     fisher_sum = None
@@ -776,6 +1016,39 @@ def _compute_fisher_llr_over_points(
         fisher_per_point = torch.zeros(n_points, total_dims, total_dims, device=device)
 
     llr_autodiff_mode = (llr_autodiff_mode or 'jacrev').lower()
+
+    # ---- PATD quadrature path -------------------------------------------
+    if use_patd_quadrature:
+        basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims
+        for p_start in range(0, n_points, pt_chunk):
+            p_end = min(p_start + pt_chunk, n_points)
+            pts = point[p_start:p_end]
+            fisher_chunk = _fisher_points_patd_quadrature(
+                pts,
+                llr_net=llr_net,
+                surrogate_func=surrogate_func,
+                fisher_info_params=fisher_info_params,
+                fixed_params=fixed_params,
+                theta0_flat=theta0_flat,
+                theta_shapes=theta_shapes,
+                theta_numels=theta_numels,
+                total_dims=total_dims,
+                n_quadrature=llr_iterations,
+                t_offset_ns=t_offset_ns,
+                t_max_ns=t_max_ns,
+                llr_autodiff_mode=llr_autodiff_mode,
+                jacrev_chunk_size=jacrev_chunk_size,
+                grad_chunk_size=grad_chunk_size,
+                device=device,
+                detach_fisher_tensors=detach_fisher_tensors,
+            )
+            if fisher_sum is not None:
+                fisher_sum.add_(fisher_chunk.sum(dim=0))
+            else:
+                fisher_per_point[p_start:p_end] = fisher_chunk
+            del fisher_chunk, pts
+            _fisher_chunk_cleanup(device)
+        return fisher_sum, fisher_per_point
     if llr_autodiff_mode == 'jacrev':
         if use_rich_features:
             # Pre-sample observations for all points BEFORE the per-point loop so
@@ -1028,7 +1301,7 @@ def directional_resolution(F3, n):
         return r68
 
 
-def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False):
+def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, t_offset_ns=100.0, t_max_ns=10000.0):
     """
     Compute the Fisher information matrix averaged over multiple LLR iterations.
     
@@ -1539,6 +1812,9 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
             device=device,
             detach_fisher_tensors=detach_fisher_tensors,
             use_rich_features=use_rich_features,
+            use_patd_quadrature=use_patd_quadrature,
+            t_offset_ns=t_offset_ns,
+            t_max_ns=t_max_ns,
         )
     # ---------------------------------------------- aggregate over points / strings
     if llr_net is not None and string_xy is None and sum_over_points:
