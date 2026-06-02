@@ -1310,10 +1310,40 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
                     ly_vals = _theta_only_fn(theta0_flat).reshape(-1)
 
             else:
-                # Forward-mode Jacobian via JVPs: linearize then apply to basis vectors.
+                # Forward-mode Jacobian via JVPs.
+                # The surrogate may contain Poisson draws which linearize would
+                # capture and vmap would then error on. Hoist a single surrogate
+                # evaluation outside linearize to get the mean λ, then
+                # differentiate a surrogate that reuses those fixed mean values.
+                # For the Fisher information of a Poisson mean, what matters is
+                # ∂λ/∂θ evaluated at θ0, not the stochastic draw — so holding
+                # the Poisson draw fixed is the correct thing to do.
+                with torch.no_grad():
+                    ly_vals_fixed = _surrogate_batched(pts, _unflatten_theta(
+                        theta0_flat,
+                        fisher_info_params=fisher_info_params,
+                        theta_shapes=theta_shapes,
+                        theta_numels=theta_numels,
+                        fixed_params=fixed_params,
+                    )).detach()  # (B,)
+
+                def _theta_only_fn_det(theta_flat):
+                    # Differentiable wrapper that avoids re-calling the stochastic
+                    # surrogate: instead re-evaluates only the mean λ(θ).
+                    # We rely on the surrogate's mean being differentiable w.r.t. θ
+                    # even when the Poisson draw is removed.
+                    params_det = _unflatten_theta(
+                        theta_flat,
+                        fisher_info_params=fisher_info_params,
+                        theta_shapes=theta_shapes,
+                        theta_numels=theta_numels,
+                        fixed_params=fixed_params,
+                    )
+                    return _surrogate_batched(pts, params_det)
+
                 basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims_local
-                ly0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
-                ly_vals = ly0.detach().reshape(-1)
+                ly_vals = ly_vals_fixed.reshape(-1)
+                _, jvp_fn = linearize(_theta_only_fn_det, theta0_flat)
 
                 cols_parts = []
                 for d_start in range(0, total_dims_local, basis_chunk_size):
@@ -1323,12 +1353,12 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
                     rows = torch.arange(k, device=device)
                     cols_idx = torch.arange(d_start, d_end, device=device)
                     basis_chunk[rows, cols_idx] = 1
-                    cols_chunk = vmap(jvp_fn, randomness='same')(basis_chunk)  # (k, B)
+                    cols_chunk = vmap(jvp_fn)(basis_chunk)  # (k, B)
                     cols_parts.append(cols_chunk)
 
                 cols = torch.cat(cols_parts, dim=0)  # (D, B)
                 J = cols.permute(1, 0).contiguous()  # (B, D)
-                del cols_parts, cols, jvp_fn, ly0
+                del cols_parts, cols, jvp_fn
 
             # Per-point Fisher (Poisson mean): outer / lambda
             outer = torch.bmm(J.unsqueeze(-1), J.unsqueeze(-2))  # (B, D, D)
