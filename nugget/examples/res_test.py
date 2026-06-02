@@ -28,7 +28,7 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     cylinder_radius=radius,
                                                     cylinder_height=height,
                                                     uniform_zenith_sampling=True,
-                                                    cos_range=torch.tensor([0,1]),
+                                                    cos_range=torch.tensor([-1,1]),
                                                     # point_towards_center=True,
                                                     # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                     )
@@ -113,7 +113,7 @@ for geom_name in ['800main_full_hex', '340grid']:
         lr_scheduler_patience=35,  # Patience for LR scheduler
     )
 
-    llr_net.load_model('best_charge_llr_model_v4')
+    llr_net.load_model('best_charge_llr_model_v5.pt')
     # llr_net.load_model('best_cascade_charge_llr_model_v1')
 
 
@@ -135,9 +135,10 @@ for geom_name in ['800main_full_hex', '340grid']:
                 skip_zero_response=True,
                 verbose=True,
                 jacrev_chunk_size=50000,
-                point_chunk_size=11000,
+                point_chunk_size=10000,
                 grad_chunk_size=7,
-                llr_autodiff_mode='jvp'
+                llr_autodiff_mode='jvp',
+                use_rich_features=True
                 )
 
     precomputed_ly = signal_yield_loss_func.light_yield_per_string(
