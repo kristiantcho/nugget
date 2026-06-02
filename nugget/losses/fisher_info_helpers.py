@@ -383,23 +383,51 @@ def _sample_rich_observations(
 
     with torch.no_grad():
         for _ in range(llr_iterations):
-            obs_row = []
-            ly_row = []
-            for b in range(B):
-                raw = surrogate_func(opt_point=pts_3[b], event_params=params_for_sampling)
+            # Call surrogate once for all B points together (matches _sample_detector_responses_batched).
+            # Fall back to per-point loop only if the surrogate doesn't support batched points.
+            try:
+                batch_raw = surrogate_func(opt_point=pts_3, event_params=params_for_sampling)
                 if is_patd:
-                    n = raw.get('num_photons', 0)
-                    ly_val = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                    # Batched PATD returns a list of dicts, one per point
+                    if not isinstance(batch_raw, (list, tuple)) or len(batch_raw) != B:
+                        raise TypeError
+                    obs_row = list(batch_raw)
+                    ly_row = [
+                        float(r.get('num_photons', 0).item()
+                              if isinstance(r.get('num_photons', 0), torch.Tensor)
+                              else r.get('num_photons', 0))
+                        for r in obs_row
+                    ]
                 else:
-                    if isinstance(raw, dict):
-                        raw = raw.get('light_yield', next(iter(raw.values())))
-                    if isinstance(raw, torch.Tensor):
-                        raw = raw.detach().float()
+                    # Batched charge returns a (B,) tensor
+                    if isinstance(batch_raw, dict):
+                        batch_raw = batch_raw.get('light_yield', next(iter(batch_raw.values())))
+                    if not isinstance(batch_raw, torch.Tensor):
+                        raise TypeError
+                    batch_raw = batch_raw.detach().float().reshape(-1)
+                    if batch_raw.numel() != B:
+                        raise ValueError
+                    obs_row = [batch_raw[b] for b in range(B)]
+                    ly_row = [float(v.item()) for v in obs_row]
+            except Exception:
+                # Fall back: call surrogate per point
+                obs_row = []
+                ly_row = []
+                for b in range(B):
+                    raw = surrogate_func(opt_point=pts_3[b], event_params=params_for_sampling)
+                    if is_patd:
+                        n = raw.get('num_photons', 0)
+                        ly_val = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
                     else:
-                        raw = torch.tensor(float(raw), dtype=torch.float32, device=device)
-                    ly_val = float(raw.item())
-                obs_row.append(raw)
-                ly_row.append(ly_val)
+                        if isinstance(raw, dict):
+                            raw = raw.get('light_yield', next(iter(raw.values())))
+                        if isinstance(raw, torch.Tensor):
+                            raw = raw.detach().float()
+                        else:
+                            raw = torch.tensor(float(raw), dtype=torch.float32, device=device)
+                        ly_val = float(raw.item())
+                    obs_row.append(raw)
+                    ly_row.append(ly_val)
             cached_obs.append(obs_row)
             ly_rows.append(ly_row)
 
