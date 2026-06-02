@@ -698,11 +698,10 @@ class LLRnet(Surrogate):
            log10(E)/8,                    log-scaled energy                    (1)
            vert_dist,                     L2(detector - vertex) normalised     (1)
            cos_angle,                     cos(direction ∠ vertex→detector)     (1)
-           t_geom_min / 1e5,              min geometric arrival time           (1)
            t_hit (log-sign scaled)]       per-photon arrival time              (1)
-                                                                           total = 14
+                                                                           total = 13
 
-        The first 13 entries are the same for every photon in the event and are
+        The first 12 entries are the same for every photon in the event and are
         replicated across rows.  Only the last column varies per photon.
 
         Normalisation uses self.domain_size via _pos_norm_divisor(), so it is
@@ -715,12 +714,11 @@ class LLRnet(Surrogate):
         event_data : dict
             Event parameters.  Must contain 'position', 'energy', 'direction'.
         patd_result : dict
-            Output of the PATD surrogate.  Must contain 'hit_times', 'num_photons',
-            and 't_geom_min'.
+            Output of the PATD surrogate.  Must contain 'hit_times' and 'num_photons'.
 
         Returns
         -------
-        features : torch.Tensor, shape (num_photons, 14)
+        features : torch.Tensor, shape (num_photons, 13)
             Per-photon feature matrix, or None if num_photons == 0.
         num_photons : int
         """
