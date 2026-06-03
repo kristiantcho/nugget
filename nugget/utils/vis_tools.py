@@ -6897,10 +6897,25 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     # Count effective detector points (non-zero response)
     num_effective_detector_points = sum(1 for resp in true_detector_responses if resp != 0.0)
 
+    # For PATD rich-feature mode: pre-compute the fixed observation quantities
+    # (t_scaled and det_normed) once for all detector points before the grid loop.
+    # This avoids recomputing them for every hypothesis value.
+    patd_precomputed_obs = None
+    if use_patd and use_rich_features and hasattr(llrnet, 'precompute_patd_observations'):
+        active_points = [p for p, r in zip(detector_points, true_detector_responses)
+                         if not (skip_zero_response and r == 0.0)]
+        active_patds = [true_patd_results[i] for i, r in enumerate(true_detector_responses)
+                        if not (skip_zero_response and r == 0.0)]
+        patd_precomputed_obs = llrnet.precompute_patd_observations(active_points, active_patds)
+
     # Get true event features for all detector points and sum their log-likelihoods
     true_llr_sum = 0.0
     with torch.no_grad():
-        if use_patd:
+        if use_patd and use_rich_features and patd_precomputed_obs is not None:
+            true_llr_sum = llrnet.evaluate_patd_likelihood_batched_hypothesis(
+                true_event, patd_precomputed_obs
+            )
+        elif use_patd:
             # In PATD mode, sum likelihoods across all photon hits from all detector points.
             # Pass the pre-computed patd_result so the surrogate is not called again.
             for det_point, true_patd in zip(detector_points, true_patd_results):
@@ -6998,45 +7013,46 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             llr_sum = 0.0
             filtered_true_event = {k: v for k, v in true_event.items() if k in event_labels}
 
-            patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
-            ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
-            for det_point, true_response, true_patd, true_ly in zip(
-                detector_points, true_detector_responses, patd_iter, ly_iter
-            ):
-                # Skip if response is zero and skip_zero_response is True
-                if skip_zero_response and true_response == 0.0:
-                    continue
-
+            if use_patd and patd_precomputed_obs is not None:
+                # Fast batched path: single network forward pass for all detectors.
                 with torch.no_grad():
-                    if use_patd:
-                        # Pass the pre-computed true patd_result so the fixed observation
-                        # (photon times from the true event) is reused for every hypothesis.
-                        llr_result = llrnet.evaluate_patd_likelihood(
-                            point=det_point,
-                            event_data=modified_event,
-                            signal_surrogate_func=signal_surrogate_func,
-                            event_labels=event_labels,
-                            use_rich_features=use_rich_features,
-                            patd_result=true_patd,
-                        )
-                        llr_sum += llr_result['joint_log_likelihood']
-                    elif use_rich_features:
-                        # Rich features: fixed true light yield, varied hypothesis params.
-                        features = llrnet.prepare_features_charge(
-                            det_point, modified_event, true_ly
-                        )
-                        llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
-                    else:
-                        # Standard mode: create features with modified parameters but TRUE detector response
-                        features = llrnet.prepare_data_from_raw(
-                            point=det_point,
-                            event_data=modified_event,
-                            surrogate_func=signal_surrogate_func,
-                            signal_event_data=true_event,
-                            event_labels=event_labels,
-                            noise_scale=0.0,
-                        )
-                        llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                    llr_sum = llrnet.evaluate_patd_likelihood_batched_hypothesis(
+                        modified_event, patd_precomputed_obs
+                    )
+            else:
+                patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
+                ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
+                for det_point, true_response, true_patd, true_ly in zip(
+                    detector_points, true_detector_responses, patd_iter, ly_iter
+                ):
+                    if skip_zero_response and true_response == 0.0:
+                        continue
+                    with torch.no_grad():
+                        if use_patd:
+                            llr_result = llrnet.evaluate_patd_likelihood(
+                                point=det_point,
+                                event_data=modified_event,
+                                signal_surrogate_func=signal_surrogate_func,
+                                event_labels=event_labels,
+                                use_rich_features=use_rich_features,
+                                patd_result=true_patd,
+                            )
+                            llr_sum += llr_result['joint_log_likelihood']
+                        elif use_rich_features:
+                            features = llrnet.prepare_features_charge(
+                                det_point, modified_event, true_ly
+                            )
+                            llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                        else:
+                            features = llrnet.prepare_data_from_raw(
+                                point=det_point,
+                                event_data=modified_event,
+                                surrogate_func=signal_surrogate_func,
+                                signal_event_data=true_event,
+                                event_labels=event_labels,
+                                noise_scale=0.0,
+                            )
+                            llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
 
             # Store raw NLL (will normalize later)
             nll = -llr_sum
@@ -7227,45 +7243,45 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                 llr_sum = 0.0
                 filtered_true_event = {k: v for k, v in true_event.items() if k in event_labels}
 
-                patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
-                ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
-                for det_point, true_response, true_patd, true_ly in zip(
-                    detector_points, true_detector_responses, patd_iter, ly_iter
-                ):
-                    # Skip if response is zero and skip_zero_response is True
-                    if skip_zero_response and true_response == 0.0:
-                        continue
-
+                if use_patd and patd_precomputed_obs is not None:
                     with torch.no_grad():
-                        if use_patd:
-                            # Pass the pre-computed true patd_result so the fixed observation
-                            # (photon times from the true event) is reused for every hypothesis.
-                            llr_result = llrnet.evaluate_patd_likelihood(
-                                point=det_point,
-                                event_data=modified_event,
-                                signal_surrogate_func=signal_surrogate_func,
-                                event_labels=event_labels,
-                                use_rich_features=use_rich_features,
-                                patd_result=true_patd,
-                            )
-                            llr_sum += llr_result['joint_log_likelihood']
-                        elif use_rich_features:
-                            # Rich features: fixed true light yield, varied hypothesis params.
-                            features = llrnet.prepare_features_charge(
-                                det_point, modified_event, true_ly
-                            )
-                            llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
-                        else:
-                            # Standard mode: create features with TRUE detector response
-                            features = llrnet.prepare_data_from_raw(
-                                point=det_point,
-                                event_data=modified_event,
-                                surrogate_func=signal_surrogate_func,
-                                signal_event_data=filtered_true_event,
-                                event_labels=event_labels,
-                                noise_scale=0.0,
-                            )
-                            llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                        llr_sum = llrnet.evaluate_patd_likelihood_batched_hypothesis(
+                            modified_event, patd_precomputed_obs
+                        )
+                else:
+                    patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
+                    ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
+                    for det_point, true_response, true_patd, true_ly in zip(
+                        detector_points, true_detector_responses, patd_iter, ly_iter
+                    ):
+                        if skip_zero_response and true_response == 0.0:
+                            continue
+                        with torch.no_grad():
+                            if use_patd:
+                                llr_result = llrnet.evaluate_patd_likelihood(
+                                    point=det_point,
+                                    event_data=modified_event,
+                                    signal_surrogate_func=signal_surrogate_func,
+                                    event_labels=event_labels,
+                                    use_rich_features=use_rich_features,
+                                    patd_result=true_patd,
+                                )
+                                llr_sum += llr_result['joint_log_likelihood']
+                            elif use_rich_features:
+                                features = llrnet.prepare_features_charge(
+                                    det_point, modified_event, true_ly
+                                )
+                                llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
+                            else:
+                                features = llrnet.prepare_data_from_raw(
+                                    point=det_point,
+                                    event_data=modified_event,
+                                    surrogate_func=signal_surrogate_func,
+                                    signal_event_data=filtered_true_event,
+                                    event_labels=event_labels,
+                                    noise_scale=0.0,
+                                )
+                                llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
                 
                 # Store raw NLL (will normalize later)
                 nll_grid[i, j] = -llr_sum

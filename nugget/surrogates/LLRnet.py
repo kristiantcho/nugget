@@ -1871,6 +1871,159 @@ class LLRnet(Surrogate):
             'individual_llrs': individual_llrs,
         }
     
+    def precompute_patd_observations(self, detector_points, patd_results):
+        """
+        Pre-compute the fixed (observation-side) quantities from PATD results for all
+        detector points. Returns a list of dicts, one per detector, containing:
+          - 't_scaled'   : (N_hits,) log-sign scaled hit times — fixed, does not vary with θ
+          - 'det_normed' : (3,) normalised detector position — fixed
+          - 'num_photons': int
+          - 'skip'       : bool, True if this detector should be skipped (zero photons)
+
+        These can be passed to evaluate_patd_likelihood_batched_hypothesis to avoid
+        recomputing t_scaled for every hypothesis in the NLL landscape grid.
+
+        Parameters
+        ----------
+        detector_points : list of torch.Tensor, each (3,)
+        patd_results    : list of dicts (one per detector, as returned by the surrogate)
+
+        Returns
+        -------
+        list of dicts
+        """
+        norm = self._pos_norm_divisor()
+        precomputed = []
+        for det_point, patd in zip(detector_points, patd_results):
+            if isinstance(det_point, np.ndarray):
+                det_point = torch.tensor(det_point, device=self.device, dtype=torch.float32)
+            else:
+                det_point = det_point.float().to(self.device)
+            det_point = det_point.squeeze()
+
+            num_photons = patd.get('num_photons', 0)
+            if isinstance(num_photons, torch.Tensor):
+                num_photons = int(num_photons.item())
+
+            if num_photons == 0:
+                precomputed.append({'skip': True, 'num_photons': 0})
+                continue
+
+            hit_times = patd['hit_times'].float().to(self.device)
+            t_scaled = torch.where(
+                hit_times < 0,
+                -torch.log10(-hit_times + 1e-4) / 4.0,
+                torch.log10(hit_times + 1e-4) / 4.0,
+            )  # (N_hits,)
+
+            precomputed.append({
+                'skip': False,
+                'det_normed': (det_point / norm).detach(),  # (3,)
+                't_scaled': t_scaled.detach(),               # (N_hits,)
+                'num_photons': num_photons,
+                'det_point': det_point,
+                'patd': patd,
+            })
+        return precomputed
+
+    def evaluate_patd_likelihood_batched_hypothesis(
+        self, hypothesis_event, precomputed_obs, skip_zero_response=True
+    ):
+        """
+        Evaluate the joint log-LLR summed across all detector points for one hypothesis,
+        using pre-computed observation features from precompute_patd_observations.
+
+        All active detector points are processed in a single batched network forward pass,
+        making this much faster than calling evaluate_patd_likelihood per detector.
+
+        Parameters
+        ----------
+        hypothesis_event : dict
+            The hypothesis parameters (position, energy, direction).
+        precomputed_obs  : list of dicts
+            Output of precompute_patd_observations.
+
+        Returns
+        -------
+        float : sum of joint log-LLRs across all detectors
+        """
+        norm = self._pos_norm_divisor()
+
+        # Build hypothesis features once (scalar quantities shared across all detectors)
+        vert = hypothesis_event['position']
+        if isinstance(vert, np.ndarray):
+            vert = torch.tensor(vert, device=self.device, dtype=torch.float32)
+        else:
+            vert = vert.float().to(self.device)
+        vert = vert.squeeze() / norm  # (3,)
+
+        direction = hypothesis_event['direction']
+        if isinstance(direction, np.ndarray):
+            direction = torch.tensor(direction, device=self.device, dtype=torch.float32)
+        else:
+            direction = direction.float().to(self.device)
+        direction = direction.squeeze()  # (3,)
+        dir_norm_val = torch.norm(direction).clamp(min=1e-8)
+
+        energy = hypothesis_event['energy']
+        if isinstance(energy, np.ndarray):
+            energy = torch.tensor(energy, device=self.device, dtype=torch.float32)
+        else:
+            energy = energy.float().to(self.device)
+        log_energy = torch.log10(energy.squeeze() + 1e-10) / 8.0  # scalar
+
+        # Concatenate all photon feature rows across all active detectors
+        all_features = []
+        photons_per_detector = []
+
+        for obs in precomputed_obs:
+            if obs['skip']:
+                photons_per_detector.append(0)
+                continue
+            det = obs['det_normed']                  # (3,) — pre-computed constant
+            t_scaled = obs['t_scaled']               # (N_hits,) — pre-computed constant
+            N = obs['num_photons']
+
+            rel = det - vert
+            vert_dist = torch.norm(rel)
+            cos_angle = torch.dot(direction, rel) / (dir_norm_val * vert_dist.clamp(min=1e-8))
+
+            ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), vert_dist.unsqueeze(0), cos_angle.unsqueeze(0)]
+            if self.add_distance_from_beam:
+                vert_unnorm = vert * norm
+                _, dist_perp = self.compute_distance_from_beam(
+                    det * norm,
+                    vert_unnorm.unsqueeze(0),
+                    direction.unsqueeze(0),
+                )
+                ds = self.domain_size
+                half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
+                ctx_parts.append((dist_perp.squeeze() / half).unsqueeze(0))
+
+            ctx = torch.cat([p.reshape(-1) for p in ctx_parts])  # (12 or 13,)
+            ctx_rep = ctx.unsqueeze(0).expand(N, -1)             # (N, 12/13)
+            feat = torch.cat([ctx_rep, t_scaled.unsqueeze(1)], dim=1)  # (N, 13/14)
+            all_features.append(feat)
+            photons_per_detector.append(N)
+
+        if not all_features:
+            return 0.0
+
+        # Single batched forward pass for all photons across all detectors
+        all_feat_cat = torch.cat(all_features, dim=0)  # (total_hits, feat_dim)
+        with torch.no_grad():
+            all_llrs = self.predict_log_likelihood_ratio(all_feat_cat)  # (total_hits,)
+
+        # Split and sum per detector
+        total_llr = 0.0
+        idx = 0
+        for N in photons_per_detector:
+            if N > 0:
+                total_llr += all_llrs[idx:idx + N].sum().item()
+                idx += N
+
+        return total_llr
+
     def predict_log_likelihood_ratio(self, features, epsilon=1e-7):
         """
         Compute the Log-Likelihood Ratio using the sigmoid trick.
