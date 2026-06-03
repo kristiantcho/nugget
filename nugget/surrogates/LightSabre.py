@@ -684,6 +684,8 @@ class LightSabrePATD(LightSabre):
             d_geom = torch.full((num_samples,), d_vertex.clamp(min=1e-6).item(), device=self.device)
             t_geom_min = d_vertex / (c / self.refractive_index)
         elif use_perpendicular_distance_only:
+            if t_foot < 0:
+                return self._empty_patd_dict(expected_N)
             s = torch.full((num_samples,), t_foot.item(), device=self.device)
             d_geom = torch.full((num_samples,), foot_length.clamp(min=1e-6).item(), device=self.device)
             t_geom_min = foot_length / (c / self.refractive_index) + t_foot / v_mu
