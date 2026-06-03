@@ -51,7 +51,6 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     log_scale_ly=True,
     norm_pos=True,
     log_scale_energy=True,
-    add_distance_from_beam=True,
     reduce_lr_on_plateau=True,
     lr_scheduler_patience=30,
     lr_scheduler_factor=0.5,
@@ -61,23 +60,25 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     num_photons_per_sample=10,
     input_charge=False,
     rel_time=False,
-    input_delta_time=False,  
+    input_delta_time=False, 
+    use_rich_features=True,
+    add_distance_from_beam=True, 
 )
 
 train_dataloader = llr_net.create_patd_dataloader(
     signal_sampler=signal_sampler,
     signal_surrogate_func=light_yield_surrogate,
-    num_samples_per_epoch=1024,
+    num_samples_per_epoch=2048,
     batch_size=32,
     num_workers=4,
     shuffle_photons=True,
-    use_rich_features=True,  # use prepare_features_patd: 14-feature geometry-rich vectors
+      
 )
 
-# input_dim=14: det(3) + vertex(3) + dir(3) + log_E(1) + vert_dist(1) + cos_angle(1) + t_geom_min(1) + t_hit(1)
+# input_dim=14: det(3) + vertex(3) + dir(3) + log_E(1) + vert_dist(1) + cos_angle(1) + dist_perp(1) + t_hit(1)
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
-    epochs=500,
+    epochs=1000,
     input_dim=14,
     grad_clip=None,
     save_every_n_epochs=20,

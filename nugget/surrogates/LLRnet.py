@@ -790,7 +790,10 @@ class LLRnet(Surrogate):
             track_pos = vert * norm  # Convert back to original scale for distance calculation
             track_dir = direction  # Already a unit vector
             _, dist_perp = self.compute_distance_from_beam(point, track_pos, track_dir)
-            event_features = torch.cat([event_features, dist_perp.squeeze() / (self.domain_size/2)], dim=0)  # Add normalized perpendicular distance
+            event_features = torch.cat(
+                [event_features, dist_perp.reshape(1) / (self.domain_size / 2)],
+                dim=0,
+            )  # Add normalized perpendicular distance
         # --- per-photon hit times: log-sign scaled ---
         hit_times = patd_result['hit_times'].float().to(self.device)  # (N,)
         t_scaled = torch.where(
