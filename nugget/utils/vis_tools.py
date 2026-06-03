@@ -6700,6 +6700,10 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     if true_event is None:
         true_event = signal_sampler.sample_events(1)[0]
 
+    # use_rich_features is now stored on the model — read from it,
+    # falling back to the explicit parameter for backward compatibility.
+    use_rich_features = getattr(llrnet, 'use_rich_features', use_rich_features)
+
     progress_print_every_n_points = (
         int(progress_print_every_n_points)
         if progress_print_every_n_points is not None

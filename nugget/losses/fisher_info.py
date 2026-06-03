@@ -193,7 +193,9 @@ class WeightedFisherInfoLoss(LossFunction):
 
     def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False, skip_zero_response=True, verbose=False, event_batch_size=1, grad_chunk_size=10, jacrev_chunk_size=10000, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, t_offset_ns=100.0, t_max_ns=10000.0):
         n_strings = len(string_xy)
-        # n_params = len(self.fisher_info_params)
+        # use_rich_features is now stored on the model — read from it if available.
+        if llr_net is not None and not use_rich_features:
+            use_rich_features = bool(getattr(llr_net, 'use_rich_features', False))
         param_dims = []
         param_names_expanded = []
         for param_name in self.fisher_info_params:
