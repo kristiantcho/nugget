@@ -190,7 +190,7 @@ class LLRnet(Surrogate):
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True,
                  add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False,
-                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False):
+                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, **kwargs):
         """
         Initialize the LLRnet surrogate model.
         
@@ -278,6 +278,7 @@ class LLRnet(Surrogate):
         self.input_charge = input_charge  # If using PATD, we will add number of photons as an input feature
         self.norm_pos = norm_pos
         self.log_scale_energy = log_scale_energy
+        self.use_rich_features = use_rich_features
         self.reduce_lr_on_plateau = reduce_lr_on_plateau
         self.lr_scheduler_patience = lr_scheduler_patience
         self.lr_scheduler_factor = lr_scheduler_factor
@@ -785,7 +786,11 @@ class LLRnet(Surrogate):
             cos_angle,
             # t_geom_min_scalar,
         ])  # (13,)
-
+        if self.add_distance_from_beam:
+            track_pos = vert * norm  # Convert back to original scale for distance calculation
+            track_dir = direction  # Already a unit vector
+            _, dist_perp = self.compute_distance_from_beam(point, track_pos, track_dir)
+            event_features = torch.cat([event_features, dist_perp.squeeze() / (self.domain_size/2)], dim=0)  # Add normalized perpendicular distance
         # --- per-photon hit times: log-sign scaled ---
         hit_times = patd_result['hit_times'].float().to(self.device)  # (N,)
         t_scaled = torch.where(
@@ -1776,7 +1781,7 @@ class LLRnet(Surrogate):
 
     def evaluate_patd_likelihood(self, point, event_data, signal_surrogate_func,
                                  event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                                 use_rich_features=False, patd_result=None):
+                                patd_result=None, **kwargs):
         """
         Evaluate joint log-likelihood for all photon hits at a detector position.
 
@@ -1822,7 +1827,7 @@ class LLRnet(Surrogate):
         else:
             point_t = point.float().to(self.device)
 
-        if use_rich_features:
+        if self.use_rich_features:
             if patd_result is None:
                 with torch.no_grad():
                     patd_result = signal_surrogate_func(opt_point=point_t, event_params=event_data)
@@ -2044,6 +2049,20 @@ class LLRnet(Surrogate):
             'frequency_scales': self.frequency_scales,
             'num_frequencies_per_branch': self.num_frequencies_per_branch,
             'shared_mlp': self.shared_mlp,
+            'signal_noise_scale': self.signal_noise_scale,
+            'background_noise_scale': self.background_noise_scale,
+            'add_relative_pos': self.add_relative_pos,
+            'use_patd': self.use_patd,
+            'use_rich_features': self.use_rich_features,
+            'log_scale_ly': self.log_scale_ly,
+            'rel_time': self.rel_time,
+            'input_charge': self.input_charge,
+            'norm_pos': self.norm_pos,
+            'log_scale_energy': self.log_scale_energy,
+            'input_delta_time': self.input_delta_time,
+            'min_photons': self.min_photons,
+            'num_photons_per_sample': self.num_photons_per_sample,
+            'add_distance_from_beam': self.add_distance_from_beam,
             'reduce_lr_on_plateau': self.reduce_lr_on_plateau,
             'lr_scheduler_patience': self.lr_scheduler_patience,
             'lr_scheduler_factor': self.lr_scheduler_factor,
@@ -2092,6 +2111,21 @@ class LLRnet(Surrogate):
         self.lr_scheduler_patience = checkpoint.get('lr_scheduler_patience', 10)
         self.lr_scheduler_factor = checkpoint.get('lr_scheduler_factor', 0.5)
         self.lr_scheduler_min_lr = checkpoint.get('lr_scheduler_min_lr', 1e-6)
+        
+        self.signal_noise_scale = checkpoint.get('signal_noise_scale', self.signal_noise_scale)
+        self.background_noise_scale = checkpoint.get('background_noise_scale', self.background_noise_scale)
+        self.add_relative_pos = checkpoint.get('add_relative_pos', self.add_relative_pos)
+        self.use_patd = checkpoint.get('use_patd', self.use_patd)
+        self.use_rich_features = checkpoint.get('use_rich_features', self.use_rich_features)
+        self.log_scale_ly = checkpoint.get('log_scale_ly', self.log_scale_ly)
+        self.rel_time = checkpoint.get('rel_time', self.rel_time)
+        self.input_charge = checkpoint.get('input_charge', self.input_charge)
+        self.norm_pos = checkpoint.get('norm_pos', self.norm_pos)
+        self.log_scale_energy = checkpoint.get('log_scale_energy', self.log_scale_energy)
+        self.input_delta_time = checkpoint.get('input_delta_time', self.input_delta_time)
+        self.min_photons = checkpoint.get('min_photons', self.min_photons)
+        self.num_photons_per_sample = checkpoint.get('num_photons_per_sample', self.num_photons_per_sample)
+        self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
         
         # Determine if this is old format (single MLP) or new format (parallel branches)
         is_old_format = 'model_state_dict' in checkpoint
@@ -2443,7 +2477,7 @@ class LLRnet(Surrogate):
             self.samples_per_event = kwargs.get('samples_per_event', 1)
             self.vary_cylinder = kwargs.get('vary_cylinder', False)
             self.cylinder_sampler = kwargs.get('cylinder_sampler', None)
-            self.use_rich_features = kwargs.get('use_rich_features', False)
+            self.use_rich_features = llrnet_instance.use_rich_features if hasattr(llrnet_instance, 'use_rich_features') else kwargs.get('use_rich_features', False)
             self.domain_size = llrnet_instance.domain_size
             # Resampling configuration: discard near-zero light yield pairs (uninformative)
             # min_light_yield: if provided, pairs where BOTH matched & mismatched light yields have
@@ -2768,7 +2802,7 @@ class LLRnet(Surrogate):
             self.shuffle_photons = shuffle_photons
             self.vary_cylinder = kwargs.get('vary_cylinder', False)
             self.cylinder_sampler = kwargs.get('cylinder_sampler', None)
-            self.use_rich_features = kwargs.get('use_rich_features', False)
+            self.use_rich_features = self.llrnet.use_rich_features if hasattr(self.llrnet, 'use_rich_features') else kwargs.get('use_rich_features', False)
             self.domain_size = llrnet_instance.domain_size
         
         def _generate_event_with_photons(self, detector_pos=None):
@@ -3103,7 +3137,7 @@ class LLRnet(Surrogate):
                               num_samples_per_epoch=1000, batch_size=32,
                               num_workers=0,
                               event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                              shuffle_photons=False, use_rich_features=False, other_kwargs={}):
+                              shuffle_photons=False, other_kwargs={}):
         """
         Create a DataLoader for PATD training using IterableDataset.
         
@@ -3226,7 +3260,7 @@ class LLRnet(Surrogate):
             min_photons=self.min_photons,
             num_photons_per_sample=self.num_photons_per_sample,
             shuffle_photons=shuffle_photons,
-            use_rich_features=use_rich_features,
+            use_rich_features=self.use_rich_features,
             **other_kwargs
         )
         
@@ -3340,8 +3374,7 @@ class LLRnet(Surrogate):
     def create_signal_only_dataloader(self, signal_sampler, signal_surrogate_func,
                                      num_samples_per_epoch=1000, batch_size=32,
                                      shuffle=True, num_workers=0, output_true_light_yield=False,
-                                     event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                                     use_rich_features=False, **other_kwargs):
+                                     event_labels=['position', 'energy', 'zenith', 'azimuth'], **other_kwargs):
         """
         Create a DataLoader for signal-only training with matched/mismatched light yields.
         
@@ -3401,7 +3434,7 @@ class LLRnet(Surrogate):
             num_samples_per_epoch=num_samples_per_epoch,
             event_labels=event_labels,
             output_true_light_yield=output_true_light_yield,
-            use_rich_features=use_rich_features,
+            use_rich_features=self.use_rich_features,
             **other_kwargs
         )
         

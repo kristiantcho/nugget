@@ -15,7 +15,7 @@ light_yield_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
         domain_size=2500,
         use_max_energy_dist=True,
         use_perpendicular_distance_only=True,
-        particle_mode='cascade',
+        particle_mode='track',
         ).light_yield_surrogate
 
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
@@ -51,17 +51,17 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     log_scale_ly=True,
     norm_pos=True,
     log_scale_energy=True,
-    add_distance_from_beam=False,
+    add_distance_from_beam=True,
     reduce_lr_on_plateau=True,
     lr_scheduler_patience=30,
     lr_scheduler_factor=0.5,
     lr_scheduler_min_lr=1e-6,
     use_patd=True,
     min_photons=1,
-    num_photons_per_sample=64,
+    num_photons_per_sample=10,
     input_charge=False,
     rel_time=False,
-    input_delta_time=False,  # residual time is baked into prepare_features_patd as t_geom_min
+    input_delta_time=False,  
 )
 
 train_dataloader = llr_net.create_patd_dataloader(
@@ -78,11 +78,11 @@ train_dataloader = llr_net.create_patd_dataloader(
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     epochs=500,
-    input_dim=13,
+    input_dim=14,
     grad_clip=None,
     save_every_n_epochs=20,
-    checkpoint_path='best_cascade_hit_llr_model_v1.pt',
+    checkpoint_path='best_hit_llr_model_v5.pt',
 )
 
 # llr_net.save_model('best_cascade_hit_llr_model_v4')
-pickle.dump(history, open('cascade_hit_llr_v1_training_history.pkl', 'wb'))
+pickle.dump(history, open('hit_llr_v5_training_history.pkl', 'wb'))

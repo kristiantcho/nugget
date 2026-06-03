@@ -908,9 +908,12 @@ class LightSabrePATD(LightSabre):
         t_residuals_fixed = t_residuals_fixed.float().to(self.device)
 
         to_detector = opt_point - track_pos
-        cross = torch.linalg.cross(to_detector, track_dir)
-        foot_length = cross.norm() / track_dir.norm().clamp_min(1e-12)
-        d_geom = foot_length.clamp(min=1e-6).expand(t_residuals_fixed.shape[0])
+        if self.particle_mode == 'cascade':
+            d_geom = to_detector.norm().clamp_min(1e-6).expand(t_residuals_fixed.shape[0])
+        else:
+            cross = torch.linalg.cross(to_detector, track_dir)
+            foot_length = cross.norm() / track_dir.norm().clamp_min(1e-12)
+            d_geom = foot_length.clamp(min=1e-6).expand(t_residuals_fixed.shape[0])
 
         cpandel_params = self.kwargs.get('cpandel_params', {})
         cpandel = CPandel(
