@@ -796,6 +796,9 @@ class LLRnet(Surrogate):
             )  # Add normalized perpendicular distance
         # --- per-photon hit times: log-sign scaled ---
         hit_times = patd_result['hit_times'].float().to(self.device)  # (N,)
+        if self.rel_time:
+            # Convert to relative times by subtracting the minimum hit time
+            hit_times = hit_times - patd_result['t_geom_min'].float().to(self.device)
         t_scaled = torch.where(
             hit_times < 0,
             -torch.log10(-hit_times + 1e-4) / 4.0,

@@ -37,6 +37,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     add_distance_from_beam=False,  # Whether to include distance from beam as a feature
     reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
     lr_scheduler_patience=35,  # Patience for LR scheduler
+    use_rich_features=True,  # Whether to use rich features from the surrogate model
     )
 
 train_dataloader = llr_net.create_signal_only_dataloader(
@@ -51,7 +52,7 @@ train_dataloader = llr_net.create_signal_only_dataloader(
     min_light_yield=0.1,         
     max_resample_attempts=30,
     vary_cylinder=False,
-    use_rich_features=True
+    
     # cylinder_sampler=nugget.samplers.cyl_sampler.CylinderSampler
     )
 

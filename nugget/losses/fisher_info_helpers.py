@@ -552,6 +552,14 @@ def _build_rich_features_from_cached_obs(
             for b in range(B):
                 raw = cached_obs[l][b]
                 hit_times = raw['hit_times'].float().to(device)
+                if bool(getattr(llr_net, 'rel_time', False)):
+                    t_geom_min = raw.get('t_geom_min', None)
+                    if t_geom_min is not None:
+                        if not isinstance(t_geom_min, torch.Tensor):
+                            t_geom_min = torch.tensor(t_geom_min, device=device, dtype=hit_times.dtype)
+                        else:
+                            t_geom_min = t_geom_min.float().to(device)
+                        hit_times = hit_times - t_geom_min
                 t_scaled = torch.where(
                     hit_times < 0,
                     -torch.log10(-hit_times + 1e-4) / 4.0,

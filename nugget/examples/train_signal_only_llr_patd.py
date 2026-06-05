@@ -12,7 +12,7 @@ light_yield_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
         device=device,
         use_poisson=True,
         num_track_points=1000,
-        domain_size=2500,
+        domain_size=2000,
         use_max_energy_dist=True,
         use_perpendicular_distance_only=True,
         particle_mode='track',
@@ -21,7 +21,7 @@ light_yield_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
         device=device,
         event_type='signal',
-        domain_size=2500,
+        domain_size=2000,
         E_min=1e2,
         E_max=1e8,
         energy_dist='log_uniform',
@@ -33,14 +33,14 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
 
 llr_net = nugget.surrogates.LLRnet.LLRnet(
     device=device,
-    domain_size=2500,
+    domain_size=2000,
     dim=3,
     hidden_dims=[64, 64, 64, 64, 64, 64],
     use_fourier_features=False,
     num_parallel_branches=1,
     learnable_frequencies=False,
-    dropout_rate=0.05,
-    learning_rate=3e-4,
+    dropout_rate=0,
+    learning_rate=1e-4,
     shared_mlp=False,
     use_residual_connections=True,
     signal_noise_scale=0,
@@ -59,7 +59,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     min_photons=1,
     num_photons_per_sample=10,
     input_charge=False,
-    rel_time=False,
+    rel_time=True,
     input_delta_time=False, 
     use_rich_features=True,
     add_distance_from_beam=True, 
@@ -69,7 +69,7 @@ train_dataloader = llr_net.create_patd_dataloader(
     signal_sampler=signal_sampler,
     signal_surrogate_func=light_yield_surrogate,
     num_samples_per_epoch=2048,
-    batch_size=32,
+    batch_size=16,
     num_workers=4,
     shuffle_photons=True,
       
@@ -82,8 +82,8 @@ history = llr_net.train_with_dataloader(
     input_dim=14,
     grad_clip=None,
     save_every_n_epochs=20,
-    checkpoint_path='best_hit_llr_model_v5.pt',
+    checkpoint_path='best_hit_llr_model_v7.pt',
 )
 
 # llr_net.save_model('best_cascade_hit_llr_model_v4')
-pickle.dump(history, open('hit_llr_v5_training_history.pkl', 'wb'))
+pickle.dump(history, open('hit_llr_v7_training_history.pkl', 'wb'))
