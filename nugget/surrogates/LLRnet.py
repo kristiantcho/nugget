@@ -2912,10 +2912,10 @@ class LLRnet(Surrogate):
         
         def __init__(self, signal_sampler, signal_surrogate_func, llrnet_instance,
                      num_samples_per_epoch=1000, event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                     min_photons=1, num_photons_per_sample=None, shuffle_photons=False, **kwargs):
+                     min_photons=1, num_photons_per_sample=None, shuffle_photons=False, manual_photons=False, **kwargs):
             """
             Initialize PATD iterable dataset.
-            
+
             Parameters:
             -----------
             signal_sampler : Sampler
@@ -2937,6 +2937,14 @@ class LLRnet(Surrogate):
             shuffle_photons : bool
                 If False (default): Returns all photons from one event together (event mode)
                 If True: Returns individual photons one at a time, shuffled across batches (photon mode)
+            manual_photons : bool
+                If True, passes num_photons_per_sample as a fixed photon count (input_photons) to
+                the surrogate, bypassing the physics-based light yield calculation. Every
+                detector/event pair will receive exactly num_photons_per_sample photons, except
+                when the detector lies behind the interaction vertex for track events (in which
+                case the surrogate returns 0 photons and the pair is skipped). min_photons is
+                still respected as the acceptance threshold.
+                If False (default), uses normal surrogate behaviour (max_photons cap).
             **kwargs:
                 vary_cylinder : bool, optional
                     If True, randomly vary cylinder dimensions for each pair
@@ -2959,29 +2967,51 @@ class LLRnet(Surrogate):
             self.min_photons = min_photons
             self.num_photons_per_sample = num_photons_per_sample
             self.shuffle_photons = shuffle_photons
+            self.manual_photons = manual_photons
             self.vary_cylinder = kwargs.get('vary_cylinder', False)
             self.cylinder_sampler = kwargs.get('cylinder_sampler', None)
             self.use_rich_features = self.llrnet.use_rich_features if hasattr(self.llrnet, 'use_rich_features') else kwargs.get('use_rich_features', False)
             self.domain_size = llrnet_instance.domain_size
         
         def _generate_event_with_photons(self, detector_pos=None):
-            """Generate an event that produces at least min_photons hits."""
+            """Generate an event that produces at least min_photons hits.
+
+            In manual_photons mode the surrogate receives a fixed photon count via
+            input_photons rather than computing the physics-based light yield.  The
+            detector-behind-vertex check is still applied by the surrogate (it returns
+            0 photons for such configurations), in which case this method returns None
+            to signal that the pair should be skipped.
+            """
             while True:
                 # Sample event and detector position
                 event_params = self.signal_sampler.sample_events(1)[0]
                 if detector_pos is None:
                     detector_pos = self.signal_sampler.sample_detector_points(1)
-                
-                # Get PATD - pass num_photons_per_sample to limit photons if specified
-                patd_result = self.signal_surrogate_func(
-                    opt_point=detector_pos, 
-                    event_params=event_params,
-                    max_photons=self.num_photons_per_sample
-                )
-                num_photons = patd_result['num_photons']
-                
-                if num_photons >= self.min_photons:
+
+                if self.manual_photons:
+                    # Pass a fixed photon count; the surrogate still performs the
+                    # behind-vertex check and returns 0 photons when appropriate.
+                    patd_result = self.signal_surrogate_func(
+                        opt_point=detector_pos,
+                        event_params=event_params,
+                        input_photons=self.num_photons_per_sample,
+                    )
+                    num_photons = patd_result['num_photons']
+                    # Detector is behind the vertex — signal caller to skip this pair.
+                    if num_photons == 0:
+                        return None, detector_pos, patd_result
                     return event_params, detector_pos, patd_result
+                else:
+                    # Get PATD - pass num_photons_per_sample to limit photons if specified
+                    patd_result = self.signal_surrogate_func(
+                        opt_point=detector_pos,
+                        event_params=event_params,
+                        max_photons=self.num_photons_per_sample,
+                    )
+                    num_photons = patd_result['num_photons']
+
+                    if num_photons >= self.min_photons:
+                        return event_params, detector_pos, patd_result
                 
         def _generate_pair_data(self, pair_idx):
             """
@@ -3007,10 +3037,15 @@ class LLRnet(Surrogate):
             
             # Sample detector point (shared for this pair)
             detector_point = self.signal_sampler.sample_detector_points(1).squeeze()
-            
+
             # Generate MATCHED sample (hypothesis and observation from same event)
             event_params_matched, _, patd_result_matched = self._generate_event_with_photons(detector_point)
-            
+
+            # In manual_photons mode the detector may lie behind the vertex, in which
+            # case _generate_event_with_photons returns event_params=None.  Skip the pair.
+            if event_params_matched is None:
+                return None
+
             # Create feature vectors for all photon hits
             if self.use_rich_features:
                 matched_features_batch, _ = self.llrnet.prepare_features_patd(
@@ -3071,9 +3106,9 @@ class LLRnet(Surrogate):
             # Create labels for all mismatched photons (all are class 0)
             num_mismatched_photons = mismatched_features_batch.shape[0]
             mismatched_labels = torch.zeros(num_mismatched_photons, dtype=torch.float32, device=self.llrnet.device)
-            
+
             # Clone and detach to ensure clean tensors without computational graph
-            return ((matched_features_batch.clone().detach(), matched_labels), 
+            return ((matched_features_batch.clone().detach(), matched_labels),
                     (mismatched_features_batch.clone().detach(), mismatched_labels))
         
         def __iter__(self):
@@ -3113,10 +3148,14 @@ class LLRnet(Surrogate):
                     # Photon mode: build separate pools for matched and mismatched photons
                     matched_pool = []
                     mismatched_pool = []
-                    
+
                     for pair_idx in range(pairs_per_worker):
                         pair_data = self._generate_pair_data(pair_idx)
-                        
+
+                        # None means the detector was behind the vertex (manual_photons mode)
+                        if pair_data is None:
+                            continue
+
                         # Extract matched photons
                         matched_features_batch, matched_labels = pair_data[0]
                         for i in range(matched_features_batch.shape[0]):
@@ -3124,7 +3163,7 @@ class LLRnet(Surrogate):
                                 matched_features_batch[i].clone().detach(),
                                 matched_labels[i]
                             ))
-                        
+
                         # Extract mismatched photons
                         mismatched_features_batch, mismatched_labels = pair_data[1]
                         for i in range(mismatched_features_batch.shape[0]):
@@ -3151,10 +3190,14 @@ class LLRnet(Surrogate):
                     # Event mode: yield all photons from one event together
                     for pair_idx in range(pairs_per_worker):
                         pair_data = self._generate_pair_data(pair_idx)
-                        
+
+                        # None means the detector was behind the vertex (manual_photons mode)
+                        if pair_data is None:
+                            continue
+
                         # Yield matched event (all photons together)
                         yield pair_data[0]
-                        
+
                         # Yield mismatched event (all photons together)
                         yield pair_data[1]
     
@@ -3296,7 +3339,7 @@ class LLRnet(Surrogate):
                               num_samples_per_epoch=1000, batch_size=32,
                               num_workers=0,
                               event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                              shuffle_photons=False, other_kwargs={}):
+                              shuffle_photons=False, manual_photons=False, other_kwargs={}):
         """
         Create a DataLoader for PATD training using IterableDataset.
         
@@ -3327,7 +3370,10 @@ class LLRnet(Surrogate):
         shuffle_photons : bool
             If False (default): Event mode - returns all photons from one event together
             If True: Photon mode - returns individual photons shuffled across batches
-            
+        manual_photons : bool
+            If True, forces exactly num_photons_per_sample photons per detector/event pair
+            by passing it as input_photons to the surrogate. Behind-vertex pairs are skipped.
+
         Returns:
         --------
         DataLoader
@@ -3419,6 +3465,7 @@ class LLRnet(Surrogate):
             min_photons=self.min_photons,
             num_photons_per_sample=self.num_photons_per_sample,
             shuffle_photons=shuffle_photons,
+            manual_photons=manual_photons,
             use_rich_features=self.use_rich_features,
             **other_kwargs
         )
