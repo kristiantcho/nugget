@@ -1407,7 +1407,7 @@ class EffectiveAreaLoss(LossFunction):
                 if perfect_trigger:
                     detector_efficiency = 1.0
                 else:
-                    sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=energy_bins[e_ind], E_max=energy_bins[e_ind + 1], cos_range=(zenith_bins[ct_ind], zenith_bins[ct_ind + 1]), 
+                    sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=10**energy_bins[e_ind], E_max=10**energy_bins[e_ind + 1], cos_range=(zenith_bins[ct_ind], zenith_bins[ct_ind + 1]),
                                                      event_type='signal', energy_dist='log_uniform', uniform_zenith_sampling=True, **cylinder_kwargs).sample_events(num_events_per_bin)
                     light_yield_per_event_per_point = torch.zeros((len(sampled_events), len(points_3d)), device=self.device)
                     for i, event_params in enumerate(sampled_events):
