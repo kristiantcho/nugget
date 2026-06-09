@@ -38,48 +38,49 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     hidden_dims=[64, 64, 64, 64, 64, 64],
     use_fourier_features=False,
     num_parallel_branches=1,
-    learnable_frequencies=False,
-    dropout_rate=0,
-    learning_rate=1e-4,
     shared_mlp=False,
     use_residual_connections=True,
-    signal_noise_scale=0,
-    background_noise_scale=0,
-    # add_relative_pos / log_scale_ly / norm_pos / log_scale_energy are unused
-    # when use_rich_features=True; prepare_features_patd handles normalisation internally.
-    add_relative_pos=False,
-    log_scale_ly=True,
-    norm_pos=True,
-    log_scale_energy=True,
+    learnable_frequencies=False,
+    dropout_rate=0,
+    
+    learning_rate=1e-4,
     reduce_lr_on_plateau=True,
     lr_scheduler_patience=30,
     lr_scheduler_factor=0.5,
     lr_scheduler_min_lr=1e-6,
+    
+    add_relative_pos=False,
+    log_scale_ly=True,
+    norm_pos=True,
+    log_scale_energy=True,
+    input_charge=False,
+    input_delta_time=False, 
+    
     use_patd=True,
     min_photons=1,
-    num_photons_per_sample=10,
-    input_charge=False,
-    rel_time=True,
-    input_delta_time=False, 
+    num_photons_per_sample=1,
+    
+    rel_time=False,
     use_rich_features=True,
     add_distance_from_beam=True, 
+    add_vertex_distance=False,
 )
 
 train_dataloader = llr_net.create_patd_dataloader(
     signal_sampler=signal_sampler,
     signal_surrogate_func=light_yield_surrogate,
-    num_samples_per_epoch=2048,
+    num_samples_per_epoch=4096,
     batch_size=16,
     num_workers=4,
     shuffle_photons=True,
+    manual_photons=True,
       
 )
 
-# input_dim=14: det(3) + vertex(3) + dir(3) + log_E(1) + vert_dist(1) + cos_angle(1) + dist_perp(1) + t_hit(1)
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
-    epochs=1000,
-    input_dim=14,
+    epochs=1500,
+    input_dim=13,
     grad_clip=None,
     save_every_n_epochs=20,
     checkpoint_path='best_hit_llr_model_v7.pt',

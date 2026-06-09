@@ -189,7 +189,7 @@ class LLRnet(Surrogate):
                  num_frequencies=64, frequency_scale=1.0, learnable_frequencies=False,
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True,
-                 add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False,
+                 add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True,
                  lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, **kwargs):
         """
         Initialize the LLRnet surrogate model.
@@ -236,6 +236,8 @@ class LLRnet(Surrogate):
         add_distance_from_beam : bool
             If True, adds perpendicular distance from detector point to beam/track as a feature.
             Requires 'position', 'zenith', and 'azimuth' in event data.
+        add_vertex_distance : bool
+            If True, adds distance from detector point to event vertex as a feature.
         log_scale_ly : bool
             If True, applies log10 scaling to light yield values
         norm_pos : bool
@@ -283,6 +285,7 @@ class LLRnet(Surrogate):
         self.lr_scheduler_patience = lr_scheduler_patience
         self.lr_scheduler_factor = lr_scheduler_factor
         self.lr_scheduler_min_lr = lr_scheduler_min_lr
+        self.add_vertex_distance = add_vertex_distance
         self.use_patd = use_patd
         self.min_photons = min_photons
         self.input_delta_time = input_delta_time
@@ -686,10 +689,9 @@ class LLRnet(Surrogate):
     
     def prepare_features_patd(self, point, event_data, patd_result):
         """
-        Build per-photon feature vectors from a pre-computed PATD surrogate result.
+        Build (rich) per-photon feature vectors from a pre-computed PATD surrogate result.
 
-        This is an alternative to prepare_data_from_raw_patd that mirrors the feature
-        engineering used in the NSF notebook (create_event_features / sample_detector_features).
+        This is an alternative to prepare_data_from_raw_patd
         It exposes richer geometric features that are strong discriminators for the
         hit-time LLR classifier:
 
@@ -697,17 +699,13 @@ class LLRnet(Surrogate):
            v_x,   v_y,   v_z,             normalised vertex position           (3)
            d_x,   d_y,   d_z,             unit direction vector                (3)
            log10(E)/8,                    log-scaled energy                    (1)
-           vert_dist,                     L2(detector - vertex) normalised     (1)
+           vert_dist,                     L2(detector - vertex) normalised     (1, optional)
            cos_angle,                     cos(direction ∠ vertex→detector)     (1)
+           beam_dist_perp,                perpendicular distance from beam     (1, optional)
            t_hit (log-sign scaled)]       per-photon arrival time              (1)
-                                                                           total = 13
+                                                                           total = 12-14
 
-        The first 12 entries are the same for every photon in the event and are
-        replicated across rows.  Only the last column varies per photon.
-
-        Normalisation uses self.domain_size via _pos_norm_divisor(), so it is
-        consistent with the rest of LLRnet regardless of detector geometry.
-
+        
         Parameters
         ----------
         point : torch.Tensor or np.ndarray
@@ -715,11 +713,11 @@ class LLRnet(Surrogate):
         event_data : dict
             Event parameters.  Must contain 'position', 'energy', 'direction'.
         patd_result : dict
-            Output of the PATD surrogate.  Must contain 'hit_times' and 'num_photons'.
+            Output of the PATD surrogate.  Must contain 'hit_times' and 'num_photons' and/or 'min_geom_time' if relative time (rel_time) is used.
 
         Returns
         -------
-        features : torch.Tensor, shape (num_photons, 13)
+        features : torch.Tensor, shape (num_photons, 13) or (num_photons, 12)
             Per-photon feature matrix, or None if num_photons == 0.
         num_photons : int
         """
@@ -776,16 +774,18 @@ class LLRnet(Surrogate):
         #     t_geom_min = t_geom_min.float().to(self.device)
         # t_geom_min_scalar = t_geom_min.squeeze().mean() / 1e5  # scalar
 
-        # --- assemble the 13 event-level context features ---
-        event_features = torch.stack([
+        # --- assemble the event-level context features ---
+        event_features = [
             det[0], det[1], det[2],
             vert[0], vert[1], vert[2],
             direction[0], direction[1], direction[2],
             log_energy,
-            vert_dist,
-            cos_angle,
-            # t_geom_min_scalar,
-        ])  # (13,)
+        ]
+        if self.add_vertex_distance:
+            event_features.append(vert_dist)
+        event_features.append(cos_angle)
+        # event_features.append(t_geom_min_scalar)
+        event_features = torch.stack(event_features)
         if self.add_distance_from_beam:
             track_pos = vert * norm  # Convert back to original scale for distance calculation
             track_dir = direction  # Already a unit vector
@@ -806,7 +806,7 @@ class LLRnet(Surrogate):
         )  # (N,)
 
         # --- replicate event features and append per-photon time ---
-        event_features_batch = event_features.unsqueeze(0).expand(num_photons, -1)  # (N, 13)
+        event_features_batch = event_features.unsqueeze(0).expand(num_photons, -1)
         features = torch.cat([event_features_batch, t_scaled.unsqueeze(1)], dim=1)  # (N, 14)
 
         return features.clone().detach(), num_photons
@@ -816,21 +816,17 @@ class LLRnet(Surrogate):
         Build a feature vector for the charge (non-PATD) LLR network from a
         pre-computed light yield value.
 
-        This is the charge analogue of prepare_features_patd.  It uses the same
-        rich geometry as the notebook's create_event_features — adding vert_dist
-        and cos_angle instead of raw relative position — and takes a pre-computed
-        light yield so that the observation can be held fixed while only the
-        hypothesis parameters change (needed for correct NLL landscape evaluation).
+        This is the charge analogue of prepare_features_patd
 
         Feature layout (10 features total):
-          [det_x, det_y, det_z,       normalised detector position    (3)
+          [det_x, det_y, det_z,       normalised detector position     (3)
            v_x,   v_y,   v_z,         normalised vertex position       (3)
            d_x,   d_y,   d_z,         unit direction vector            (3)
            log10(E)/8,                log-scaled energy                (1)
-           vert_dist,                 L2(detector - vertex) normalised (1)
+           vert_dist,                 L2(detector - vertex) normalised (1, optional)
            cos_angle,                 cos(direction ∠ vertex→detector) (1)
            log_ly]                    log-scaled light yield           (1)
-                                                               total = 13
+                                                                                                                             total = 12 or 13
 
         Normalisation uses self.domain_size via _pos_norm_divisor().
 
@@ -845,7 +841,7 @@ class LLRnet(Surrogate):
 
         Returns
         -------
-        features : torch.Tensor, shape (13,)
+        features : torch.Tensor, shape (13,) or (12,)
         """
         if isinstance(point, np.ndarray):
             point = torch.tensor(point, device=self.device, dtype=torch.float32)
@@ -893,15 +889,17 @@ class LLRnet(Surrogate):
             light_yield = light_yield.float().to(self.device)
         log_ly = torch.log10(torch.abs(light_yield.squeeze()) + 1e-10) / 4.0  # scalar
 
-        features = torch.stack([
+        feature_values = [
             det[0], det[1], det[2],
             vert[0], vert[1], vert[2],
             direction[0], direction[1], direction[2],
             log_energy,
-            vert_dist,
-            cos_angle,
-            log_ly,
-        ])  # (13,)
+        ]
+        if self.add_vertex_distance:
+            feature_values.append(vert_dist)
+        feature_values.extend([cos_angle, log_ly])
+
+        features = torch.stack(feature_values)
 
         return features.clone().detach()
 
@@ -1513,6 +1511,7 @@ class LLRnet(Surrogate):
                 sample_features, _ = sample_batch
                 # Features are now (batch_size, feature_dim) since each sample is an individual event
                 feature_dim = sample_features.shape[1]
+                
                 print(f"Number of datapoints per batch: {sample_features.shape[0]}")
                 self._build_network(feature_dim)
             else:
@@ -2222,6 +2221,7 @@ class LLRnet(Surrogate):
             'min_photons': self.min_photons,
             'num_photons_per_sample': self.num_photons_per_sample,
             'add_distance_from_beam': self.add_distance_from_beam,
+            'add_vertex_distance': self.add_vertex_distance,
             'reduce_lr_on_plateau': self.reduce_lr_on_plateau,
             'lr_scheduler_patience': self.lr_scheduler_patience,
             'lr_scheduler_factor': self.lr_scheduler_factor,
@@ -2285,7 +2285,7 @@ class LLRnet(Surrogate):
         self.min_photons = checkpoint.get('min_photons', self.min_photons)
         self.num_photons_per_sample = checkpoint.get('num_photons_per_sample', self.num_photons_per_sample)
         self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
-        
+        self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
         # Determine if this is old format (single MLP) or new format (parallel branches)
         is_old_format = 'model_state_dict' in checkpoint
         

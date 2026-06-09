@@ -180,7 +180,31 @@ def _as_flat_tensor(value: Any) -> torch.Tensor:
 	return torch.as_tensor(value).reshape(-1)
 
 
-def _matches_limit(event_value: Any, limit_value: Any) -> bool:
+def _matches_zenith_limit(event_value: Any, limit_value: Any) -> bool | None:
+	if not isinstance(limit_value, str):
+		return None
+
+	normalized_limit = limit_value.strip().lower()
+	if "horizontal" in normalized_limit:
+		threshold = 0.2
+		comparison = torch.lt
+	elif "vertical" in normalized_limit:
+		threshold = 0.8
+		comparison = torch.gt
+	else:
+		return None
+
+	zenith_tensor = _as_flat_tensor(event_value).to(dtype=torch.float32)
+	abs_cos_zenith = torch.abs(torch.cos(zenith_tensor))
+	return bool(torch.all(comparison(abs_cos_zenith, torch.as_tensor(threshold, dtype=abs_cos_zenith.dtype))))
+
+
+def _matches_limit(event_key: str, event_value: Any, limit_value: Any) -> bool:
+	if event_key == "zenith":
+		zenith_match = _matches_zenith_limit(event_value, limit_value)
+		if zenith_match is not None:
+			return zenith_match
+
 	event_tensor = _as_flat_tensor(event_value)
 
 	if isinstance(limit_value, torch.Tensor):
@@ -239,7 +263,7 @@ def select_event_indices(
 	list[int]
 		Indices of the events that match the requested limits.
 	"""
-	selected_indices: list[int] = []
+	selected_indices = []
 
 	for event_index, event in enumerate(events):
 		matches = True
@@ -247,7 +271,7 @@ def select_event_indices(
 			if key not in event:
 				matches = False
 				break
-			if not _matches_limit(event[key], limit_value):
+			if not _matches_limit(key, event[key], limit_value):
 				matches = False
 				break
 
@@ -265,7 +289,7 @@ def select_events(
 
 	This uses the same limit semantics as :func:`select_event_indices`.
 	"""
-	selected_events: list[dict[str, Any]] = []
+	selected_events = []
 
 	for event in events:
 		matches = True
@@ -273,7 +297,7 @@ def select_events(
 			if key not in event:
 				matches = False
 				break
-			if not _matches_limit(event[key], limit_value):
+			if not _matches_limit(key, event[key], limit_value):
 				matches = False
 				break
 
