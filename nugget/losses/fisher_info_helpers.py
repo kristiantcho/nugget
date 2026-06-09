@@ -4,7 +4,8 @@ import numpy as np
 import gc
 import os
 import math
-from torch.func import jacrev, jvp, vmap, linearize
+from torch.func import jacrev, vmap, linearize
+from torch.func import jvp as func_jvp
 
 
 def _pos_norm_divisor_from_domain_size(domain_size, *, device, dtype=torch.float32):
@@ -977,7 +978,9 @@ def _fisher_points_patd_quadrature(
         J_raw = jacrev(_theta_only_fn, chunk_size=jacrev_chunk_size)(theta0_flat)
         J = J_raw.reshape(B, n_quadrature, total_dims)
         del J_raw
-    else:
+    elif llr_net is not None:
+        # LLR-net: use linearize+vmap (function was pre-sampled, is deterministic
+        # inside the trace, and vmap over basis vectors is fast).
         y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
         del y0
         cols_parts = []
@@ -988,6 +991,25 @@ def _fisher_points_patd_quadrature(
             bvecs[torch.arange(k, device=device), torch.arange(d_start, d_end, device=device)] = 1
             cols_parts.append(vmap(jvp_fn, randomness='same')(bvecs))  # (k, B, N)
         del jvp_fn
+        cols = torch.cat(cols_parts, dim=0)   # (D, B, N)
+        J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
+        del cols, cols_parts
+    else:
+        # eval_patd_log_probs path: deterministic but contains scipy calls that
+        # make_fx cannot trace. Use torch.func.jvp directly in a Python loop —
+        # each call is concrete so scipy executes normally and the Hyp1f1 jvp
+        # hook fires via forward-mode AD without any symbolic tracing.
+        
+        cols_parts = []
+        for d_start in range(0, total_dims, basis_chunk_size):
+            d_end = min(d_start + basis_chunk_size, total_dims)
+            chunk_cols = []
+            for d in range(d_start, d_end):
+                v = torch.zeros(total_dims, device=device, dtype=theta0_flat.dtype)
+                v[d] = 1.0
+                _, col = func_jvp(_theta_only_fn, (theta0_flat,), (v,))  # (B, N)
+                chunk_cols.append(col)
+            cols_parts.append(torch.stack(chunk_cols, dim=0))  # (k, B, N)
         cols = torch.cat(cols_parts, dim=0)   # (D, B, N)
         J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
         del cols, cols_parts
