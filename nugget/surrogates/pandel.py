@@ -49,9 +49,9 @@ class Hyp1f1Function(torch.autograd.Function):
         b = ctx._b
         z = ctx._z
         if tangents_z is None:
-            return None, None, torch.zeros_like(z)
+            return torch.zeros_like(z)
         h = Hyp1f1Function.apply(a + 1.0, b + 1.0, z)
-        return None, None, tangents_z * (a / b) * h
+        return tangents_z * (a / b) * h
 
 def hyp1f1(a, b, z):
     """
