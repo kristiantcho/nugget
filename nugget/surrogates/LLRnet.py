@@ -2988,7 +2988,7 @@ class LLRnet(Surrogate):
                 if detector_pos is None:
                     detector_pos = self.signal_sampler.sample_detector_points(1)
 
-                if self.manual_photons:
+                if self.manual_photons and self.num_photons_per_sample is not None:
                     # Pass a fixed photon count; the surrogate still performs the
                     # behind-vertex check and returns 0 photons when appropriate.
                     patd_result = self.signal_surrogate_func(
@@ -2999,19 +2999,18 @@ class LLRnet(Surrogate):
                     num_photons = patd_result['num_photons']
                     # Detector is behind the vertex — signal caller to skip this pair.
                     if num_photons >= self.min_photons:
-                        if self.num_photons_per_sample is not None:
-                            if num_photons > self.num_photons_per_sample:
-                                # Cap the photon count in the result dict to num_photons_per_sample
-                                patd_result['num_photons'] = self.num_photons_per_sample
-                                if 'hit_times' in patd_result:
-                                    patd_result['hit_times'] = patd_result['hit_times'][:self.num_photons_per_sample]
-                            else:
-                                patd_result = self.signal_surrogate_func(
-                                    opt_point=detector_pos,
-                                    event_params=event_params,
-                                    input_photons=self.num_photons_per_sample,
-                                )
-                        return event_params, detector_pos, patd_result
+                        if num_photons > self.num_photons_per_sample:
+                            # Cap the photon count in the result dict to num_photons_per_sample
+                            patd_result['num_photons'] = self.num_photons_per_sample
+                            if 'hit_times' in patd_result:
+                                patd_result['hit_times'] = patd_result['hit_times'][:self.num_photons_per_sample]
+                        else:
+                            patd_result = self.signal_surrogate_func(
+                                opt_point=detector_pos,
+                                event_params=event_params,
+                                input_photons=self.num_photons_per_sample,
+                            )
+                    return event_params, detector_pos, patd_result
                 else:
                     # Get PATD - pass num_photons_per_sample to limit photons if specified
                     patd_result = self.signal_surrogate_func(
@@ -3071,9 +3070,6 @@ class LLRnet(Surrogate):
                     surrogate_func=lambda **kwargs: patd_result_matched,
                     event_labels=self.event_labels,
                 )
-
-            if matched_features_batch is None:
-                return None
 
             # Create labels for all matched photons (all are class 1)
             num_matched_photons = matched_features_batch.shape[0]

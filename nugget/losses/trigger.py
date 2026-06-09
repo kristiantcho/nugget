@@ -46,6 +46,8 @@ class TriggerLoss(LossFunction):
             Temperature for t1 sigmoid (higher = sharper transition).
         t3_temperature : float
             Temperature for per-bar thresholding sigmoid (higher = sharper transition).
+        t_temperature : float
+            Temperature for aggregating bar scores (higher = more focus on max).
         use_hard_cuts : bool
             If True, use hard thresholds to produce binary trigger outputs (0/1) instead of
             smooth differentiable sigmoid/softmax aggregations.

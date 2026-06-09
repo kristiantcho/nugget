@@ -11,8 +11,8 @@ import torch
 from nugget.samplers.cyl_sampler import CylinderSampler
 
 # Default packaged data directory (nugget/assets/data)
-# data_dir = Path(__file__).resolve().parents[1] / "assets" / "data"
-data_dir=''
+data_dir = Path(__file__).resolve().parents[1] / "assets" / "data"
+# data_dir=''
 
 
 def _to_numpy_no_grad(x):
@@ -1407,7 +1407,8 @@ class EffectiveAreaLoss(LossFunction):
                 if perfect_trigger:
                     detector_efficiency = 1.0
                 else:
-                    sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=energy_bins[e_ind], E_max=energy_bins[e_ind + 1], cos_range=(zenith_bins[ct_ind], zenith_bins[ct_ind + 1]), event_type='signal', **cylinder_kwargs).sample_events(num_events_per_bin)
+                    sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=energy_bins[e_ind], E_max=energy_bins[e_ind + 1], cos_range=(zenith_bins[ct_ind], zenith_bins[ct_ind + 1]), 
+                                                     event_type='signal', energy_dist='log_uniform', uniform_zenith_sampling=True, **cylinder_kwargs).sample_events(num_events_per_bin)
                     light_yield_per_event_per_point = torch.zeros((len(sampled_events), len(points_3d)), device=self.device)
                     for i, event_params in enumerate(sampled_events):
                         light_yield_per_event_per_point[i] = surrogate_func(opt_point=points_3d, event_params=event_params)
