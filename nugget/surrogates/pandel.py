@@ -25,6 +25,13 @@ class Hyp1f1Function(torch.autograd.Function):
     def setup_context(ctx, inputs, output):
         a, b, z = inputs
         ctx.save_for_backward(a, b, z)
+        # Also store as plain attributes for the jvp hook — save_for_backward
+        # tensors are unavailable during forward-mode AD (torch.func.jvp) because
+        # the inputs are dual tensors at that point and cannot be saved via the
+        # standard mechanism.
+        ctx._a = a
+        ctx._b = b
+        ctx._z = z
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -38,9 +45,11 @@ class Hyp1f1Function(torch.autograd.Function):
 
     @staticmethod
     def jvp(ctx, tangents_a, tangents_b, tangents_z):
-        a, b, z = ctx.saved_tensors
+        a = ctx._a
+        b = ctx._b
+        z = ctx._z
         if tangents_z is None:
-            return torch.zeros_like(z)
+            return None, None, torch.zeros_like(z)
         h = Hyp1f1Function.apply(a + 1.0, b + 1.0, z)
         return None, None, tangents_z * (a / b) * h
 
