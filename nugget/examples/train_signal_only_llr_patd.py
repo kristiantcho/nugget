@@ -58,9 +58,9 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     
     use_patd=True,
     min_photons=1,
-    num_photons_per_sample=1,
+    num_photons_per_sample=16,
     
-    rel_time=False,
+    rel_time=True,
     use_rich_features=True,
     add_distance_from_beam=True, 
     add_vertex_distance=False,
@@ -70,7 +70,7 @@ train_dataloader = llr_net.create_patd_dataloader(
     signal_sampler=signal_sampler,
     signal_surrogate_func=light_yield_surrogate,
     num_samples_per_epoch=4096,
-    batch_size=16,
+    batch_size=32,
     num_workers=4,
     shuffle_photons=True,
     manual_photons=True,
