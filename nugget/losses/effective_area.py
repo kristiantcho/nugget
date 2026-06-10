@@ -1410,6 +1410,8 @@ class EffectiveAreaLoss(LossFunction):
             # Sample all events for all bins at once, run a single batched trigger+surrogate
             # pass, then bin results in post-processing. Avoids num_energy_bins*num_zenith_bins
             # separate trigger calls and CylinderSampler constructions.
+            # Use binned_trigger_batch_size to cap memory per chunk (None = one big batch).
+            binned_trigger_batch_size = kwargs.get('binned_trigger_batch_size', None)
             total_events = num_energy_bins * num_zenith_bins * num_events_per_bin
             all_events = CylinderSampler(
                 domain_size=self.domain_size,
@@ -1422,22 +1424,7 @@ class EffectiveAreaLoss(LossFunction):
                 **cylinder_kwargs,
             ).sample_events(total_events)
 
-            if not perfect_trigger:
-                all_light_yields = torch.stack([
-                    surrogate_func(opt_point=points_3d, event_params=ep) for ep in all_events
-                ], dim=0)
-                trigger_out = self.trigger(
-                    geom_dict={'points_3d': points_3d},
-                    signal_surrogate_func=surrogate_func,
-                    signal_event_params=all_events,
-                    precomputed_light_yield_per_point_per_event=all_light_yields,
-                    use_batched_trigger=use_batched_trigger,
-                )
-                all_trigger = trigger_out['t_per_event']
-            else:
-                all_trigger = torch.ones(total_events, device=self.device, dtype=points_3d.dtype)
-
-            # Extract per-event energies and cos_zenith for binning
+            # Extract energies and cos_zenith for all events upfront (cheap, no surrogate)
             all_energies = torch.stack([
                 torch.as_tensor(ep['energy'], device=self.device, dtype=points_3d.dtype).reshape(-1)[0]
                 for ep in all_events
@@ -1449,16 +1436,44 @@ class EffectiveAreaLoss(LossFunction):
                 for ep in all_events
             ])
 
-            log_energies = torch.log10(all_energies)
-            e_idx = torch.bucketize(log_energies, energy_bins[1:-1])
-            ct_idx = torch.bucketize(all_cos_zenith, zenith_bins[1:-1])
             counts = torch.zeros((num_zenith_bins, num_energy_bins), device=self.device)
 
-            for k in range(total_events):
-                ei, ci = e_idx[k].item(), ct_idx[k].item()
-                if 0 <= ei < num_energy_bins and 0 <= ci < num_zenith_bins:
-                    detector_efficiencies[ci, ei] += all_trigger[k].detach()
-                    counts[ci, ei] += 1
+            if not perfect_trigger:
+                chunk_size = binned_trigger_batch_size if binned_trigger_batch_size is not None else total_events
+                for chunk_start in range(0, total_events, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, total_events)
+                    chunk_events = all_events[chunk_start:chunk_end]
+
+                    chunk_light_yields = torch.stack([
+                        surrogate_func(opt_point=points_3d, event_params=ep) for ep in chunk_events
+                    ], dim=0)
+                    trigger_out = self.trigger(
+                        geom_dict={'points_3d': points_3d},
+                        signal_surrogate_func=surrogate_func,
+                        signal_event_params=chunk_events,
+                        precomputed_light_yield_per_point_per_event=chunk_light_yields,
+                        use_batched_trigger=use_batched_trigger,
+                    )
+                    chunk_trigger = trigger_out['t_per_event']
+
+                    log_e = torch.log10(all_energies[chunk_start:chunk_end])
+                    e_idx = torch.bucketize(log_e, energy_bins[1:-1])
+                    ct_idx = torch.bucketize(all_cos_zenith[chunk_start:chunk_end], zenith_bins[1:-1])
+
+                    for k in range(len(chunk_events)):
+                        ei, ci = e_idx[k].item(), ct_idx[k].item()
+                        if 0 <= ei < num_energy_bins and 0 <= ci < num_zenith_bins:
+                            detector_efficiencies[ci, ei] += chunk_trigger[k].detach()
+                            counts[ci, ei] += 1
+            else:
+                log_e = torch.log10(all_energies)
+                e_idx = torch.bucketize(log_e, energy_bins[1:-1])
+                ct_idx = torch.bucketize(all_cos_zenith, zenith_bins[1:-1])
+                for k in range(total_events):
+                    ei, ci = e_idx[k].item(), ct_idx[k].item()
+                    if 0 <= ei < num_energy_bins and 0 <= ci < num_zenith_bins:
+                        detector_efficiencies[ci, ei] += 1
+                        counts[ci, ei] += 1
 
             nonzero = counts > 0
             detector_efficiencies[nonzero] /= counts[nonzero]
