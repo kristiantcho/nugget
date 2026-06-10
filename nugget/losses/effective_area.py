@@ -1438,15 +1438,22 @@ class EffectiveAreaLoss(LossFunction):
 
             counts = torch.zeros((num_zenith_bins, num_energy_bins), device=self.device)
 
+            batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
+
             if not perfect_trigger:
                 chunk_size = binned_trigger_batch_size if binned_trigger_batch_size is not None else total_events
                 for chunk_start in range(0, total_events, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, total_events)
                     chunk_events = all_events[chunk_start:chunk_end]
 
-                    chunk_light_yields = torch.stack([
-                        surrogate_func(opt_point=points_3d, event_params=ep) for ep in chunk_events
-                    ], dim=0)
+                    if batched_surrogate_func is not None:
+                        chunk_light_yields = batched_surrogate_func(
+                            om_positions=points_3d, event_params_list=chunk_events
+                        )
+                    else:
+                        chunk_light_yields = torch.stack([
+                            surrogate_func(opt_point=points_3d, event_params=ep) for ep in chunk_events
+                        ], dim=0)
                     trigger_out = self.trigger(
                         geom_dict={'points_3d': points_3d},
                         signal_surrogate_func=surrogate_func,
