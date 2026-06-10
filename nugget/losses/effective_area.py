@@ -1253,6 +1253,7 @@ class EffectiveAreaLoss(LossFunction):
         # If True, sample all bin events at once and bin results in post-processing
         # instead of running a separate trigger+surrogate call per (E, cos_zenith) bin.
         use_batched_binned_trigger = kwargs.get('use_batched_binned_trigger', False)
+        detach_light_yields = kwargs.get('detach_light_yields', False)
 
         if precomputed_light_yield_per_point_per_event is None:
             precomputed_light_yield_per_point_per_event = pc_ly_per_event_per_point_per_e_per_ct
@@ -1328,11 +1329,14 @@ class EffectiveAreaLoss(LossFunction):
             if perfect_trigger:
                 per_event_trigger = torch.ones(len(event_params_list), device=self.device, dtype=points_3d.dtype)
             else:
+                ly = precomputed_light_yield_per_point_per_event
+                if detach_light_yields and ly is not None:
+                    ly = ly.detach()
                 trigger_out = self.trigger(
                     geom_dict={'points_3d': points_3d},
                     signal_surrogate_func=surrogate_func,
                     signal_event_params=event_params_list,
-                    precomputed_light_yield_per_point_per_event=precomputed_light_yield_per_point_per_event,
+                    precomputed_light_yield_per_point_per_event=ly,
                     use_batched_trigger=use_batched_trigger,
                 )
                 per_event_trigger = trigger_out['t_per_event']
@@ -1454,6 +1458,8 @@ class EffectiveAreaLoss(LossFunction):
                         chunk_light_yields = torch.stack([
                             surrogate_func(opt_point=points_3d, event_params=ep) for ep in chunk_events
                         ], dim=0)
+                    if detach_light_yields:
+                        chunk_light_yields = chunk_light_yields.detach()
                     trigger_out = self.trigger(
                         geom_dict={'points_3d': points_3d},
                         signal_surrogate_func=surrogate_func,
