@@ -1912,6 +1912,8 @@ class LLRnet(Surrogate):
                 continue
 
             hit_times = patd['hit_times'].float().to(self.device)
+            if self.rel_time:
+                hit_times = hit_times - patd.get('t_geom_min', 0.0).float().to(self.device)
             t_scaled = torch.where(
                 hit_times < 0,
                 -torch.log10(-hit_times + 1e-4) / 4.0,
@@ -1985,12 +1987,13 @@ class LLRnet(Surrogate):
             det = obs['det_normed']                  # (3,) — pre-computed constant
             t_scaled = obs['t_scaled']               # (N_hits,) — pre-computed constant
             N = obs['num_photons']
-
             rel = det - vert
             vert_dist = torch.norm(rel)
             cos_angle = torch.dot(direction, rel) / (dir_norm_val * vert_dist.clamp(min=1e-8))
-
-            ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), vert_dist.unsqueeze(0), cos_angle.unsqueeze(0)]
+            if self.add_vertex_distance:
+                ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), vert_dist.unsqueeze(0), cos_angle.unsqueeze(0)]
+            else:
+                ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), cos_angle.unsqueeze(0)]           
             if self.add_distance_from_beam:
                 vert_unnorm = vert * norm
                 _, dist_perp = self.compute_distance_from_beam(

@@ -1468,7 +1468,7 @@ class EffectiveAreaLoss(LossFunction):
                         use_batched_trigger=use_batched_trigger,
                     )
                     chunk_trigger = trigger_out['t_per_event']
-
+                    del chunk_light_yields
                     log_e = torch.log10(all_energies[chunk_start:chunk_end])
                     e_idx = torch.bucketize(log_e, energy_bins[1:-1])
                     ct_idx = torch.bucketize(all_cos_zenith[chunk_start:chunk_end], zenith_bins[1:-1])
@@ -1476,8 +1476,11 @@ class EffectiveAreaLoss(LossFunction):
                     for k in range(len(chunk_events)):
                         ei, ci = e_idx[k].item(), ct_idx[k].item()
                         if 0 <= ei < num_energy_bins and 0 <= ci < num_zenith_bins:
-                            detector_efficiencies[ci, ei] += chunk_trigger[k].detach()
+                            detector_efficiencies[ci, ei] += chunk_trigger[k]
                             counts[ci, ei] += 1
+                    if kwargs.get('detach_trigger', False):
+                        chunk_trigger = chunk_trigger.detach() 
+                        del chunk_trigger
             else:
                 log_e = torch.log10(all_energies)
                 e_idx = torch.bucketize(log_e, energy_bins[1:-1])
