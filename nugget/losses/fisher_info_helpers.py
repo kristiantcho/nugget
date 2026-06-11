@@ -514,16 +514,16 @@ def _build_rich_features_from_cached_obs(
         vert.expand(B, -1),     # (B, 3)
         direction.expand(B, -1),# (B, 3)
         log_energy_expanded,    # (B, 1)
-        vert_dist,              # (B, 1)
-        cos_angle,              # (B, 1)
     ]
+    if bool(getattr(llr_net, 'add_vertex_distance', True)):
+        ctx_parts.append(vert_dist)                        # (B, 1)
+    ctx_parts.append(cos_angle)                            # (B, 1)
     if bool(getattr(llr_net, 'add_distance_from_beam', False)):
-        # dist_perp depends on vert (θ-dependent) so must be inside the trace
         vert_unnorm = vert * norm if not isinstance(norm, float) else vert * norm  # (1, 3) unnorm
         _, dist_perp = llr_net.compute_distance_from_beam(pts_3, vert_unnorm.expand(B, -1), direction.expand(B, -1))
         dist_perp_norm = dist_perp / (llr_net.domain_size / 2 if isinstance(llr_net.domain_size, (int, float)) else llr_net.domain_size[0] / 2)
         ctx_parts.append(dist_perp_norm)                   # (B, 1)
-    ctx = torch.cat(ctx_parts, dim=-1)  # (B, 12) or (B, 13) depending on add_distance_from_beam
+    ctx = torch.cat(ctx_parts, dim=-1)
 
     if not is_patd:
         # Charge path: one scalar observation per (l, b) → (L, B, 1)
@@ -689,9 +689,10 @@ def _fisher_points_all_iters_jvp(
                 vert.expand(B, -1),
                 direction.expand(B, -1),
                 log_energy,
-                vert_dist,
-                cos_angle,
             ]
+            if bool(getattr(llr_net, 'add_vertex_distance', True)):
+                ctx_parts.append(vert_dist)
+            ctx_parts.append(cos_angle)
             if bool(getattr(llr_net, 'add_distance_from_beam', False)):
                 vert_unnorm = vert * norm_const
                 _, dist_perp = llr_net.compute_distance_from_beam(pts_3, vert_unnorm.expand(B, -1), direction.expand(B, -1))
@@ -881,10 +882,13 @@ def _fisher_points_patd_quadrature(
 
     if llr_net is not None:
         # LLR-net path: self-normalised ratio
+        # If the model was trained with rel_time=True, hit times were expressed
+        # relative to t_geom_min — apply the same subtraction here.
+        t_for_scaling = t_grid - t_geom_min_per_pt.unsqueeze(1) if bool(getattr(llr_net, 'rel_time', False)) else t_grid
         t_scaled = torch.where(
-            t_grid < 0,
-            -torch.log10(-t_grid + 1e-4) / 4.0,
-            torch.log10(t_grid + 1e-4) / 4.0,
+            t_for_scaling < 0,
+            -torch.log10(-t_for_scaling + 1e-4) / 4.0,
+            torch.log10(t_for_scaling + 1e-4) / 4.0,
         )  # (B, N)
         t_scaled_flat = t_scaled.reshape(B * n_quadrature, 1).detach()
 
@@ -907,8 +911,10 @@ def _fisher_points_patd_quadrature(
             cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
                 dir_norm * vert_dist.clamp(min=1e-8))
 
-            ctx_parts = [det_const, vert.expand(B, -1), direction.expand(B, -1),
-                         log_energy, vert_dist, cos_angle]
+            ctx_parts = [det_const, vert.expand(B, -1), direction.expand(B, -1), log_energy]
+            if bool(getattr(llr_net, 'add_vertex_distance', True)):
+                ctx_parts.append(vert_dist)
+            ctx_parts.append(cos_angle)
             if bool(getattr(llr_net, 'add_distance_from_beam', False)):
                 vert_unnorm = vert * norm_const
                 _, dist_perp = llr_net.compute_distance_from_beam(
@@ -916,7 +922,7 @@ def _fisher_points_patd_quadrature(
                 ds = llr_net.domain_size
                 half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
                 ctx_parts.append(dist_perp / half)
-            ctx = torch.cat(ctx_parts, dim=-1)  # (B, 12 or 13)
+            ctx = torch.cat(ctx_parts, dim=-1)
 
             ctx_rep = ctx.unsqueeze(1).expand(B, n_quadrature, -1).reshape(B * n_quadrature, -1)
             features = torch.cat([ctx_rep, t_scaled_flat], dim=-1)
