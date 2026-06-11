@@ -1326,9 +1326,18 @@ class EffectiveAreaLoss(LossFunction):
                 if precomputed_light_yield_per_point_per_event is not None:
                     precomputed_light_yield_per_point_per_event = precomputed_light_yield_per_point_per_event[selected_indices]
 
+            batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
+            chunk_size = kwargs.get('binned_trigger_batch_size', None)
+            n_events = len(event_params_list)
+
             if perfect_trigger:
-                per_event_trigger = torch.ones(len(event_params_list), device=self.device, dtype=points_3d.dtype)
-            else:
+                per_event_trigger = torch.ones(n_events, device=self.device, dtype=points_3d.dtype)
+            elif chunk_size is None:
+                # Single pass — precompute light yields with batched surrogate if available
+                if precomputed_light_yield_per_point_per_event is None and batched_surrogate_func is not None:
+                    precomputed_light_yield_per_point_per_event = batched_surrogate_func(
+                        om_positions=points_3d, event_params_list=event_params_list
+                    )
                 ly = precomputed_light_yield_per_point_per_event
                 if detach_light_yields and ly is not None:
                     ly = ly.detach()
@@ -1340,6 +1349,34 @@ class EffectiveAreaLoss(LossFunction):
                     use_batched_trigger=use_batched_trigger,
                 )
                 per_event_trigger = trigger_out['t_per_event']
+            else:
+                # Chunked pass — process chunk_size events at a time to cap memory
+                per_event_trigger = torch.zeros(n_events, device=self.device, dtype=points_3d.dtype)
+                for chunk_start in range(0, n_events, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, n_events)
+                    chunk_events = event_params_list[chunk_start:chunk_end]
+
+                    if precomputed_light_yield_per_point_per_event is not None:
+                        chunk_ly = precomputed_light_yield_per_point_per_event[chunk_start:chunk_end]
+                    elif batched_surrogate_func is not None:
+                        chunk_ly = batched_surrogate_func(
+                            om_positions=points_3d, event_params_list=chunk_events
+                        )
+                    else:
+                        chunk_ly = None
+
+                    if detach_light_yields and chunk_ly is not None:
+                        chunk_ly = chunk_ly.detach()
+
+                    trigger_out = self.trigger(
+                        geom_dict={'points_3d': points_3d},
+                        signal_surrogate_func=surrogate_func,
+                        signal_event_params=chunk_events,
+                        precomputed_light_yield_per_point_per_event=chunk_ly,
+                        use_batched_trigger=use_batched_trigger,
+                    )
+                    per_event_trigger[chunk_start:chunk_end] = trigger_out['t_per_event']
+                    del trigger_out
 
             if use_batched_effective_area:
                 per_event_energies, per_event_cos_zenith = _extract_energy_and_cos_zenith_batch(
