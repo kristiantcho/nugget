@@ -5,7 +5,7 @@ import numpy as np
 # import os
 # from nugget.losses.effective_area import get_bounding_cylinder
 
-device = 'cuda:0'
+device = 'cuda:1'
 num_events = 50000
 version = 'r600_50_u_1'
 print(f"Using device: {device}")
@@ -13,7 +13,7 @@ print(f"Using signal_version: {version}")
 center = [0,0,0]
 radius = 600
 height = 1000
-use_patd=True
+use_patd=False
 
 if not use_patd:
     lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=1600, particle_mode = 'track')
@@ -104,7 +104,7 @@ for geom_name in ['800main_full_hex', '340grid']:
     if not use_patd:
         llr_net = nugget.surrogates.LLRnet.LLRnet(
             device=device,
-            domain_size=(radius*2,height),  # Size of the detector domain
+            domain_size=2000,  # Size of the detector domain
             dim=3,  # 3D spatial coordinates
             hidden_dims=[64, 64, 64, 64],  # Neural network architecture
             use_fourier_features=False,  # Use Fourier features for better spatial encoding
@@ -125,13 +125,14 @@ for geom_name in ['800main_full_hex', '340grid']:
             add_distance_from_beam=False,  # Whether to include distance from beam as a feature
             reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
             lr_scheduler_patience=35,  # Patience for LR scheduler
+            use_rich_features=True,  # Whether to use rich features from the surrogate model
         )
 
         llr_net.load_model('best_charge_llr_model_v5.pt')
     else:
         llr_net = nugget.surrogates.LLRnet.LLRnet(
         device=device,
-        domain_size=2500,
+        domain_size=2000,
         dim=3,
         hidden_dims=[64, 64, 64, 64, 64, 64],
         use_fourier_features=False,

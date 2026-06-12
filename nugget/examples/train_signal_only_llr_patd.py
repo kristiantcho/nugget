@@ -35,7 +35,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     device=device,
     domain_size=2000,
     dim=3,
-    hidden_dims=[64, 64, 64, 64, 64, 64],
+    hidden_dims=[64, 64, 64, 64, 64, 64, 64, 64],
     use_fourier_features=False,
     num_parallel_branches=1,
     shared_mlp=False,
@@ -58,9 +58,10 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     
     use_patd=True,
     min_photons=1,
-    num_photons_per_sample=16,
+    num_photons_per_sample=32,
     
     rel_time=True,
+    jitter_time=30.0,
     use_rich_features=True,
     add_distance_from_beam=True, 
     add_vertex_distance=False,
@@ -83,8 +84,8 @@ history = llr_net.train_with_dataloader(
     input_dim=13,
     grad_clip=None,
     save_every_n_epochs=20,
-    checkpoint_path='best_hit_llr_model_v7.pt',
+    checkpoint_path='best_hit_llr_model_v8.pt',
 )
 
 # llr_net.save_model('best_cascade_hit_llr_model_v4')
-pickle.dump(history, open('hit_llr_v7_training_history.pkl', 'wb'))
+pickle.dump(history, open('hit_llr_v8_training_history.pkl', 'wb'))

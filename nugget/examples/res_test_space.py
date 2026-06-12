@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spacing-max", type=float, default=200.0)
     parser.add_argument("--spacing-count", type=int, default=20)
     parser.add_argument("--use_llrnet", type=str, default="true")
+    parser.add_argument("--use_patd", type=str, default="true")
     return parser.parse_args()
 
 
@@ -47,6 +48,7 @@ def split_events(signal_events, num_shards, shard_index):
 args = parse_args()
 
 use_llrnet = args.use_llrnet == "true"
+use_patd = args.use_patd == "true"
 device = args.device
 num_events = args.num_events
 version = args.version
@@ -58,34 +60,47 @@ print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
 print(f"Using signal events path: {signal_events_path}")
 print(f"Using LLRnet surrogate: {use_llrnet}")
-
+print(f"Using PATD surrogate: {use_patd}")
 if use_llrnet:
     extra = ""
 else:
     extra = "_lambda"
 version += extra
+if use_patd:
+    version += "_patd"
 output_dir = output_dir / f"{version}"
 output_dir.mkdir(parents=True, exist_ok=True)
 center = [0, 0, 0]
 radius = 600
 height = 1000
-lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=use_llrnet, domain_size=1600, particle_mode='track')
+if not use_patd:
+    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=2500, particle_mode = 'track')
+else:
+    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
+        device=device,
+        use_poisson=False,
+        num_track_points=1000,
+        domain_size=2500,
+        use_max_energy_dist=True,
+        use_perpendicular_distance_only=True,
+        particle_mode='track',
+        )
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate
-signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
-                                                    device=None,
-                                                    event_type='signal',
-                                                    domain_size=1600,
-                                                    E_min=1e2,
-                                                    E_max=1e8,
-                                                    find_exact_intersection=False,
-                                                    random_position_along_ray=True,
-                                                    energy_dist='log_uniform',
-                                                    cylinder_center=center,
-                                                    cylinder_radius=radius,
-                                                    cylinder_height=height,
-                                                    # point_towards_center=True,
-                                                    # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
-                                                    )
+# signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+#                                                     device=None,
+#                                                     event_type='signal',
+#                                                     domain_size=2500,
+#                                                     E_min=1e2,
+#                                                     E_max=1e8,
+#                                                     find_exact_intersection=False,
+#                                                     random_position_along_ray=True,
+#                                                     energy_dist='log_uniform',
+#                                                     cylinder_center=center,
+#                                                     cylinder_radius=radius,
+#                                                     cylinder_height=height,
+#                                                     # point_towards_center=True,
+#                                                     # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
+#                                                     )
 # signal_events = signal_sampler.sample_events(num_events)
 signal_events = nugget.utils.data_tools.load_signal_events_parquet(signal_events_path)
 
@@ -130,7 +145,7 @@ for string_spacing in np.linspace(args.spacing_min, args.spacing_max, args.spaci
     if use_llrnet:
         llr_net = nugget.surrogates.LLRnet.LLRnet(
         device=device,
-        domain_size=2500,
+        domain_size=2000,
         dim=3,
         hidden_dims=[64, 64, 64, 64, 64, 64],
         use_fourier_features=False,
@@ -157,7 +172,7 @@ for string_spacing in np.linspace(args.spacing_min, args.spacing_max, args.spaci
         input_delta_time=False,
         use_rich_features=True,
         add_distance_from_beam=False,
-        use_patd=False,
+        use_patd=use_patd,
         )
 
         llr_net.load_model('best_charge_llr_model_v5.pt')
@@ -174,7 +189,12 @@ for string_spacing in np.linspace(args.spacing_min, args.spacing_max, args.spaci
                 jacrev_chunk_size=50000,
                 point_chunk_size=11000,
                 grad_chunk_size=7,
-                llr_autodiff_mode='jvp'
+                llr_autodiff_mode='jvp',
+                use_patd=use_patd,
+                use_rich_features=True,
+                use_patd_quadrature=True,
+                t_offset_ns=0.0,
+                t_max_ns=5000.0,
                 )
 
     output_path = output_dir / (

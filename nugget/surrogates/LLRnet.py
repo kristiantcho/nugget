@@ -188,7 +188,7 @@ class LLRnet(Surrogate):
                  dropout_rate=0.1, learning_rate=1e-3, use_fourier_features=True,
                  num_frequencies=64, frequency_scale=1.0, learnable_frequencies=False,
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False,
-                 shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True,
+                 shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True, jitter_time=0.0,
                  add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True,
                  lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, **kwargs):
         """
@@ -258,6 +258,8 @@ class LLRnet(Surrogate):
             Number of photons to sample from each valid event in PATD mode.
             If None, defaults to min_photons. Can be set higher than min_photons to
             sample more photons from each event, or lower (but >= 1) to sample fewer.
+        jitter_time : float
+            Amount of time jitter to add to each photon arrival time (default: 0.0)
         """
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         
@@ -290,6 +292,7 @@ class LLRnet(Surrogate):
         self.min_photons = min_photons
         self.input_delta_time = input_delta_time
         self.num_photons_per_sample = num_photons_per_sample if num_photons_per_sample is not None else min_photons
+        self.jitter_time = jitter_time
         # Handle multiple branch configurations
         if num_parallel_branches > 1:
             # Set up frequency scales for each branch
@@ -798,7 +801,7 @@ class LLRnet(Surrogate):
         hit_times = patd_result['hit_times'].float().to(self.device)  # (N,)
         if self.rel_time:
             # Convert to relative times by subtracting the minimum hit time
-            hit_times = hit_times - patd_result['t_geom_min'].float().to(self.device)
+            hit_times = hit_times - (patd_result['t_geom_min'].float().to(self.device) - self.jitter_time)
         t_scaled = torch.where(
             hit_times < 0,
             -torch.log10(-hit_times + 1e-4) / 4.0,
@@ -2217,6 +2220,7 @@ class LLRnet(Surrogate):
             'use_rich_features': self.use_rich_features,
             'log_scale_ly': self.log_scale_ly,
             'rel_time': self.rel_time,
+            'jitter_time': self.jitter_time,
             'input_charge': self.input_charge,
             'norm_pos': self.norm_pos,
             'log_scale_energy': self.log_scale_energy,
@@ -2279,6 +2283,8 @@ class LLRnet(Surrogate):
         self.add_relative_pos = checkpoint.get('add_relative_pos', self.add_relative_pos)
         self.use_patd = checkpoint.get('use_patd', self.use_patd)
         self.use_rich_features = checkpoint.get('use_rich_features', self.use_rich_features)
+        
+        self.domain_size = checkpoint.get('domain_size', self.domain_size)
         self.log_scale_ly = checkpoint.get('log_scale_ly', self.log_scale_ly)
         self.rel_time = checkpoint.get('rel_time', self.rel_time)
         self.input_charge = checkpoint.get('input_charge', self.input_charge)
@@ -2287,6 +2293,7 @@ class LLRnet(Surrogate):
         self.input_delta_time = checkpoint.get('input_delta_time', self.input_delta_time)
         self.min_photons = checkpoint.get('min_photons', self.min_photons)
         self.num_photons_per_sample = checkpoint.get('num_photons_per_sample', self.num_photons_per_sample)
+        self.jitter_time = checkpoint.get('jitter_time', 0.0)
         self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
         self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
         # Determine if this is old format (single MLP) or new format (parallel branches)
