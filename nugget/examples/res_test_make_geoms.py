@@ -20,9 +20,9 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
     rov_height=159.9, 
     rov_tri_length=159.9
 )
-version = '_pl_1'
-use_rov = 'no_rov'
-num_events = 30000
+version = '_u_1'
+use_rov = 'rov'
+num_events = 50000
 folder_name = f'res_test/opt_geoms_full_hex_{num_events}_r600_50{version}_{use_rov}/'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
@@ -30,22 +30,22 @@ print(f"Saving optimized geometries to folder: {folder_name}")
 if not os.path.exists(folder_name):
     os.makedirs(folder_name)
 # check if there are already optimized geometries in the folder, and if so add a number to the folder name
-count = 0
-while os.path.exists(f'{folder_name}geom_{count}.pkl'):
-    count += 1
+# count = 0
+# while os.path.exists(f'{folder_name}geom_{count}.pkl'):
+#     count += 1
 
 loss_params = {
     # 'signal_event_params': pickle.load(open(f'res_test/signal_events_{num_events}_r600_50{version}.pkl', 'rb'))[:],
-    'signal_event_params': nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_r600_50{version}.pt')[:],
+    # 'signal_event_params': nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_r600_50{version}.pt')[:],
     'num_events': 300,  # Number of events to sample per optimization step
     'boundary_range': 1200,  # Size of boundary region
     'skip_zero_response': True,
     'use_relative_energy': True,
-    'precomputed_signal_yield_per_string': torch.load(f'res_test/light_yield_per_string_{num_events}_800main_full_hex_r600_50{version}.pt')[:],
-    'precomputed_fisher_info_per_string_per_event': torch.load(f'res_test/fisher_info_per_string_per_event_{num_events}_800main_full_hex_r600_50{version}.pt')[:]
+    # 'precomputed_signal_yield_per_string': torch.load(f'res_test/light_yield_per_string_{num_events}_800main_full_hex_r600_50{version}.pt')[:],
+    # 'precomputed_fisher_info_per_string_per_event': torch.load(f'res_test/fisher_info_per_string_per_event_{num_events}_800main_full_hex_r600_50{version}.pt')[:]
     }
 loss_params.update({
-    'eva_min_num_strings': 70,  # Minimum number of active strings
+    'eva_min_num_strings': 61,  # Minimum number of active strings
     'max_radius': 80,  # Maximum radius for string placement
     'num_angles': 360,  # Number of angles (divided into 360 degrees) to test for rov
     'rov_alt_mode': True,  # Whether to use alternative mode for rov penalty (see rov_penalty.py for details)
@@ -115,9 +115,21 @@ loss_func_dict = {
 if use_rov == 'rov':
     loss_func_dict['rov_penalty'] = rov_penalty
 
-for i in range(15):
-    print(f"Running optimization iteration {i+1}/15")
-    
+for i in range(6):
+    # print(f"Running optimization iteration {i+1}/15")
+    selection_limits = {
+        'energy': (10**(i+2), 10**(i+3)),  # Example energy range
+        }
+    selection_inds = nugget.utils.data_tools.select_event_indices(
+            nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_r600_50{version}.pt')[:],
+            limits=selection_limits  # Example limit
+            )
+    signal_events = nugget.utils.data_tools.select_events(nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_r600_50{version}.pt'),limits=selection_limits)
+    fisher_info = torch.load(f'res_test/fisher_info_per_string_per_event_{num_events}_800main_full_hex_r600_50{version}.pt')[selection_inds]
+    loss_params.update({
+        'signal_event_params': signal_events,
+        'precomputed_fisher_info_per_string_per_event': fisher_info
+    })
     geometry = nugget.geometries.EvanescentString.EvanescentString(
             # device="cuda:1",
             hex_type='hexagonal',
@@ -154,6 +166,6 @@ for i in range(15):
         n_iter=2000,                           # Maximum number of optimization iterations
         print_freq=100,                          # Print progress every N iterations
         sigmoid_loss_list=loss_sigmoid_list,         # Which losses to apply sigmoid to (for better optimization dynamics)
-        save_best_geom_file = f'{folder_name}geom_{i+count}.pkl',  # File to save best geometry found
+        save_best_geom_file = f'{folder_name}geom_e{i+2}_e{i+3}.pkl',  # File to save best geometry found
         save_last_geom = True, 
     )
