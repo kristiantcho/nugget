@@ -3081,6 +3081,9 @@ class LLRnet(Surrogate):
                     event_labels=self.event_labels,
                 )
 
+            if matched_features_batch is None:
+                return None
+
             # Create labels for all matched photons (all are class 1)
             num_matched_photons = matched_features_batch.shape[0]
             matched_labels = torch.ones(num_matched_photons, dtype=torch.float32, device=self.llrnet.device)
