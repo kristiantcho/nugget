@@ -58,7 +58,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     
     use_patd=True,
     min_photons=1,
-    num_photons_per_sample=32,
+    num_photons_per_sample=8,
     
     rel_time=True,
     jitter_time=30.0,
