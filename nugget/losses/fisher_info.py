@@ -741,18 +741,17 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 resolution_per_event = torch.stack(resolution_per_event)
             finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
             if finite_mask.any():
-                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                # Replace bad entries with a large sentinel WITHIN the graph so their
+                # 1/r68^2 contribution is ~0 and no NaN gradient flows back through
+                # string_weights for the zero-Fisher strings.
+                safe_res = torch.where(
+                    finite_mask,
+                    torch.clamp_min(resolution_per_event, 1e-12),
+                    torch.full_like(resolution_per_event, 1e6),
+                )
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
             else:
-                # Keep optimization stable when all events are invalid/singular.
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
-            # finite_mask = torch.isfinite(resolution_per_event)
-            # if finite_mask.any():
-            #     total_resolution = torch.mean(resolution_per_event[finite_mask])
-            #     total_resolution = total_resolution/max_angular_resolution
-            # else:
-            #     # If all resolutions are NaN/inf, return a large penalty value
-            #     total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
             return {'angular_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
         elif self.resolution_type == 'energy':
             # Compute covariance matrix for energy resolution
@@ -784,7 +783,11 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
             resolution_per_event = torch.stack(resolution_per_event)
             finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
             if finite_mask.any():
-                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                safe_res = torch.where(
+                    finite_mask,
+                    torch.clamp_min(resolution_per_event, 1e-12),
+                    torch.full_like(resolution_per_event, 1e6),
+                )
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
