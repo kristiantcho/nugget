@@ -37,7 +37,7 @@ def _pos_norm_divisor_from_domain_size(domain_size, *, device, dtype=torch.float
     return float(domain_size) / 2.0
 
 
-def _llr_mask_from_true_ly(true_ly, *, threshold=0.5, sharpness=12.0):
+def _llr_mask_from_true_ly(true_ly, *, threshold=0.01, sharpness=12.0):
     return torch.sigmoid((true_ly - threshold) * sharpness) + 1e-6
 
 
@@ -2012,7 +2012,7 @@ def compute_fisher_info_single(fisher_info_params, point, event_params, surrogat
             # Sigmoid with scaling factor to smoothly mask out low/zero responses
             # Factor of 10 gives steep transition around ly=0.5
             # print(ly.sum())
-            mask = torch.sigmoid((ly-0.5) * 12.0) + 1e-6  # Small offset to avoid exact zero
+            mask = torch.sigmoid((ly-0.001) * 12.0) + 1e-6  # Small offset to avoid exact zero
            
  
             # Apply mask element-wise if batched, or as scalar if single

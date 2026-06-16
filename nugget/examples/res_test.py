@@ -10,13 +10,14 @@ num_events = 50000
 version = 'r600_50_u_1'
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
+use_poisson = False
 center = [0,0,0]
 radius = 600
 height = 1000
 use_patd=False
 
 if not use_patd:
-    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=1600, particle_mode = 'track')
+    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=use_poisson, domain_size=1600, particle_mode = 'track')
 else:
     lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
         device=device,
@@ -184,7 +185,7 @@ for geom_name in ['800main_full_hex', '340grid']:
                 signal_event_params=signal_events,
                 signal_surrogate_func=light_yield_surrogate,
                 llr_net=llr_net,
-                llr_iterations=100,
+                llr_iterations=1 if not use_poisson else 100,
                 skip_zero_response=True,
                 verbose=True,
                 jacrev_chunk_size=50000,
@@ -193,7 +194,7 @@ for geom_name in ['800main_full_hex', '340grid']:
                 llr_autodiff_mode='jvp',
                 use_rich_features=True,
                 use_patd=use_patd,
-                use_patd_quadrature=True,
+                use_patd_quadrature=use_patd,
                 t_offset_ns=0,
                 t_max_ns=5000
                 )
@@ -207,6 +208,7 @@ for geom_name in ['800main_full_hex', '340grid']:
 
 
     extra = '_patd' if use_patd else ''
+    extra += '_no_pois' if not use_poisson else ''
     torch.save(fisher_info_per_string_per_event.cpu(), f'res_test/fisher_info_per_string_per_event_{num_events}_{geom_name}_{version}{extra}.pt')
     # torch.save(precomputed_ly.cpu(), f'res_test/light_yield_per_string_{num_events}_{geom_name}_{version}.pt')
 
