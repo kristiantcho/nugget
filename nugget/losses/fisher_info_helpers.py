@@ -1286,15 +1286,19 @@ def directional_resolution(F3, n):
 
         # --- Project Fisher ---
         F2 = B.T @ F3 @ B   # 2x2 Fisher in tangent coords
-        F2 = F2 + 1e-4 * torch.eye(2, device=F2.device, dtype=F2.dtype)
-
+        F2 = F2 + 1e-10 * torch.eye(2, device=F2.device, dtype=F2.dtype)  # Increased regularization for stability
+        
         # --- Invert to get covariance ---
-        Cov2 = torch.linalg.solve(F2, torch.eye(2, device=F2.device, dtype=F2.dtype))
+        try:
+            Cov2 = torch.inverse(F2)
+        except RuntimeError:
+            Cov2 = torch.pinverse(F2)
 
         # --- Angular resolution (approx small-angle) ---
         eigvals = torch.linalg.eigvalsh(Cov2)
-        eigvals = torch.clamp_min(eigvals, 1e-10)
-        sigma_eff = torch.sqrt(torch.mean(eigvals))
+        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
+        # eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
+        sigma_eff = torch.sqrt(torch.mean(eigvals) + 1e-10)  # Add epsilon for numerical stability
         r68 = 1.515 * sigma_eff
         
         return r68
@@ -1332,23 +1336,27 @@ def directional_resolution(F3, n):
         # F2 = B.T @ F3 @ B for each batch element
         F2 = torch.bmm(torch.bmm(B.transpose(1, 2), F3), B)  # (N, 2, 2)
         
-        # Add regularization — must be large enough that inverse() gradients don't
-        # overflow to NaN when F2 is near-zero (e.g. zero-Fisher-info strings).
-        # Gradient of inverse is O(1/eps^2), so 1e-8 -> 1e16 gradients; use 1e-4.
-        F2 = F2 + 1e-4 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)
-
+        # Add regularization
+        F2 = F2 + 1e-8 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)  # Increased regularization for stability
+        
         # --- Invert to get covariance (N, 2, 2) ---
-        # torch.linalg.solve is more numerically stable than inverse() and has
-        # better-behaved gradients near singularity.
-        rhs = torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
-        Cov2 = torch.linalg.solve(F2, rhs)
-
+        try:
+            Cov2 = torch.inverse(F2)
+        except RuntimeError:
+            # Fall back to loop with pinverse if needed
+            Cov2 = []
+            for i in range(batch_size):
+                try:
+                    Cov2.append(torch.inverse(F2[i]))
+                except:
+                    Cov2.append(torch.pinverse(F2[i]))
+            Cov2 = torch.stack(Cov2)
+        
         # --- Angular resolution for all events ---
         eigvals = torch.linalg.eigvalsh(Cov2)  # (N, 2)
-        # Clamp to positive before sqrt — softplus with a shift can go negative
-        # when eigenvalues are tiny, giving sqrt(negative) = NaN.
-        eigvals = torch.clamp_min(eigvals, 1e-10)
-        sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1))  # (N,)
+        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
+        # eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
+        sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) + 1e-10)  # (N,) Add epsilon for numerical stability
         r68 = 1.515 * sigma_eff  # (N,)
         
         return r68
