@@ -191,7 +191,7 @@ class WeightedFisherInfoLoss(LossFunction):
         # self.background_event_params = background_event_params
         self.fisher_info_params = fisher_info_params # Default parameters for Fisher Info
 
-    def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False, skip_zero_response=True, verbose=False, event_batch_size=1, grad_chunk_size=10, jacrev_chunk_size=10000, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, t_offset_ns=100.0, t_max_ns=10000.0):
+    def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False, skip_zero_response=True, verbose=False, event_batch_size=1, grad_chunk_size=10, jacrev_chunk_size=10000, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5):
         n_strings = len(string_xy)
         # use_rich_features is now stored on the model — read from it if available.
         if llr_net is not None and not use_rich_features:
@@ -248,6 +248,7 @@ class WeightedFisherInfoLoss(LossFunction):
                         use_patd_quadrature=use_patd_quadrature,
                         t_offset_ns=t_offset_ns,
                         t_max_ns=t_max_ns,
+                        zero_response_threshold=zero_response_threshold,
                         )
             fisher_per_string_per_event[i] += fisher_matrices.to(self.device)
             if verbose and (i % 100 == 0 or i == len(signal_event_params)-1):
@@ -633,6 +634,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         use_patd_quadrature = kwargs.get('use_patd_quadrature', False)
         t_offset_ns = kwargs.get('t_offset_ns', 100.0)
         t_max_ns = kwargs.get('t_max_ns', 10000.0)
+        zero_response_threshold = kwargs.get('zero_response_threshold', 0.5)
 
         # New parameters for batched loading from files
         event_paths = kwargs.get('event_paths', None)
@@ -673,6 +675,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 use_patd_quadrature=use_patd_quadrature,
                 t_offset_ns=t_offset_ns,
                 t_max_ns=t_max_ns,
+                zero_response_threshold=zero_response_threshold,
             )
         else:
             fisher_info_per_string_per_event = precomputed_fisher_info_per_string_per_event.to(self.device)

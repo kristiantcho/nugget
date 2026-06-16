@@ -66,6 +66,7 @@ def _llr_out_single_point_all_iters(
     skip_zero_response,
     event_param_names,
     use_rich_features=False,
+    zero_response_threshold=0.5,
 ):
     params = {fisher_info_params[i]: theta_vals[i] for i in range(len(fisher_info_params))}
     params.update(fixed_params)
@@ -113,7 +114,7 @@ def _llr_out_single_point_all_iters(
 
     llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(-1)  # (L,)
     if skip_zero_response:
-        llr_out = llr_out * _llr_mask_from_true_ly(ly.reshape(-1))
+        llr_out = llr_out * _llr_mask_from_true_ly(ly.reshape(-1), threshold=zero_response_threshold)
     return llr_out
 
 
@@ -132,6 +133,7 @@ def _fisher_one_point_jacrev(
     jacrev_chunk_size,
     detach_fisher_tensors=True,
     use_rich_features=False,
+    zero_response_threshold=0.5,
 ):
     if use_rich_features:
         # Pre-sample observations outside the jacrev trace so the surrogate is
@@ -166,6 +168,7 @@ def _fisher_one_point_jacrev(
             skip_zero_response=skip_zero_response,
             event_param_names=event_param_names,
             use_rich_features=use_rich_features,
+            zero_response_threshold=zero_response_threshold,
         )
 
     J_tuple = jacrev(
@@ -592,6 +595,7 @@ def _fisher_points_all_iters_jvp(
     device,
     detach_fisher_tensors=True,
     use_rich_features=False,
+    zero_response_threshold=0.5,
 ):
     # Rich-feature path: can never cache responses (surrogate dict structure differs).
     can_cache_responses = (
@@ -636,7 +640,7 @@ def _fisher_points_all_iters_jvp(
             )
             llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(llr_iterations, B)
             if skip_zero_response:
-                llr_out = llr_out * _llr_mask_from_true_ly(cached_ly_true)
+                llr_out = llr_out * _llr_mask_from_true_ly(cached_ly_true, threshold=zero_response_threshold)
             return llr_out.transpose(0, 1).contiguous()  # (B, L)
     elif use_rich_features:
         params0 = _unflatten_theta(
@@ -707,7 +711,7 @@ def _fisher_points_all_iters_jvp(
 
             llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(L, B)
             if skip_zero_response:
-                llr_out = llr_out * _llr_mask_from_true_ly(cached_ly_true)
+                llr_out = llr_out * _llr_mask_from_true_ly(cached_ly_true, threshold=zero_response_threshold)
             return llr_out.transpose(0, 1).contiguous()
     else:
         # PATD path (non-rich): call surrogate inside the trace (no caching possible).
@@ -732,7 +736,7 @@ def _fisher_points_all_iters_jvp(
             ly = ly.reshape(llr_iterations, B)
             llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(llr_iterations, B)
             if skip_zero_response:
-                llr_out = llr_out * _llr_mask_from_true_ly(ly)
+                llr_out = llr_out * _llr_mask_from_true_ly(ly, threshold=zero_response_threshold)
             return llr_out.transpose(0, 1).contiguous()
 
     y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
@@ -785,6 +789,8 @@ def _fisher_points_patd_quadrature(
     device,
     detach_fisher_tensors=True,
     eval_patd_log_probs=None,
+    skip_zero_response=True,
+    zero_response_threshold=0.5,
 ):
     """
     Quadrature-based Fisher information over a log-spaced time grid.
@@ -859,21 +865,41 @@ def _fisher_points_patd_quadrature(
                     ly = r.item() if isinstance(r, torch.Tensor) else float(r)
                     lambda_per_pt[b] = ly
 
-    # Log-spaced time grids: one per detector point, shape (B, N)
-    t_start = (t_geom_min_per_pt - t_offset_ns).clamp(min=1.0)   # (B,) ns
-    t_end = torch.full((B,), t_max_ns, device=device)             # (B,) ns
+    # Skip detectors with negligible expected photon count — saves Jacobian cost
+    # and matches the behaviour of skip_zero_response in the LLR-net paths.
+    if skip_zero_response:
+        active_mask = lambda_per_pt >= zero_response_threshold   # (B,) bool
+        if not active_mask.any():
+            return torch.zeros(B, total_dims, total_dims, device=device)
+    else:
+        active_mask = torch.ones(B, dtype=torch.bool, device=device)
+
+    # Restrict computation to active points only — skip the Jacobian for detectors
+    # below the zero-response threshold.  Results are scattered back at the end.
+    active_idx = active_mask.nonzero(as_tuple=True)[0]  # indices into [0, B)
+    Ba = active_idx.shape[0]                             # number of active points
+    pts_3 = pts_3[active_idx]
+    t_geom_min_per_pt = t_geom_min_per_pt[active_idx]
+    lambda_per_pt = lambda_per_pt[active_idx]
+    if norm_const is not None:
+        det_const = det_const[active_idx]
+
+    # Log-spaced time grids: one per active detector point, shape (Ba, N)
+    t_start = (t_geom_min_per_pt - t_offset_ns).clamp(min=1.0)   # (Ba,) ns
+    t_end = torch.full((Ba,), t_max_ns, device=device)            # (Ba,) ns
 
     log_t_start = torch.log10(t_start)
     log_t_end = torch.log10(t_end)
     alpha = torch.linspace(0.0, 1.0, n_quadrature, device=device)  # (N,)
     log_t_grid = log_t_start.unsqueeze(1) + alpha.unsqueeze(0) * (
-        log_t_end - log_t_start).unsqueeze(1)    # (B, N)
-    t_grid = torch.pow(10.0, log_t_grid)          # (B, N) ns
+        log_t_end - log_t_start).unsqueeze(1)    # (Ba, N)
+    t_grid = torch.pow(10.0, log_t_grid)          # (Ba, N) ns
 
-    delta_log_t = (log_t_end - log_t_start) / max(n_quadrature - 1, 1)  # (B,)
-    dt_grid = t_grid * (math.log(10.0) * delta_log_t.unsqueeze(1))       # (B, N)
+    delta_log_t = (log_t_end - log_t_start) / max(n_quadrature - 1, 1)  # (Ba,)
+    dt_grid = t_grid * (math.log(10.0) * delta_log_t.unsqueeze(1))       # (Ba, N)
 
     dt_grid_detached = dt_grid.detach()
+    B = Ba  # from here on B refers to the active subset
 
     # ------------------------------------------------------------------ #
     # Phase 2: differentiable θ-dependent log-density + Fisher            #
@@ -1023,13 +1049,25 @@ def _fisher_points_patd_quadrature(
     # ------------------------------------------------------------------ #
     # Phase 4: weighted Fisher sum  F_b = λ_b × Σ_n w_n J_n J_n^T       #
     # ------------------------------------------------------------------ #
-    p_weights = _get_p_weights(theta0_flat)  # (B, N)
+    p_weights = _get_p_weights(theta0_flat)  # (Ba, N)
 
-    weighted_J = J * p_weights.unsqueeze(-1)                     # (B, N, D)
-    F_per_point = torch.einsum('bnd,bne->bde', weighted_J, J)    # (B, D, D)
+    weighted_J = J * p_weights.unsqueeze(-1)                       # (Ba, N, D)
+    F_active = torch.einsum('bnd,bne->bde', weighted_J, J)         # (Ba, D, D)
     del J, weighted_J
 
-    F_per_point = F_per_point * lambda_per_pt.view(B, 1, 1)
+    F_active = F_active * lambda_per_pt.view(B, 1, 1)
+
+    # Scatter active results back into a full (original B) tensor; inactive
+    # points remain zero (no photons → zero Fisher information).
+    B_orig = active_mask.shape[0]
+    if B_orig == B:
+        # All points were active — no scatter needed.
+        F_per_point = F_active
+    else:
+        F_per_point = torch.zeros(B_orig, total_dims, total_dims, device=device,
+                                  dtype=F_active.dtype)
+        F_per_point[active_idx] = F_active
+    del F_active
 
     return F_per_point.detach() if detach_fisher_tensors else F_per_point
 
@@ -1061,6 +1099,7 @@ def _compute_fisher_llr_over_points(
     t_offset_ns=100.0,
     t_max_ns=10000.0,
     eval_patd_log_probs=None,
+    zero_response_threshold=0.5,
 ):
     theta_tuple = tuple(event_params[p].detach().to(device) for p in fisher_info_params)
     theta_shapes = [event_params[p].detach().to(device).shape for p in fisher_info_params]
@@ -1102,6 +1141,8 @@ def _compute_fisher_llr_over_points(
                 device=device,
                 detach_fisher_tensors=detach_fisher_tensors,
                 eval_patd_log_probs=eval_patd_log_probs,
+                skip_zero_response=skip_zero_response,
+                zero_response_threshold=zero_response_threshold,
             )
             if fisher_sum is not None:
                 fisher_sum.add_(fisher_chunk.sum(dim=0))
@@ -1192,6 +1233,7 @@ def _compute_fisher_llr_over_points(
                     jacrev_chunk_size=jacrev_chunk_size,
                     detach_fisher_tensors=detach_fisher_tensors,
                     use_rich_features=False,
+                    zero_response_threshold=zero_response_threshold,
                 )
 
             for p_start in range(0, n_points, pt_chunk):
@@ -1241,6 +1283,7 @@ def _compute_fisher_llr_over_points(
             device=device,
             detach_fisher_tensors=detach_fisher_tensors,
             use_rich_features=use_rich_features,
+            zero_response_threshold=zero_response_threshold,
         )
         if detach_fisher_tensors:
             fisher_chunk = fisher_chunk.detach()
@@ -1362,7 +1405,7 @@ def directional_resolution(F3, n):
         return r68
 
 
-def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, t_offset_ns=100.0, t_max_ns=10000.0):
+def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5):
     """
     Compute the Fisher information matrix averaged over multiple LLR iterations.
     
@@ -1610,7 +1653,7 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
             _call_count = 0
             while _call_count < _max_calls:
                 if all(
-                    (skip_zero_response and mean_charges[_i] < 1) or
+                    (skip_zero_response and mean_charges[_i] < zero_response_threshold) or
                     (sum(len(_rt) for _rt in t_residuals_per_pt[_i]) >= llr_iterations)
                     for _i in range(n_points)
                 ):
@@ -1749,6 +1792,7 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
             t_offset_ns=t_offset_ns,
             t_max_ns=t_max_ns,
             eval_patd_log_probs=eval_patd_log_probs,
+            zero_response_threshold=zero_response_threshold,
         )
 
     elif llr_net is None:
@@ -1921,6 +1965,7 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
             t_offset_ns=t_offset_ns,
             t_max_ns=t_max_ns,
             eval_patd_log_probs=eval_patd_log_probs,
+            zero_response_threshold=zero_response_threshold,
         )
     # ---------------------------------------------- aggregate over points / strings
     if llr_net is not None and string_xy is None and sum_over_points:
