@@ -1094,7 +1094,9 @@ def _find_llr_charge_peak(eval_llr_on_charges, n_points, *, device,
 
     Returns
     -------
-    c_peak : (n_points,) charge at the per-detector LLR peak (>0)
+    c_peak    : (n_points,) charge at the per-detector LLR peak (>0)
+    llr_peak  : (n_points,) the LLR value at that peak (used for zero-response
+                gating when no surrogate is available)
     """
     B = n_points
     log_scan = torch.linspace(math.log10(charge_floor), math.log10(charge_ceil),
@@ -1105,9 +1107,9 @@ def _find_llr_charge_peak(eval_llr_on_charges, n_points, *, device,
         c_feat = (torch.log10(c_scan + 1e-10) / 4.0).reshape(B * n_scan, 1)
         llr = eval_llr_on_charges(c_feat).reshape(B, n_scan)               # (B, n_scan)
         llr = torch.nan_to_num(llr, nan=-1e30, posinf=1e30, neginf=-1e30)
-        peak_idx = torch.argmax(llr, dim=1)                                # (B,)
+        llr_peak, peak_idx = torch.max(llr, dim=1)                         # (B,), (B,)
         c_peak = c_scan[torch.arange(B, device=device), peak_idx]          # (B,)
-    return c_peak.detach()
+    return c_peak.detach(), llr_peak.detach()
 
 
 def _charge_quadrature_grid(center_per_pt, n_quadrature, *, device,
@@ -1192,87 +1194,43 @@ def _fisher_points_charge_quadrature(
     the self-normalised PDF  p̃(c|θ) = exp(LLR(c,θ)) / Z  and integrate the score
     over a charge grid.
 
-    The grid is centred on the surrogate mean λ by default. If
-    ``center_on_llr_peak=True`` the centre is instead the charge at which the
-    network likelihood peaks (found by a network-only coarse scan — the surrogate
-    output is not used for the centre). This guards against the case where the
-    LLR-net peak does not coincide with the surrogate's mean.
+    Two centring modes:
+    - Default (``center_on_llr_peak=False``): the grid is centred on the surrogate
+      mean λ. Requires ``surrogate_func``; skip_zero_response gates on λ.
+    - ``center_on_llr_peak=True``: the centre is the charge at which the network
+      likelihood peaks (network-only coarse scan). In this mode the surrogate is
+      NOT called at all and may be omitted (None). skip_zero_response then gates
+      on the peak charge against the SAME zero_response_threshold.
 
-    Requires an LLR net (the network defines the charge likelihood). Always
-    expects a non-zero light yield per active detector (still used for the
-    skip_zero_response gate).
+    Requires an LLR net (the network defines the charge likelihood).
     """
     if llr_net is None:
         raise ValueError(
             "_fisher_points_charge_quadrature requires an llr_net (it defines the "
             "charge likelihood ratio)."
         )
+    if not center_on_llr_peak and surrogate_func is None:
+        raise ValueError(
+            "_fisher_points_charge_quadrature requires surrogate_func unless "
+            "center_on_llr_peak=True (which centres the grid on the network peak "
+            "and needs no surrogate)."
+        )
 
     B = pts_3.shape[0]
     pts_3 = pts_3.float().to(device)
 
-    params0 = _unflatten_theta(
-        theta0_flat,
-        fisher_info_params=fisher_info_params,
-        theta_shapes=theta_shapes,
-        theta_numels=theta_numels,
-        fixed_params=fixed_params,
-    )
-
     norm_const = llr_net._pos_norm_divisor()
     det_const = (pts_3 / norm_const).detach()  # (B, 3)
 
-    # ------------------------------------------------------------------ #
-    # Phase 1: surrogate mean charge λ per detector (no grad)            #
-    # ------------------------------------------------------------------ #
-    lambda_per_pt = torch.zeros(B, device=device)
-    with torch.no_grad():
-        try:
-            raw = surrogate_func(opt_point=pts_3, event_params=params0)
-            if isinstance(raw, torch.Tensor):
-                lambda_per_pt = raw.detach().float().reshape(-1)[:B]
-            elif isinstance(raw, (list, tuple)) and len(raw) == B:
-                for b, r in enumerate(raw):
-                    if isinstance(r, dict):
-                        n = r.get('expected_photons', r.get('num_photons', 0))
-                        lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
-                    else:
-                        lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
-            else:
-                raise TypeError
-        except Exception:
-            for b in range(B):
-                r = surrogate_func(opt_point=pts_3[b], event_params=params0)
-                if isinstance(r, dict):
-                    n = r.get('expected_photons', r.get('num_photons', 0))
-                    lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
-                else:
-                    lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
-
-    lambda_per_pt = lambda_per_pt.abs()  # charge magnitude
-
-    # Skip negligible-charge detectors (cost + matches skip_zero_response).
-    if skip_zero_response:
-        active_mask = lambda_per_pt >= zero_response_threshold
-        if not active_mask.any():
-            return torch.zeros(B, total_dims, total_dims, device=device)
-    else:
-        active_mask = torch.ones(B, dtype=torch.bool, device=device)
-
-    active_idx = active_mask.nonzero(as_tuple=True)[0]
-    Ba = active_idx.shape[0]
-    pts_3 = pts_3[active_idx]
-    det_const = det_const[active_idx]
-    lambda_per_pt = lambda_per_pt[active_idx]
-
-    # ------------------------------------------------------------------ #
-    # Phase 2: log-spaced charge grid + θ-dependent self-normalised PDF  #
-    # ------------------------------------------------------------------ #
-    B = Ba  # from here on B is the active subset
     basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims
 
     def _build_ctx(theta_flat):
-        """Per-detector network context (B, ctx_dim), excluding the charge slot."""
+        """Per-detector network context (Bc, ctx_dim), excluding the charge slot.
+
+        Reads pts_3 / det_const from the enclosing scope, so it must be (re)bound
+        to the current subset before each call group. Bc is the current row count.
+        """
+        Bc = det_const.shape[0]
         params = _unflatten_theta(
             theta_flat,
             fisher_info_params=fisher_info_params,
@@ -1284,41 +1242,101 @@ def _fisher_points_charge_quadrature(
         direction = params['direction'].float().to(device).reshape(1, 3)
         dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
         energy = params['energy'].float().to(device).squeeze()
-        log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
+        log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(Bc, 1)
 
         rel = det_const - vert
         vert_dist = torch.norm(rel, dim=-1, keepdim=True)
         cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
             dir_norm * vert_dist.clamp(min=1e-8))
 
-        ctx_parts = [det_const, vert.expand(B, -1), direction.expand(B, -1), log_energy]
+        ctx_parts = [det_const, vert.expand(Bc, -1), direction.expand(Bc, -1), log_energy]
         if bool(getattr(llr_net, 'add_vertex_distance', True)):
             ctx_parts.append(vert_dist)
         ctx_parts.append(cos_angle)
         if bool(getattr(llr_net, 'add_distance_from_beam', False)):
             vert_unnorm = vert * norm_const
             _, dist_perp = llr_net.compute_distance_from_beam(
-                pts_3, vert_unnorm.expand(B, -1), direction.expand(B, -1))
+                pts_3, vert_unnorm.expand(Bc, -1), direction.expand(Bc, -1))
             ds = llr_net.domain_size
             half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
             ctx_parts.append(dist_perp / half)
-        return torch.cat(ctx_parts, dim=-1)  # (B, ctx_dim)
+        return torch.cat(ctx_parts, dim=-1)  # (Bc, ctx_dim)
 
-    # Choose the grid centre: surrogate mean λ, or the LLR-net likelihood peak.
+    def _eval_llr_on_charges(ctx0, c_feat_flat):
+        # ctx0: (Bc, ctx_dim) fixed context; c_feat_flat: (Bc*n_scan, 1).
+        Bc = ctx0.shape[0]
+        n_scan = c_feat_flat.shape[0] // Bc
+        ctx_rep = ctx0.unsqueeze(1).expand(Bc, n_scan, -1).reshape(Bc * n_scan, -1)
+        feats = torch.cat([ctx_rep, c_feat_flat], dim=-1)
+        return llr_net.predict_log_likelihood_ratio(feats, epsilon=1e-10)
+
+    # ------------------------------------------------------------------ #
+    # Phase 1: per-detector grid centre + active mask                    #
+    # ------------------------------------------------------------------ #
     if center_on_llr_peak:
-        ctx0 = _build_ctx(theta0_flat).detach()  # (B, ctx_dim)
-
-        def _eval_llr_on_charges(c_feat_flat):
-            # c_feat_flat: (B*n_scan, 1). Pair each detector's ctx with its scan row.
-            n_scan = c_feat_flat.shape[0] // B
-            ctx_rep = ctx0.unsqueeze(1).expand(B, n_scan, -1).reshape(B * n_scan, -1)
-            feats = torch.cat([ctx_rep, c_feat_flat], dim=-1)
-            return llr_net.predict_log_likelihood_ratio(feats, epsilon=1e-10)
-
-        grid_center = _find_llr_charge_peak(
-            _eval_llr_on_charges, B, device=device, n_scan=peak_scan_points)
+        # No surrogate: centre on the network likelihood peak and gate on the
+        # peak charge against zero_response_threshold.
+        ctx0_full = _build_ctx(theta0_flat).detach()  # (B, ctx_dim)
+        c_peak, _ = _find_llr_charge_peak(
+            lambda cf: _eval_llr_on_charges(ctx0_full, cf),
+            B, device=device, n_scan=peak_scan_points)
+        grid_center_full = c_peak  # (B,)
+        gate_value = c_peak        # gate on peak charge, same threshold
+        del ctx0_full
     else:
-        grid_center = lambda_per_pt
+        # Surrogate mean charge λ per detector (no grad).
+        lambda_per_pt = torch.zeros(B, device=device)
+        params0 = _unflatten_theta(
+            theta0_flat,
+            fisher_info_params=fisher_info_params,
+            theta_shapes=theta_shapes,
+            theta_numels=theta_numels,
+            fixed_params=fixed_params,
+        )
+        with torch.no_grad():
+            try:
+                raw = surrogate_func(opt_point=pts_3, event_params=params0)
+                if isinstance(raw, torch.Tensor):
+                    lambda_per_pt = raw.detach().float().reshape(-1)[:B]
+                elif isinstance(raw, (list, tuple)) and len(raw) == B:
+                    for b, r in enumerate(raw):
+                        if isinstance(r, dict):
+                            n = r.get('expected_photons', r.get('num_photons', 0))
+                            lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                        else:
+                            lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
+                else:
+                    raise TypeError
+            except Exception:
+                for b in range(B):
+                    r = surrogate_func(opt_point=pts_3[b], event_params=params0)
+                    if isinstance(r, dict):
+                        n = r.get('expected_photons', r.get('num_photons', 0))
+                        lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                    else:
+                        lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
+        lambda_per_pt = lambda_per_pt.abs()  # charge magnitude
+        grid_center_full = lambda_per_pt
+        gate_value = lambda_per_pt
+
+    # Skip negligible-response detectors (cost + matches skip_zero_response).
+    if skip_zero_response:
+        active_mask = gate_value >= zero_response_threshold
+        if not active_mask.any():
+            return torch.zeros(B, total_dims, total_dims, device=device)
+    else:
+        active_mask = torch.ones(B, dtype=torch.bool, device=device)
+
+    active_idx = active_mask.nonzero(as_tuple=True)[0]
+    Ba = active_idx.shape[0]
+    pts_3 = pts_3[active_idx]
+    det_const = det_const[active_idx]          # _build_ctx now sees the active subset
+    grid_center = grid_center_full[active_idx]
+
+    # ------------------------------------------------------------------ #
+    # Phase 2: log-spaced charge grid + θ-dependent self-normalised PDF  #
+    # ------------------------------------------------------------------ #
+    B = Ba  # from here on B is the active subset
 
     c_grid, dc_grid = _charge_quadrature_grid(grid_center, n_quadrature, device=device)  # (B, N)
     dc_grid_detached = dc_grid.detach()
@@ -1390,7 +1408,7 @@ def _fisher_points_charge_quadrature(
     # Release the per-point grid / feature intermediates before returning so
     # they are not held alive across the caller's next chunk.
     del p_weights, c_grid, dc_grid, dc_grid_detached, log_c_feat
-    del det_const, pts_3, lambda_per_pt
+    del det_const, pts_3, grid_center
 
     return F_per_point.detach() if detach_fisher_tensors else F_per_point
 
@@ -1905,6 +1923,13 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
     if use_charge_quadrature and (use_patd or use_patd_quadrature):
         raise ValueError(
             "use_charge_quadrature is mutually exclusive with use_patd / use_patd_quadrature."
+        )
+    if (use_charge_quadrature and not charge_center_on_llr_peak
+            and surrogate_func is None):
+        raise ValueError(
+            "use_charge_quadrature with charge_center_on_llr_peak=False requires a "
+            "surrogate_func (to centre the grid on the surrogate mean λ). Either "
+            "supply surrogate_func or set charge_center_on_llr_peak=True."
         )
 
     if use_patd_quadrature:
