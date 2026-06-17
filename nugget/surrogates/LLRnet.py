@@ -1782,10 +1782,11 @@ class LLRnet(Surrogate):
         if return_probabilities:
             return probabilities
         else:
-            # Convert probabilities to LLR: log(p/(1-p))
-            epsilon = 1e-7  # Small value to prevent log(0)
-            prob_clamped = torch.clamp(probabilities, epsilon, 1 - epsilon)
-            return torch.log(prob_clamped / (1 - prob_clamped))
+            # Convert probabilities to LLR = logit(p) = log(p/(1-p)).
+            # Do NOT clamp before logit: clamp has zero gradient in the clamped
+            # region, which kills Fisher info for saturated outputs. nn.Sigmoid
+            # never produces exactly 0 or 1 in float32, so logit stays finite.
+            return torch.logit(probabilities)
 
     def evaluate_patd_likelihood(self, point, event_data, signal_surrogate_func,
                                  event_labels=['position', 'energy', 'zenith', 'azimuth'],
@@ -2066,12 +2067,12 @@ class LLRnet(Surrogate):
         
         # Get probabilities from the network (already has sigmoid)
         probabilities = self._forward_pass(features)
-        
-        # Compute LLR: log(p/(1-p))
-        # epsilon = 1e-7  # Small value to prevent log(0)
-        prob_clamped = torch.clamp(probabilities, epsilon, 1 - epsilon)
-        llr = torch.log(prob_clamped / (1 - prob_clamped))
-        # llr = torch.log(probabilities + 1e-10) - torch.log(1 - (probabilities + 1e-10))
+
+        # Compute LLR = logit(p) = log(p/(1-p)).
+        # Do NOT clamp before logit: clamp has zero gradient in the clamped region,
+        # which kills Fisher info for saturated (out-of-distribution) outputs.
+        # nn.Sigmoid never produces exactly 0 or 1 in float32, so logit stays finite.
+        llr = torch.logit(probabilities)
         return llr
     
     def predict_likelihood_ratio(self, features):

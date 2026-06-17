@@ -1072,6 +1072,324 @@ def _fisher_points_patd_quadrature(
     return F_per_point.detach() if detach_fisher_tensors else F_per_point
 
 
+def _find_llr_charge_peak(eval_llr_on_charges, n_points, *, device,
+                          n_scan=64, charge_floor=1e-3, charge_ceil=1e4):
+    """Locate, per detector, the charge at which the LLR-net likelihood peaks.
+
+    This depends ONLY on the network: it scans a coarse log-spaced charge grid
+    over the full physical range [charge_floor, charge_ceil], evaluates the LLR,
+    and returns the per-detector argmax charge. The surrogate output is not used.
+
+    Fully vectorised: one batched network call over (n_points * n_scan) feature
+    rows, then a per-row argmax.
+
+    Parameters
+    ----------
+    eval_llr_on_charges : callable (c_feat_flat) -> llr_flat
+        Given a (n_points*n_scan, 1) tensor of log10(charge)/4 features, returns
+        the (n_points*n_scan,) LLR values (network evaluated at the fixed θ0
+        context for each detector).
+    n_points : int
+        Number of detectors (batch size B).
+
+    Returns
+    -------
+    c_peak : (n_points,) charge at the per-detector LLR peak (>0)
+    """
+    B = n_points
+    log_scan = torch.linspace(math.log10(charge_floor), math.log10(charge_ceil),
+                              n_scan, device=device)                        # (n_scan,)
+    c_scan = torch.pow(10.0, log_scan).unsqueeze(0).expand(B, n_scan)       # (B, n_scan)
+
+    with torch.no_grad():
+        c_feat = (torch.log10(c_scan + 1e-10) / 4.0).reshape(B * n_scan, 1)
+        llr = eval_llr_on_charges(c_feat).reshape(B, n_scan)               # (B, n_scan)
+        llr = torch.nan_to_num(llr, nan=-1e30, posinf=1e30, neginf=-1e30)
+        peak_idx = torch.argmax(llr, dim=1)                                # (B,)
+        c_peak = c_scan[torch.arange(B, device=device), peak_idx]          # (B,)
+    return c_peak.detach()
+
+
+def _charge_quadrature_grid(center_per_pt, n_quadrature, *, device,
+                            poisson_k=1.5, mag_k=0.5, w_min=0.3, w_max=3.0,
+                            charge_floor=1e-3, charge_ceil=1e4):
+    """Build a per-detector log-spaced charge grid centred on ``center_per_pt``.
+
+    ``center_per_pt`` is the per-detector charge the grid is centred on — either
+    the surrogate mean λ, or (when the LLR-net peak search is enabled) the charge
+    at which the network likelihood peaks.
+
+    The half-width (in decades) adapts to the *order of magnitude* of the centre
+    charge on two complementary axes:
+
+      1. Magnitude term (mag_k): a slab whose width grows with how many decades the
+         centre sits above the floor — log10(c / charge_floor). This makes the
+         window scale with the order of magnitude of the charge, so a centre near
+         1000 gets a proportionally wider absolute window than one near 0.1.
+      2. Poisson term (poisson_k): the statistical relative spread of a Poisson(c),
+         std √c → ≈ 0.4343/√c decades. This dominates at small c where the charge
+         PDF is broad / quasi-discrete and vanishes for large c.
+
+    The two are combined (max) and clamped to [w_min, w_max]; the lower edge is
+    clamped to charge_floor and the upper edge to charge_ceil so the grid stays
+    physical across the full ~0.01 → 1000s dynamic range.
+
+    Returns
+    -------
+    c_grid   : (B, N) charge values (>0)
+    dc_grid  : (B, N) Riemann widths in linear charge (for ∫ p dc normalisation)
+    """
+    lam = center_per_pt.clamp(min=charge_floor)                   # (B,)
+    log_lam = torch.log10(lam)                                     # (B,)
+    log_floor = math.log10(charge_floor)
+
+    # 1. Order-of-magnitude term: scales with decades above the floor.
+    mag_width = mag_k * (log_lam - log_floor)                      # (B,)
+    # 2. Poisson relative width in decades (0.4342944819 = 1/ln(10)).
+    poisson_width = poisson_k * 0.4342944819 / torch.sqrt(lam)     # (B,)
+
+    width = torch.maximum(mag_width, poisson_width).clamp(min=w_min, max=w_max)  # (B,)
+
+    log_lo = torch.clamp(log_lam - width, min=log_floor)                          # (B,)
+    log_hi = torch.clamp(log_lam + width, max=math.log10(charge_ceil))            # (B,)
+
+    alpha = torch.linspace(0.0, 1.0, n_quadrature, device=device)  # (N,)
+    log_c_grid = log_lo.unsqueeze(1) + alpha.unsqueeze(0) * (log_hi - log_lo).unsqueeze(1)  # (B, N)
+    c_grid = torch.pow(10.0, log_c_grid)                           # (B, N)
+
+    delta_log_c = (log_hi - log_lo) / max(n_quadrature - 1, 1)     # (B,)
+    dc_grid = c_grid * (math.log(10.0) * delta_log_c.unsqueeze(1)) # (B, N) linear widths
+    return c_grid, dc_grid
+
+
+def _fisher_points_charge_quadrature(
+    pts_3,
+    *,
+    llr_net,
+    surrogate_func,
+    fisher_info_params,
+    fixed_params,
+    theta0_flat,
+    theta_shapes,
+    theta_numels,
+    total_dims,
+    n_quadrature,
+    llr_autodiff_mode,
+    jacrev_chunk_size,
+    grad_chunk_size,
+    device,
+    detach_fisher_tensors=True,
+    skip_zero_response=True,
+    zero_response_threshold=0.5,
+    center_on_llr_peak=False,
+    peak_scan_points=64,
+):
+    """Quadrature-based Fisher information over a log-spaced *charge* grid.
+
+    Non-PATD analogue of _fisher_points_patd_quadrature: the observable is the
+    detector charge (light yield) rather than a photon arrival time.  The LLR
+    network gives log(p_sig/p_bg) as a function of the observed charge; we form
+    the self-normalised PDF  p̃(c|θ) = exp(LLR(c,θ)) / Z  and integrate the score
+    over a charge grid.
+
+    The grid is centred on the surrogate mean λ by default. If
+    ``center_on_llr_peak=True`` the centre is instead the charge at which the
+    network likelihood peaks (found by a network-only coarse scan — the surrogate
+    output is not used for the centre). This guards against the case where the
+    LLR-net peak does not coincide with the surrogate's mean.
+
+    Requires an LLR net (the network defines the charge likelihood). Always
+    expects a non-zero light yield per active detector (still used for the
+    skip_zero_response gate).
+    """
+    if llr_net is None:
+        raise ValueError(
+            "_fisher_points_charge_quadrature requires an llr_net (it defines the "
+            "charge likelihood ratio)."
+        )
+
+    B = pts_3.shape[0]
+    pts_3 = pts_3.float().to(device)
+
+    params0 = _unflatten_theta(
+        theta0_flat,
+        fisher_info_params=fisher_info_params,
+        theta_shapes=theta_shapes,
+        theta_numels=theta_numels,
+        fixed_params=fixed_params,
+    )
+
+    norm_const = llr_net._pos_norm_divisor()
+    det_const = (pts_3 / norm_const).detach()  # (B, 3)
+
+    # ------------------------------------------------------------------ #
+    # Phase 1: surrogate mean charge λ per detector (no grad)            #
+    # ------------------------------------------------------------------ #
+    lambda_per_pt = torch.zeros(B, device=device)
+    with torch.no_grad():
+        try:
+            raw = surrogate_func(opt_point=pts_3, event_params=params0)
+            if isinstance(raw, torch.Tensor):
+                lambda_per_pt = raw.detach().float().reshape(-1)[:B]
+            elif isinstance(raw, (list, tuple)) and len(raw) == B:
+                for b, r in enumerate(raw):
+                    if isinstance(r, dict):
+                        n = r.get('expected_photons', r.get('num_photons', 0))
+                        lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                    else:
+                        lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
+            else:
+                raise TypeError
+        except Exception:
+            for b in range(B):
+                r = surrogate_func(opt_point=pts_3[b], event_params=params0)
+                if isinstance(r, dict):
+                    n = r.get('expected_photons', r.get('num_photons', 0))
+                    lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                else:
+                    lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
+
+    lambda_per_pt = lambda_per_pt.abs()  # charge magnitude
+
+    # Skip negligible-charge detectors (cost + matches skip_zero_response).
+    if skip_zero_response:
+        active_mask = lambda_per_pt >= zero_response_threshold
+        if not active_mask.any():
+            return torch.zeros(B, total_dims, total_dims, device=device)
+    else:
+        active_mask = torch.ones(B, dtype=torch.bool, device=device)
+
+    active_idx = active_mask.nonzero(as_tuple=True)[0]
+    Ba = active_idx.shape[0]
+    pts_3 = pts_3[active_idx]
+    det_const = det_const[active_idx]
+    lambda_per_pt = lambda_per_pt[active_idx]
+
+    # ------------------------------------------------------------------ #
+    # Phase 2: log-spaced charge grid + θ-dependent self-normalised PDF  #
+    # ------------------------------------------------------------------ #
+    B = Ba  # from here on B is the active subset
+    basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims
+
+    def _build_ctx(theta_flat):
+        """Per-detector network context (B, ctx_dim), excluding the charge slot."""
+        params = _unflatten_theta(
+            theta_flat,
+            fisher_info_params=fisher_info_params,
+            theta_shapes=theta_shapes,
+            theta_numels=theta_numels,
+            fixed_params=fixed_params,
+        )
+        vert = params['position'].float().to(device).reshape(1, 3) / norm_const
+        direction = params['direction'].float().to(device).reshape(1, 3)
+        dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+        energy = params['energy'].float().to(device).squeeze()
+        log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
+
+        rel = det_const - vert
+        vert_dist = torch.norm(rel, dim=-1, keepdim=True)
+        cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
+            dir_norm * vert_dist.clamp(min=1e-8))
+
+        ctx_parts = [det_const, vert.expand(B, -1), direction.expand(B, -1), log_energy]
+        if bool(getattr(llr_net, 'add_vertex_distance', True)):
+            ctx_parts.append(vert_dist)
+        ctx_parts.append(cos_angle)
+        if bool(getattr(llr_net, 'add_distance_from_beam', False)):
+            vert_unnorm = vert * norm_const
+            _, dist_perp = llr_net.compute_distance_from_beam(
+                pts_3, vert_unnorm.expand(B, -1), direction.expand(B, -1))
+            ds = llr_net.domain_size
+            half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
+            ctx_parts.append(dist_perp / half)
+        return torch.cat(ctx_parts, dim=-1)  # (B, ctx_dim)
+
+    # Choose the grid centre: surrogate mean λ, or the LLR-net likelihood peak.
+    if center_on_llr_peak:
+        ctx0 = _build_ctx(theta0_flat).detach()  # (B, ctx_dim)
+
+        def _eval_llr_on_charges(c_feat_flat):
+            # c_feat_flat: (B*n_scan, 1). Pair each detector's ctx with its scan row.
+            n_scan = c_feat_flat.shape[0] // B
+            ctx_rep = ctx0.unsqueeze(1).expand(B, n_scan, -1).reshape(B * n_scan, -1)
+            feats = torch.cat([ctx_rep, c_feat_flat], dim=-1)
+            return llr_net.predict_log_likelihood_ratio(feats, epsilon=1e-10)
+
+        grid_center = _find_llr_charge_peak(
+            _eval_llr_on_charges, B, device=device, n_scan=peak_scan_points)
+    else:
+        grid_center = lambda_per_pt
+
+    c_grid, dc_grid = _charge_quadrature_grid(grid_center, n_quadrature, device=device)  # (B, N)
+    dc_grid_detached = dc_grid.detach()
+
+    # The network consumes log10(charge)/4 in the observation slot, matching the
+    # charge feature layout used elsewhere (see _build_rich_features_from_cached_obs).
+    log_c_feat = (torch.log10(c_grid + 1e-10) / 4.0).reshape(B * n_quadrature, 1).detach()
+
+    def _theta_only_fn(theta_flat):
+        ctx = _build_ctx(theta_flat)
+        ctx_rep = ctx.unsqueeze(1).expand(B, n_quadrature, -1).reshape(B * n_quadrature, -1)
+        features = torch.cat([ctx_rep, log_c_feat], dim=-1)
+        llr_vals = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-10)
+
+        r_vals = torch.exp(llr_vals).reshape(B, n_quadrature)
+        Z = (r_vals * dc_grid_detached).sum(dim=1, keepdim=True).clamp(min=1e-20)
+        log_r_norm = llr_vals.reshape(B, n_quadrature) - torch.log(Z)  # (B, N)
+        return log_r_norm
+
+    def _get_p_weights(theta_flat):
+        with torch.no_grad():
+            log_p = _theta_only_fn(theta_flat)   # (B, N)
+            r = torch.exp(log_p)
+            Z = (r * dc_grid_detached).sum(dim=1, keepdim=True).clamp(min=1e-20)
+            return (r * dc_grid_detached / Z).detach()  # (B, N)
+
+    # ------------------------------------------------------------------ #
+    # Phase 3: Jacobian ∂ log p̃(c_n|θ) / ∂θ                              #
+    # ------------------------------------------------------------------ #
+    if llr_autodiff_mode == 'jacrev':
+        J_raw = jacrev(_theta_only_fn, chunk_size=jacrev_chunk_size)(theta0_flat)
+        J = J_raw.reshape(B, n_quadrature, total_dims)
+        del J_raw
+    else:
+        # LLR-net is deterministic inside the trace: linearize + vmap over basis.
+        y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
+        del y0
+        cols_parts = []
+        for d_start in range(0, total_dims, basis_chunk_size):
+            d_end = min(d_start + basis_chunk_size, total_dims)
+            k = d_end - d_start
+            bvecs = torch.zeros(k, total_dims, device=device, dtype=theta0_flat.dtype)
+            bvecs[torch.arange(k, device=device), torch.arange(d_start, d_end, device=device)] = 1
+            cols_parts.append(vmap(jvp_fn, randomness='same')(bvecs))  # (k, B, N)
+        del jvp_fn
+        cols = torch.cat(cols_parts, dim=0)        # (D, B, N)
+        J = cols.permute(1, 2, 0).contiguous()     # (B, N, D)
+        del cols, cols_parts
+
+    # ------------------------------------------------------------------ #
+    # Phase 4: weighted Fisher sum  F_b = Σ_n w_n J_n J_n^T              #
+    # (No λ multiplier: charge is the observable, so this is the full     #
+    #  charge-distribution Fisher already.)                               #
+    # ------------------------------------------------------------------ #
+    p_weights = _get_p_weights(theta0_flat)  # (Ba, N)
+    weighted_J = J * p_weights.unsqueeze(-1)                       # (Ba, N, D)
+    F_active = torch.einsum('bnd,bne->bde', weighted_J, J)         # (Ba, D, D)
+    del J, weighted_J
+
+    B_orig = active_mask.shape[0]
+    if B_orig == B:
+        F_per_point = F_active
+    else:
+        F_per_point = torch.zeros(B_orig, total_dims, total_dims, device=device,
+                                  dtype=F_active.dtype)
+        F_per_point[active_idx] = F_active
+    del F_active
+
+    return F_per_point.detach() if detach_fisher_tensors else F_per_point
+
+
 def _compute_fisher_llr_over_points(
     *,
     point,
@@ -1096,6 +1414,9 @@ def _compute_fisher_llr_over_points(
     detach_fisher_tensors=True,
     use_rich_features=False,
     use_patd_quadrature=False,
+    use_charge_quadrature=False,
+    charge_center_on_llr_peak=False,
+    charge_peak_scan_points=64,
     t_offset_ns=100.0,
     t_max_ns=10000.0,
     eval_patd_log_probs=None,
@@ -1115,6 +1436,40 @@ def _compute_fisher_llr_over_points(
         fisher_per_point = torch.zeros(n_points, total_dims, total_dims, device=device)
 
     llr_autodiff_mode = (llr_autodiff_mode or 'jacrev').lower()
+
+    # ---- charge quadrature path -----------------------------------------
+    if use_charge_quadrature:
+        for p_start in range(0, n_points, pt_chunk):
+            p_end = min(p_start + pt_chunk, n_points)
+            pts = point[p_start:p_end]
+            fisher_chunk = _fisher_points_charge_quadrature(
+                pts,
+                llr_net=llr_net,
+                surrogate_func=surrogate_func,
+                fisher_info_params=fisher_info_params,
+                fixed_params=fixed_params,
+                theta0_flat=theta0_flat,
+                theta_shapes=theta_shapes,
+                theta_numels=theta_numels,
+                total_dims=total_dims,
+                n_quadrature=llr_iterations,
+                llr_autodiff_mode=llr_autodiff_mode,
+                jacrev_chunk_size=jacrev_chunk_size,
+                grad_chunk_size=grad_chunk_size,
+                device=device,
+                detach_fisher_tensors=detach_fisher_tensors,
+                skip_zero_response=skip_zero_response,
+                zero_response_threshold=zero_response_threshold,
+                center_on_llr_peak=charge_center_on_llr_peak,
+                peak_scan_points=charge_peak_scan_points,
+            )
+            if fisher_sum is not None:
+                fisher_sum.add_(fisher_chunk.sum(dim=0))
+            else:
+                fisher_per_point[p_start:p_end] = fisher_chunk
+            del fisher_chunk, pts
+            _fisher_chunk_cleanup(device)
+        return fisher_sum, fisher_per_point
 
     # ---- PATD quadrature path -------------------------------------------
     if use_patd_quadrature:
@@ -1329,8 +1684,12 @@ def directional_resolution(F3, n):
 
         # --- Project Fisher ---
         F2 = B.T @ F3 @ B   # 2x2 Fisher in tangent coords
-        F2 = F2 + 1e-10 * torch.eye(2, device=F2.device, dtype=F2.dtype)  # Increased regularization for stability
-        
+        # Regularization must be large enough that the inverse() gradient stays
+        # finite when F2 is near-singular (zero-Fisher strings); the gradient of
+        # inverse scales like O(1/eps^2), so 1e-10 -> ~1e20. 1e-6 keeps it bounded
+        # while remaining small relative to physically-informative Fisher values.
+        F2 = F2 + 1e-6 * torch.eye(2, device=F2.device, dtype=F2.dtype)
+
         # --- Invert to get covariance ---
         try:
             Cov2 = torch.inverse(F2)
@@ -1379,8 +1738,11 @@ def directional_resolution(F3, n):
         # F2 = B.T @ F3 @ B for each batch element
         F2 = torch.bmm(torch.bmm(B.transpose(1, 2), F3), B)  # (N, 2, 2)
         
-        # Add regularization
-        F2 = F2 + 1e-8 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)  # Increased regularization for stability
+        # Add regularization. Must be large enough that the inverse() gradient
+        # stays finite when F2 is near-singular (zero-Fisher strings); the gradient
+        # of inverse scales like O(1/eps^2), so 1e-8 -> ~1e16. 1e-6 keeps it bounded
+        # while remaining small relative to physically-informative Fisher values.
+        F2 = F2 + 1e-6 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)
         
         # --- Invert to get covariance (N, 2, 2) ---
         try:
@@ -1405,7 +1767,7 @@ def directional_resolution(F3, n):
         return r68
 
 
-def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5):
+def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, use_charge_quadrature=False, charge_center_on_llr_peak=False, charge_peak_scan_points=64, t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5):
     """
     Compute the Fisher information matrix averaged over multiple LLR iterations.
     
@@ -1530,6 +1892,16 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
     fixed_params = {k: v.detach().to(device) for k, v in event_params.items() if k not in fisher_info_params}
 
     # -----------------------------------------------------------------------
+    if use_charge_quadrature and llr_net is None:
+        raise ValueError(
+            "use_charge_quadrature=True requires an llr_net (the network defines the "
+            "charge likelihood ratio)."
+        )
+    if use_charge_quadrature and (use_patd or use_patd_quadrature):
+        raise ValueError(
+            "use_charge_quadrature is mutually exclusive with use_patd / use_patd_quadrature."
+        )
+
     if use_patd_quadrature:
         # ---- PATD quadrature path (via LLR net, no CPandel needed) ----------
         # Handled inside _compute_fisher_llr_over_points — falls through to the
@@ -1962,6 +2334,9 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
             detach_fisher_tensors=detach_fisher_tensors,
             use_rich_features=use_rich_features,
             use_patd_quadrature=use_patd_quadrature,
+            use_charge_quadrature=use_charge_quadrature,
+            charge_center_on_llr_peak=charge_center_on_llr_peak,
+            charge_peak_scan_points=charge_peak_scan_points,
             t_offset_ns=t_offset_ns,
             t_max_ns=t_max_ns,
             eval_patd_log_probs=eval_patd_log_probs,

@@ -191,7 +191,7 @@ class WeightedFisherInfoLoss(LossFunction):
         # self.background_event_params = background_event_params
         self.fisher_info_params = fisher_info_params # Default parameters for Fisher Info
 
-    def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False, skip_zero_response=True, verbose=False, event_batch_size=1, grad_chunk_size=10, jacrev_chunk_size=10000, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5):
+    def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False, skip_zero_response=True, verbose=False, event_batch_size=1, grad_chunk_size=10, jacrev_chunk_size=10000, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, use_charge_quadrature=False, charge_center_on_llr_peak=False, charge_peak_scan_points=64, t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5):
         n_strings = len(string_xy)
         # use_rich_features is now stored on the model — read from it if available.
         if llr_net is not None and not use_rich_features:
@@ -246,6 +246,9 @@ class WeightedFisherInfoLoss(LossFunction):
                         eval_patd_log_probs=eval_patd_log_probs,
                         use_rich_features=use_rich_features,
                         use_patd_quadrature=use_patd_quadrature,
+                        use_charge_quadrature=use_charge_quadrature,
+                        charge_center_on_llr_peak=charge_center_on_llr_peak,
+                        charge_peak_scan_points=charge_peak_scan_points,
                         t_offset_ns=t_offset_ns,
                         t_max_ns=t_max_ns,
                         zero_response_threshold=zero_response_threshold,
@@ -632,6 +635,9 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         eval_patd_log_probs = kwargs.get('eval_patd_log_probs', None)
         use_rich_features = kwargs.get('use_rich_features', False)
         use_patd_quadrature = kwargs.get('use_patd_quadrature', False)
+        use_charge_quadrature = kwargs.get('use_charge_quadrature', False)
+        charge_center_on_llr_peak = kwargs.get('charge_center_on_llr_peak', False)
+        charge_peak_scan_points = kwargs.get('charge_peak_scan_points', 64)
         t_offset_ns = kwargs.get('t_offset_ns', 100.0)
         t_max_ns = kwargs.get('t_max_ns', 10000.0)
         zero_response_threshold = kwargs.get('zero_response_threshold', 0.5)
@@ -673,6 +679,9 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 eval_patd_log_probs=eval_patd_log_probs,
                 use_rich_features=use_rich_features,
                 use_patd_quadrature=use_patd_quadrature,
+                use_charge_quadrature=use_charge_quadrature,
+                charge_center_on_llr_peak=charge_center_on_llr_peak,
+                charge_peak_scan_points=charge_peak_scan_points,
                 t_offset_ns=t_offset_ns,
                 t_max_ns=t_max_ns,
                 zero_response_threshold=zero_response_threshold,
@@ -744,18 +753,18 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 resolution_per_event = torch.stack(resolution_per_event)
             finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
             if finite_mask.any():
-                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                # Replace bad entries with a large sentinel WITHIN the graph (not via
+                # boolean indexing) so their 1/r^2 contribution is ~0 AND no NaN/inf
+                # gradient flows back through string_weights for those events.
+                safe_res = torch.where(
+                    finite_mask,
+                    torch.clamp_min(resolution_per_event, 1e-12),
+                    torch.full_like(resolution_per_event, 1e6),
+                )
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
             else:
                 # Keep optimization stable when all events are invalid/singular.
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
-            # finite_mask = torch.isfinite(resolution_per_event)
-            # if finite_mask.any():
-            #     total_resolution = torch.mean(resolution_per_event[finite_mask])
-            #     total_resolution = total_resolution/max_angular_resolution
-            # else:
-            #     # If all resolutions are NaN/inf, return a large penalty value
-            #     total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
             return {'angular_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
         elif self.resolution_type == 'energy':
             # Compute covariance matrix for energy resolution
@@ -787,7 +796,11 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
             resolution_per_event = torch.stack(resolution_per_event)
             finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
             if finite_mask.any():
-                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                safe_res = torch.where(
+                    finite_mask,
+                    torch.clamp_min(resolution_per_event, 1e-12),
+                    torch.full_like(resolution_per_event, 1e6),
+                )
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
@@ -951,7 +964,11 @@ class ResolutionLoss(FisherInfoLoss):
             resolution_per_event = torch.stack(resolution_per_event)
             finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
             if finite_mask.any():
-                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                safe_res = torch.where(
+                    finite_mask,
+                    torch.clamp_min(resolution_per_event, 1e-12),
+                    torch.full_like(resolution_per_event, 1e6),
+                )
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / safe_res**2))
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
@@ -990,7 +1007,11 @@ class ResolutionLoss(FisherInfoLoss):
             resolution_per_event = torch.stack(resolution_per_event)
             finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
             if finite_mask.any():
-                safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
+                safe_res = torch.where(
+                    finite_mask,
+                    torch.clamp_min(resolution_per_event, 1e-12),
+                    torch.full_like(resolution_per_event, 1e6),
+                )
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / safe_res**2))
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
