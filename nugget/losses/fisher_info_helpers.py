@@ -1385,7 +1385,12 @@ def _fisher_points_charge_quadrature(
         F_per_point = torch.zeros(B_orig, total_dims, total_dims, device=device,
                                   dtype=F_active.dtype)
         F_per_point[active_idx] = F_active
-    del F_active
+        del F_active
+
+    # Release the per-point grid / feature intermediates before returning so
+    # they are not held alive across the caller's next chunk.
+    del p_weights, c_grid, dc_grid, dc_grid_detached, log_c_feat
+    del det_const, pts_3, lambda_per_pt
 
     return F_per_point.detach() if detach_fisher_tensors else F_per_point
 
