@@ -828,8 +828,9 @@ class LLRnet(Surrogate):
            log10(E)/8,                log-scaled energy                (1)
            vert_dist,                 L2(detector - vertex) normalised (1, optional)
            cos_angle,                 cos(direction ∠ vertex→detector) (1)
+           dist_perp,                 perp. distance to beam normalised(1, optional)
            log_ly]                    log-scaled light yield           (1)
-                                                                                                                             total = 12 or 13
+                                                                                                                             total = 12, 13 or 14
 
         Normalisation uses self.domain_size via _pos_norm_divisor().
 
@@ -900,7 +901,13 @@ class LLRnet(Surrogate):
         ]
         if self.add_vertex_distance:
             feature_values.append(vert_dist)
-        feature_values.extend([cos_angle, log_ly])
+        feature_values.append(cos_angle)
+        if self.add_distance_from_beam:
+            track_pos = vert * norm  # back to original scale for distance calculation
+            track_dir = direction    # already a unit vector
+            _, dist_perp = self.compute_distance_from_beam(point, track_pos, track_dir)
+            feature_values.append(dist_perp.reshape(()) / (self.domain_size / 2))
+        feature_values.append(log_ly)
 
         features = torch.stack(feature_values)
 
