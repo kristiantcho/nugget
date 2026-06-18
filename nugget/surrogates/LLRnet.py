@@ -3528,11 +3528,61 @@ class LLRnet(Surrogate):
         # Since the dataset returns a full batch at once, batch_size for DataLoader must be None
         # or 1 (if we squeeze later). Usually None disables automatic batching.
         return DataLoader(dataset, batch_size=None, num_workers=num_workers)
-    
+
+    def _resolve_pin_memory(self, pin_memory=None, pin_memory_device=None):
+        """Resolve (pin_memory, pin_memory_device) for a DataLoader.
+
+        pin_memory speeds up host->GPU transfers, but the pin-memory thread
+        allocates CUDA pinned host memory against a specific device. If that
+        device (default: cuda:0) is full or unusable it raises
+        cudaErrorMemoryAllocation — even when the tensors live on CPU.
+
+        Parameters
+        ----------
+        pin_memory : bool or None
+            None  -> auto: enable only if CUDA is available (works for CPU
+                     training too, since pinning is host-side, as long as some
+                     CUDA device can be addressed).
+            True  -> force on (use pin_memory_device to pick which GPU to pin to).
+            False -> force off.
+        pin_memory_device : str / int / torch.device or None
+            Which CUDA device the pin-memory thread targets. Defaults to this
+            model's device if it is CUDA, else 'cuda:0'. Pass e.g. 'cuda:1' to
+            avoid a full device 0. Ignored when pin_memory is False.
+
+        Returns
+        -------
+        (pin_memory: bool, pin_memory_device: str)  — device is '' when disabled.
+        """
+        cuda_ok = torch.cuda.is_available()
+        model_dev = getattr(self, 'device', None)
+        if model_dev is not None and not isinstance(model_dev, torch.device):
+            model_dev = torch.device(model_dev)
+
+        if pin_memory is None:
+            pin_memory = bool(cuda_ok)
+
+        if not pin_memory or not cuda_ok:
+            return False, ''
+
+        # Pick the target device for pinning.
+        if pin_memory_device is None:
+            if model_dev is not None and model_dev.type == 'cuda':
+                pin_memory_device = f'cuda:{model_dev.index if model_dev.index is not None else 0}'
+            else:
+                pin_memory_device = 'cuda:0'
+        elif isinstance(pin_memory_device, int):
+            pin_memory_device = f'cuda:{pin_memory_device}'
+        else:
+            pin_memory_device = str(pin_memory_device)
+
+        return True, pin_memory_device
+
     def create_event_dataloader(self, signal_sampler, background_sampler, signal_surrogate_func, background_surrogate_func,
                                num_samples_per_epoch=1000, batch_size=32,
                                shuffle=True, num_workers=0, output_true_light_yield=False,
-                               event_labels=['position', 'energy', 'zenith', 'azimuth'], pin_memory=None):
+                               event_labels=['position', 'energy', 'zenith', 'azimuth'],
+                               pin_memory=None, pin_memory_device=None):
         """
         Create a DataLoader for balanced signal/background training using the EventDataset class.
         
@@ -3598,28 +3648,24 @@ class LLRnet(Surrogate):
             event_labels=event_labels, output_true_light_yield=output_true_light_yield
         )
 
-        # See create_signal_only_dataloader: only pin memory when on a CUDA device,
-        # otherwise the pin-memory thread can raise cudaErrorMemoryAllocation.
-        if pin_memory is None:
-            dev = getattr(self, 'device', None)
-            dev = torch.device(dev) if dev is not None and not isinstance(dev, torch.device) else dev
-            pin_memory = bool(torch.cuda.is_available() and dev is not None and dev.type == 'cuda')
-
-        dataloader = DataLoader(
+        pin_memory, pin_memory_device = self._resolve_pin_memory(pin_memory, pin_memory_device)
+        dl_kwargs = dict(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=pin_memory  # Speed up GPU transfers (only when on CUDA)
+            pin_memory=pin_memory,
         )
+        if pin_memory and pin_memory_device:
+            dl_kwargs['pin_memory_device'] = pin_memory_device
 
-        return dataloader
+        return DataLoader(**dl_kwargs)
     
     def create_signal_only_dataloader(self, signal_sampler, signal_surrogate_func,
                                      num_samples_per_epoch=1000, batch_size=32,
                                      shuffle=True, num_workers=0, output_true_light_yield=False,
                                      event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                                     pin_memory=None, **other_kwargs):
+                                     pin_memory=None, pin_memory_device=None, **other_kwargs):
         """
         Create a DataLoader for signal-only training with matched/mismatched light yields.
         
@@ -3683,24 +3729,17 @@ class LLRnet(Surrogate):
             **other_kwargs
         )
 
-        # pin_memory speeds up host->GPU transfers but the pin-memory thread
-        # allocates CUDA pinned host memory, which needs a usable CUDA context
-        # even when the tensors themselves live on CPU. On a CPU-only / GPU-full
-        # node that allocation raises cudaErrorMemoryAllocation. Default to
-        # enabling it only when training on a CUDA device.
-        if pin_memory is None:
-            dev = getattr(self, 'device', None)
-            dev = torch.device(dev) if dev is not None and not isinstance(dev, torch.device) else dev
-            pin_memory = bool(torch.cuda.is_available() and dev is not None and dev.type == 'cuda')
-
-        dataloader = DataLoader(
+        pin_memory, pin_memory_device = self._resolve_pin_memory(pin_memory, pin_memory_device)
+        dl_kwargs = dict(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=pin_memory  # Speed up GPU transfers (only when on CUDA)
+            pin_memory=pin_memory,
         )
+        if pin_memory and pin_memory_device:
+            dl_kwargs['pin_memory_device'] = pin_memory_device
 
-        return dataloader
+        return DataLoader(**dl_kwargs)
 
 
