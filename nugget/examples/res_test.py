@@ -5,19 +5,19 @@ import numpy as np
 # import os
 # from nugget.losses.effective_area import get_bounding_cylinder
 
-device = 'cuda:1'
+device = 'cuda:3'
 num_events = 50000
 version = 'r600_50_u_1'
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
-use_poisson = False
+# use_poisson = False
 center = [0,0,0]
 radius = 600
 height = 1000
 use_patd=False
 
 if not use_patd:
-    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=use_poisson, domain_size=1600, particle_mode = 'track')
+    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = 'track')
 else:
     lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
         device=device,
@@ -185,18 +185,22 @@ for geom_name in ['800main_full_hex', '340grid']:
                 signal_event_params=signal_events,
                 signal_surrogate_func=light_yield_surrogate,
                 llr_net=llr_net,
-                llr_iterations=1 if not use_poisson else 100,
+                llr_iterations=200,
                 skip_zero_response=True,
                 verbose=True,
                 jacrev_chunk_size=50000,
-                point_chunk_size=13000,
+                point_chunk_size=5000,
                 grad_chunk_size=7,
                 llr_autodiff_mode='jvp',
                 use_rich_features=True,
                 use_patd=use_patd,
                 use_patd_quadrature=use_patd,
                 t_offset_ns=0,
-                t_max_ns=5000
+                t_max_ns=5000,
+                zero_response_threshold=0.01,
+                use_charge_quadrature=not use_patd,  # for patd, charge quadrature is handled inside the surrogate
+                charge_center_on_llr_peak=not use_patd,  # for patd, the surrogate is already centered on the llr peak
+                charge_peak_scan_points=64,
                 )
 
     # precomputed_ly = signal_yield_loss_func.light_yield_per_string(
@@ -208,7 +212,7 @@ for geom_name in ['800main_full_hex', '340grid']:
 
 
     extra = '_patd' if use_patd else ''
-    extra += '_no_pois' if not use_poisson else ''
+    # extra += '_no_pois' if not use_poisson else ''
     torch.save(fisher_info_per_string_per_event.cpu(), f'res_test/fisher_info_per_string_per_event_{num_events}_{geom_name}_{version}{extra}.pt')
     # torch.save(precomputed_ly.cpu(), f'res_test/light_yield_per_string_{num_events}_{geom_name}_{version}.pt')
 

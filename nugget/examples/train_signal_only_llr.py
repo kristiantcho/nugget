@@ -1,7 +1,7 @@
 import nugget  # Main NUGGET package for neutrino detector optimization
 import pickle 
 
-lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=2000, particle_mode='cascade')
+lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=2000, particle_mode='track')
 light_yield_surrogate = lightsabre.light_yield_surrogate
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
             event_type='signal', 
@@ -25,7 +25,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     num_frequencies_per_branch=[64,64],  # Number of Fourier features per branch
     learnable_frequencies=False,  # Fixed frequency features
     dropout_rate=0,  # Regularization
-    learning_rate=1e-3,  # Optimizer learning rate
+    learning_rate=1e-4,  # Optimizer learning rate
     shared_mlp=False,  # Independent MLPs for each branch
     use_residual_connections=True,  # Skip connections for better training
     signal_noise_scale=0,  # Noise level for signal events
@@ -34,10 +34,11 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     log_scale_ly=True,  # Whether to log-scale the light yield inputs
     norm_pos=True,  # Whether to normalize position inputs
     log_scale_energy=True,  # Whether to log-scale the energy inputs
-    add_distance_from_beam=False,  # Whether to include distance from beam as a feature
+    add_distance_from_beam=True,  # Whether to include distance from beam as a feature
     reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
     lr_scheduler_patience=35,  # Patience for LR scheduler
     use_rich_features=True,  # Whether to use rich features from the surrogate model
+    add_vertex_distance=False
     )
 
 train_dataloader = llr_net.create_signal_only_dataloader(
@@ -58,15 +59,15 @@ train_dataloader = llr_net.create_signal_only_dataloader(
 
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
-    epochs=700,
+    epochs=1500,
     input_dim=13,
     grad_clip=None,
     save_every_n_epochs=20,
-    checkpoint_path='best_cascade_charge_llr_model_v2.pt',
+    checkpoint_path='best_charge_llr_model_v6.pt',
 )
 
 # Save the best model for later use
 # llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('cascade_charge_llr_v2_training_history.pkl', 'wb'))
+pickle.dump(history, open('charge_llr_v6_training_history.pkl', 'wb'))
