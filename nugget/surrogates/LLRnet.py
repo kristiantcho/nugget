@@ -3530,9 +3530,9 @@ class LLRnet(Surrogate):
         return DataLoader(dataset, batch_size=None, num_workers=num_workers)
     
     def create_event_dataloader(self, signal_sampler, background_sampler, signal_surrogate_func, background_surrogate_func,
-                               num_samples_per_epoch=1000, batch_size=32, 
+                               num_samples_per_epoch=1000, batch_size=32,
                                shuffle=True, num_workers=0, output_true_light_yield=False,
-                               event_labels=['position', 'energy', 'zenith', 'azimuth']):
+                               event_labels=['position', 'energy', 'zenith', 'azimuth'], pin_memory=None):
         """
         Create a DataLoader for balanced signal/background training using the EventDataset class.
         
@@ -3597,21 +3597,29 @@ class LLRnet(Surrogate):
             num_samples_per_epoch=num_samples_per_epoch,
             event_labels=event_labels, output_true_light_yield=output_true_light_yield
         )
-        
+
+        # See create_signal_only_dataloader: only pin memory when on a CUDA device,
+        # otherwise the pin-memory thread can raise cudaErrorMemoryAllocation.
+        if pin_memory is None:
+            dev = getattr(self, 'device', None)
+            dev = torch.device(dev) if dev is not None and not isinstance(dev, torch.device) else dev
+            pin_memory = bool(torch.cuda.is_available() and dev is not None and dev.type == 'cuda')
+
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=True  # Speed up GPU transfers
+            pin_memory=pin_memory  # Speed up GPU transfers (only when on CUDA)
         )
-        
+
         return dataloader
     
     def create_signal_only_dataloader(self, signal_sampler, signal_surrogate_func,
                                      num_samples_per_epoch=1000, batch_size=32,
                                      shuffle=True, num_workers=0, output_true_light_yield=False,
-                                     event_labels=['position', 'energy', 'zenith', 'azimuth'], **other_kwargs):
+                                     event_labels=['position', 'energy', 'zenith', 'azimuth'],
+                                     pin_memory=None, **other_kwargs):
         """
         Create a DataLoader for signal-only training with matched/mismatched light yields.
         
@@ -3674,15 +3682,25 @@ class LLRnet(Surrogate):
             use_rich_features=self.use_rich_features,
             **other_kwargs
         )
-        
+
+        # pin_memory speeds up host->GPU transfers but the pin-memory thread
+        # allocates CUDA pinned host memory, which needs a usable CUDA context
+        # even when the tensors themselves live on CPU. On a CPU-only / GPU-full
+        # node that allocation raises cudaErrorMemoryAllocation. Default to
+        # enabling it only when training on a CUDA device.
+        if pin_memory is None:
+            dev = getattr(self, 'device', None)
+            dev = torch.device(dev) if dev is not None and not isinstance(dev, torch.device) else dev
+            pin_memory = bool(torch.cuda.is_available() and dev is not None and dev.type == 'cuda')
+
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=True  # Speed up GPU transfers
+            pin_memory=pin_memory  # Speed up GPU transfers (only when on CUDA)
         )
-        
+
         return dataloader
 
 
