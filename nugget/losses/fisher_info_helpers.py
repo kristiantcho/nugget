@@ -1110,12 +1110,17 @@ def _fisher_points_patd_quadrature(
         if good.any():
             F_active[pending[good]] = F_try[good]
         pending = pending[~good]
+        # Release this iteration's heavy tensors before the next (tighter-grid)
+        # pass so the per-event memory does not accumulate across retries.
+        del F_try, good
+        _fisher_chunk_cleanup(device)
         if pending.numel() == 0:
             break
         if not adaptive_grid_retry or t_max_cur <= adaptive_t_max_floor_ns:
             # Give up: assign a tiny isotropic (extremely uninformative) Fisher.
             eye = torch.eye(total_dims, device=device).unsqueeze(0)
             F_active[pending] = uninformative_fisher_value * eye
+            del eye
             break
         # Shrink the grid by one decade (not below the floor) and retry.
         t_max_cur = max(t_max_cur / 10.0, adaptive_t_max_floor_ns)

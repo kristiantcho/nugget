@@ -312,14 +312,20 @@ class WeightedFisherInfoLoss(LossFunction):
                     # No points map to these strings — assign uninformative defaults.
                     eye = torch.eye(total_dims, device=self.device)
                     fisher_per_string_per_event[i, bad_strings] = uninformative_fisher_value * eye
+                    del eye
                 else:
                     recomputed = _compute(pts_subset, bad_sxy).to(self.device)  # (n_bad, D, D)
                     fisher_per_string_per_event[i, bad_strings] = recomputed
+                    del recomputed
                 if verbose and (i % 100 == 0 or i == n_events - 1):
                     print(f"Event {i+1}/{n_events}: recomputed {bad_strings.numel()} bad strings", flush=True)
+                del bad_mask, bad_strings, bad_sxy, point_masks, pts_mask, pts_subset
+                _fisher_chunk_cleanup(self.device if isinstance(self.device, torch.device) else torch.device(self.device))
             else:
                 fisher_matrices = _compute(points_3d, string_xy)
                 fisher_per_string_per_event[i] += fisher_matrices.to(self.device)
+                del fisher_matrices
+                _fisher_chunk_cleanup(self.device if isinstance(self.device, torch.device) else torch.device(self.device))
                 if verbose and (i % 100 == 0 or i == n_events - 1):
                     print(f"Computed Fisher info for event {i+1}/{n_events}", flush=True)
         # else:
