@@ -791,6 +791,9 @@ def _fisher_points_patd_quadrature(
     eval_patd_log_probs=None,
     skip_zero_response=True,
     zero_response_threshold=0.5,
+    adaptive_grid_retry=True,
+    adaptive_t_max_floor_ns=10.0,
+    uninformative_fisher_value=1e-6,
 ):
     """
     Quadrature-based Fisher information over a log-spaced time grid.
@@ -799,6 +802,13 @@ def _fisher_points_patd_quadrature(
     - llr_net mode: self-normalised ratio p̃ = exp(LLR) / Z; score has zero mean.
     - eval_patd_log_probs mode (llr_net=None): normalised PDF supplied directly;
       no Z step needed. eval_patd_log_probs(t_residuals, opt_point, params) -> (N,) log-prob.
+
+    Adaptive grid retry (adaptive_grid_retry=True): after computing the per-point
+    Fisher, any point whose matrix is all-zero / NaN / Inf is recomputed with its
+    grid upper bound shrunk by one decade at a time (t_max -> t_max/10) down to
+    adaptive_t_max_floor_ns. Points still bad at the floor are assigned a tiny
+    isotropic Fisher (uninformative_fisher_value * I) — finite and extremely
+    uninformative, but not exactly zero (so downstream inverses stay well-posed).
     """
     B = pts_3.shape[0]
     pts_3 = pts_3.float().to(device)
@@ -884,184 +894,236 @@ def _fisher_points_patd_quadrature(
     if norm_const is not None:
         det_const = det_const[active_idx]
 
-    # Log-spaced time grids: one per active detector point, shape (Ba, N)
-    t_start = (t_geom_min_per_pt - t_offset_ns).clamp(min=1.0)   # (Ba,) ns
-    t_end = torch.full((Ba,), t_max_ns, device=device)            # (Ba,) ns
-
-    log_t_start = torch.log10(t_start)
-    log_t_end = torch.log10(t_end)
-    alpha = torch.linspace(0.0, 1.0, n_quadrature, device=device)  # (N,)
-    log_t_grid = log_t_start.unsqueeze(1) + alpha.unsqueeze(0) * (
-        log_t_end - log_t_start).unsqueeze(1)    # (Ba, N)
-    t_grid = torch.pow(10.0, log_t_grid)          # (Ba, N) ns
-
-    delta_log_t = (log_t_end - log_t_start) / max(n_quadrature - 1, 1)  # (Ba,)
-    dt_grid = t_grid * (math.log(10.0) * delta_log_t.unsqueeze(1))       # (Ba, N)
-
-    dt_grid_detached = dt_grid.detach()
-    B = Ba  # from here on B refers to the active subset
-
-    # ------------------------------------------------------------------ #
-    # Phase 2: differentiable θ-dependent log-density + Fisher            #
-    # ------------------------------------------------------------------ #
+    # FIX 3 (grid restriction): when the LLR net was trained with rel_time=True it
+    # only ever saw residual times t_hit - t_geom_min >= 0 (positive branch of the
+    # log-sign scaling). Evaluating the network at residuals < 0 (or ~0) probes a
+    # region with no training data, where it saturates and the likelihood is not
+    # well defined. So when rel_time is active we build the grid directly in
+    # *residual* time over [resid_floor, t_max_for_grid] and add t_geom_min back to
+    # get absolute hit times — guaranteeing every node sits in the trained domain.
+    _rel_time = bool(getattr(llr_net, 'rel_time', False)) if llr_net is not None else False
+    # Smallest residual we evaluate at. The training scaling uses log10(t + 1e-4),
+    # so residuals below ~1e-4 ns are numerically indistinguishable; floor at 1e-3.
+    resid_floor = 1e-3
     basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims
 
-    if llr_net is not None:
-        # LLR-net path: self-normalised ratio
-        # If the model was trained with rel_time=True, hit times were expressed
-        # relative to t_geom_min — apply the same subtraction here.
-        t_for_scaling = t_grid - t_geom_min_per_pt.unsqueeze(1) if bool(getattr(llr_net, 'rel_time', False)) else t_grid
-        t_scaled = torch.where(
-            t_for_scaling < 0,
-            -torch.log10(-t_for_scaling + 1e-4) / 4.0,
-            torch.log10(t_for_scaling + 1e-4) / 4.0,
-        )  # (B, N)
-        t_scaled_flat = t_scaled.reshape(B * n_quadrature, 1).detach()
+    # ------------------------------------------------------------------ #
+    # Per-subset Fisher: build the log-spaced grid over [resid_floor or       #
+    # t_start, t_max_for_grid], differentiate the (self-)normalised log-PDF,  #
+    # and assemble F = (λ ×) Σ_n w_n J_n J_n^T for the requested subset of    #
+    # active points. Returns (len(sub_idx), D, D). Wrapped so the adaptive     #
+    # retry loop can recompute only the problematic points with a tighter grid.#
+    # ------------------------------------------------------------------ #
+    def _fisher_for_subset(sub_idx, t_max_for_grid):
+        Bs = int(sub_idx.shape[0])
+        pts_s = pts_3[sub_idx]                              # (Bs, 3)
+        tgm_s = t_geom_min_per_pt[sub_idx]                  # (Bs,)
+        lam_s = lambda_per_pt[sub_idx]                      # (Bs,)
+        det_s = det_const[sub_idx] if norm_const is not None else None
+        alpha = torch.linspace(0.0, 1.0, n_quadrature, device=device)  # (N,)
 
-        def _theta_only_fn(theta_flat):
-            params = _unflatten_theta(
-                theta_flat,
-                fisher_info_params=fisher_info_params,
-                theta_shapes=theta_shapes,
-                theta_numels=theta_numels,
-                fixed_params=fixed_params,
-            )
-            vert = params['position'].float().to(device).reshape(1, 3) / norm_const
-            direction = params['direction'].float().to(device).reshape(1, 3)
-            dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
-            energy = params['energy'].float().to(device).squeeze()
-            log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
+        if _rel_time and llr_net is not None:
+            r_start = torch.full((Bs,), resid_floor, device=device)
+            r_end = torch.full((Bs,), float(t_max_for_grid), device=device)
+            log_r_start = torch.log10(r_start)
+            log_r_end = torch.log10(r_end)
+            log_r_grid = log_r_start.unsqueeze(1) + alpha.unsqueeze(0) * (
+                log_r_end - log_r_start).unsqueeze(1)
+            resid_grid = torch.pow(10.0, log_r_grid)
+            t_grid = resid_grid + tgm_s.unsqueeze(1)
+            delta_log_t = (log_r_end - log_r_start) / max(n_quadrature - 1, 1)
+            dt_grid = resid_grid * (math.log(10.0) * delta_log_t.unsqueeze(1))
+        else:
+            t_start = (tgm_s - t_offset_ns).clamp(min=1.0)
+            t_end = torch.full((Bs,), float(t_max_for_grid), device=device)
+            # Guard: with a shrunken t_max_for_grid the upper edge may fall below
+            # t_start; ensure a strictly increasing grid.
+            t_end = torch.maximum(t_end, t_start * 1.0001)
+            log_t_start = torch.log10(t_start)
+            log_t_end = torch.log10(t_end)
+            log_t_grid = log_t_start.unsqueeze(1) + alpha.unsqueeze(0) * (
+                log_t_end - log_t_start).unsqueeze(1)
+            t_grid = torch.pow(10.0, log_t_grid)
+            delta_log_t = (log_t_end - log_t_start) / max(n_quadrature - 1, 1)
+            dt_grid = t_grid * (math.log(10.0) * delta_log_t.unsqueeze(1))
 
-            rel = det_const - vert
-            vert_dist = torch.norm(rel, dim=-1, keepdim=True)
-            cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
-                dir_norm * vert_dist.clamp(min=1e-8))
+        dt_grid_detached = dt_grid.detach()
+        B = Bs
 
-            ctx_parts = [det_const, vert.expand(B, -1), direction.expand(B, -1), log_energy]
-            if bool(getattr(llr_net, 'add_vertex_distance', True)):
-                ctx_parts.append(vert_dist)
-            ctx_parts.append(cos_angle)
-            if bool(getattr(llr_net, 'add_distance_from_beam', False)):
-                vert_unnorm = vert * norm_const
-                _, dist_perp = llr_net.compute_distance_from_beam(
-                    pts_3, vert_unnorm.expand(B, -1), direction.expand(B, -1))
-                ds = llr_net.domain_size
-                half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
-                ctx_parts.append(dist_perp / half)
-            ctx = torch.cat(ctx_parts, dim=-1)
+        # ----- Phase 2: θ-dependent (self-)normalised log-density --------
 
-            ctx_rep = ctx.unsqueeze(1).expand(B, n_quadrature, -1).reshape(B * n_quadrature, -1)
-            features = torch.cat([ctx_rep, t_scaled_flat], dim=-1)
-            llr_vals = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-10)
+        if llr_net is not None:
+            # LLR-net path: self-normalised ratio. rel_time grid already lives in
+            # residual time, so t_for_scaling = t_grid - t_geom_min recovers it.
+            t_for_scaling = t_grid - tgm_s.unsqueeze(1) if _rel_time else t_grid
+            t_scaled = torch.where(
+                t_for_scaling < 0,
+                -torch.log10(-t_for_scaling + 1e-4) / 4.0,
+                torch.log10(t_for_scaling + 1e-4) / 4.0,
+            )  # (B, N)
+            t_scaled_flat = t_scaled.reshape(B * n_quadrature, 1).detach()
 
-            r_vals = torch.exp(llr_vals).reshape(B, n_quadrature)
-            Z = (r_vals * dt_grid_detached).sum(dim=1, keepdim=True).clamp(min=1e-20)
-            log_r_norm = llr_vals.reshape(B, n_quadrature) - torch.log(Z)  # (B, N)
-            return log_r_norm
+            def _theta_only_fn(theta_flat):
+                params = _unflatten_theta(
+                    theta_flat,
+                    fisher_info_params=fisher_info_params,
+                    theta_shapes=theta_shapes,
+                    theta_numels=theta_numels,
+                    fixed_params=fixed_params,
+                )
+                vert = params['position'].float().to(device).reshape(1, 3) / norm_const
+                direction = params['direction'].float().to(device).reshape(1, 3)
+                dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+                energy = params['energy'].float().to(device).squeeze()
+                log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
 
-        def _get_p_weights(theta_flat):
-            with torch.no_grad():
-                log_p = _theta_only_fn(theta_flat)   # (B, N)
-                r = torch.exp(log_p)
-                Z = (r * dt_grid_detached).sum(dim=1, keepdim=True).clamp(min=1e-20)
-                return (r * dt_grid_detached / Z).detach()  # (B, N)
+                rel = det_s - vert
+                vert_dist = torch.norm(rel, dim=-1, keepdim=True)
+                cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
+                    dir_norm * vert_dist.clamp(min=1e-8))
 
-    else:
-        # Analytic-PDF path: eval_patd_log_probs is normalised, no Z step needed.
-        # t_grid is in absolute hit-time ns; eval_patd_log_probs expects residual
-        # times (t_hit - t_geom_min). Subtract the per-detector t_geom_min here.
-        # t_geom_min_per_pt was computed at params0 (no grad) and is treated as a
-        # fixed constant — the PDF's d_geom / foot_length is re-derived from θ inside
-        # eval_patd_log_probs, so θ-dependence of t_geom_min is not needed for the score.
-        t_residual_grid = (t_grid - t_geom_min_per_pt.unsqueeze(1)).detach()  # (B, N)
-        t_residual_flat = t_residual_grid.reshape(B * n_quadrature)            # (B*N,)
+                ctx_parts = [det_s, vert.expand(B, -1), direction.expand(B, -1), log_energy]
+                if bool(getattr(llr_net, 'add_vertex_distance', True)):
+                    ctx_parts.append(vert_dist)
+                ctx_parts.append(cos_angle)
+                if bool(getattr(llr_net, 'add_distance_from_beam', False)):
+                    vert_unnorm = vert * norm_const
+                    _, dist_perp = llr_net.compute_distance_from_beam(
+                        pts_s, vert_unnorm.expand(B, -1), direction.expand(B, -1))
+                    ds = llr_net.domain_size
+                    half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
+                    ctx_parts.append(dist_perp / half)
+                ctx = torch.cat(ctx_parts, dim=-1)
 
-        def _theta_only_fn(theta_flat):
-            params = _unflatten_theta(
-                theta_flat,
-                fisher_info_params=fisher_info_params,
-                theta_shapes=theta_shapes,
-                theta_numels=theta_numels,
-                fixed_params=fixed_params,
-            )
-            # eval_patd_log_probs is called per detector point (B sequential calls).
-            # Each returns (N,) log-probs for the N quadrature residual times at that point.
-            log_p_rows = []
-            for b in range(B):
-                t_b = t_residual_flat[b * n_quadrature:(b + 1) * n_quadrature]  # (N,)
-                log_p_b = eval_patd_log_probs(t_b, pts_3[b], params)            # (N,)
-                log_p_rows.append(log_p_b)
-            return torch.stack(log_p_rows, dim=0)  # (B, N)
+                ctx_rep = ctx.unsqueeze(1).expand(B, n_quadrature, -1).reshape(B * n_quadrature, -1)
+                features = torch.cat([ctx_rep, t_scaled_flat], dim=-1)
+                llr_vals = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-10)
+                llr_vals = llr_vals.reshape(B, n_quadrature)
 
-        def _get_p_weights(theta_flat):
-            with torch.no_grad():
-                log_p = _theta_only_fn(theta_flat)            # (B, N)
-                p = torch.exp(log_p)
-                # normalise so weights sum to 1 per detector (PDF already normalised,
-                # but Riemann-sum weights make this exact on the discrete grid)
-                w = p * dt_grid_detached                      # (B, N)
-                Z = w.sum(dim=1, keepdim=True).clamp(min=1e-20)
-                return (w / Z).detach()                       # (B, N)
+                # FIX 2 (log-sum-exp): normalise in log-space using the per-row max
+                # so Z never overflows (exp(llr) then sum could hit inf -> NaN when
+                # the network saturates). log Z = m + log Σ exp(llr - m) dt.
+                m = llr_vals.max(dim=1, keepdim=True).values
+                log_Z = m + torch.log(
+                    (torch.exp(llr_vals - m) * dt_grid_detached).sum(dim=1, keepdim=True)
+                    .clamp(min=1e-30))
+                return llr_vals - log_Z  # (B, N)
+
+            def _get_p_weights(theta_flat):
+                with torch.no_grad():
+                    log_p = _theta_only_fn(theta_flat)   # (B, N) log-normalised
+                    m = log_p.max(dim=1, keepdim=True).values
+                    w = torch.exp(log_p - m) * dt_grid_detached
+                    Z = w.sum(dim=1, keepdim=True).clamp(min=1e-30)
+                    return (w / Z).detach()  # (B, N)
+
+        else:
+            # Analytic-PDF path: eval_patd_log_probs is normalised, no Z step needed.
+            t_residual_grid = (t_grid - tgm_s.unsqueeze(1)).detach()           # (B, N)
+            t_residual_flat = t_residual_grid.reshape(B * n_quadrature)        # (B*N,)
+
+            def _theta_only_fn(theta_flat):
+                params = _unflatten_theta(
+                    theta_flat,
+                    fisher_info_params=fisher_info_params,
+                    theta_shapes=theta_shapes,
+                    theta_numels=theta_numels,
+                    fixed_params=fixed_params,
+                )
+                log_p_rows = []
+                for b in range(B):
+                    t_b = t_residual_flat[b * n_quadrature:(b + 1) * n_quadrature]
+                    log_p_b = eval_patd_log_probs(t_b, pts_s[b], params)
+                    log_p_rows.append(log_p_b)
+                return torch.stack(log_p_rows, dim=0)  # (B, N)
+
+            def _get_p_weights(theta_flat):
+                with torch.no_grad():
+                    log_p = _theta_only_fn(theta_flat)            # (B, N)
+                    p = torch.exp(log_p)
+                    w = p * dt_grid_detached
+                    Z = w.sum(dim=1, keepdim=True).clamp(min=1e-20)
+                    return (w / Z).detach()
+
+        # ----- Phase 3: Jacobian ∂ log p(t_n|θ) / ∂θ ---------------------
+        if llr_autodiff_mode == 'jacrev':
+            J_raw = jacrev(_theta_only_fn, chunk_size=jacrev_chunk_size)(theta0_flat)
+            J = J_raw.reshape(B, n_quadrature, total_dims)
+            del J_raw
+        elif llr_net is not None:
+            y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
+            del y0
+            cols_parts = []
+            for d_start in range(0, total_dims, basis_chunk_size):
+                d_end = min(d_start + basis_chunk_size, total_dims)
+                k = d_end - d_start
+                bvecs = torch.zeros(k, total_dims, device=device, dtype=theta0_flat.dtype)
+                bvecs[torch.arange(k, device=device), torch.arange(d_start, d_end, device=device)] = 1
+                cols_parts.append(vmap(jvp_fn, randomness='same')(bvecs))  # (k, B, N)
+            del jvp_fn
+            cols = torch.cat(cols_parts, dim=0)   # (D, B, N)
+            J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
+            del cols, cols_parts
+        else:
+            cols_parts = []
+            for d_start in range(0, total_dims, basis_chunk_size):
+                d_end = min(d_start + basis_chunk_size, total_dims)
+                chunk_cols = []
+                for d in range(d_start, d_end):
+                    v = torch.zeros(total_dims, device=device, dtype=theta0_flat.dtype)
+                    v[d] = 1.0
+                    _, col = func_jvp(_theta_only_fn, (theta0_flat,), (v,))  # (B, N)
+                    chunk_cols.append(col)
+                cols_parts.append(torch.stack(chunk_cols, dim=0))  # (k, B, N)
+            cols = torch.cat(cols_parts, dim=0)   # (D, B, N)
+            J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
+            del cols, cols_parts
+
+        # ----- Phase 4: weighted Fisher sum  F_b = λ_b × Σ_n w_n J_n J_n^T
+        p_weights = _get_p_weights(theta0_flat)  # (Bs, N)
+        weighted_J = J * p_weights.unsqueeze(-1)
+        F_sub = torch.einsum('bnd,bne->bde', weighted_J, J)   # (Bs, D, D)
+        del J, weighted_J
+        F_sub = F_sub * lam_s.view(Bs, 1, 1)
+        return F_sub
 
     # ------------------------------------------------------------------ #
-    # Phase 3: Jacobian ∂ log p(t_n|θ) / ∂θ via jacrev or jvp           #
+    # Adaptive grid retry: compute Fisher for all active points, then for #
+    # any point whose matrix is all-zero / NaN / Inf, shrink its grid     #
+    # upper bound by one decade and recompute, down to a floor. Points    #
+    # still bad at the floor get a tiny isotropic Fisher (uninformative   #
+    # but finite & non-zero, so downstream inverses stay well-posed).     #
     # ------------------------------------------------------------------ #
-    if llr_autodiff_mode == 'jacrev':
-        J_raw = jacrev(_theta_only_fn, chunk_size=jacrev_chunk_size)(theta0_flat)
-        J = J_raw.reshape(B, n_quadrature, total_dims)
-        del J_raw
-    elif llr_net is not None:
-        # LLR-net: use linearize+vmap (function was pre-sampled, is deterministic
-        # inside the trace, and vmap over basis vectors is fast).
-        y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
-        del y0
-        cols_parts = []
-        for d_start in range(0, total_dims, basis_chunk_size):
-            d_end = min(d_start + basis_chunk_size, total_dims)
-            k = d_end - d_start
-            bvecs = torch.zeros(k, total_dims, device=device, dtype=theta0_flat.dtype)
-            bvecs[torch.arange(k, device=device), torch.arange(d_start, d_end, device=device)] = 1
-            cols_parts.append(vmap(jvp_fn, randomness='same')(bvecs))  # (k, B, N)
-        del jvp_fn
-        cols = torch.cat(cols_parts, dim=0)   # (D, B, N)
-        J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
-        del cols, cols_parts
-    else:
-        # eval_patd_log_probs path: deterministic but contains scipy calls that
-        # make_fx cannot trace. Use torch.func.jvp directly in a Python loop —
-        # each call is concrete so scipy executes normally and the Hyp1f1 jvp
-        # hook fires via forward-mode AD without any symbolic tracing.
-        
-        cols_parts = []
-        for d_start in range(0, total_dims, basis_chunk_size):
-            d_end = min(d_start + basis_chunk_size, total_dims)
-            chunk_cols = []
-            for d in range(d_start, d_end):
-                v = torch.zeros(total_dims, device=device, dtype=theta0_flat.dtype)
-                v[d] = 1.0
-                _, col = func_jvp(_theta_only_fn, (theta0_flat,), (v,))  # (B, N)
-                chunk_cols.append(col)
-            cols_parts.append(torch.stack(chunk_cols, dim=0))  # (k, B, N)
-        cols = torch.cat(cols_parts, dim=0)   # (D, B, N)
-        J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
-        del cols, cols_parts
+    def _bad_rows(F):
+        # F: (n, D, D). Bad = non-finite anywhere, or effectively all-zero.
+        nonfinite = ~torch.isfinite(F).all(dim=(1, 2))                  # (n,)
+        near_zero = F.abs().amax(dim=(1, 2)) <= 0.0                     # exactly zero
+        return nonfinite | near_zero
 
-    # ------------------------------------------------------------------ #
-    # Phase 4: weighted Fisher sum  F_b = λ_b × Σ_n w_n J_n J_n^T       #
-    # ------------------------------------------------------------------ #
-    p_weights = _get_p_weights(theta0_flat)  # (Ba, N)
+    F_active = torch.zeros(Ba, total_dims, total_dims, device=device)
+    pending = torch.arange(Ba, device=device)          # active-local indices still to solve
+    t_max_cur = float(t_max_ns)
 
-    weighted_J = J * p_weights.unsqueeze(-1)                       # (Ba, N, D)
-    F_active = torch.einsum('bnd,bne->bde', weighted_J, J)         # (Ba, D, D)
-    del J, weighted_J
-
-    F_active = F_active * lambda_per_pt.view(B, 1, 1)
+    while pending.numel() > 0:
+        F_try = _fisher_for_subset(pending, t_max_cur)
+        good = ~_bad_rows(F_try)
+        if good.any():
+            F_active[pending[good]] = F_try[good]
+        pending = pending[~good]
+        if pending.numel() == 0:
+            break
+        if not adaptive_grid_retry or t_max_cur <= adaptive_t_max_floor_ns:
+            # Give up: assign a tiny isotropic (extremely uninformative) Fisher.
+            eye = torch.eye(total_dims, device=device).unsqueeze(0)
+            F_active[pending] = uninformative_fisher_value * eye
+            break
+        # Shrink the grid by one decade (not below the floor) and retry.
+        t_max_cur = max(t_max_cur / 10.0, adaptive_t_max_floor_ns)
 
     # Scatter active results back into a full (original B) tensor; inactive
     # points remain zero (no photons → zero Fisher information).
     B_orig = active_mask.shape[0]
-    if B_orig == B:
-        # All points were active — no scatter needed.
+    if B_orig == Ba:
         F_per_point = F_active
     else:
         F_per_point = torch.zeros(B_orig, total_dims, total_dims, device=device,
@@ -1444,6 +1506,9 @@ def _compute_fisher_llr_over_points(
     t_max_ns=10000.0,
     eval_patd_log_probs=None,
     zero_response_threshold=0.5,
+    adaptive_grid_retry=True,
+    adaptive_t_max_floor_ns=10.0,
+    uninformative_fisher_value=1e-6,
 ):
     theta_tuple = tuple(event_params[p].detach().to(device) for p in fisher_info_params)
     theta_shapes = [event_params[p].detach().to(device).shape for p in fisher_info_params]
@@ -1521,6 +1586,9 @@ def _compute_fisher_llr_over_points(
                 eval_patd_log_probs=eval_patd_log_probs,
                 skip_zero_response=skip_zero_response,
                 zero_response_threshold=zero_response_threshold,
+                adaptive_grid_retry=adaptive_grid_retry,
+                adaptive_t_max_floor_ns=adaptive_t_max_floor_ns,
+                uninformative_fisher_value=uninformative_fisher_value,
             )
             if fisher_sum is not None:
                 fisher_sum.add_(fisher_chunk.sum(dim=0))
@@ -1790,7 +1858,17 @@ def directional_resolution(F3, n):
         return r68
 
 
-def compute_fisher_info_single_averaged(fisher_info_params, point, event_params, surrogate_func, llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True, device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, use_charge_quadrature=False, charge_center_on_llr_peak=False, charge_peak_scan_points=64, t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5):
+def compute_fisher_info_single_averaged(
+    fisher_info_params, point, event_params, surrogate_func,
+    llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False,
+    skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True,
+    device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None,
+    llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False,
+    eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False,
+    use_charge_quadrature=False, charge_center_on_llr_peak=False, charge_peak_scan_points=64,
+    t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5,
+    adaptive_grid_retry=True, adaptive_t_max_floor_ns=10.0, uninformative_fisher_value=1e-6,
+):
     """
     Compute the Fisher information matrix averaged over multiple LLR iterations.
     
@@ -2195,6 +2273,9 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
             t_max_ns=t_max_ns,
             eval_patd_log_probs=eval_patd_log_probs,
             zero_response_threshold=zero_response_threshold,
+            adaptive_grid_retry=adaptive_grid_retry,
+            adaptive_t_max_floor_ns=adaptive_t_max_floor_ns,
+            uninformative_fisher_value=uninformative_fisher_value,
         )
 
     elif llr_net is None:
@@ -2371,6 +2452,9 @@ def compute_fisher_info_single_averaged(fisher_info_params, point, event_params,
             t_max_ns=t_max_ns,
             eval_patd_log_probs=eval_patd_log_probs,
             zero_response_threshold=zero_response_threshold,
+            adaptive_grid_retry=adaptive_grid_retry,
+            adaptive_t_max_floor_ns=adaptive_t_max_floor_ns,
+            uninformative_fisher_value=uninformative_fisher_value,
         )
     # ---------------------------------------------- aggregate over points / strings
     if llr_net is not None and string_xy is None and sum_over_points:

@@ -191,7 +191,18 @@ class WeightedFisherInfoLoss(LossFunction):
         # self.background_event_params = background_event_params
         self.fisher_info_params = fisher_info_params # Default parameters for Fisher Info
 
-    def compute_fisher_info_per_string_per_event(self, string_xy, points_3d, signal_event_params, signal_surrogate_func, llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False, skip_zero_response=True, verbose=False, event_batch_size=1, grad_chunk_size=10, jacrev_chunk_size=10000, point_chunk_size=None, llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False, use_charge_quadrature=False, charge_center_on_llr_peak=False, charge_peak_scan_points=64, t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5):
+    def compute_fisher_info_per_string_per_event(
+        self, string_xy, points_3d, signal_event_params, signal_surrogate_func,
+        llr_net=None, signal_noise_scale=None, llr_iterations=1, add_relative_pos=False,
+        skip_zero_response=True, verbose=False, event_batch_size=1, grad_chunk_size=10,
+        jacrev_chunk_size=10000, point_chunk_size=None, llr_autodiff_mode='jacrev',
+        detach_fisher_tensors=True, use_patd=False, eval_patd_log_probs=None,
+        use_rich_features=False, use_patd_quadrature=False, use_charge_quadrature=False,
+        charge_center_on_llr_peak=False, charge_peak_scan_points=64,
+        t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5,
+        adaptive_grid_retry=True, adaptive_t_max_floor_ns=10.0, uninformative_fisher_value=1e-6,
+        precomputed_fisher_per_string_per_event=None, recompute_bad_points=True,
+    ):
         n_strings = len(string_xy)
         # use_rich_features is now stored on the model — read from it if available.
         if llr_net is not None and not use_rich_features:
@@ -211,23 +222,45 @@ class WeightedFisherInfoLoss(LossFunction):
                 for i in range(dim_size):
                     param_names_expanded.append(f"{param_name}_{i}")
         total_dims = sum(param_dims)
-        fisher_per_string_per_event = torch.zeros(len(signal_event_params), n_strings, total_dims, total_dims, device=self.device)
-        # if event_batch_size == 1:    
-        for i, signal_params in enumerate(signal_event_params):
-            # for s_idx in range(n_strings):
-            #     mask = (points_3d[:, 1] == string_xy[s_idx][1]) & (points_3d[:, 0] == string_xy[s_idx][0])
-            #     string_points = points_3d[mask]
-            #     fisher_matrix = torch.zeros(total_dims, total_dims, device=self.device)
-            #     # for point in string_points: 
-            #     # for _ in range(llr_iterations):    
-            #         # fisher_matrix += compute_fisher_info_single(self.fisher_info_params, string_points, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos, skip_zero_response=skip_zero_response)
-            #     # fisher_matrix = fisher_matrix/llr_iterations
-            #     fisher_matrix = compute_fisher_info_single_averaged(self.fisher_info_params, string_points, llr_iterations=llr_iterations, event_params=signal_params, surrogate_func=signal_surrogate_func, llr_net=llr_net, signal_noise_scale=signal_noise_scale, add_relative_pos=add_relative_pos, skip_zero_response=skip_zero_response)
-            #     fisher_per_string_per_event[i, s_idx] += fisher_matrix
-            # Returns (n_strings, n_events, total_dims, total_dims), need to permute to (n_events, n_strings, ...)
-            fisher_matrices = compute_fisher_info_single_averaged(
+        n_events = len(signal_event_params)
+
+        # If a precomputed Fisher tensor is supplied, start from it and only
+        # recompute the "bad" strings (zero / NaN / Inf) per event.  Otherwise
+        # start from zeros and compute everything.
+        have_precomp = precomputed_fisher_per_string_per_event is not None
+        if have_precomp:
+            fisher_per_string_per_event = precomputed_fisher_per_string_per_event.to(self.device).clone()
+            if fisher_per_string_per_event.shape != (n_events, n_strings, total_dims, total_dims):
+                raise ValueError(
+                    "precomputed_fisher_per_string_per_event has shape "
+                    f"{tuple(fisher_per_string_per_event.shape)}, expected "
+                    f"{(n_events, n_strings, total_dims, total_dims)}."
+                )
+            if not recompute_bad_points:
+                # Caller just wants the precomputed tensor back (no recomputation).
+                return fisher_per_string_per_event
+        else:
+            fisher_per_string_per_event = torch.zeros(
+                n_events, n_strings, total_dims, total_dims, device=self.device)
+
+        def _bad_strings(F_event):
+            # F_event: (n_strings, D, D). Bad = non-finite anywhere, or exactly zero.
+            nonfinite = ~torch.isfinite(F_event).all(dim=(1, 2))           # (n_strings,)
+            near_zero = F_event.abs().amax(dim=(1, 2)) <= 0.0              # (n_strings,)
+            return nonfinite | near_zero
+
+        # Pre-map each string -> the indices of points_3d that belong to it, so a
+        # bad-string subset can be turned into a point subset without rescanning.
+        def _string_xy_val(s):
+            sx, sy = string_xy[s][0], string_xy[s][1]
+            sx = sx.to(self.device) if isinstance(sx, torch.Tensor) else torch.tensor(sx, device=self.device)
+            sy = sy.to(self.device) if isinstance(sy, torch.Tensor) else torch.tensor(sy, device=self.device)
+            return sx, sy
+
+        def _compute(points, sxy):
+            return compute_fisher_info_single_averaged(
                         fisher_info_params=self.fisher_info_params,
-                        point=points_3d,
+                        point=points,
                         event_params=signal_params,
                         surrogate_func=signal_surrogate_func,
                         llr_net=llr_net,
@@ -235,7 +268,7 @@ class WeightedFisherInfoLoss(LossFunction):
                         add_relative_pos=add_relative_pos,
                         skip_zero_response=skip_zero_response,
                         llr_iterations=llr_iterations,
-                        string_xy=string_xy,
+                        string_xy=sxy,
                         device=self.device,
                         grad_chunk_size=grad_chunk_size,
                         jacrev_chunk_size=jacrev_chunk_size,
@@ -252,10 +285,43 @@ class WeightedFisherInfoLoss(LossFunction):
                         t_offset_ns=t_offset_ns,
                         t_max_ns=t_max_ns,
                         zero_response_threshold=zero_response_threshold,
+                        adaptive_grid_retry=adaptive_grid_retry,
+                        adaptive_t_max_floor_ns=adaptive_t_max_floor_ns,
+                        uninformative_fisher_value=uninformative_fisher_value,
                         )
-            fisher_per_string_per_event[i] += fisher_matrices.to(self.device)
-            if verbose and (i % 100 == 0 or i == len(signal_event_params)-1):
-                print(f"Computed Fisher info for event {i+1}/{len(signal_event_params)}", flush=True)        
+
+        for i, signal_params in enumerate(signal_event_params):
+            if have_precomp:
+                # Recompute only the strings flagged bad in the precomputed slice.
+                bad_mask = _bad_strings(fisher_per_string_per_event[i])     # (n_strings,)
+                bad_strings = bad_mask.nonzero(as_tuple=True)[0]
+                if bad_strings.numel() == 0:
+                    if verbose and (i % 100 == 0 or i == n_events - 1):
+                        print(f"Event {i+1}/{n_events}: 0 bad strings, kept precomputed", flush=True)
+                    continue
+                # Build the point subset belonging to the bad strings, preserving
+                # the bad-string order so the returned (n_bad, D, D) maps back 1:1.
+                bad_sxy = [string_xy[int(s)] for s in bad_strings.tolist()]
+                point_masks = []
+                for s in bad_strings.tolist():
+                    sx, sy = _string_xy_val(s)
+                    point_masks.append((points_3d[:, 0] == sx) & (points_3d[:, 1] == sy))
+                pts_mask = torch.stack(point_masks, dim=0).any(dim=0)       # (n_points,)
+                pts_subset = points_3d[pts_mask]
+                if pts_subset.shape[0] == 0:
+                    # No points map to these strings — assign uninformative defaults.
+                    eye = torch.eye(total_dims, device=self.device)
+                    fisher_per_string_per_event[i, bad_strings] = uninformative_fisher_value * eye
+                else:
+                    recomputed = _compute(pts_subset, bad_sxy).to(self.device)  # (n_bad, D, D)
+                    fisher_per_string_per_event[i, bad_strings] = recomputed
+                if verbose and (i % 100 == 0 or i == n_events - 1):
+                    print(f"Event {i+1}/{n_events}: recomputed {bad_strings.numel()} bad strings", flush=True)
+            else:
+                fisher_matrices = _compute(points_3d, string_xy)
+                fisher_per_string_per_event[i] += fisher_matrices.to(self.device)
+                if verbose and (i % 100 == 0 or i == n_events - 1):
+                    print(f"Computed Fisher info for event {i+1}/{n_events}", flush=True)
         # else:
         #     for i in range(0, len(signal_event_params), event_batch_size):
         #         batch_params = signal_event_params[i:i+event_batch_size]
@@ -641,6 +707,12 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         t_offset_ns = kwargs.get('t_offset_ns', 100.0)
         t_max_ns = kwargs.get('t_max_ns', 10000.0)
         zero_response_threshold = kwargs.get('zero_response_threshold', 0.5)
+        adaptive_grid_retry = kwargs.get('adaptive_grid_retry', True)
+        adaptive_t_max_floor_ns = kwargs.get('adaptive_t_max_floor_ns', 10.0)
+        uninformative_fisher_value = kwargs.get('uninformative_fisher_value', 1e-6)
+        # When a precomputed Fisher tensor is supplied, optionally recompute only
+        # its bad (zero/NaN/Inf) strings per event instead of using it verbatim.
+        recompute_bad_points = kwargs.get('recompute_bad_points', False)
 
         # New parameters for batched loading from files
         event_paths = kwargs.get('event_paths', None)
@@ -657,8 +729,11 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         if signal_event_params is None and signal_sampler is not None:
             signal_event_params = signal_sampler.sample_events(num_events)
         
-        # Compute or use precomputed Fisher info
-        if precomputed_fisher_info_per_string_per_event is None:
+        # Compute Fisher info. Three cases:
+        #   1. No precomputed tensor                  -> compute everything.
+        #   2. Precomputed + recompute_bad_points      -> recompute only bad strings.
+        #   3. Precomputed + not recompute_bad_points  -> use verbatim.
+        if precomputed_fisher_info_per_string_per_event is None or recompute_bad_points:
             fisher_info_per_string_per_event = self.compute_fisher_info_per_string_per_event(
                 string_xy,
                 points_3d,
@@ -685,6 +760,11 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 t_offset_ns=t_offset_ns,
                 t_max_ns=t_max_ns,
                 zero_response_threshold=zero_response_threshold,
+                adaptive_grid_retry=adaptive_grid_retry,
+                adaptive_t_max_floor_ns=adaptive_t_max_floor_ns,
+                uninformative_fisher_value=uninformative_fisher_value,
+                precomputed_fisher_per_string_per_event=precomputed_fisher_info_per_string_per_event,
+                recompute_bad_points=recompute_bad_points,
             )
         else:
             fisher_info_per_string_per_event = precomputed_fisher_info_per_string_per_event.to(self.device)
