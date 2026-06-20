@@ -53,6 +53,8 @@ train_dataloader = llr_net.create_signal_only_dataloader(
     min_light_yield=0.1,         
     max_resample_attempts=30,
     vary_cylinder=False,
+    pin_memory=True,
+    pin_memory_device="cuda:3",
     
     # cylinder_sampler=nugget.samplers.cyl_sampler.CylinderSampler
     )

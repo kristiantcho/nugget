@@ -11,8 +11,8 @@ import torch
 from nugget.samplers.cyl_sampler import CylinderSampler
 
 # Default packaged data directory (nugget/assets/data)
-data_dir = Path(__file__).resolve().parents[1] / "assets" / "data"
-# data_dir=''
+# data_dir = Path(__file__).resolve().parents[1] / "assets" / "data"
+data_dir=''
 
 
 def _to_numpy_no_grad(x):
