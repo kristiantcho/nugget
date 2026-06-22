@@ -998,22 +998,22 @@ def _fisher_points_patd_quadrature(
                 ctx_rep = ctx.unsqueeze(1).expand(B, n_quadrature, -1).reshape(B * n_quadrature, -1)
                 features = torch.cat([ctx_rep, t_scaled_flat], dim=-1)
                 llr_vals = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-10)
-                llr_vals = llr_vals.reshape(B, n_quadrature)
-
-                # FIX 2 (log-sum-exp): normalise in log-space using the per-row max
-                # so Z never overflows (exp(llr) then sum could hit inf -> NaN when
-                # the network saturates). log Z = m + log Σ exp(llr - m) dt.
-                m = llr_vals.max(dim=1, keepdim=True).values
-                log_Z = m + torch.log(
-                    (torch.exp(llr_vals - m) * dt_grid_detached).sum(dim=1, keepdim=True)
-                    .clamp(min=1e-30))
-                return llr_vals - log_Z  # (B, N)
+                # Return the RAW (un-normalised) log-ratio log r(t|θ). The score of
+                # the normalised density is  ∂_θ log p̃ = ∂_θ log r - ∂_θ log Z, and
+                # ∂_θ log Z = Σ_n w_n ∂_θ log r_n is just the weighted-mean score.
+                # The Fisher F = Σ_n w_n (∂log p̃)(∂log p̃)^T is therefore the
+                # weight-covariance of ∂log r, which Phase 4 forms explicitly via the
+                # mean-subtraction below — so we do NOT need to differentiate through
+                # log Z (the logsumexp) here. Dropping it shrinks the autodiff graph.
+                return llr_vals.reshape(B, n_quadrature)  # (B, N) raw log r
 
             def _get_p_weights(theta_flat):
+                # Quadrature weights w_n = p̃(t_n) dt_n, computed once, no-grad.
+                # logsumexp with per-row max keeps Z finite even if the net saturates.
                 with torch.no_grad():
-                    log_p = _theta_only_fn(theta_flat)   # (B, N) log-normalised
-                    m = log_p.max(dim=1, keepdim=True).values
-                    w = torch.exp(log_p - m) * dt_grid_detached
+                    log_r = _theta_only_fn(theta_flat)   # (B, N) raw log r
+                    m = log_r.max(dim=1, keepdim=True).values
+                    w = torch.exp(log_r - m) * dt_grid_detached
                     Z = w.sum(dim=1, keepdim=True).clamp(min=1e-30)
                     return (w / Z).detach()  # (B, N)
 
@@ -1079,11 +1079,21 @@ def _fisher_points_patd_quadrature(
             J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
             del cols, cols_parts
 
-        # ----- Phase 4: weighted Fisher sum  F_b = λ_b × Σ_n w_n J_n J_n^T
+        # ----- Phase 4: weighted Fisher = λ × weight-covariance of the score.
+        # J holds the RAW score s_n = ∂_θ log r(t_n|θ) (LLR-net path) or the score
+        # of the normalised pdf (analytic path). For the LLR-net path the Fisher of
+        # the normalised density is the covariance of s under the weights w_n:
+        #     F = Σ_n w_n s_n s_n^T - s̄ s̄^T ,   s̄ = Σ_n w_n s_n.
+        # The mean-subtraction (-s̄ s̄^T) is exactly the contribution of ∂_θ log Z,
+        # recovered here without differentiating through Z. The analytic-PDF path
+        # already differentiates a normalised pdf, so its mean score is ~0 on the
+        # grid and the subtraction is a (harmless) higher-order correction.
         p_weights = _get_p_weights(theta0_flat)  # (Bs, N)
-        weighted_J = J * p_weights.unsqueeze(-1)
-        F_sub = torch.einsum('bnd,bne->bde', weighted_J, J)   # (Bs, D, D)
-        del J, weighted_J
+        weighted_J = J * p_weights.unsqueeze(-1)                       # (Bs, N, D)
+        F_sub = torch.einsum('bnd,bne->bde', weighted_J, J)           # Σ w s s^T
+        s_bar = weighted_J.sum(dim=1)                                 # (Bs, D) = Σ w s
+        F_sub = F_sub - torch.einsum('bd,be->bde', s_bar, s_bar)     # centred covariance
+        del J, weighted_J, s_bar
         F_sub = F_sub * lam_s.view(Bs, 1, 1)
         return F_sub
 
@@ -1417,18 +1427,22 @@ def _fisher_points_charge_quadrature(
         ctx_rep = ctx.unsqueeze(1).expand(B, n_quadrature, -1).reshape(B * n_quadrature, -1)
         features = torch.cat([ctx_rep, log_c_feat], dim=-1)
         llr_vals = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-10)
-
-        r_vals = torch.exp(llr_vals).reshape(B, n_quadrature)
-        Z = (r_vals * dc_grid_detached).sum(dim=1, keepdim=True).clamp(min=1e-20)
-        log_r_norm = llr_vals.reshape(B, n_quadrature) - torch.log(Z)  # (B, N)
-        return log_r_norm
+        # Return the RAW (un-normalised) log-ratio log r(c|θ). The score of the
+        # normalised density is ∂_θ log p̃ = ∂_θ log r - ∂_θ log Z, and ∂_θ log Z =
+        # Σ_n w_n ∂_θ log r_n is the weighted-mean score. Phase 4 forms the
+        # weight-covariance Σ_n w_n s_n s_n^T - s̄ s̄^T explicitly, so we do not need
+        # to differentiate through Z (the logsumexp) here.
+        return llr_vals.reshape(B, n_quadrature)  # (B, N) raw log r
 
     def _get_p_weights(theta_flat):
+        # Quadrature weights w_n = p̃(c_n) dc_n, computed once, no-grad.
+        # Per-row max keeps Z finite even if the network saturates.
         with torch.no_grad():
-            log_p = _theta_only_fn(theta_flat)   # (B, N)
-            r = torch.exp(log_p)
-            Z = (r * dc_grid_detached).sum(dim=1, keepdim=True).clamp(min=1e-20)
-            return (r * dc_grid_detached / Z).detach()  # (B, N)
+            log_r = _theta_only_fn(theta_flat)   # (B, N) raw log r
+            m = log_r.max(dim=1, keepdim=True).values
+            w = torch.exp(log_r - m) * dc_grid_detached
+            Z = w.sum(dim=1, keepdim=True).clamp(min=1e-30)
+            return (w / Z).detach()  # (B, N)
 
     # ------------------------------------------------------------------ #
     # Phase 3: Jacobian ∂ log p̃(c_n|θ) / ∂θ                              #
@@ -1454,14 +1468,19 @@ def _fisher_points_charge_quadrature(
         del cols, cols_parts
 
     # ------------------------------------------------------------------ #
-    # Phase 4: weighted Fisher sum  F_b = Σ_n w_n J_n J_n^T              #
-    # (No λ multiplier: charge is the observable, so this is the full     #
-    #  charge-distribution Fisher already.)                               #
+    # Phase 4: weighted Fisher = weight-covariance of the raw score.      #
+    # J holds s_n = ∂_θ log r(c_n|θ). The Fisher of the normalised density #
+    # is  F = Σ_n w_n s_n s_n^T - s̄ s̄^T,  s̄ = Σ_n w_n s_n,  recovering    #
+    # the ∂_θ log Z contribution without differentiating through Z.        #
+    # (No λ multiplier: charge is the observable, so this is the full      #
+    #  charge-distribution Fisher already.)                                #
     # ------------------------------------------------------------------ #
     p_weights = _get_p_weights(theta0_flat)  # (Ba, N)
     weighted_J = J * p_weights.unsqueeze(-1)                       # (Ba, N, D)
-    F_active = torch.einsum('bnd,bne->bde', weighted_J, J)         # (Ba, D, D)
-    del J, weighted_J
+    F_active = torch.einsum('bnd,bne->bde', weighted_J, J)         # Σ w s s^T
+    s_bar = weighted_J.sum(dim=1)                                 # (Ba, D) = Σ w s
+    F_active = F_active - torch.einsum('bd,be->bde', s_bar, s_bar)  # centred covariance
+    del J, weighted_J, s_bar
 
     B_orig = active_mask.shape[0]
     if B_orig == B:
