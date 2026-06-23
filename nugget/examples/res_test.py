@@ -5,7 +5,7 @@ import numpy as np
 # import os
 # from nugget.losses.effective_area import get_bounding_cylinder
 
-device = 'cuda:3'
+device = 'cuda:2'
 num_events = 50000
 version = 'r600_50_u_1'
 print(f"Using device: {device}")
@@ -14,8 +14,9 @@ print(f"Using signal_version: {version}")
 center = [0,0,0]
 radius = 600
 height = 1000
-use_patd=False
-
+use_patd=True
+recompute=True
+extra = '_patd' if use_patd else ''
 if not use_patd:
     lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = 'track')
 else:
@@ -178,14 +179,22 @@ for geom_name in ['800main_full_hex', '340grid']:
 
     # while os.path.isfile(events_file_name + str(i) + '.pkl'):
     #     i += 1
-
+    if recompute:
+        events_file_name = f'res_test/fisher_info_per_string_per_event_{num_events}_{geom_name}_{version}{extra}.pt'
+        try: 
+            fisher_info_recompute = torch.load(events_file_name)
+            fisher_info_recompute = fisher_info_recompute.to(device)
+            print(f"Loaded precomputed fisher info from file: {events_file_name}")
+        except FileNotFoundError:
+            print(f"No precomputed fisher info found at {events_file_name}, computing from scratch...")
+            recompute = False
     fisher_info_per_string_per_event = angular_resolution_loss.compute_fisher_info_per_string_per_event(
                 string_xy=geom_dict['string_xy'],
                 points_3d=geom_dict['points_3d'],
                 signal_event_params=signal_events,
                 signal_surrogate_func=light_yield_surrogate,
                 llr_net=llr_net,
-                llr_iterations=200,
+                llr_iterations=100,
                 skip_zero_response=True,
                 verbose=True,
                 jacrev_chunk_size=50000,
@@ -201,6 +210,11 @@ for geom_name in ['800main_full_hex', '340grid']:
                 use_charge_quadrature=not use_patd,  # for patd, charge quadrature is handled inside the surrogate
                 charge_center_on_llr_peak=not use_patd,  # for patd, the surrogate is already centered on the llr peak
                 charge_peak_scan_points=64,
+                adaptive_grid_retry=True,
+                adaptive_t_max_floor_ns=10,
+                uninformative_fisher_value=1e-6,
+                precomputed_fisher_per_string_per_event=fisher_info_recompute if recompute else None,
+                recompute_bad_points=recompute,
                 )
 
     # precomputed_ly = signal_yield_loss_func.light_yield_per_string(
@@ -211,7 +225,7 @@ for geom_name in ['800main_full_hex', '340grid']:
     #             )
 
 
-    extra = '_patd' if use_patd else ''
+    
     # extra += '_no_pois' if not use_poisson else ''
     torch.save(fisher_info_per_string_per_event.cpu(), f'res_test/fisher_info_per_string_per_event_{num_events}_{geom_name}_{version}{extra}.pt')
     # torch.save(precomputed_ly.cpu(), f'res_test/light_yield_per_string_{num_events}_{geom_name}_{version}.pt')
