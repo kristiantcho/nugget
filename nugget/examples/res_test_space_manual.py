@@ -15,19 +15,20 @@ def move_events_to_device(signal_events, device):
         moved_events.append(moved_event)
     return moved_events
 
-min_energy=2
-max_energy=3
+min_energy=6
+max_energy=8
 spacing_min=25.0
 spacing_max=300.0
 spacing_count=25
 use_llrnet = True
 use_patd = False
-device = "cuda:1"
+device = "cuda:2"
 num_events = 1000
-version = f"r600_50_u_sp_e{min_energy}-{max_energy}"
+zenith_range = 'horizontal'
+version = f"r600_50_u_sp_1"
 output_dir = Path("res_test/space_test")
 
-signal_events_path = Path(f"res_test/signal_events_{num_events}_{version}.pt")
+signal_events_path = Path(f"res_test/space_test/{version}/signal_events_{num_events}_e{min_energy}-{max_energy}_{zenith_range}.pt")
 
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
@@ -46,8 +47,9 @@ output_dir.mkdir(parents=True, exist_ok=True)
 center = [0, 0, 0]
 radius = 600
 height = 1000
+
 if not use_patd:
-    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=2500, particle_mode = 'track')
+    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=2500, particle_mode = 'track')
 else:
     lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
         device=device,
@@ -68,14 +70,15 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     find_exact_intersection=True,
                                                     random_position_along_ray=False,
                                                     energy_dist='log_uniform',
+                                                    uniform_zenith_sampling=True,
                                                     cylinder_center=center,
                                                     cylinder_radius=radius,
                                                     cylinder_height=height,
                                                     # point_towards_center=True,
-                                                    # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
+                                                    cos_range=zenith_range if zenith_range in ['horizontal', 'vertical'] else torch.tensor([-1.0, 1.0]),
                                                     )
 signal_events = signal_sampler.sample_events(num_events)
-signal_events = nugget.utils.data_tools.save_signal_events_parquet(signal_events, signal_events_path)
+nugget.utils.data_tools.save_signal_events_parquet(signal_events, signal_events_path)
 signal_events = move_events_to_device(signal_events, device)
 for string_spacing in np.linspace(spacing_min, spacing_max, spacing_count):
     print(f"Running fisher info calculations for string spacing: {string_spacing}m")
@@ -129,11 +132,13 @@ for string_spacing in np.linspace(spacing_min, spacing_max, spacing_count):
         rel_time=False,
         input_delta_time=False,
         use_rich_features=True,
-        add_distance_from_beam=False,
+        add_distance_from_beam=use_patd,
         use_patd=use_patd,
         )
-
-        llr_net.load_model('best_charge_llr_model_v5.pt')
+        if not use_patd:
+            llr_net.load_model('best_charge_llr_model_v5.pt')
+        else:
+            llr_net.load_model('best_hit_llr_model_v7.pt')
 
     fisher_info_per_string_per_event = angular_resolution_loss.compute_fisher_info_per_string_per_event(
                 string_xy=geom_dict['string_xy'],
@@ -163,7 +168,7 @@ for string_spacing in np.linspace(spacing_min, spacing_max, spacing_count):
                 )
 
     output_path = output_dir / (
-        f"fisher_info_per_string_per_event_{num_events}_{int(string_spacing)}_{version}.pt"
+        f"fisher_info_per_string_per_event_{num_events}_{int(string_spacing)}_e{min_energy}-{max_energy}_{zenith_range}.pt"
     )
     torch.save(fisher_info_per_string_per_event.cpu(), output_path)
 
