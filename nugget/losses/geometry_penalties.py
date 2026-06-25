@@ -730,152 +730,132 @@ class ROVPenalty(LossFunction):
         self.rov_tri_length = rov_tri_length
         
     def _compute_blockage_per_angle_alt(self, all_relative, num_angles, half_height, tri_length, rec_width, other_probs=None):
-        """Exact hard-mask triangle+rectangle blockage via interval accumulation.
+        """Vectorized hard-mask triangle+rectangle blockage via flat diff-array scatter.
 
-        This mode matches the non-alt hard geometry rules while avoiding the large
-        (N, N-1, num_angles) tensor. Each blocker contributes a small set of angular
-        intervals that are accumulated with a per-string difference array.
+        Eliminates the Python for-loop over N strings by flattening all N*(N-1) pairs,
+        computing geometry quantities in bulk, and scattering into a flat diff array of
+        length N*(num_angles+1) before a single row-wise cumsum.
         """
         device = all_relative.device
         dtype = all_relative.dtype
         N = all_relative.shape[0]
+        P = N * (N - 1)
+        A1 = num_angles + 1  # diff array has one guard slot per row
 
         two_pi = 2.0 * torch.pi
         angle_step = two_pi / float(num_angles)
-        blockage_per_angle = torch.zeros(N, num_angles, device=device, dtype=dtype)
 
         L_tri = float(tri_length)
         L_tot = float(tri_length + rec_width)
         beta = float(torch.atan(torch.tensor(half_height / max(L_tri, 1e-12))))
         eps = 1e-12
 
-        # If blocker distance is larger than this, neither triangle nor rectangle can include it.
         max_dist = (L_tot ** 2 + half_height ** 2) ** 0.5
 
-        def _add_theta_intervals(diff, start, end, w):
-            """Add inclusive angular intervals [start, end] on periodic [0, 2pi)."""
-            if start.numel() == 0:
-                return
+        # --- Step 1: flatten all pairs ---
+        rel_flat = all_relative.reshape(P, 2)                                   # (P, 2)
+        row_idx = torch.arange(N, device=device).repeat_interleave(N - 1)      # (P,)
 
-            start = torch.remainder(start, two_pi)
-            end = torch.remainder(end, two_pi)
-            wrap = start > end
+        if other_probs is not None:
+            pair_weight = other_probs.reshape(P)                                # (P,)
+        else:
+            pair_weight = torch.ones(P, device=device, dtype=dtype)             # (P,)
 
-            start_idx = torch.ceil((start - eps) / angle_step).to(torch.long)
-            end_idx = torch.floor((end + eps) / angle_step).to(torch.long)
-            start_idx = torch.clamp(start_idx, 0, num_angles - 1)
-            end_idx = torch.clamp(end_idx, 0, num_angles - 1)
+        # --- Step 2: geometric quantities, filter by valid distance ---
+        dx = rel_flat[:, 0]
+        dy = rel_flat[:, 1]
+        dist = torch.sqrt(dx * dx + dy * dy + 1e-12)                           # (P,)
+        valid = (dist > 1e-8) & (dist <= max_dist)                              # (P,)
 
+        dist_v = dist[valid]                                                    # (V,)
+        phi_v  = torch.remainder(torch.atan2(dy[valid], dx[valid]), two_pi)    # (V,)
+        pw_v   = pair_weight[valid]                                             # (V,)
+        row_v  = row_idx[valid]                                                 # (V,)
+
+        # --- Step 3: angular interval bounds (vectorized over V) ---
+        tri_low = torch.where(
+            dist_v > L_tri,
+            torch.acos(torch.clamp(L_tri / dist_v, max=1.0)),
+            torch.zeros_like(dist_v),
+        )                                                                       # (V,)
+        tri_high = torch.full_like(dist_v, beta)                               # (V,)
+        tri_ok   = tri_low <= (tri_high + eps)                                 # (V,)
+
+        rect_high = torch.minimum(
+            torch.asin(torch.clamp(half_height / dist_v, max=1.0)),
+            torch.acos(torch.clamp(L_tri / dist_v, max=1.0)),
+        )                                                                       # (V,)
+        rect_low = torch.where(
+            dist_v > L_tot,
+            torch.acos(torch.clamp(L_tot / dist_v, max=1.0)),
+            torch.zeros_like(dist_v),
+        )                                                                       # (V,)
+        rect_ok = (dist_v >= L_tri) & (rect_low <= (rect_high + eps))         # (V,)
+
+        inter_low  = torch.maximum(tri_low,  rect_low)                        # (V,)
+        inter_high = torch.minimum(tri_high, rect_high)                       # (V,)
+        inter_ok   = tri_ok & rect_ok & (inter_low <= (inter_high + eps))     # (V,)
+
+        # --- Step 4: flat diff array ---
+        diff_flat = torch.zeros(N * A1, device=device, dtype=dtype)            # (N*A1,)
+
+        def _add_intervals_flat(start_raw, end_raw, w, row_ids):
+            """Scatter signed angular intervals into diff_flat (no Python loops over pairs)."""
+            start = torch.remainder(start_raw, two_pi)
+            end   = torch.remainder(end_raw,   two_pi)
+
+            start_idx = torch.clamp(
+                torch.ceil((start - eps) / angle_step).to(torch.long), 0, num_angles - 1)
+            end_idx = torch.clamp(
+                torch.floor((end + eps) / angle_step).to(torch.long), 0, num_angles - 1)
+
+            wrap     = start > end
             non_wrap = ~wrap
-            if torch.any(non_wrap):
-                s_nw = start_idx[non_wrap]
-                e_nw = end_idx[non_wrap]
-                w_nw = w[non_wrap]
-                keep = s_nw <= e_nw
-                if torch.any(keep):
-                    s_nw = s_nw[keep]
-                    e_nw = e_nw[keep]
-                    w_nw = w_nw[keep]
-                    diff.index_add_(0, s_nw, w_nw)
-                    diff.index_add_(0, e_nw + 1, -w_nw)
 
-            if torch.any(wrap):
-                s_w = start_idx[wrap]
-                e_w = end_idx[wrap]
-                w_w = w[wrap]
+            # Non-wrapping: valid where start_idx <= end_idx
+            nw = non_wrap & (start_idx <= end_idx)
+            if nw.any():
+                flat_s = row_ids[nw] * A1 + start_idx[nw]
+                flat_e = row_ids[nw] * A1 + end_idx[nw] + 1
+                diff_flat.index_add_(0, flat_s,  w[nw])
+                diff_flat.index_add_(0, flat_e, -w[nw])
 
-                keep_head = e_w >= 0
-                if torch.any(keep_head):
-                    e_h = e_w[keep_head]
-                    w_h = w_w[keep_head]
-                    diff[0] += torch.sum(w_h)
-                    diff.index_add_(0, e_h + 1, -w_h)
+            # Wrapping: head piece [0, end_idx] + tail piece [start_idx, num_angles-1]
+            if wrap.any():
+                # Head: +w at col 0, -w at end_idx+1
+                flat_head_s = row_ids[wrap] * A1
+                flat_head_e = row_ids[wrap] * A1 + end_idx[wrap] + 1
+                diff_flat.index_add_(0, flat_head_s,  w[wrap])
+                diff_flat.index_add_(0, flat_head_e, -w[wrap])
+                # Tail: +w at start_idx, -w at guard slot (col num_angles)
+                flat_tail_s = row_ids[wrap] * A1 + start_idx[wrap]
+                flat_tail_e = row_ids[wrap] * A1 + num_angles
+                diff_flat.index_add_(0, flat_tail_s,  w[wrap])
+                diff_flat.index_add_(0, flat_tail_e, -w[wrap])
 
-                keep_tail = s_w <= (num_angles - 1)
-                if torch.any(keep_tail):
-                    s_t = s_w[keep_tail]
-                    w_t = w_w[keep_tail]
-                    diff.index_add_(0, s_t, w_t)
-                    diff[num_angles] -= torch.sum(w_t)
-
-        for i in range(N):
-            rel_i = all_relative[i]  # (N-1, 2)
-            dx = rel_i[:, 0]
-            dy = rel_i[:, 1]
-
-            dist = torch.sqrt(dx * dx + dy * dy + 1e-12)
-            valid = (dist > 1e-8) & (dist <= max_dist)
-            if not torch.any(valid):
+        # --- Step 5: scatter all 6 interval sets (3 shapes × 2 symmetric halves) ---
+        for lo_all, hi_all, ok_all, sign in (
+            (tri_low,   tri_high,   tri_ok,   1.0),
+            (rect_low,  rect_high,  rect_ok,  1.0),
+            (inter_low, inter_high, inter_ok, -1.0),
+        ):
+            if not ok_all.any():
                 continue
+            lo_k  = lo_all[ok_all]
+            hi_k  = hi_all[ok_all]
+            phi_k = phi_v[ok_all]
+            w_k   = pw_v[ok_all] * sign
+            row_k = row_v[ok_all]
 
-            phi = torch.atan2(dy, dx)
-            phi = torch.remainder(phi, two_pi)
+            # Positive half: delta in [lo, hi] => theta in [lo-phi, hi-phi]
+            _add_intervals_flat(lo_k - phi_k, hi_k - phi_k,   w_k, row_k)
+            # Negative half: delta in [-hi, -lo] => theta in [-hi-phi, -lo-phi]
+            _add_intervals_flat(-hi_k - phi_k, -lo_k - phi_k, w_k, row_k)
 
-            if other_probs is not None:
-                pair_weight = other_probs[i]
-            else:
-                pair_weight = torch.ones_like(dist)
-
-            phi = phi[valid]
-            dist = dist[valid]
-            pair_weight = pair_weight[valid]
-
-            diff = torch.zeros(num_angles + 1, device=device, dtype=dtype)
-
-            # Build |delta| intervals for triangle and rectangle pieces, then
-            # combine with inclusion-exclusion (tri + rect - overlap) so each
-            # blocker contributes exactly once where shapes overlap.
-
-            # Triangle piece:
-            # 0 <= x <= L_tri and |y| <= (half_height/L_tri) * x.
-            tri_low = torch.where(
-                dist > L_tri,
-                torch.acos(torch.clamp(L_tri / dist, max=1.0)),
-                torch.zeros_like(dist),
-            )
-            tri_high = torch.full_like(dist, beta)
-            tri_valid = tri_low <= (tri_high + eps)
-
-            # Rectangle piece:
-            # L_tri <= x <= L_tot and |y| <= half_height.
-            rect_high = torch.minimum(
-                torch.asin(torch.clamp(half_height / dist, max=1.0)),
-                torch.acos(torch.clamp(L_tri / dist, max=1.0)),
-            )
-            rect_low = torch.where(
-                dist > L_tot,
-                torch.acos(torch.clamp(L_tot / dist, max=1.0)),
-                torch.zeros_like(dist),
-            )
-            rect_valid = (dist >= L_tri) & (rect_low <= (rect_high + eps))
-
-            # Intersection on |delta| side for inclusion-exclusion.
-            inter_low = torch.maximum(tri_low, rect_low)
-            inter_high = torch.minimum(tri_high, rect_high)
-            inter_valid = tri_valid & rect_valid & (inter_low <= (inter_high + eps))
-
-            for lo, hi, is_valid, sign in (
-                (tri_low, tri_high, tri_valid, 1.0),
-                (rect_low, rect_high, rect_valid, 1.0),
-                (inter_low, inter_high, inter_valid, -1.0),
-            ):
-                if not torch.any(is_valid):
-                    continue
-
-                lo_v = lo[is_valid]
-                hi_v = hi[is_valid]
-                phi_v = phi[is_valid]
-                w_v = pair_weight[is_valid] * sign
-
-                # Non-alt path uses y_rot = dx*sin(theta) + dy*cos(theta),
-                # so blocked intervals are centered at theta = -phi.
-                # delta in [lo, hi] => theta in [lo-phi, hi-phi]
-                _add_theta_intervals(diff, lo_v - phi_v, hi_v - phi_v, w_v)
-                # delta in [-hi, -lo] => theta in [-hi-phi, -lo-phi]
-                _add_theta_intervals(diff, -hi_v - phi_v, -lo_v - phi_v, w_v)
-
-            blockage_per_angle[i] = torch.cumsum(diff, dim=0)[:num_angles]
-            blockage_per_angle[i].clamp_(min=0.0)
+        # --- Step 6: cumsum, slice, clamp ---
+        diff_2d = diff_flat.reshape(N, A1)
+        blockage_per_angle = torch.cumsum(diff_2d, dim=1)[:, :num_angles]     # (N, num_angles)
+        blockage_per_angle = torch.clamp(blockage_per_angle, min=0.0)
 
         return blockage_per_angle
 
@@ -952,6 +932,9 @@ class ROVPenalty(LossFunction):
                 penalty_per_string = -angle_softmin_tau * torch.logsumexp(
                     -blockage_per_angle / angle_softmin_tau, dim=1
                 )
+                # softmin underestimates the true min and goes negative when blockage
+                # is zero everywhere (log(num_angles) artefact) — clamp before loss.
+                penalty_per_string = penalty_per_string.clamp(min=0.0)
             else:
                 penalty_per_string = blockage_per_angle.min(dim=1)[0]
 
@@ -964,70 +947,104 @@ class ROVPenalty(LossFunction):
             c = torch.cos(angles)
             s = torch.sin(angles)
 
-            # Apply rotation for all angles at once: (N, N-1, num_angles, 2)
             rel_expanded = all_relative.unsqueeze(2)  # (N, N-1, 1, 2)
-            x_rot = rel_expanded[..., 0] * c - rel_expanded[..., 1] * s
-            y_rot_abs = (rel_expanded[..., 0] * s + rel_expanded[..., 1] * c).abs()
-
-            if not soft_inside:
-                inside_tri = (x_rot >= 0) & (x_rot <= L_tri) & (y_rot_abs <= slope * x_rot)
-                inside_rect = (x_rot >= L_tri) & (x_rot <= L_tri + L_rect) & (y_rot_abs <= half_height)
-                inside = (inside_rect | inside_tri).float()  # (N, N-1, num_angles)
-            else:
-                k = inside_sharpness
-
-                def _soft_between(x, lo, hi):
-                    # ~1 if lo<=x<=hi, ~0 otherwise
-                    return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
-
-                # Triangle: 0<=x<=L_tri and |y| <= slope*x
-                tri_x = _soft_between(x_rot, 0.0, L_tri)
-                tri_y_bound = slope * x_rot
-                tri_y = torch.sigmoid(k * (tri_y_bound - y_rot_abs))
-                inside_tri = tri_x * tri_y
-
-                # Rectangle: L_tri<=x<=L_tri+L_rect and |y|<=W_rect/2
-                rect_x = _soft_between(x_rot, L_tri, L_tri + L_rect)
-                rect_y = torch.sigmoid(k * (half_height - y_rot_abs))
-                inside_rect = rect_x * rect_y
-
-                # Soft OR (union)
-                inside = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)  # (N, N-1, num_angles)
 
             if string_probs is not None:
-                # Get weights of other strings for each position
                 other_probs = string_probs.unsqueeze(0).expand(N, N)[mask].reshape(N, N-1)
                 if detach_other_probs:
                     other_probs = other_probs.detach()
+            else:
+                other_probs = None
 
-                # For each angle, sum weights of strings inside safe space
-                # (N, num_angles) = sum over other strings
-                blockage_per_angle = (inside.float() * other_probs.unsqueeze(-1)).sum(dim=1)
+            # soft_inside on GPU: chunk over angles to avoid materialising the full
+            # (N, N-1, num_angles) float tensor. Hard-inside uses bool which is 8x
+            # smaller so chunking is only worthwhile for soft.
+            use_chunked = soft_inside and points.is_cuda
+            chunk_size = kwargs.get('rov_angle_chunk_size', 16)
+
+            if use_chunked:
+                k = inside_sharpness
+
+                def _soft_between(x, lo, hi):
+                    return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
+
+                blockage_per_angle = torch.zeros(N, num_angles, device=points.device, dtype=points.dtype)
+                for a_start in range(0, num_angles, chunk_size):
+                    a_end = min(a_start + chunk_size, num_angles)
+                    c_ch = c[a_start:a_end]
+                    s_ch = s[a_start:a_end]
+
+                    x_rot     = rel_expanded[..., 0] * c_ch - rel_expanded[..., 1] * s_ch   # (N, N-1, chunk)
+                    y_rot_abs = (rel_expanded[..., 0] * s_ch + rel_expanded[..., 1] * c_ch).abs()
+
+                    tri_x      = _soft_between(x_rot, 0.0, L_tri)
+                    tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
+                    inside_tri = tri_x * tri_y
+
+                    rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
+                    rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
+                    inside_rect = rect_x * rect_y
+
+                    inside_ch = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)   # (N, N-1, chunk)
+
+                    if other_probs is not None:
+                        blockage_per_angle[:, a_start:a_end] = (inside_ch * other_probs.unsqueeze(-1)).sum(dim=1)
+                    else:
+                        blockage_per_angle[:, a_start:a_end] = inside_ch.sum(dim=1)
+
+                angle_scores_per_angle = blockage_per_angle
+            else:
+                # Apply rotation for all angles at once: (N, N-1, num_angles)
+                x_rot     = rel_expanded[..., 0] * c - rel_expanded[..., 1] * s
+                y_rot_abs = (rel_expanded[..., 0] * s + rel_expanded[..., 1] * c).abs()
+
+                if not soft_inside:
+                    inside_tri  = (x_rot >= 0) & (x_rot <= L_tri) & (y_rot_abs <= slope * x_rot)
+                    inside_rect = (x_rot >= L_tri) & (x_rot <= L_tri + L_rect) & (y_rot_abs <= half_height)
+                    inside = (inside_rect | inside_tri).float()
+                else:
+                    k = inside_sharpness
+
+                    def _soft_between(x, lo, hi):
+                        return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
+
+                    tri_x      = _soft_between(x_rot, 0.0, L_tri)
+                    tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
+                    inside_tri = tri_x * tri_y
+
+                    rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
+                    rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
+                    inside_rect = rect_x * rect_y
+
+                    inside = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)
+
+                if other_probs is not None:
+                    blockage_per_angle = (inside.float() * other_probs.unsqueeze(-1)).sum(dim=1)
+                else:
+                    blockage_per_angle = inside.float().sum(dim=1)
+
                 angle_scores_per_angle = blockage_per_angle
 
+            if other_probs is not None:
                 # For each string: minimum blockage across all angles (optionally smooth)
                 if angle_softmin_tau > 0.0:
                     penalty_per_string = -angle_softmin_tau * torch.logsumexp(
                         -blockage_per_angle / angle_softmin_tau, dim=1
                     )
+                    penalty_per_string = penalty_per_string.clamp(min=0.0)
                 else:
                     penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
 
                 # Weight by string probability and sum
                 loss = (penalty_per_string * string_probs).sum()
             else:
-                # Count number of strings inside for each angle
-                # (N, num_angles) = count of other strings inside
-                count_per_angle = inside.sum(dim=1)  # (N, num_angles)
-                angle_scores_per_angle = count_per_angle
-
-                # For each string: minimum count across all angles (optionally smooth)
                 if angle_softmin_tau > 0.0:
                     penalty_per_string = -angle_softmin_tau * torch.logsumexp(
-                        -count_per_angle / angle_softmin_tau, dim=1
+                        -blockage_per_angle / angle_softmin_tau, dim=1
                     )
+                    penalty_per_string = penalty_per_string.clamp(min=0.0)
                 else:
-                    penalty_per_string = count_per_angle.min(dim=1)[0]  # (N,)
+                    penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
 
                 loss = penalty_per_string.sum()
 
