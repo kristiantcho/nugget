@@ -202,6 +202,7 @@ class WeightedFisherInfoLoss(LossFunction):
         t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5,
         adaptive_grid_retry=True, adaptive_t_max_floor_ns=10.0, uninformative_fisher_value=1e-6,
         precomputed_fisher_per_string_per_event=None, recompute_bad_points=True,
+        empty_cache_after_event=False,
     ):
         n_strings = len(string_xy)
         # use_rich_features is now stored on the model — read from it if available.
@@ -321,11 +322,15 @@ class WeightedFisherInfoLoss(LossFunction):
                     print(f"Event {i+1}/{n_events}: recomputed {bad_strings.numel()} bad strings", flush=True)
                 del bad_mask, bad_strings, bad_sxy, point_masks, pts_mask, pts_subset
                 _fisher_chunk_cleanup(self.device if isinstance(self.device, torch.device) else torch.device(self.device))
+                if empty_cache_after_event and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             else:
                 fisher_matrices = _compute(points_3d, string_xy)
                 fisher_per_string_per_event[i] += fisher_matrices.to(self.device)
                 del fisher_matrices
                 _fisher_chunk_cleanup(self.device if isinstance(self.device, torch.device) else torch.device(self.device))
+                if empty_cache_after_event and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 if verbose and (i % 100 == 0 or i == n_events - 1):
                     print(f"Computed Fisher info for event {i+1}/{n_events}", flush=True)
         # else:
