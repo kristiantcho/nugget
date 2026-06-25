@@ -190,7 +190,7 @@ class LLRnet(Surrogate):
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True, jitter_time=0.0,
                  add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True,
-                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, **kwargs):
+                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, **kwargs):
         """
         Initialize the LLRnet surrogate model.
         
@@ -279,6 +279,7 @@ class LLRnet(Surrogate):
         self.add_distance_from_beam = add_distance_from_beam
         self.log_scale_ly = log_scale_ly
         self.rel_time = rel_time
+        self.flag_negative_times = flag_negative_times
         self.input_charge = input_charge  # If using PATD, we will add number of photons as an input feature
         self.norm_pos = norm_pos
         self.log_scale_energy = log_scale_energy
@@ -705,8 +706,9 @@ class LLRnet(Surrogate):
            vert_dist,                     L2(detector - vertex) normalised     (1, optional)
            cos_angle,                     cos(direction ∠ vertex→detector)     (1)
            beam_dist_perp,                perpendicular distance from beam     (1, optional)
-           t_hit (log-sign scaled)]       per-photon arrival time              (1)
-                                                                           total = 12-14
+           t_hit (log-sign scaled),       per-photon arrival time              (1)
+           is_negative]                   1 if t_residual < 0 else 0           (1, optional)
+                                                                           total = 12-15
 
         
         Parameters
@@ -720,8 +722,9 @@ class LLRnet(Surrogate):
 
         Returns
         -------
-        features : torch.Tensor, shape (num_photons, 13) or (num_photons, 12)
+        features : torch.Tensor, shape (num_photons, 12–15)
             Per-photon feature matrix, or None if num_photons == 0.
+            Width is 12 base + add_vertex_distance + add_distance_from_beam + flag_negative_times.
         num_photons : int
         """
         num_photons = patd_result['num_photons']
@@ -810,7 +813,11 @@ class LLRnet(Surrogate):
 
         # --- replicate event features and append per-photon time ---
         event_features_batch = event_features.unsqueeze(0).expand(num_photons, -1)
-        features = torch.cat([event_features_batch, t_scaled.unsqueeze(1)], dim=1)  # (N, 14)
+        if self.flag_negative_times:
+            is_neg = (hit_times < 0).float().unsqueeze(1)  # (N, 1)
+            features = torch.cat([event_features_batch, t_scaled.unsqueeze(1), is_neg], dim=1)
+        else:
+            features = torch.cat([event_features_batch, t_scaled.unsqueeze(1)], dim=1)  # (N, 14)
 
         return features.clone().detach(), num_photons
 
@@ -1095,9 +1102,15 @@ class LLRnet(Surrogate):
             base_features_batch = base_features.unsqueeze(0).repeat(num_photons_int, 1)
             
             # Concatenate base features with hit times
-            if self.input_delta_time:
+            if self.flag_negative_times:
+                is_neg = (hit_times < 0).float().view(-1, 1).sort(dim=0).values
+                if self.input_delta_time:
+                    features_batch = torch.cat([base_features_batch, hit_times_processed, delta_times_processed, is_neg], dim=1)
+                else:
+                    features_batch = torch.cat([base_features_batch, hit_times_processed, is_neg], dim=1)
+            elif self.input_delta_time:
                 features_batch = torch.cat([base_features_batch, hit_times_processed, delta_times_processed], dim=1)
-            else:    
+            else:
                 features_batch = torch.cat([base_features_batch, hit_times_processed], dim=1)
             
             all_features_batches.append(features_batch)
@@ -2229,6 +2242,7 @@ class LLRnet(Surrogate):
             'log_scale_ly': self.log_scale_ly,
             'rel_time': self.rel_time,
             'jitter_time': self.jitter_time,
+            'flag_negative_times': self.flag_negative_times,
             'input_charge': self.input_charge,
             'norm_pos': self.norm_pos,
             'log_scale_energy': self.log_scale_energy,
@@ -2302,6 +2316,7 @@ class LLRnet(Surrogate):
         self.min_photons = checkpoint.get('min_photons', self.min_photons)
         self.num_photons_per_sample = checkpoint.get('num_photons_per_sample', self.num_photons_per_sample)
         self.jitter_time = checkpoint.get('jitter_time', 0.0)
+        self.flag_negative_times = checkpoint.get('flag_negative_times', False)
         self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
         self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
         # Determine if this is old format (single MLP) or new format (parallel branches)
