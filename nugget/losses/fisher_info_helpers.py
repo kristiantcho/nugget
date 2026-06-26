@@ -1873,12 +1873,18 @@ def directional_resolution(F3, n):
             Cov2 = torch.stack(Cov2)
         
         # --- Angular resolution for all events ---
-        eigvals = torch.linalg.eigvalsh(Cov2)  # (N, 2)
+        try:
+            eigvals = torch.linalg.eigvalsh(Cov2)  # (N, 2)
+        except Exception:
+            # Closed-form 2x2 eigenvalues — always numerically stable
+            tr = Cov2[:, 0, 0] + Cov2[:, 1, 1]
+            det = Cov2[:, 0, 0] * Cov2[:, 1, 1] - Cov2[:, 0, 1] ** 2
+            half_gap = 0.5 * torch.sqrt(torch.clamp(tr ** 2 - 4.0 * det, min=0.0))
+            eigvals = torch.stack([0.5 * tr - half_gap, 0.5 * tr + half_gap], dim=1)  # (N, 2)
         eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
-        # eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
-        sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) + 1e-10)  # (N,) Add epsilon for numerical stability
+        sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) + 1e-10)  # (N,)
         r68 = 1.515 * sigma_eff  # (N,)
-        
+
         return r68
 
 
