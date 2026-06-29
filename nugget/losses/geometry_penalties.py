@@ -929,11 +929,9 @@ class ROVPenalty(LossFunction):
             angle_scores_per_angle = blockage_per_angle
 
             if angle_softmin_tau > 0.0:
-                # Mean softplus penalty: F.softplus(-τ·b)/τ is ~0 when blockage is
-                # large (angle clear) and ~1/τ·log(2) when blockage is 0 (angle
-                # fully open but unpenalised). Naturally non-negative with clean
-                # gradients everywhere — no clamp needed.
-                penalty_per_string = F.softplus(-angle_softmin_tau * blockage_per_angle).mean(dim=1) / angle_softmin_tau
+                penalty_per_string = F.softplus(-angle_softmin_tau * torch.logsumexp(
+                    -blockage_per_angle / angle_softmin_tau, dim=1
+                ))
             else:
                 penalty_per_string = blockage_per_angle.min(dim=1)[0]
 
@@ -1026,7 +1024,9 @@ class ROVPenalty(LossFunction):
 
             if other_probs is not None:
                 if angle_softmin_tau > 0.0:
-                    penalty_per_string = F.softplus(-angle_softmin_tau * blockage_per_angle).mean(dim=1) / angle_softmin_tau
+                    penalty_per_string = F.softplus(-angle_softmin_tau * torch.logsumexp(
+                        -blockage_per_angle / angle_softmin_tau, dim=1
+                    ))
                 else:
                     penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
 
@@ -1034,7 +1034,9 @@ class ROVPenalty(LossFunction):
                 loss = (penalty_per_string * string_probs).sum()
             else:
                 if angle_softmin_tau > 0.0:
-                    penalty_per_string = F.softplus(-angle_softmin_tau * blockage_per_angle).mean(dim=1) / angle_softmin_tau
+                    penalty_per_string = F.softplus(-angle_softmin_tau * torch.logsumexp(
+                        -blockage_per_angle / angle_softmin_tau, dim=1
+                    ))
                 else:
                     penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
 
