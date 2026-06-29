@@ -667,10 +667,18 @@ class StringNumberPenalty(LossFunction):
         eva_min_num_strings = kwargs.get('eva_min_num_strings', 70)
         string_number_beta = kwargs.get('string_number_beta', 1.0)
         
+        use_binarization_weight = kwargs.get('string_number_use_binarization_weight', False)
+
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
-        # string_probs = string_weights
         if string_probs is not None:
-            return {'string_number_penalty': F.softplus(torch.sum(string_probs) - eva_min_num_strings, beta=string_number_beta)/string_probs.shape[0]}
+            if use_binarization_weight:
+                # Per-string binary entropy in [0, log(2)]; normalise to [0, 1].
+                h = -string_probs * torch.log(string_probs + 1e-6) - (1 - string_probs) * torch.log(1 - string_probs + 1e-6)
+                binarization_weight = h / math.log(2)  # in [0, 1], peaks at p=0.5
+                effective_probs = string_probs * binarization_weight
+            else:
+                effective_probs = string_probs
+            return {'string_number_penalty': F.softplus(torch.sum(effective_probs) - eva_min_num_strings, beta=string_number_beta) / string_probs.shape[0]}
         else:
             return {'string_number_penalty': torch.tensor(0.0)}
 
@@ -708,7 +716,7 @@ class WeightBinarizationPenalty(LossFunction):
         # string_probs_cut = torch.clamp(string_probs, min=0.0, max=1.0)
         
         if string_probs is not None:
-            return {'weight_binarization_penalty': torch.mean(string_probs * (1.0 - string_probs))}
+            return {'weight_binarization_penalty': torch.sum(-string_probs * torch.log(string_probs + 1e-6) - (1 - string_probs) * torch.log(1 - string_probs + 1e-6)) / len(string_probs)}
         else:
             return {'weight_binarization_penalty': torch.tensor(0.0)}
 
