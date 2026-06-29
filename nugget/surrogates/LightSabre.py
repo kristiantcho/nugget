@@ -785,6 +785,7 @@ class LightSabrePATD(LightSabre):
             'use_perpendicular_distance_only',
             self.kwargs.get('use_perpendicular_distance_only', False)
         )
+        throughgoing = kwargs.get('throughgoing', self.kwargs.get('throughgoing', False))
         c = 0.299792458
         v_mu = self.kwargs.get('v_mu', c)
         cpandel_params = self.kwargs.get('cpandel_params', {})
@@ -821,6 +822,13 @@ class LightSabrePATD(LightSabre):
             s = torch.zeros((num_samples,), device=self.device)
             d_geom = torch.full((num_samples,), d_vertex.clamp(min=1e-6).item(), device=self.device)
             t_geom_min = d_vertex / (c / self.refractive_index)
+        elif throughgoing:
+            # Throughgoing mode: geom_time is purely the photon travel time from the
+            # closest point on the infinite track to the detector, with no t_foot guard.
+            # d_geom = perpendicular distance; t_geom = d_geom / (c/n).
+            s = torch.full((num_samples,), t_foot.item(), device=self.device)
+            d_geom = torch.full((num_samples,), foot_length.clamp(min=1e-6).item(), device=self.device)
+            t_geom_min = foot_length / (c / self.refractive_index)
         elif use_perpendicular_distance_only:
             if t_foot < 0:
                 return self._empty_patd_dict(expected_N)
@@ -851,7 +859,10 @@ class LightSabrePATD(LightSabre):
             else:
                 t_geom_min = torch.norm(to_detector) / (c / self.refractive_index)
 
-        t_geom = d_geom / (c / self.refractive_index) + s / v_mu
+        if throughgoing and not is_cascade:
+            t_geom = d_geom / (c / self.refractive_index)
+        else:
+            t_geom = d_geom / (c / self.refractive_index) + s / v_mu
 
         cpandel = CPandel(
             tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 57.4),
@@ -897,6 +908,7 @@ class LightSabrePATD(LightSabre):
             'use_perpendicular_distance_only',
             self.kwargs.get('use_perpendicular_distance_only', False)
         )
+        throughgoing = kwargs.get('throughgoing', self.kwargs.get('throughgoing', False))
         c = 0.299792458
         v_mu = self.kwargs.get('v_mu', c)
         cpandel_params = self.kwargs.get('cpandel_params', {})
@@ -912,7 +924,8 @@ class LightSabrePATD(LightSabre):
             to_detector, track_dir.unsqueeze(0).expand(n_pts, 3)
         )
         foot_length = cross.norm(dim=1) / track_dir.norm().clamp_min(1e-12)            # (n_pts,)
-        valid_mask = torch.ones_like(t_foot, dtype=torch.bool) if is_cascade else (t_foot >= 0)  # (n_pts,)
+        # throughgoing mode: no t_foot guard — all detectors are valid
+        valid_mask = torch.ones_like(t_foot, dtype=torch.bool) if (is_cascade or throughgoing) else (t_foot >= 0)
         d_vertex = to_detector.norm(dim=1)                                              # (n_pts,)
 
         # ---- Vectorised light yield + Poisson ---------------------------
@@ -934,6 +947,9 @@ class LightSabrePATD(LightSabre):
         fl_safe = foot_length.clamp(min=1e-6)
         if is_cascade:
             t_geom_min_batch = d_vertex.clamp(min=1e-6) / (c / self.refractive_index)  # (n_pts,)
+        elif throughgoing:
+            # geom_time = photon travel from closest track point to detector only
+            t_geom_min_batch = fl_safe / (c / self.refractive_index)                   # (n_pts,)
         elif use_perpendicular_distance_only:
             t_geom_min_batch = fl_safe / (c / self.refractive_index) + t_foot / v_mu  # (n_pts,)
         else:
@@ -947,8 +963,8 @@ class LightSabrePATD(LightSabre):
             else:
                 t_geom_min_batch = to_detector.norm(dim=1) / (c / self.refractive_index)
 
-        # ---- Track-weight matrix (non-perp mode, computed once) ---------
-        if not is_cascade and not use_perpendicular_distance_only:
+        # ---- Track-weight matrix (non-perp, non-throughgoing mode) ------
+        if not is_cascade and not use_perpendicular_distance_only and not throughgoing:
             if not self.use_max_energy_dist:
                 S = self.kwargs.get('track_segment_length', 200.0)
                 t_min = max(0.0, float(t_foot.min().item()) - S)
@@ -983,6 +999,9 @@ class LightSabrePATD(LightSabre):
             if is_cascade:
                 s_i = torch.zeros((N_i,), device=self.device)
                 d_geom_i = torch.full((N_i,), d_vertex[i].clamp(min=1e-6).item(), device=self.device)
+            elif throughgoing:
+                s_i = torch.full((N_i,), t_foot[i].item(), device=self.device)
+                d_geom_i = torch.full((N_i,), fl_safe[i].item(), device=self.device)
             elif use_perpendicular_distance_only:
                 s_i = torch.full((N_i,), t_foot[i].item(), device=self.device)
                 d_geom_i = torch.full((N_i,), fl_safe[i].item(), device=self.device)
@@ -991,7 +1010,10 @@ class LightSabrePATD(LightSabre):
                 s_i = t_vals[sampled_idx]
                 d_geom_i = dists_matrix[sampled_idx, i]
 
-            t_geom_i = d_geom_i / (c / self.refractive_index) + s_i / v_mu
+            if throughgoing:
+                t_geom_i = d_geom_i / (c / self.refractive_index)
+            else:
+                t_geom_i = d_geom_i / (c / self.refractive_index) + s_i / v_mu
 
             hit_times, t_residual, t_geom_i, vertex_times, emission_points, t_residual_probs = \
                 self._sample_cpandel(
