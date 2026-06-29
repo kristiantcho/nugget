@@ -6,8 +6,8 @@ import numpy as np
 # from nugget.losses.effective_area import get_bounding_cylinder
 
 device = 'cuda:2'
-num_events = 50000
-version = 'r600_50_u_1'
+num_events = 3000
+version = 'r600_50_u_sp_1'
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
 # use_poisson = False
@@ -15,7 +15,7 @@ center = [0,0,0]
 radius = 600
 height = 1000
 use_patd=True
-recompute=True
+recompute=False
 extra = '_patd' if use_patd else ''
 if not use_patd:
     lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = 'track')
@@ -55,7 +55,15 @@ light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate
 # events_file_name = f'res_test/signal_events_{num_events}_{version}'
 # pickle.dump(signal_events, open(events_file_name +'.pkl', 'wb'))
 # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'res_test/signal_events_{num_events}_{version}.pt')
-signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_{version}.pt')
+# signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_{version}.pt')
+signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e2-4_vertical.pt')
+signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e4-6_vertical.pt')
+signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e6-8_vertical.pt')
+# signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e5-6_vertical.pt')
+# signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e6-8_vertical.pt')
+num_events *= 3
+version += '_vertical'
+nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'res_test/signal_events_{num_events}_{version}.pt')
 for i, signal_event in enumerate(signal_events):
     for key, value in signal_event.items():
         if isinstance(value, torch.Tensor):
@@ -97,7 +105,7 @@ for geom_name in ['800main_full_hex', '340grid']:
     angular_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
         device=device,
         resolution_type='angular',
-        fisher_info_params=['position','energy', 'direction']
+        fisher_info_params=['energy', 'direction']
     )
 
     signal_yield_loss_func = nugget.losses.light_yield.WeightedLightYieldLoss(
@@ -198,7 +206,7 @@ for geom_name in ['800main_full_hex', '340grid']:
                 skip_zero_response=True,
                 verbose=True,
                 jacrev_chunk_size=50000,
-                point_chunk_size=5000,
+                point_chunk_size=7000,
                 grad_chunk_size=7,
                 llr_autodiff_mode='jvp',
                 use_rich_features=True,
@@ -215,6 +223,7 @@ for geom_name in ['800main_full_hex', '340grid']:
                 uninformative_fisher_value=1e-6,
                 precomputed_fisher_per_string_per_event=fisher_info_recompute if recompute else None,
                 recompute_bad_points=recompute,
+                empty_cache_after_event=False,
                 )
 
     # precomputed_ly = signal_yield_loss_func.light_yield_per_string(

@@ -35,7 +35,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     device=device,
     domain_size=2000,
     dim=3,
-    hidden_dims=[64, 64, 64, 64, 64, 64, 64, 64],
+    hidden_dims=[64, 64, 64, 64, 64, 64],
     use_fourier_features=False,
     num_parallel_branches=1,
     shared_mlp=False,
@@ -43,11 +43,11 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     learnable_frequencies=False,
     dropout_rate=0,
     
-    learning_rate=1e-4,
+    learning_rate=1e-3,
     reduce_lr_on_plateau=True,
     lr_scheduler_patience=30,
     lr_scheduler_factor=0.5,
-    lr_scheduler_min_lr=1e-6,
+    lr_scheduler_min_lr=1e-5,
     
     add_relative_pos=False,
     log_scale_ly=True,
@@ -58,10 +58,11 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     
     use_patd=True,
     min_photons=1,
-    num_photons_per_sample=8,
+    num_photons_per_sample=16,
     
     rel_time=True,
-    jitter_time=30.0,
+    jitter_time=0.0,
+    flag_negative_times=True,
     use_rich_features=True,
     add_distance_from_beam=True, 
     add_vertex_distance=False,
@@ -71,17 +72,17 @@ train_dataloader = llr_net.create_patd_dataloader(
     signal_sampler=signal_sampler,
     signal_surrogate_func=light_yield_surrogate,
     num_samples_per_epoch=4096,
-    batch_size=32,
+    batch_size=16,
     num_workers=4,
     shuffle_photons=True,
-    manual_photons=True,
+    manual_photons=False,
       
 )
 
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     epochs=1500,
-    input_dim=13,
+    input_dim=14,
     grad_clip=None,
     save_every_n_epochs=20,
     checkpoint_path='best_hit_llr_model_v8.pt',

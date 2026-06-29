@@ -724,6 +724,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         # When a precomputed Fisher tensor is supplied, optionally recompute only
         # its bad (zero/NaN/Inf) strings per event instead of using it verbatim.
         recompute_bad_points = kwargs.get('recompute_bad_points', False)
+        empty_cache_after_event = kwargs.get('empty_cache_after_event', False)
 
         # New parameters for batched loading from files
         event_paths = kwargs.get('event_paths', None)
@@ -776,6 +777,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 uninformative_fisher_value=uninformative_fisher_value,
                 precomputed_fisher_per_string_per_event=precomputed_fisher_info_per_string_per_event,
                 recompute_bad_points=recompute_bad_points,
+                empty_cache_after_event=empty_cache_after_event,
             )
         else:
             fisher_info_per_string_per_event = precomputed_fisher_info_per_string_per_event.to(self.device)

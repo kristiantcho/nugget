@@ -792,7 +792,7 @@ class LightSabrePATD(LightSabre):
 
         track_pos, track_dir, energy = self._parse_event_params(event_params)
 
-        if self.kwargs.get('input_photons', None) is None:
+        if self.kwargs.get('input_photons', None) is None and kwargs.get('input_photons', None) is None:
             light_yield = self.__call__(
                 track_pos=track_pos, track_dir=track_dir,
                 track_energy=energy, om_positions=detector_pos.unsqueeze(0)
@@ -800,7 +800,10 @@ class LightSabrePATD(LightSabre):
             if self.kwargs.get('use_poisson', False):
                 light_yield = torch.poisson(self._sanitize_rate_for_poisson(light_yield))
         else:
-            light_yield = torch.tensor(self.kwargs.get('input_photons'), device=self.device)
+            if kwargs.get('input_photons', None) is not None:
+                light_yield = torch.tensor(kwargs.get('input_photons'), device=self.device)
+            else:
+                light_yield = torch.tensor(self.kwargs.get('input_photons'), device=self.device)
 
         expected_N = torch.round(light_yield).int().detach().cpu().item()
         N = min(expected_N, max_photons) if (max_photons is not None and max_photons < expected_N) else expected_N
