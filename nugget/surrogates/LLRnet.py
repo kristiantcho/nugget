@@ -190,7 +190,7 @@ class LLRnet(Surrogate):
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True, jitter_time=0.0,
                  add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True,
-                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, **kwargs):
+                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, **kwargs):
         """
         Initialize the LLRnet surrogate model.
         
@@ -294,6 +294,10 @@ class LLRnet(Surrogate):
         self.input_delta_time = input_delta_time
         self.num_photons_per_sample = num_photons_per_sample if num_photons_per_sample is not None else min_photons
         self.jitter_time = jitter_time
+        # Divisor applied to log-sign-scaled photon arrival times in prepare_features_patd.
+        # Larger values compress the timing signal into a narrower range (and can make it
+        # negligible relative to the geometric features); smaller values let timing dominate.
+        self.time_scale_divisor = time_scale_divisor
         # Handle multiple branch configurations
         if num_parallel_branches > 1:
             # Set up frequency scales for each branch
@@ -805,10 +809,11 @@ class LLRnet(Surrogate):
         if self.rel_time:
             # Convert to relative times by subtracting the minimum hit time
             hit_times = hit_times - (patd_result['t_geom_min'].float().to(self.device) - self.jitter_time)
+        t_div = self.time_scale_divisor
         t_scaled = torch.where(
             hit_times < 0,
-            -torch.log10(-hit_times + 1e-4) / 4.0,
-            torch.log10(hit_times + 1e-4) / 4.0,
+            -torch.log10(-hit_times + 1e-4) / t_div,
+            torch.log10(hit_times + 1e-4) / t_div,
         )  # (N,)
 
         # --- replicate event features and append per-photon time ---
@@ -3111,42 +3116,32 @@ class LLRnet(Surrogate):
             num_matched_photons = matched_features_batch.shape[0]
             matched_labels = torch.ones(num_matched_photons, dtype=torch.float32, device=self.llrnet.device)
 
-            # Generate MISMATCHED sample: observation from a different event, hypothesis from matched event.
-            # event_params_obs, _, patd_result_obs = self._generate_event_with_photons(detector_point)
-
-            # if self.use_rich_features:
-            #     # Hypothesis features come from event_params_matched; observation times from patd_result_obs.
-            #     # prepare_features_patd only takes one event_data dict, so we build a merged view:
-            #     # keep all params from matched (hypothesis) but swap in the obs hit_times via patd_result_obs.
-            #     mismatched_features_batch, _ = self.llrnet.prepare_features_patd(
-            #         point=detector_point,
-            #         event_data=event_params_matched,   # hypothesis: position, energy, direction from matched
-            #         patd_result=patd_result_obs,        # observation: photon times from a different event
-            #     )
-            # else:
-            #     # event_data drives the surrogate call (provides photon times via patd_result_obs),
-            #     # signal_event_data provides the hypothesis features (position, energy, direction).
-            #     mismatched_features_batch, _ = self.llrnet.prepare_data_from_raw_patd(
-            #         point=detector_point,
-            #         event_data=event_params_obs,            # observation: photon times from a different event
-            #         surrogate_func=lambda **kwargs: patd_result_obs,
-            #         signal_event_data=event_params_matched, # hypothesis: parameters from matched event
-            #         event_labels=self.event_labels,
-            #     )
-            event_params_hypothesis_mismatch = self.signal_sampler.sample_events(1)[0]
+            # Generate MISMATCHED sample: SAME hypothesis (event_params_matched), but the
+            # observation photon times come from a DIFFERENT event. This is the key design
+            # choice: the hypothesis (geometry) columns are held fixed between the matched and
+            # mismatched member of the pair, so the ONLY thing that flips the label is the
+            # photon arrival-time distribution. This forces the network to learn the timing
+            # likelihood rather than a hypothesis-self-consistency proxy that ignores time.
+            event_params_obs, _, patd_result_obs = self._generate_event_with_photons(detector_point)
 
             if self.use_rich_features:
+                # Hypothesis features come from event_params_matched; observation times from patd_result_obs.
+                # prepare_features_patd uses event_data only for the hypothesis/geometry columns
+                # and patd_result for the per-photon times, so passing matched params + obs times
+                # gives (hypothesis=matched, observation=different event).
                 mismatched_features_batch, _ = self.llrnet.prepare_features_patd(
                     point=detector_point,
-                    event_data=event_params_hypothesis_mismatch,  # hypothesis: parameters from different event
-                    patd_result=patd_result_matched,              # observation: same hit times as matched
+                    event_data=event_params_matched,   # hypothesis: position, energy, direction from matched
+                    patd_result=patd_result_obs,        # observation: photon times from a different event
                 )
             else:
+                # event_data drives the surrogate call (provides photon times via patd_result_obs),
+                # signal_event_data provides the hypothesis features (position, energy, direction).
                 mismatched_features_batch, _ = self.llrnet.prepare_data_from_raw_patd(
                     point=detector_point,
-                    event_data=event_params_matched,               # observation: same hit times as matched
-                    surrogate_func=lambda **kwargs: patd_result_matched,
-                    signal_event_data=event_params_hypothesis_mismatch,  # hypothesis: from different event
+                    event_data=event_params_obs,            # observation: photon times from a different event
+                    surrogate_func=lambda **kwargs: patd_result_obs,
+                    signal_event_data=event_params_matched, # hypothesis: parameters from matched event
                     event_labels=self.event_labels,
                 )
             # Create labels for all mismatched photons (all are class 0)
