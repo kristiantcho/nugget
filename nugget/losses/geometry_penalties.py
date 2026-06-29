@@ -929,12 +929,11 @@ class ROVPenalty(LossFunction):
             angle_scores_per_angle = blockage_per_angle
 
             if angle_softmin_tau > 0.0:
-                penalty_per_string = -angle_softmin_tau * torch.logsumexp(
-                    -blockage_per_angle / angle_softmin_tau, dim=1
-                )
-                # softmin underestimates the true min and goes negative when blockage
-                # is zero everywhere (log(num_angles) artefact) — clamp before loss.
-                penalty_per_string = penalty_per_string.clamp(min=0.0)
+                # Mean softplus penalty: F.softplus(-τ·b)/τ is ~0 when blockage is
+                # large (angle clear) and ~1/τ·log(2) when blockage is 0 (angle
+                # fully open but unpenalised). Naturally non-negative with clean
+                # gradients everywhere — no clamp needed.
+                penalty_per_string = F.softplus(-angle_softmin_tau * blockage_per_angle).mean(dim=1) / angle_softmin_tau
             else:
                 penalty_per_string = blockage_per_angle.min(dim=1)[0]
 
@@ -1026,12 +1025,8 @@ class ROVPenalty(LossFunction):
                 angle_scores_per_angle = blockage_per_angle
 
             if other_probs is not None:
-                # For each string: minimum blockage across all angles (optionally smooth)
                 if angle_softmin_tau > 0.0:
-                    penalty_per_string = -angle_softmin_tau * torch.logsumexp(
-                        -blockage_per_angle / angle_softmin_tau, dim=1
-                    )
-                    penalty_per_string = penalty_per_string.clamp(min=0.0)
+                    penalty_per_string = F.softplus(-angle_softmin_tau * blockage_per_angle).mean(dim=1) / angle_softmin_tau
                 else:
                     penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
 
@@ -1039,10 +1034,7 @@ class ROVPenalty(LossFunction):
                 loss = (penalty_per_string * string_probs).sum()
             else:
                 if angle_softmin_tau > 0.0:
-                    penalty_per_string = -angle_softmin_tau * torch.logsumexp(
-                        -blockage_per_angle / angle_softmin_tau, dim=1
-                    )
-                    penalty_per_string = penalty_per_string.clamp(min=0.0)
+                    penalty_per_string = F.softplus(-angle_softmin_tau * blockage_per_angle).mean(dim=1) / angle_softmin_tau
                 else:
                     penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
 
