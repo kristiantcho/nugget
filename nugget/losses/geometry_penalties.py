@@ -672,9 +672,11 @@ class StringNumberPenalty(LossFunction):
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
         if string_probs is not None:
             if use_binarization_weight:
-                # Per-string binary entropy in [0, log(2)]; normalise to [0, 1].
+                # Per-string binary entropy normalised to [0, 1]; invert so weight
+                # is 1 for fully binarized strings (p near 0 or 1) and 0 for
+                # maximally ambiguous strings (p near 0.5).
                 h = -string_probs * torch.log(string_probs + 1e-6) - (1 - string_probs) * torch.log(1 - string_probs + 1e-6)
-                binarization_weight = h / math.log(2)  # in [0, 1], peaks at p=0.5
+                binarization_weight = 1.0 - h / math.log(2)  # in [0, 1], 1 at extremes
                 effective_probs = string_probs * binarization_weight
             else:
                 effective_probs = string_probs
