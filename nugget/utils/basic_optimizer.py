@@ -76,9 +76,10 @@ class Optimizer():
     def _update_alm_parameters(self):
         """Update ALM parameters according to the algorithm"""
         for constraint_name in self.constraints_list:
-            if constraint_name in self._current_uw_loss_dict:
-                # Get the latest constraint value C_i(θ)
-                constraint_value = self._current_uw_loss_dict[constraint_name].detach().item()
+            if constraint_name in self._current_loss_dict:
+                # Get the latest constraint value C_i(θ) — use the weighted loss so
+                # λ/μ updates are on the same scale as the augmented loss term.
+                constraint_value = self._current_loss_dict[constraint_name].detach().item()
                 # Update weighted moving average for lambda gradient 
                 lambda_grad_squared = constraint_value ** 2
                 self.alm_v_lambda[constraint_name] = (self.alm_alpha * self.alm_v_lambda[constraint_name] + 
