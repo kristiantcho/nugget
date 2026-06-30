@@ -121,8 +121,8 @@ class SpaceString(Geometry):
                 z_dists = []
                 for n_points in points_per_string_list:
                     if n_points >= 1:
-                        z_count += n_points
                         z_vals = result['z_values'][z_count:z_count+n_points]
+                        z_count += n_points
                         # pairwise differences between each z_val in z_values
                         z_dists.append(torch.abs(z_vals[:, None] - z_vals[None, :]))
                 if len(z_dists) > 0:
@@ -233,8 +233,8 @@ class SpaceString(Geometry):
             z_dists = []
             for n_points in points_per_string_list:
                 if n_points >= 1:
-                    z_count += n_points
                     z_vals = z_values[z_count:z_count+n_points]
+                    z_count += n_points
                     # pairwise differences between each z_val in z_values
                     z_dists.append(torch.abs(z_vals[:, None] - z_vals[None, :]))
             if len(z_dists) > 0:
