@@ -190,7 +190,7 @@ class LLRnet(Surrogate):
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True, jitter_time=0.0,
                  add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True,
-                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, **kwargs):
+                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, rich_rel_pos_mode=False, **kwargs):
         """
         Initialize the LLRnet surrogate model.
         
@@ -298,6 +298,7 @@ class LLRnet(Surrogate):
         # Larger values compress the timing signal into a narrower range (and can make it
         # negligible relative to the geometric features); smaller values let timing dominate.
         self.time_scale_divisor = time_scale_divisor
+        self.rich_rel_pos_mode = rich_rel_pos_mode
         # Handle multiple branch configurations
         if num_parallel_branches > 1:
             # Set up frequency scales for each branch
@@ -785,12 +786,20 @@ class LLRnet(Surrogate):
         # t_geom_min_scalar = t_geom_min.squeeze().mean() / 1e5  # scalar
 
         # --- assemble the event-level context features ---
-        event_features = [
-            det[0], det[1], det[2],
-            vert[0], vert[1], vert[2],
-            direction[0], direction[1], direction[2],
-            log_energy,
-        ]
+        if self.rich_rel_pos_mode:
+            # Use only relative position (detector - vertex) instead of both absolute positions
+            event_features = [
+                rel[0], rel[1], rel[2],
+                direction[0], direction[1], direction[2],
+                log_energy,
+            ]
+        else:
+            event_features = [
+                det[0], det[1], det[2],
+                vert[0], vert[1], vert[2],
+                direction[0], direction[1], direction[2],
+                log_energy,
+            ]
         if self.add_vertex_distance:
             event_features.append(vert_dist)
         event_features.append(cos_angle)
@@ -905,12 +914,20 @@ class LLRnet(Surrogate):
             light_yield = light_yield.float().to(self.device)
         log_ly = torch.log10(torch.abs(light_yield.squeeze()) + 1e-10) / 4.0  # scalar
 
-        feature_values = [
-            det[0], det[1], det[2],
-            vert[0], vert[1], vert[2],
-            direction[0], direction[1], direction[2],
-            log_energy,
-        ]
+        if self.rich_rel_pos_mode:
+            # Use only relative position (detector - vertex) instead of both absolute positions
+            feature_values = [
+                rel[0], rel[1], rel[2],
+                direction[0], direction[1], direction[2],
+                log_energy,
+            ]
+        else:
+            feature_values = [
+                det[0], det[1], det[2],
+                vert[0], vert[1], vert[2],
+                direction[0], direction[1], direction[2],
+                log_energy,
+            ]
         if self.add_vertex_distance:
             feature_values.append(vert_dist)
         feature_values.append(cos_angle)
@@ -2257,6 +2274,7 @@ class LLRnet(Surrogate):
             'num_photons_per_sample': self.num_photons_per_sample,
             'add_distance_from_beam': self.add_distance_from_beam,
             'add_vertex_distance': self.add_vertex_distance,
+            'rich_rel_pos_mode': self.rich_rel_pos_mode,
             'reduce_lr_on_plateau': self.reduce_lr_on_plateau,
             'lr_scheduler_patience': self.lr_scheduler_patience,
             'lr_scheduler_factor': self.lr_scheduler_factor,
@@ -2326,6 +2344,7 @@ class LLRnet(Surrogate):
         self.time_scale_divisor = checkpoint.get('time_scale_divisor', 4.0)
         self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
         self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
+        self.rich_rel_pos_mode = checkpoint.get('rich_rel_pos_mode', False)
         # Determine if this is old format (single MLP) or new format (parallel branches)
         is_old_format = 'model_state_dict' in checkpoint
         
