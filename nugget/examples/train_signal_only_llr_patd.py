@@ -45,7 +45,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     
     learning_rate=1e-3,
     reduce_lr_on_plateau=True,
-    lr_scheduler_patience=30,
+    lr_scheduler_patience=10,
     lr_scheduler_factor=0.5,
     lr_scheduler_min_lr=1e-5,
     
@@ -58,7 +58,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     
     use_patd=True,
     min_photons=1,
-    num_photons_per_sample=16,
+    num_photons_per_sample=8,
     
     rel_time=True,
     jitter_time=0.0,
@@ -66,13 +66,14 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     use_rich_features=True,
     add_distance_from_beam=True, 
     add_vertex_distance=False,
+    time_scale_divisor=1.0,
 )
 
 train_dataloader = llr_net.create_patd_dataloader(
     signal_sampler=signal_sampler,
     signal_surrogate_func=light_yield_surrogate,
     num_samples_per_epoch=4096,
-    batch_size=16,
+    batch_size=8,
     num_workers=4,
     shuffle_photons=True,
     manual_photons=False,

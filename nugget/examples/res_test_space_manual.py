@@ -24,6 +24,7 @@ use_llrnet = True
 use_patd = False
 device = "cuda:3"
 num_events = 3000
+throughgoing = True
 zenith_range = 'vertical'
 version = f"r600_50_u_sp_1"
 output_dir = Path("res_test/space_test")
@@ -77,8 +78,24 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     # point_towards_center=True,
                                                     cos_range=zenith_range if zenith_range in ['horizontal', 'vertical'] else torch.tensor([-1.0, 1.0]),
                                                     )
-signal_events = signal_sampler.sample_events(num_events)
-nugget.utils.data_tools.save_signal_events_parquet(signal_events, signal_events_path)
+#check if signal events already exist, if not, sample and save them
+if signal_events_path.exists():
+    print(f"Loading signal events from {signal_events_path}")
+    signal_events = torch.load(signal_events_path)
+else:    
+    signal_events = signal_sampler.sample_events(num_events)
+    nugget.utils.data_tools.save_signal_events_parquet(signal_events, signal_events_path)
+
+if use_patd and throughgoing:
+    signal_events = nugget.samplers.cyl_sampler.remap_event_vertices(
+        events=signal_events,
+        cyl = {
+            'center': center,
+            'radius': radius,
+            'height': height},
+        mode = 'box_intersection',
+        domain_size=2000,   
+    )
 signal_events = move_events_to_device(signal_events, device)
 for string_spacing in np.linspace(spacing_min, spacing_max, spacing_count):
     print(f"Running fisher info calculations for string spacing: {string_spacing}m")
@@ -165,6 +182,7 @@ for string_spacing in np.linspace(spacing_min, spacing_max, spacing_count):
                 adaptive_grid_retry=True,
                 adaptive_t_max_floor_ns=10,
                 uninformative_fisher_value=1e-6,
+                empty_cache_after_event=True,
                 )
 
     output_path = output_dir / (

@@ -2248,6 +2248,7 @@ class LLRnet(Surrogate):
             'rel_time': self.rel_time,
             'jitter_time': self.jitter_time,
             'flag_negative_times': self.flag_negative_times,
+            'time_scale_divisor': self.time_scale_divisor,
             'input_charge': self.input_charge,
             'norm_pos': self.norm_pos,
             'log_scale_energy': self.log_scale_energy,
@@ -2322,6 +2323,7 @@ class LLRnet(Surrogate):
         self.num_photons_per_sample = checkpoint.get('num_photons_per_sample', self.num_photons_per_sample)
         self.jitter_time = checkpoint.get('jitter_time', 0.0)
         self.flag_negative_times = checkpoint.get('flag_negative_times', False)
+        self.time_scale_divisor = checkpoint.get('time_scale_divisor', 4.0)
         self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
         self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
         # Determine if this is old format (single MLP) or new format (parallel branches)
