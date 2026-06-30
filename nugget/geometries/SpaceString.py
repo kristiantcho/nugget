@@ -29,7 +29,7 @@ class SpaceString(Geometry):
         
         self.dim = original_dim
         self.starting_z_spacing = starting_z_spacing
-        self.optimize_z = optimize_z
+        self.optimize_z_spacing = optimize_z
         self.hybrid_mix_init = hybrid_mix_init
         self.make_hybrid_iter = make_hybrid_iter
         self.hybrid_iter_step = hybrid_iter_step
@@ -192,7 +192,7 @@ class SpaceString(Geometry):
         """
         # Apply sigmoid to string weights to get probabilities between 0 and 1
     
-        hybrid_mix = kwargs.get('hybrid_mix', self.hybrid_mix)
+        hybrid_mix = kwargs.get('hybrid_mix', self.hybrid_mix_init)
         total_points = torch.sum(torch.tensor(points_per_string_list, device=self.device)).item()
         new_points_3d = torch.zeros(total_points, 3, device=self.device)
         original_dim = self.dim

@@ -15,17 +15,17 @@ def move_events_to_device(signal_events, device):
         moved_events.append(moved_event)
     return moved_events
 
-min_energy=2
-max_energy=4
+min_energy=6
+max_energy=8
 spacing_min=25.0
 spacing_max=300.0
 spacing_count=25
 use_llrnet = True
 use_patd = False
-device = "cuda:3"
+device = "cuda:1"
 num_events = 3000
 throughgoing = True
-zenith_range = 'vertical'
+zenith_range = 'horizontal'
 version = f"r600_50_u_sp_1"
 output_dir = Path("res_test/space_test")
 
