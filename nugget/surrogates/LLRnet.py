@@ -1949,6 +1949,10 @@ class LLRnet(Surrogate):
                 det_point = det_point.float().to(self.device)
             det_point = det_point.squeeze()
 
+            if not isinstance(patd, dict):
+                precomputed.append({'skip': True, 'num_photons': 0})
+                continue
+
             num_photons = patd.get('num_photons', 0)
             if isinstance(num_photons, torch.Tensor):
                 num_photons = int(num_photons.item())
