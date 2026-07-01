@@ -1959,17 +1959,19 @@ class LLRnet(Surrogate):
 
             hit_times = patd['hit_times'].float().to(self.device)
             if self.rel_time:
-                hit_times = hit_times - patd.get('t_geom_min', 0.0).float().to(self.device)
+                hit_times = hit_times - (patd.get('t_geom_min', 0.0).float().to(self.device) - self.jitter_time)
+            t_div = self.time_scale_divisor
             t_scaled = torch.where(
                 hit_times < 0,
-                -torch.log10(-hit_times + 1e-4) / 4.0,
-                torch.log10(hit_times + 1e-4) / 4.0,
+                -torch.log10(-hit_times + 1e-4) / t_div,
+                torch.log10(hit_times + 1e-4) / t_div,
             )  # (N_hits,)
 
             precomputed.append({
                 'skip': False,
                 'det_normed': (det_point / norm).detach(),  # (3,)
                 't_scaled': t_scaled.detach(),               # (N_hits,)
+                'hit_times_shifted': hit_times.detach(),     # (N_hits,) after rel_time shift, for flag_negative_times
                 'num_photons': num_photons,
                 'det_point': det_point,
                 'patd': patd,
@@ -2036,10 +2038,16 @@ class LLRnet(Surrogate):
             rel = det - vert
             vert_dist = torch.norm(rel)
             cos_angle = torch.dot(direction, rel) / (dir_norm_val * vert_dist.clamp(min=1e-8))
-            if self.add_vertex_distance:
-                ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), vert_dist.unsqueeze(0), cos_angle.unsqueeze(0)]
+            if self.rich_rel_pos_mode:
+                if self.add_vertex_distance:
+                    ctx_parts = [rel, direction, log_energy.unsqueeze(0), vert_dist.unsqueeze(0), cos_angle.unsqueeze(0)]
+                else:
+                    ctx_parts = [rel, direction, log_energy.unsqueeze(0), cos_angle.unsqueeze(0)]
             else:
-                ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), cos_angle.unsqueeze(0)]           
+                if self.add_vertex_distance:
+                    ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), vert_dist.unsqueeze(0), cos_angle.unsqueeze(0)]
+                else:
+                    ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), cos_angle.unsqueeze(0)]
             if self.add_distance_from_beam:
                 vert_unnorm = vert * norm
                 _, dist_perp = self.compute_distance_from_beam(
@@ -2051,9 +2059,13 @@ class LLRnet(Surrogate):
                 half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
                 ctx_parts.append((dist_perp.squeeze() / half).unsqueeze(0))
 
-            ctx = torch.cat([p.reshape(-1) for p in ctx_parts])  # (12 or 13,)
-            ctx_rep = ctx.unsqueeze(0).expand(N, -1)             # (N, 12/13)
-            feat = torch.cat([ctx_rep, t_scaled.unsqueeze(1)], dim=1)  # (N, 13/14)
+            ctx = torch.cat([p.reshape(-1) for p in ctx_parts])
+            ctx_rep = ctx.unsqueeze(0).expand(N, -1)
+            if self.flag_negative_times:
+                is_neg = (obs['hit_times_shifted'] < 0).float().unsqueeze(1)  # (N, 1)
+                feat = torch.cat([ctx_rep, t_scaled.unsqueeze(1), is_neg], dim=1)
+            else:
+                feat = torch.cat([ctx_rep, t_scaled.unsqueeze(1)], dim=1)
             all_features.append(feat)
             photons_per_detector.append(N)
 
