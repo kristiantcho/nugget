@@ -25,20 +25,21 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     num_frequencies_per_branch=[64,64],  # Number of Fourier features per branch
     learnable_frequencies=False,  # Fixed frequency features
     dropout_rate=0,  # Regularization
-    learning_rate=1e-4,  # Optimizer learning rate
+    learning_rate=5e-4,  # Optimizer learning rate
     shared_mlp=False,  # Independent MLPs for each branch
     use_residual_connections=True,  # Skip connections for better training
     signal_noise_scale=0,  # Noise level for signal events
-    background_noise_scale=0.2,  # Noise level for background events
+    background_noise_scale=0,  # Noise level for background events
     add_relative_pos=False,  # Whether to include relative position features
     log_scale_ly=True,  # Whether to log-scale the light yield inputs
     norm_pos=True,  # Whether to normalize position inputs
     log_scale_energy=True,  # Whether to log-scale the energy inputs
     add_distance_from_beam=True,  # Whether to include distance from beam as a feature
     reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
-    lr_scheduler_patience=35,  # Patience for LR scheduler
+    lr_scheduler_patience=15,  # Patience for LR scheduler
     use_rich_features=True,  # Whether to use rich features from the surrogate model
-    add_vertex_distance=False
+    add_vertex_distance=False,
+    rich_rel_pos_mode=True
     )
 
 train_dataloader = llr_net.create_signal_only_dataloader(
@@ -54,7 +55,7 @@ train_dataloader = llr_net.create_signal_only_dataloader(
     max_resample_attempts=30,
     vary_cylinder=False,
     pin_memory=True,
-    pin_memory_device="cuda:3",
+    pin_memory_device=None,
     
     # cylinder_sampler=nugget.samplers.cyl_sampler.CylinderSampler
     )
@@ -62,7 +63,7 @@ train_dataloader = llr_net.create_signal_only_dataloader(
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     epochs=1500,
-    input_dim=13,
+    input_dim=10,
     grad_clip=None,
     save_every_n_epochs=20,
     checkpoint_path='best_charge_llr_model_v6.pt',

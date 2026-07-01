@@ -43,7 +43,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     learnable_frequencies=False,
     dropout_rate=0,
     
-    learning_rate=1e-3,
+    learning_rate=5e-4,
     reduce_lr_on_plateau=True,
     lr_scheduler_patience=10,
     lr_scheduler_factor=0.5,
@@ -58,7 +58,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     
     use_patd=True,
     min_photons=1,
-    num_photons_per_sample=8,
+    num_photons_per_sample=32,
     
     rel_time=True,
     jitter_time=0.0,
@@ -66,7 +66,8 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     use_rich_features=True,
     add_distance_from_beam=True, 
     add_vertex_distance=False,
-    time_scale_divisor=1.0,
+    time_scale_divisor=3.0,
+    rich_rel_pos_mode=True,
 )
 
 train_dataloader = llr_net.create_patd_dataloader(
@@ -83,7 +84,7 @@ train_dataloader = llr_net.create_patd_dataloader(
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     epochs=1500,
-    input_dim=14,
+    input_dim=11,
     grad_clip=None,
     save_every_n_epochs=20,
     checkpoint_path='best_hit_llr_model_v8.pt',
