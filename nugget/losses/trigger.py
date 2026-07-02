@@ -1,6 +1,6 @@
 import torch
 from nugget.losses.base_loss import LossFunction
-
+from nugget.losses.fisher_info import WeightedResolutionLoss
 
 class TriggerLoss(LossFunction):
     """
@@ -573,3 +573,128 @@ class TriggerLoss(LossFunction):
             'detector_efficiency': detector_efficiency,
             't_per_event': t_values
         }
+
+
+class ResolutionSelectionLoss(LossFunction):
+    
+
+    def __init__(self, 
+                 device=None, 
+                 resolution_type='angular',
+                 fisher_info_params=['energy', 'azimuth', 'zenith'],
+                 ):
+        
+        super().__init__(device)
+        self.resolution_type = resolution_type
+        self.fisher_info_params = fisher_info_params
+      
+
+
+    def soft_between(self, selection_thresholds, lower, upper, temperature=1.0):
+
+        """
+        Compute a soft mask for whether [lower, upper] intersects the selection threshold range.
+
+        Parameters:
+        -----------
+        selection_thresholds : list
+            List containing lower and upper thresholds range, shape (2,)
+        lower : float or torch.Tensor
+            Lower bound(s), shape (n_events,) or scalar
+        upper : float or torch.Tensor
+            Upper bound(s), shape (n_events,) or scalar
+        temperature : float
+            Temperature for the soft selection (higher = sharper transition)
+        """
+        # Intersection requires lower <= thresholds[1] and upper >= thresholds[0]
+        lower_mask = torch.sigmoid(temperature * (selection_thresholds[1] - lower))
+        upper_mask = torch.sigmoid(temperature * (upper - selection_thresholds[0]))
+        return lower_mask * upper_mask
+
+    def __call__(self, geom_dict, **kwargs):
+        """
+        Compute resolution selection loss for detector geometry.
+        
+        Parameters:
+        -----------
+        geom_dict : dict
+            Dictionary containing 'points_3d' and optionally 'string_xy' and 'string_weights'.
+            If 'string_xy' and 'string_weights' are provided, weights will be mapped to points
+            based on xy positions (points at same xy get same weight).
+        **kwargs : dict
+            Must contain:
+            - signal_surrogate_func : callable
+            - signal_event_params : list of dict (event parameters)
+            Optional:
+            - precomputed_fisher_info_per_string_per_event : torch.Tensor, shape (n_events, n_strings, 3, 3)
+        """
+        selection_soft_temperature = kwargs.get('selection_soft_temperature', 1.0)
+        precalculated_resolution_loss = kwargs.get('precalculated_resolution_loss', None)
+        
+        selection_thresholds=kwargs.get('selection_thresholds', [-1, 0.1])
+        self.selection_soft_temperature = kwargs.get('selection_soft_temperature', selection_soft_temperature)
+        if precalculated_resolution_loss is None:    
+            weighted_resolution_loss=WeightedResolutionLoss(
+                device=self.device,
+                resolution_type=self.resolution_type,
+                fisher_info_params=self.fisher_info_params
+            ) 
+            loss_stuff = weighted_resolution_loss(geom_dict, **kwargs)
+            resolution_per_event = loss_stuff['resolution_per_event']
+            signal_event_params = loss_stuff['resolution_params']
+        else:
+            resolution_per_event = precalculated_resolution_loss['resolution_per_event']
+            signal_event_params = precalculated_resolution_loss['resolution_params']
+        true_params = []
+        if self.resolution_type =='angular':
+            for event in signal_event_params:
+                if 'zenith' not in event or 'azimuth' not in event:
+                    raise ValueError("For angular resolution, each event must have 'zenith' and 'azimuth' parameters.")
+                true_params.append(event['zenith'])
+        elif self.resolution_type =='energy':
+            for event in signal_event_params:
+                if 'energy' not in event:
+                    raise ValueError("For energy resolution, each event must have 'energy' parameter.")
+                true_params.append(event['energy'])
+        else:
+            raise ValueError(f"Unsupported resolution type: {self.resolution_type}. Supported types are 'angular' and 'energy'.")
+        true_params = torch.stack(true_params).to(device=self.device)
+        if kwargs.get('hard_selection', False):
+            # check if the resolution contour around the true parameter intersects the threshold range
+            if self.resolution_type =='angular': # take cosine of zenith angle for angular resolution
+                cos_true_params = torch.cos(true_params)
+                lower_bound = cos_true_params - torch.sin(true_params) * resolution_per_event
+                upper_bound = cos_true_params + torch.sin(true_params) * resolution_per_event
+                selection_mask = (lower_bound <= selection_thresholds[1]) & (upper_bound >= selection_thresholds[0])
+            elif self.resolution_type =='energy':
+                lower_bound = true_params - resolution_per_event
+                upper_bound = true_params + resolution_per_event
+                selection_mask = (lower_bound <= selection_thresholds[1]) & (upper_bound >= selection_thresholds[0])
+        else: # use soft selection based on resolution
+            if self.resolution_type =='angular':
+                cos_true_params = torch.cos(true_params)
+                lower_bound = cos_true_params - torch.sin(true_params) * resolution_per_event
+                upper_bound = cos_true_params + torch.sin(true_params) * resolution_per_event
+                selection_mask = self.soft_between(selection_thresholds, lower_bound, upper_bound, temperature=self.selection_soft_temperature)
+            elif self.resolution_type =='energy':
+                lower_bound = true_params - resolution_per_event
+                upper_bound = true_params + resolution_per_event
+                selection_mask = self.soft_between(selection_thresholds, lower_bound, upper_bound, temperature=self.selection_soft_temperature)
+
+
+
+        selection_efficiency = torch.mean(selection_mask.float())
+        selection_loss = 1.0 - selection_efficiency
+
+        return {
+            'selection_loss': selection_loss,
+            'selection_efficiency': selection_efficiency,
+            'resolution_per_event': resolution_per_event,
+            'resolution_params': signal_event_params,
+            'selection_per_event': selection_mask
+        }          
+        
+
+    
+
+

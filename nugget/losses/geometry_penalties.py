@@ -869,7 +869,91 @@ class ROVPenalty(LossFunction):
 
         return blockage_per_angle
 
-   
+    def _compute_blockage_per_angle_default(
+        self, all_relative, angles, half_height, tri_length, rec_width,
+        soft_inside=False, inside_sharpness=5.0, other_probs=None,
+        use_chunked=False, chunk_size=16,
+    ):
+        """Vectorized triangle+rectangle blockage via per-angle rotation.
+
+        Pure-tensor core (no kwargs/dict access) so it can be wrapped with
+        torch.compile independently of __call__'s dynamic argument parsing.
+        Mirrors _compute_blockage_per_angle_alt's role for the non-alt path.
+        """
+        L_tri = tri_length
+        L_rect = rec_width
+        slope = half_height / max(L_tri, 1e-12)
+
+        c = torch.cos(angles)
+        s = torch.sin(angles)
+
+        rel_expanded = all_relative.unsqueeze(2)  # (N, N-1, 1, 2)
+
+        num_angles = angles.shape[0]
+
+        if use_chunked:
+            k = inside_sharpness
+
+            def _soft_between(x, lo, hi):
+                return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
+
+            blockage_per_angle = torch.zeros(
+                all_relative.shape[0], num_angles, device=all_relative.device, dtype=all_relative.dtype)
+            for a_start in range(0, num_angles, chunk_size):
+                a_end = min(a_start + chunk_size, num_angles)
+                c_ch = c[a_start:a_end]
+                s_ch = s[a_start:a_end]
+
+                x_rot     = rel_expanded[..., 0] * c_ch - rel_expanded[..., 1] * s_ch   # (N, N-1, chunk)
+                y_rot_abs = (rel_expanded[..., 0] * s_ch + rel_expanded[..., 1] * c_ch).abs()
+
+                tri_x      = _soft_between(x_rot, 0.0, L_tri)
+                tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
+                inside_tri = tri_x * tri_y
+
+                rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
+                rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
+                inside_rect = rect_x * rect_y
+
+                inside_ch = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)   # (N, N-1, chunk)
+
+                if other_probs is not None:
+                    blockage_per_angle[:, a_start:a_end] = (inside_ch * other_probs.unsqueeze(-1)).sum(dim=1)
+                else:
+                    blockage_per_angle[:, a_start:a_end] = inside_ch.sum(dim=1)
+
+            return blockage_per_angle
+
+        # Apply rotation for all angles at once: (N, N-1, num_angles)
+        x_rot     = rel_expanded[..., 0] * c - rel_expanded[..., 1] * s
+        y_rot_abs = (rel_expanded[..., 0] * s + rel_expanded[..., 1] * c).abs()
+
+        if not soft_inside:
+            inside_tri  = (x_rot >= 0) & (x_rot <= L_tri) & (y_rot_abs <= slope * x_rot)
+            inside_rect = (x_rot >= L_tri) & (x_rot <= L_tri + L_rect) & (y_rot_abs <= half_height)
+            inside = (inside_rect | inside_tri).float()
+        else:
+            k = inside_sharpness
+
+            def _soft_between(x, lo, hi):
+                return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
+
+            tri_x      = _soft_between(x_rot, 0.0, L_tri)
+            tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
+            inside_tri = tri_x * tri_y
+
+            rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
+            rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
+            inside_rect = rect_x * rect_y
+
+            inside = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)
+
+        if other_probs is not None:
+            blockage_per_angle = (inside.float() * other_probs.unsqueeze(-1)).sum(dim=1)
+        else:
+            blockage_per_angle = inside.float().sum(dim=1)
+
+        return blockage_per_angle
 
     def __call__(self, geom_dict, **kwargs):
         """
@@ -917,7 +1001,6 @@ class ROVPenalty(LossFunction):
         W_rect = float(self.rov_height)
         L_tri = float(self.rov_tri_length)
         half_height = W_rect / 2.0
-        slope = half_height / max(L_tri, 1e-12)
 
         if alt_mode and (not soft_inside):
             if string_probs is not None:
@@ -952,11 +1035,6 @@ class ROVPenalty(LossFunction):
                 loss = penalty_per_string.sum()
 
         else:
-            c = torch.cos(angles)
-            s = torch.sin(angles)
-
-            rel_expanded = all_relative.unsqueeze(2)  # (N, N-1, 1, 2)
-
             if string_probs is not None:
                 other_probs = string_probs.unsqueeze(0).expand(N, N)[mask].reshape(N, N-1)
                 if detach_other_probs:
@@ -970,68 +1048,19 @@ class ROVPenalty(LossFunction):
             use_chunked = soft_inside and points.is_cuda
             chunk_size = kwargs.get('rov_angle_chunk_size', 16)
 
-            if use_chunked:
-                k = inside_sharpness
-
-                def _soft_between(x, lo, hi):
-                    return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
-
-                blockage_per_angle = torch.zeros(N, num_angles, device=points.device, dtype=points.dtype)
-                for a_start in range(0, num_angles, chunk_size):
-                    a_end = min(a_start + chunk_size, num_angles)
-                    c_ch = c[a_start:a_end]
-                    s_ch = s[a_start:a_end]
-
-                    x_rot     = rel_expanded[..., 0] * c_ch - rel_expanded[..., 1] * s_ch   # (N, N-1, chunk)
-                    y_rot_abs = (rel_expanded[..., 0] * s_ch + rel_expanded[..., 1] * c_ch).abs()
-
-                    tri_x      = _soft_between(x_rot, 0.0, L_tri)
-                    tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
-                    inside_tri = tri_x * tri_y
-
-                    rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
-                    rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
-                    inside_rect = rect_x * rect_y
-
-                    inside_ch = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)   # (N, N-1, chunk)
-
-                    if other_probs is not None:
-                        blockage_per_angle[:, a_start:a_end] = (inside_ch * other_probs.unsqueeze(-1)).sum(dim=1)
-                    else:
-                        blockage_per_angle[:, a_start:a_end] = inside_ch.sum(dim=1)
-
-                angle_scores_per_angle = blockage_per_angle
-            else:
-                # Apply rotation for all angles at once: (N, N-1, num_angles)
-                x_rot     = rel_expanded[..., 0] * c - rel_expanded[..., 1] * s
-                y_rot_abs = (rel_expanded[..., 0] * s + rel_expanded[..., 1] * c).abs()
-
-                if not soft_inside:
-                    inside_tri  = (x_rot >= 0) & (x_rot <= L_tri) & (y_rot_abs <= slope * x_rot)
-                    inside_rect = (x_rot >= L_tri) & (x_rot <= L_tri + L_rect) & (y_rot_abs <= half_height)
-                    inside = (inside_rect | inside_tri).float()
-                else:
-                    k = inside_sharpness
-
-                    def _soft_between(x, lo, hi):
-                        return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
-
-                    tri_x      = _soft_between(x_rot, 0.0, L_tri)
-                    tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
-                    inside_tri = tri_x * tri_y
-
-                    rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
-                    rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
-                    inside_rect = rect_x * rect_y
-
-                    inside = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)
-
-                if other_probs is not None:
-                    blockage_per_angle = (inside.float() * other_probs.unsqueeze(-1)).sum(dim=1)
-                else:
-                    blockage_per_angle = inside.float().sum(dim=1)
-
-                angle_scores_per_angle = blockage_per_angle
+            blockage_per_angle = self._compute_blockage_per_angle_default(
+                all_relative=all_relative,
+                angles=angles,
+                half_height=half_height,
+                tri_length=L_tri,
+                rec_width=L_rect,
+                soft_inside=soft_inside,
+                inside_sharpness=inside_sharpness,
+                other_probs=other_probs,
+                use_chunked=use_chunked,
+                chunk_size=chunk_size,
+            )
+            angle_scores_per_angle = blockage_per_angle
 
             if other_probs is not None:
                 if angle_softmin_tau > 0.0:

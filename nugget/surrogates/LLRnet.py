@@ -3,6 +3,7 @@ import torch
 import time
 from nugget.surrogates.base_surrogate import Surrogate
 from torch.utils.data import Dataset, DataLoader, IterableDataset
+from scipy.stats import gaussian_kde
 import random
 # import matplotlib.pyplot as plt
 import h5py
@@ -335,6 +336,10 @@ class LLRnet(Surrogate):
         self.train_losses = []
         self.val_losses = []
         self.is_trained = False
+
+        # Cache of estimated marginal light-yield densities, keyed by detector
+        # point (see estimate_marginal_ly_density / predict_debiased_likelihood)
+        self.marginal_ly_kdes = {}
 
     def _pos_norm_divisor(self):
         """Return a divisor for normalizing (x,y,z) positions.
@@ -941,6 +946,209 @@ class LLRnet(Surrogate):
         features = torch.stack(feature_values)
 
         return features.clone().detach()
+
+    def estimate_marginal_ly_density(self, point, signal_sampler, signal_surrogate_func,
+                                      n_samples=20000, point_key=None,
+                                      min_light_yield=None, max_resample_attempts=10):
+        """
+        Estimate the marginal light-yield density p_LY(LY | point) induced by the
+        training sampler, and cache a KDE fit for later use at inference time.
+
+        SignalOnlyDataset builds the "mismatched" (label=0) class by pairing one
+        event's parameters with the light yield of an *independently sampled*
+        second event, evaluated at the same detector point (see
+        SignalOnlyDataset._generate_pair_data). At the Bayes-optimal solution the
+        sigmoid trick therefore gives predict_likelihood_ratio(...) ~= p(LY|theta)
+        / p_marginal(LY), where p_marginal is exactly this induced distribution,
+        not a flat reference. This method reproduces that same sampling procedure
+        (fresh independent events from signal_sampler, light yield evaluated at
+        the fixed point) so the resulting KDE can be used to divide the marginal
+        back out of the ratio and recover something proportional to p(LY|theta).
+
+        If `min_light_yield` is set, this also mirrors SignalOnlyDataset's
+        resampling policy for skipping uninformative near-zero responses: a draw
+        whose light yield falls below the threshold is resampled (up to
+        `max_resample_attempts` times) rather than kept as-is, matching the
+        "skip zero response" filtering used during training.
+
+        The density is fit in log10(light yield) space (light yield spans many
+        decades) and cached in self.marginal_ly_kdes, keyed by `point_key` (or by
+        the point's coordinates if not given), so it can be reused across calls
+        and saved/loaded with the model checkpoint.
+
+        Parameters
+        ----------
+        point : torch.Tensor or np.ndarray
+            Detector point at which to estimate the marginal, shape (3,).
+        signal_sampler : Sampler
+            Sampler used to draw independent events, e.g. the same
+            CylinderSampler instance passed to create_signal_only_dataloader.
+        signal_surrogate_func : callable
+            Light-yield surrogate function, e.g. the same one passed to
+            create_signal_only_dataloader (light_yield_surrogate).
+        n_samples : int
+            Number of independent events to draw for the density estimate.
+        point_key : hashable, optional
+            Key under which to cache the fitted KDE. Defaults to a tuple of the
+            point's coordinates (rounded) so repeated calls at the same point
+            reuse/overwrite the same cache entry.
+        min_light_yield : float, optional
+            If provided, matches SignalOnlyDataset's `min_light_yield`: draws
+            with mean absolute light yield below this threshold are resampled
+            (skip-zero-response policy) instead of being kept.
+        max_resample_attempts : int
+            Cap on resampling attempts per draw when `min_light_yield` is set,
+            matching SignalOnlyDataset's `max_resample_attempts`.
+
+        Returns
+        -------
+        scipy.stats.gaussian_kde
+            The fitted KDE over log10(light yield). Also stored in
+            self.marginal_ly_kdes[point_key].
+        """
+        if isinstance(point, np.ndarray):
+            point_tensor = torch.tensor(point, device=self.device, dtype=torch.float32)
+        else:
+            point_tensor = point.float().to(self.device)
+        point_tensor = point_tensor.squeeze()
+
+        if point_key is None:
+            point_key = tuple(np.round(point_tensor.cpu().detach().numpy(), 3).tolist())
+
+        def _draw_ly():
+            event = signal_sampler.sample_events(1)[0]
+            with torch.no_grad():
+                ly = signal_surrogate_func(opt_point=point_tensor, event_params=event)
+            return ly.item() if torch.is_tensor(ly) else float(ly)
+
+        marginal_lys = []
+        for _ in range(n_samples):
+            ly_val = _draw_ly()
+            if min_light_yield is not None:
+                attempt = 0
+                while abs(ly_val) < min_light_yield and attempt < max_resample_attempts:
+                    ly_val = _draw_ly()
+                    attempt += 1
+            marginal_lys.append(ly_val)
+        marginal_lys = np.array(marginal_lys)
+        marginal_lys = marginal_lys[marginal_lys > 0]  # log-space KDE needs positive support
+
+        if marginal_lys.size < 2:
+            raise RuntimeError(
+                "Not enough positive light-yield samples to fit a marginal density "
+                f"(got {marginal_lys.size}); try increasing n_samples."
+            )
+
+        log_marginal = np.log10(marginal_lys)
+        kde = gaussian_kde(log_marginal)
+
+        if self.marginal_ly_kdes is None:
+            self.marginal_ly_kdes = {}
+        self.marginal_ly_kdes[point_key] = kde
+
+        return kde
+
+    def marginal_ly_density(self, light_yields, point=None, point_key=None):
+        """
+        Evaluate the cached marginal light-yield density p_marginal(LY | point)
+        at the given light-yield values.
+
+        Must be called after estimate_marginal_ly_density has been run (and
+        cached, or loaded from a checkpoint) for the relevant point.
+
+        Parameters
+        ----------
+        light_yields : torch.Tensor or np.ndarray
+            Light-yield values to evaluate the density at, shape (N,).
+        point : torch.Tensor or np.ndarray, optional
+            Detector point the density was estimated at. Used only to derive
+            point_key if point_key is not given directly.
+        point_key : hashable, optional
+            Key used to look up the cached KDE in self.marginal_ly_kdes.
+
+        Returns
+        -------
+        torch.Tensor
+            p_marginal(LY) evaluated at each input light-yield value, shape (N,).
+        """
+        if not self.marginal_ly_kdes:
+            raise RuntimeError(
+                "No cached marginal density found. Call estimate_marginal_ly_density(...) "
+                "first (or load a checkpoint that has one saved)."
+            )
+
+        if point_key is None:
+            if point is None:
+                raise ValueError("Either point or point_key must be provided.")
+            if isinstance(point, np.ndarray):
+                point_np = point
+            else:
+                point_np = point.float().cpu().detach().numpy()
+            point_key = tuple(np.round(point_np.squeeze(), 3).tolist())
+
+        if point_key not in self.marginal_ly_kdes:
+            raise KeyError(
+                f"No cached marginal density for point_key={point_key}. "
+                "Call estimate_marginal_ly_density(...) for this point first."
+            )
+        kde = self.marginal_ly_kdes[point_key]
+
+        if isinstance(light_yields, torch.Tensor):
+            light_yields_np = light_yields.float().cpu().detach().numpy()
+        else:
+            light_yields_np = np.asarray(light_yields, dtype=np.float32)
+
+        log_ly_np = np.log10(np.abs(light_yields_np) + 1e-10)
+
+        # KDE gives density in log10(LY) space; convert to density in LY space via
+        # the Jacobian d(log10 c)/dc = 1/(c * ln(10)) so it matches the raw
+        # likelihood ratio, which is a ratio of light-yield-space densities.
+        p_marginal_logspace = kde(log_ly_np)
+        p_marginal_ly = p_marginal_logspace / (np.abs(light_yields_np) * np.log(10.0) + 1e-30)
+
+        return torch.tensor(p_marginal_ly, device=self.device, dtype=torch.float32)
+
+    def predict_debiased_likelihood(self, features, light_yields, point=None, point_key=None):
+        """
+        Convert the classifier's likelihood ratio into a quantity proportional to
+        p(LY | theta) by dividing out the estimated marginal p_marginal(LY | point).
+
+        SignalOnlyDataset trains the network so that, at the Bayes-optimal
+        solution, predict_likelihood_ratio(features) ~= p(LY|theta) /
+        p_marginal(LY), where p_marginal is induced by the sampler (see
+        estimate_marginal_ly_density). This method multiplies that ratio by the
+        estimated p_marginal back in, recovering a quantity proportional to
+        p(LY|theta) itself. The result is NOT normalized to integrate to 1 over
+        light yield -- callers scanning a grid of light_yields should renormalize
+        (e.g. via torch.trapz) afterwards.
+
+        Must be called after estimate_marginal_ly_density has been run (and
+        cached, or loaded from a checkpoint) for the relevant point.
+
+        Parameters
+        ----------
+        features : torch.Tensor
+            Network input features for each light-yield hypothesis, e.g. built
+            via prepare_features_charge, shape (N, feature_dim).
+        light_yields : torch.Tensor or np.ndarray
+            The light-yield values used to build `features`, shape (N,). Needed
+            separately since the marginal density is defined over light yield,
+            not over the feature vector.
+        point : torch.Tensor or np.ndarray, optional
+            Detector point the density was estimated at. Used only to derive
+            point_key if point_key is not given directly.
+        point_key : hashable, optional
+            Key used to look up the cached KDE in self.marginal_ly_kdes.
+
+        Returns
+        -------
+        torch.Tensor
+            De-biased likelihood (ratio * marginal density), proportional to
+            p(LY | theta) up to a normalization constant, shape (N,).
+        """
+        raw_ratio = self.predict_likelihood_ratio(features).reshape(-1)
+        p_marginal_ly = self.marginal_ly_density(light_yields, point=point, point_key=point_key)
+        return raw_ratio * p_marginal_ly
 
     def prepare_data_from_raw_patd(self, point, event_data, surrogate_func, event_labels=['position', 'energy', 'zenith', 'azimuth'], signal_event_data=None, num_samples=1, input_photons=None):
         """
@@ -2303,6 +2511,8 @@ class LLRnet(Surrogate):
         else:
             save_dict['fourier_features_list_state_dict'] = None
 
+        save_dict['marginal_ly_kdes'] = getattr(self, 'marginal_ly_kdes', None)
+
         torch.save(save_dict, filepath)
 
     def save_model(self, filepath):
@@ -2361,6 +2571,7 @@ class LLRnet(Surrogate):
         self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
         self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
         self.rich_rel_pos_mode = checkpoint.get('rich_rel_pos_mode', False)
+        self.marginal_ly_kdes = checkpoint.get('marginal_ly_kdes', None)
         # Determine if this is old format (single MLP) or new format (parallel branches)
         is_old_format = 'model_state_dict' in checkpoint
         
