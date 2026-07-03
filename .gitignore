@@ -1,0 +1,60 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.json
+*.parquet
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Experiment data and logs
+logs/
+data/
+gifs/
+nn_test_outputs/
+old_notebooks/
+gif_temp/
+# plots and gifs
+*.png
+*.jpg
+*.gif
+*.log
+*.pdf
+*.pt
+*.pkl
+*.sh
+# nugget/examples/modular_surrogate_notebook.ipynb
+
+nugget/examples/best_geom_uniform.pkl
+nugget/examples/signal_move_test.ipynb
+nugget/examples/*.pkl
+nugget/examples/*.npy
+nugget/examples/loss_landscape_test.py
+nugget/examples/*50_events*
+nugget/examples/best_geom_signal_rov.pkl
+nugget/examples/rov_uniform_geom*
+nugget/examples/best_ls*
+nugget/examples/*.h5
+nugget/examples/res_test
+nugget/other/geom_2nd_optimization_counts.py

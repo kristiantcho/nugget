@@ -730,10 +730,10 @@ class ResolutionSelectionLoss(LossFunction):
                 fisher_info_params=self.fisher_info_params
             ) 
             loss_stuff = weighted_resolution_loss(geom_dict, **kwargs)
-            resolution_per_event = loss_stuff['resolution_per_event']
+            resolution_per_event = loss_stuff['resolution_per_event'].squeeze()
             signal_event_params = loss_stuff['resolution_params']
         else:
-            resolution_per_event = precalculated_resolution_loss['resolution_per_event']
+            resolution_per_event = precalculated_resolution_loss['resolution_per_event'].squeeze()
             signal_event_params = precalculated_resolution_loss['resolution_params']
         true_params = []
         if self.resolution_type =='angular':
@@ -748,7 +748,7 @@ class ResolutionSelectionLoss(LossFunction):
                 true_params.append(event['energy'])
         else:
             raise ValueError(f"Unsupported resolution type: {self.resolution_type}. Supported types are 'angular' and 'energy'.")
-        true_params = torch.stack(true_params).to(device=self.device)
+        true_params = torch.stack(true_params).to(device=self.device).squeeze()
         if kwargs.get('hard_selection', False):
             # check if the resolution contour around the true parameter intersects the threshold range
             if self.resolution_type =='angular': # take cosine of zenith angle for angular resolution

@@ -14,6 +14,7 @@ from nugget.losses.fisher_info import WeightedResolutionLoss
 from torch.special import ndtr
 from typing import Union, List
 from numpy.typing import ArrayLike as Array
+import time
 
 def bKDE(
     binning_var:Union[float,Array],
@@ -45,7 +46,7 @@ def bKDE(
     bins = torch.Tensor([-torch.inf, *bins, torch.inf]) if reflect_infinities else bins
 
     # get cumulative counts (area under kde) for each set of bin edges
-    z = ((bins.reshape(-1, 1) - binning_var.reshape(1, -1)) / bandwidth)
+    z = ((bins.reshape(-1, 1) - binning_var) / bandwidth)
 
     cdf = ndtr(z)
     event_cdf = cdf
@@ -59,7 +60,7 @@ def bKDE(
             + torch.Tensor([counts[0]] + [0] * (len(counts) - 3))
             + torch.Tensor([0] * (len(counts) - 3) + [counts[-1]])
         )
-    
+    print(f"counts: {counts}")
     return counts
 
 def bKDEnD(
@@ -93,7 +94,7 @@ def calc_fisher_matrix(mu,grad_hist,ssq,signal_idx):
 
     #TODO softmasking using ssq
 
-    values = torch.stack(grad_hist)          
+    values = torch.stack(grad_hist).squeeze()      
     values = values / torch.sqrt(mu + eps)
 
     fim = torch.einsum('i...,j...->ij', values, values)
@@ -180,20 +181,25 @@ class AnalysisLoss(LossFunction):
         # grad_weights        = kwargs.get('grad_flux_weights') # :List[Tensor]
         trigger_loss        = kwargs.get('trigger_loss', None) # :Tensor
         optimality          = kwargs.get('analysis_optimality','a') # :str
+        live_time           = kwargs.get('live_time', 1.0) # :float
+        
         
 
-
+    
         if signal_event_params is None:
             signal_event_params = signal_sampler.sample_events(num_events)
         else:
             # randomly sample a subset of the provided signal events and corresponding precomputed values if more than num_events are given
             if len(signal_event_params) > num_events:
+                weight_factor = live_time*len(signal_event_params) / num_events
                 selected_indices = random.sample(range(len(signal_event_params)), num_events)
                 signal_event_params = [signal_event_params[i] for i in selected_indices]
                 if precomputed_fisher is not None:
                     precomputed_fisher = precomputed_fisher[selected_indices]
                 if precomputed_ly is not None:
                     precomputed_ly = precomputed_ly[selected_indices]
+            else:
+                weight_factor = live_time
             kwargs['signal_event_params'] = signal_event_params
             kwargs['precomputed_fisher_info_per_string_per_event'] = precomputed_fisher
             kwargs['precomputed_light_yield_per_point_per_event'] = precomputed_ly
@@ -217,12 +223,12 @@ class AnalysisLoss(LossFunction):
             uncerainty = loss_stuff['resolution_per_event']
             if input_name == 'energy':
                 for i in range(len(uncerainty)):
-                    uncerainty[i] =  uncerainty[i] / torch.log10(signal_event_params[i]['energy'])
+                    uncerainty[i] =  uncerainty[i] / signal_event_params[i]['energy']
             elif input_name == 'zenith':
                 kwargs['precalculated_resolution_loss'] = loss_stuff
                 for i in range(len(uncerainty)):
                     uncerainty[i] =  uncerainty[i] * torch.abs(torch.sin(signal_event_params[i]['zenith']))
-            uncertainties.append(uncerainty)
+            uncertainties.append(uncerainty.squeeze())
             if input_name == 'zenith':
                 selection_loss = ResolutionSelectionLoss(
                     device=self.device,
@@ -232,7 +238,7 @@ class AnalysisLoss(LossFunction):
                 selection_acceptance = selection_loss(geom_dict, **kwargs)['selection_per_event']
         
         if trigger_loss is not None:
-            acceptance = selection_acceptance * trigger_loss(geom_dict, **kwargs)['t_per_event']
+            acceptance = selection_acceptance.squeeze() * trigger_loss(geom_dict, **kwargs)['t_per_event'].squeeze()
         else:
             acceptance = selection_acceptance
         ########
@@ -254,32 +260,32 @@ class AnalysisLoss(LossFunction):
                         signal_idx.append(var_count)
                 var_count += 1
         for signal_event in signal_event_params:
-            weights.append(signal_event['weights'])
+            weights.append(signal_event['weights']*weight_factor)
             count = 0
             for key in signal_event:
                 if key.startswith('grad_weights_'):
-                    grad_weights[count].append(signal_event[key])
+                    grad_weights[count].append(signal_event[key]*weight_factor)
                     count += 1
                 if key == 'energy' and 'energy' in binning_var_names:
                     signal_event[key] = torch.log10(signal_event[key])
                 if key == 'zenith' and 'zenith' in binning_var_names:
                     signal_event[key] = torch.cos(signal_event[key])
-        weights = torch.stack(weights)
+        weights = torch.stack(weights).squeeze()
         for i in range(len(grad_weights)):
-            grad_weights[i] = torch.stack(grad_weights[i])
+            grad_weights[i] = torch.stack(grad_weights[i]).squeeze()
         bins = []
         for input_name in binning_var_names:
             if input_name == 'energy':
                 bins.append(energy_bins)
             elif input_name == 'zenith':
                 bins.append(zenith_bins)
-        print(bins)
+        # print(bins)
 
         for i, input_name in enumerate(binning_var_names):
             for signal_event in signal_event_params:
                 input_vars[i].append(signal_event[input_name])
             input_vars[i] = torch.stack(input_vars[i]).squeeze()
-        print(f"input_vars: {input_vars}")
+        # print(f"input_vars: {input_vars}")
         per_event_counts = bKDEnD(input_vars,bins,uncertainties)
 
         mu = calc_weighted_hists(per_event_counts,weights*acceptance)
