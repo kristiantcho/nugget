@@ -93,12 +93,11 @@ def calc_fisher_matrix(mu,grad_hist,ssq,signal_idx):
 
     #TODO softmasking using ssq
 
-    keys = list(grad_hist.keys())
     values = torch.stack(grad_hist)          
     values = values / torch.sqrt(mu + eps)
 
-    fim = torch.einsum('ib,jb->ij', values, values)
-    fim = rearrange_matrix(fim)
+    fim = torch.einsum('i...,j...->ij', values, values)
+    fim = rearrange_matrix(fim,signal_idx)
 
     k = len(signal_idx)
     A = fim[:k,:k]
