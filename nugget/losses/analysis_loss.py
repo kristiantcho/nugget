@@ -45,8 +45,7 @@ def bKDE(
     bins = torch.Tensor([-torch.inf, *bins, torch.inf]) if reflect_infinities else bins
 
     # get cumulative counts (area under kde) for each set of bin edges
-    print(bins.reshape(-1, 1).shape)
-    z = ((bins.reshape(-1, 1) - binning_var) / bandwidth)
+    z = ((bins.reshape(-1, 1) - binning_var.reshape(1, -1)) / bandwidth)
 
     cdf = ndtr(z)
     event_cdf = cdf
