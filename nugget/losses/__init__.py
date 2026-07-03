@@ -9,3 +9,4 @@ from . import trigger
 from . import effective_area
 from . import pointsource_fom
 from . import fisher_info_helpers
+from . import analysis_loss
