@@ -9,7 +9,8 @@ import pickle
 import gc
 import os
 from torch.func import jacrev, jvp, vmap, linearize
-
+from nugget.losses.trigger import TriggerLoss, ResolutionSelectionLoss
+from nugget.losses.fisher_info import WeightedResolutionLoss
 from torch.special import ndtr
 
 def bKDE(
@@ -122,7 +123,7 @@ def A_optimality(fim, **kwargs):
 
 
 class AnalysisLoss(LossFunction):
-    def __init__(self, device=None, print_loss=False, random_seed=None):
+    def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith']):
         """
         Initialize the weighted LLR loss function.
         
@@ -151,7 +152,7 @@ class AnalysisLoss(LossFunction):
         
         self.print_loss = print_loss
         self.random_seed = random_seed
-
+        self.fisher_info_params = fisher_info_params
 
 
 
@@ -162,24 +163,67 @@ class AnalysisLoss(LossFunction):
         - Acceptance
 
         """
-        points_3d           = geom_dict.get('points_3d', None)
+        # points_3d           = geom_dict.get('points_3d', None)
 
-        uncertainties       = kwargs.get('uncertainties') # :List[Tensor]
-        acceptance          = kwargs.get('acceptance', 1.) # :Tensor
+        # uncertainties       = kwargs.get('uncertainties') # :List[Tensor]
+        # acceptance          = kwargs.get('detection_eff_func', None) # :Tensor
 
-        binning_var_names   = kwargs.get('binning_var_names') # :List[str]
+        binning_var_names   = kwargs.get('analysis_binning_var_names') # :List[str]
+        num_events           = kwargs.get('num_events', 1) # :int
+        signal_event_params = kwargs.get('signal_event_params', None) #:List[Dict]
+        precomputed_fisher = kwargs.get('precomputed_fisher_info_per_string_per_event', None) # :Tensor
+        precomputed_ly = kwargs.get('precomputed_light_yield_per_point_per_event', None) # :Tensor
+        bins                = kwargs.get('analysis_bins') # :List[Tensor]
+        signal_idx          = kwargs.get('analysis_signal_idx') # :List[int]
+        signal_sampler         = kwargs.get('signal_sampler') # :Callable
+        weights             = kwargs.get('flux_weights') # :Tensor
+        grad_weights        = kwargs.get('grad_flux_weights') # :List[Tensor]
+        trigger_loss        = kwargs.get('trigger_loss', None) # :Tensor
+        optimality          = kwargs.get('analysis_optimality','a') # :str
 
-        signal_event_params = kwargs.get('signal_event_params')
+        if signal_event_params is None:
+            signal_event_params = signal_sampler.sample_events(num_events)
+        else:
+            # randomly sample a subset of the provided signal events and corresponding precomputed values if more than num_events are given
+            if len(signal_event_params) > num_events:
+                selected_indices = random.sample(range(len(signal_event_params)), num_events)
+                signal_event_params = [signal_event_params[i] for i in selected_indices]
+                if precomputed_fisher is not None:
+                    precomputed_fisher = precomputed_fisher[selected_indices]
+                if precomputed_ly is not None:
+                    precomputed_ly = precomputed_ly[selected_indices]
+            kwargs['signal_event_params'] = signal_event_params
+            kwargs['precomputed_fisher_info_per_string_per_event'] = precomputed_fisher
+            kwargs['precomputed_light_yield_per_point_per_event'] = precomputed_ly
 
-        bins                = kwargs.get('bins') # :List[Tensor]
-        signal_idx          = kwargs.get('signal_idx') # :List[int]
-
-        weights             = kwargs.get('weights') # :Tensor
-        grad_weights        = kwargs.get('grad_weights') # :List[Tensor]
-
-        optimality          = kwargs.get('optimality') # :str
-
-
+        uncertainties = []
+        for input_name in binning_var_names:
+            if input_name == 'energy':
+                weighted_resolution_loss=WeightedResolutionLoss(
+                        device=self.device,
+                        resolution_type='energy',
+                        fisher_info_params=self.fisher_info_params
+                )
+            elif input_name == 'zenith':
+                weighted_resolution_loss=WeightedResolutionLoss(
+                        device=self.device,
+                        resolution_type='angular',
+                        fisher_info_params=self.fisher_info_params
+                )
+            loss_stuff = weighted_resolution_loss(geom_dict, **kwargs)
+            uncertainties.append(loss_stuff['resolution_per_event'])
+            if input_name == 'zenith':
+                selection_loss = ResolutionSelectionLoss(
+                    device=self.device,
+                    resolution_type='angular',
+                    fisher_info_params=self.fisher_info_params
+                )
+                selection_acceptance = selection_loss(geom_dict, **kwargs)['selection_per_event']
+        
+        if trigger_loss is not None:
+            acceptance = selection_acceptance * trigger_loss(geom_dict, **kwargs)['t_per_event']
+        else:
+            acceptance = selection_acceptance
         ########
 
         input_vars = [[a[input_name] for a in signal_event_params] for input_name in binning_var_names]

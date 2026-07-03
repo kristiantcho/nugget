@@ -1241,7 +1241,6 @@ class EffectiveAreaLoss(LossFunction):
         use_irregular_cylinder = kwargs.get('use_irregular_cylinder', False)
         use_batched_effective_area = kwargs.get('use_batched_effective_area', False)
         cylinder_kwargs = kwargs.get('cylinder_sampler_kwargs', {})
-        perfect_trigger = kwargs.get('perfect_efficiency', False)
         pc_ly_per_event_per_point_per_e_per_ct = kwargs.get('pc_ly_per_point_per_event_per_e_per_ct', None)
         event_params_list = kwargs.get('signal_event_params', None)
         signal_sampler = kwargs.get('signal_sampler', None)
@@ -1253,7 +1252,6 @@ class EffectiveAreaLoss(LossFunction):
         # If True, sample all bin events at once and bin results in post-processing
         # instead of running a separate trigger+surrogate call per (E, cos_zenith) bin.
         use_batched_binned_trigger = kwargs.get('use_batched_binned_trigger', False)
-        detach_light_yields = kwargs.get('detach_light_yields', False)
 
         if precomputed_light_yield_per_point_per_event is None:
             precomputed_light_yield_per_point_per_event = pc_ly_per_event_per_point_per_e_per_ct
@@ -1269,12 +1267,7 @@ class EffectiveAreaLoss(LossFunction):
         # - False: force single-event loop
         use_batched_trigger = kwargs.get('use_batched_trigger', None)
 
-        # Optional trigger overrides for sliding-bar trigger.
-        self.trigger.distance_bar_length = kwargs.get('distance_bar_length', self.trigger.distance_bar_length)
-        self.trigger.distance_bar_step = kwargs.get('distance_bar_step', self.trigger.distance_bar_step)
-        self.trigger.min_points_threshold = kwargs.get('min_points_threshold', self.trigger.min_points_threshold)
-        
-        
+
         # signal_sampler = CylinderSampler(event_type='signal', domain_size=2500, E_min=energy_range, E_max=1e8, energy_dist='log_uniform')
     
         point_weights = None
@@ -1326,57 +1319,17 @@ class EffectiveAreaLoss(LossFunction):
                 if precomputed_light_yield_per_point_per_event is not None:
                     precomputed_light_yield_per_point_per_event = precomputed_light_yield_per_point_per_event[selected_indices]
 
-            batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
-            chunk_size = kwargs.get('binned_trigger_batch_size', None)
-            n_events = len(event_params_list)
-
-            if perfect_trigger:
-                per_event_trigger = torch.ones(n_events, device=self.device, dtype=points_3d.dtype)
-            elif chunk_size is None:
-                # Single pass — precompute light yields with batched surrogate if available
-                if precomputed_light_yield_per_point_per_event is None and batched_surrogate_func is not None:
-                    precomputed_light_yield_per_point_per_event = batched_surrogate_func(
-                        om_positions=points_3d, event_params_list=event_params_list
-                    )
-                ly = precomputed_light_yield_per_point_per_event
-                if detach_light_yields and ly is not None:
-                    ly = ly.detach()
-                trigger_out = self.trigger(
-                    geom_dict={'points_3d': points_3d},
-                    signal_surrogate_func=surrogate_func,
-                    signal_event_params=event_params_list,
-                    precomputed_light_yield_per_point_per_event=ly,
-                    use_batched_trigger=use_batched_trigger,
-                )
-                per_event_trigger = trigger_out['t_per_event']
-            else:
-                # Chunked pass — process chunk_size events at a time to cap memory
-                per_event_trigger = torch.zeros(n_events, device=self.device, dtype=points_3d.dtype)
-                for chunk_start in range(0, n_events, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, n_events)
-                    chunk_events = event_params_list[chunk_start:chunk_end]
-
-                    if precomputed_light_yield_per_point_per_event is not None:
-                        chunk_ly = precomputed_light_yield_per_point_per_event[chunk_start:chunk_end]
-                    elif batched_surrogate_func is not None:
-                        chunk_ly = batched_surrogate_func(
-                            om_positions=points_3d, event_params_list=chunk_events
-                        )
-                    else:
-                        chunk_ly = None
-
-                    if detach_light_yields and chunk_ly is not None:
-                        chunk_ly = chunk_ly.detach()
-
-                    trigger_out = self.trigger(
-                        geom_dict={'points_3d': points_3d},
-                        signal_surrogate_func=surrogate_func,
-                        signal_event_params=chunk_events,
-                        precomputed_light_yield_per_point_per_event=chunk_ly,
-                        use_batched_trigger=use_batched_trigger,
-                    )
-                    per_event_trigger[chunk_start:chunk_end] = trigger_out['t_per_event']
-                    del trigger_out
+            trigger_out = self.trigger(
+                {'points_3d': points_3d},
+                **{
+                    **kwargs,
+                    'signal_surrogate_func': surrogate_func,
+                    'signal_event_params': event_params_list,
+                    'precomputed_light_yield_per_point_per_event': precomputed_light_yield_per_point_per_event,
+                    'use_batched_trigger': use_batched_trigger,
+                },
+            )
+            per_event_trigger = trigger_out['t_per_event']
 
             if use_batched_effective_area:
                 per_event_energies, per_event_cos_zenith = _extract_energy_and_cos_zenith_batch(
@@ -1479,54 +1432,29 @@ class EffectiveAreaLoss(LossFunction):
 
             counts = torch.zeros((num_zenith_bins, num_energy_bins), device=self.device)
 
-            batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
+            trigger_out = self.trigger(
+                {'points_3d': points_3d},
+                **{
+                    **kwargs,
+                    'signal_surrogate_func': surrogate_func,
+                    'signal_event_params': all_events,
+                    'precomputed_light_yield_per_point_per_event': None,
+                    'use_batched_trigger': use_batched_trigger,
+                    'binned_trigger_batch_size': binned_trigger_batch_size,
+                },
+            )
+            all_trigger = trigger_out['t_per_event']
+            if kwargs.get('detach_trigger', False):
+                all_trigger = all_trigger.detach()
 
-            if not perfect_trigger:
-                chunk_size = binned_trigger_batch_size if binned_trigger_batch_size is not None else total_events
-                for chunk_start in range(0, total_events, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, total_events)
-                    chunk_events = all_events[chunk_start:chunk_end]
-
-                    if batched_surrogate_func is not None:
-                        chunk_light_yields = batched_surrogate_func(
-                            om_positions=points_3d, event_params_list=chunk_events
-                        )
-                    else:
-                        chunk_light_yields = torch.stack([
-                            surrogate_func(opt_point=points_3d, event_params=ep) for ep in chunk_events
-                        ], dim=0)
-                    if detach_light_yields:
-                        chunk_light_yields = chunk_light_yields.detach()
-                    trigger_out = self.trigger(
-                        geom_dict={'points_3d': points_3d},
-                        signal_surrogate_func=surrogate_func,
-                        signal_event_params=chunk_events,
-                        precomputed_light_yield_per_point_per_event=chunk_light_yields,
-                        use_batched_trigger=use_batched_trigger,
-                    )
-                    chunk_trigger = trigger_out['t_per_event']
-                    del chunk_light_yields
-                    log_e = torch.log10(all_energies[chunk_start:chunk_end])
-                    e_idx = torch.bucketize(log_e, energy_bins[1:-1])
-                    ct_idx = torch.bucketize(all_cos_zenith[chunk_start:chunk_end], zenith_bins[1:-1])
-
-                    for k in range(len(chunk_events)):
-                        ei, ci = e_idx[k].item(), ct_idx[k].item()
-                        if 0 <= ei < num_energy_bins and 0 <= ci < num_zenith_bins:
-                            detector_efficiencies[ci, ei] += chunk_trigger[k]
-                            counts[ci, ei] += 1
-                    if kwargs.get('detach_trigger', False):
-                        chunk_trigger = chunk_trigger.detach() 
-                        del chunk_trigger
-            else:
-                log_e = torch.log10(all_energies)
-                e_idx = torch.bucketize(log_e, energy_bins[1:-1])
-                ct_idx = torch.bucketize(all_cos_zenith, zenith_bins[1:-1])
-                for k in range(total_events):
-                    ei, ci = e_idx[k].item(), ct_idx[k].item()
-                    if 0 <= ei < num_energy_bins and 0 <= ci < num_zenith_bins:
-                        detector_efficiencies[ci, ei] += 1
-                        counts[ci, ei] += 1
+            log_e = torch.log10(all_energies)
+            e_idx = torch.bucketize(log_e, energy_bins[1:-1])
+            ct_idx = torch.bucketize(all_cos_zenith, zenith_bins[1:-1])
+            for k in range(total_events):
+                ei, ci = e_idx[k].item(), ct_idx[k].item()
+                if 0 <= ei < num_energy_bins and 0 <= ci < num_zenith_bins:
+                    detector_efficiencies[ci, ei] += all_trigger[k]
+                    counts[ci, ei] += 1
 
             nonzero = counts > 0
             detector_efficiencies[nonzero] /= counts[nonzero]
@@ -1561,24 +1489,21 @@ class EffectiveAreaLoss(LossFunction):
         else:
             for e_ind, e in enumerate(energy_centers):
                 for ct_ind, ct in enumerate(zenith_centers):
-                    if perfect_trigger:
-                        detector_efficiency = 1.0
-                    else:
-                        sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=10**energy_bins[e_ind], E_max=10**energy_bins[e_ind + 1], cos_range=(zenith_bins[ct_ind], zenith_bins[ct_ind + 1]),
-                                                         event_type='signal', energy_dist='log_uniform', uniform_zenith_sampling=True, **cylinder_kwargs).sample_events(num_events_per_bin)
-                        light_yield_per_event_per_point = torch.zeros((len(sampled_events), len(points_3d)), device=self.device)
-                        for i, event_params in enumerate(sampled_events):
-                            light_yield_per_event_per_point[i] = surrogate_func(opt_point=points_3d, event_params=event_params)
+                    sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=10**energy_bins[e_ind], E_max=10**energy_bins[e_ind + 1], cos_range=(zenith_bins[ct_ind], zenith_bins[ct_ind + 1]),
+                                                     event_type='signal', energy_dist='log_uniform', uniform_zenith_sampling=True, **cylinder_kwargs).sample_events(num_events_per_bin)
 
-                        trigger_out = self.trigger(
-                            geom_dict={'points_3d': points_3d},
-                            signal_surrogate_func=surrogate_func,
-                            signal_event_params=sampled_events,
-                            precomputed_light_yield_per_point_per_event=light_yield_per_event_per_point,
-                            use_batched_trigger=use_batched_trigger,
-                        )
-                        detector_efficiency = trigger_out['detector_efficiency']
-                        detector_efficiencies[ct_ind, e_ind] = detector_efficiency
+                    trigger_out = self.trigger(
+                        {'points_3d': points_3d},
+                        **{
+                            **kwargs,
+                            'signal_surrogate_func': surrogate_func,
+                            'signal_event_params': sampled_events,
+                            'precomputed_light_yield_per_point_per_event': None,
+                            'use_batched_trigger': use_batched_trigger,
+                        },
+                    )
+                    detector_efficiency = trigger_out['detector_efficiency']
+                    detector_efficiencies[ct_ind, e_ind] = detector_efficiency
                     if use_irregular_cylinder:
                         event_params_geom = {
                             "position": center,
