@@ -336,6 +336,10 @@ class LLRnet(Surrogate):
         self.val_losses = []
         self.is_trained = False
 
+        # Accumulated [x, y, z, light_yield, label] rows recorded during
+        # training when record_marginal_lys=True (see train_with_dataloader)
+        self.recorded_lys = torch.empty((0, 5), dtype=torch.float32)
+
     def _pos_norm_divisor(self):
         """Return a divisor for normalizing (x,y,z) positions.
 
@@ -1511,15 +1515,15 @@ class LLRnet(Surrogate):
     def train_with_dataloader(self, train_dataloader, val_dataloader=None, epochs=100,
                              verbose=True, early_stopping_patience=10, input_dim=None,
                              grad_clip=None, save_every_n_epochs=None,
-                             checkpoint_path=None):
+                             checkpoint_path=None, dataset_checkpoint_path=None):
         """
         Train the LLR network using PyTorch DataLoader with balanced signal/background events.
-        
+
         This method is designed to work with EventDataset that dynamically generates
         balanced signal and background events. The dataset ensures that for every signal
         event there is a corresponding background event with the same detector point and
         shared parameters, differing only in detector response.
-        
+
         Parameters:
         -----------
         train_dataloader : torch.utils.data.DataLoader
@@ -1527,7 +1531,7 @@ class LLRnet(Surrogate):
         val_dataloader : torch.utils.data.DataLoader, optional
             DataLoader for validation data. If None, no validation is performed.
         epochs : int
-            Number of training epochs  
+            Number of training epochs
         verbose : bool
             Whether to print training progress
         early_stopping_patience : int
@@ -1537,7 +1541,12 @@ class LLRnet(Surrogate):
         checkpoint_path : str or None
             File path to overwrite on each periodic save. Required when
             save_every_n_epochs is set.
-            
+        dataset_checkpoint_path : str or None
+            If set, save self.recorded_lys (accumulated [x, y, z, light_yield,
+            label] rows from SignalOnlyDataset, requires record_marginal_lys=True)
+            to this path on the same save_every_n_epochs cadence. Requires
+            save_every_n_epochs to be set.
+
         Returns:
         --------
         dict : Training history with 'train_loss' and 'val_loss' keys
@@ -1546,6 +1555,16 @@ class LLRnet(Surrogate):
             raise ValueError("save_every_n_epochs must be a positive integer or None")
         if save_every_n_epochs is not None and checkpoint_path is None:
             raise ValueError("checkpoint_path must be provided when save_every_n_epochs is set")
+        if dataset_checkpoint_path is not None and save_every_n_epochs is None:
+            raise ValueError("save_every_n_epochs must be provided when dataset_checkpoint_path is set")
+        record_marginal_lys = getattr(train_dataloader.dataset, 'record_marginal_lys', False)
+        if dataset_checkpoint_path is not None and not record_marginal_lys:
+            raise ValueError(
+                "dataset_checkpoint_path was set but train_dataloader.dataset was not "
+                "created with record_marginal_lys=True; pass it to "
+                "create_signal_only_dataloader to enable recording."
+            )
+        recorded_ly_batches = []  # list of (N, 5) tensors [x, y, z, light_yield, label], merged periodically
 
         # Build network if not already built
         # We need to get a sample to determine the feature dimension
@@ -1553,7 +1572,7 @@ class LLRnet(Surrogate):
             if input_dim is None:
                 sample_batch = next(iter(train_dataloader))
                 # print(f"Sampled batch in {time.time() - start_time:.4f} seconds")
-                sample_features, _ = sample_batch
+                sample_features = sample_batch[0]
                 # Features are now (batch_size, feature_dim) since each sample is an individual event
                 feature_dim = sample_features.shape[1]
                 
@@ -1583,9 +1602,18 @@ class LLRnet(Surrogate):
             
             # Iterate through batches of individual events
             time_start = time.time()
-            for batch_features, batch_labels in train_dataloader:
-                
-                
+            for batch in train_dataloader:
+                batch_features, batch_labels = batch[0], batch[1]
+                if record_marginal_lys:
+                    # ly_record is always the last element of the batch tuple
+                    # (see SignalOnlyDataset.__getitem__ / _pack): shape (B, 4)
+                    # columns [x, y, z, light_yield]. Append the label column so
+                    # each accumulated batch is [x, y, z, light_yield, label].
+                    batch_ly_record = batch[-1]
+                    recorded_ly_batches.append(
+                        torch.cat([batch_ly_record, batch_labels.reshape(-1, 1)], dim=1).cpu()
+                    )
+
                 # Debug: Check device and dtype before transfer
                 if n_batches == 0 and epoch == 0:
                     print(f"Batch loaded in {time.time() - time_start:.4f} seconds")
@@ -1595,18 +1623,18 @@ class LLRnet(Surrogate):
                     # print(f"  Features min: {batch_features[:,-1].min().item():.4f}, max: {batch_features[:,-1].max().item():.4f}")
                     # print(f"  Features mean: {batch_features[:,-1].mean().item():.4f}, std: {batch_features[:,-1].std().item():.4f}")
                     time_start = time.time()
-                
-                    # 
+
+                    #
                 # Each sample is now an individual event
                 # batch_features shape: (batch_size, feature_dim)
                 # batch_labels shape: (batch_size,)
                 batch_features = batch_features.to(self.device)
                 batch_labels = batch_labels.to(self.device)
-                
+
                 # if n_batches == 0 and epoch == 0:
                 #     print(f"  Features device after .to(): {batch_features.device}")
                 #     print(f"  Labels device after .to(): {batch_labels.device}")
-                
+
                 self.optimizer.zero_grad()
                 outputs = self._forward_pass(batch_features)
             
@@ -1709,12 +1737,22 @@ class LLRnet(Surrogate):
                         fourier_layer.load_state_dict(self.best_state_dict['fourier_features_list'][i])
                 break
 
+            if record_marginal_lys and recorded_ly_batches:
+                self.recorded_lys = torch.cat([self.recorded_lys, *recorded_ly_batches], dim=0)
+                recorded_ly_batches = []
+
             if save_every_n_epochs is not None and ((epoch + 1) % save_every_n_epochs == 0 or (epoch+1) == epochs):
                 checkpoint_dirname = os.path.dirname(checkpoint_path)
                 if checkpoint_dirname:
                     os.makedirs(checkpoint_dirname, exist_ok=True)
                 self._save_model_state(checkpoint_path)
-        
+
+                if dataset_checkpoint_path is not None:
+                    dataset_checkpoint_dirname = os.path.dirname(dataset_checkpoint_path)
+                    if dataset_checkpoint_dirname:
+                        os.makedirs(dataset_checkpoint_dirname, exist_ok=True)
+                    torch.save(self.recorded_lys, dataset_checkpoint_path)
+
         self.is_trained = True
         
         return {
@@ -2725,15 +2763,12 @@ class LLRnet(Surrogate):
             self.pair_access_tracker = {}
             self.current_epoch_id = 0
 
-            # Record every mismatched (label=0) light yield actually used during
-            # training, together with the detector point it was evaluated at.
-            # This is exactly the marginal distribution p_marginal(LY | point)
-            # the classifier is implicitly trained against, available afterwards
-            # via dataset.recorded_marginal_lys for building a density estimate.
+            # If True, __getitem__ returns an extra [x, y, z, light_yield]
+            # tensor per item (matched or mismatched), which flows back through
+            # normal DataLoader collation -- safe with num_workers > 0. See
+            # LLRnet.train_with_dataloader.
             self.record_marginal_lys = kwargs.get('record_marginal_lys', False)
-            self.max_marginal_ly_records = kwargs.get('max_marginal_ly_records', 200000)
-            self.recorded_marginal_lys = []  # list of (point_tuple, light_yield)
-            
+
         def _generate_pair_data(self, pair_idx):
             """
             Generate matched/mismatched pair data for a specific pair index.
@@ -2813,18 +2848,16 @@ class LLRnet(Surrogate):
             matched_label = torch.tensor(1.0, device=self.llrnet.device)
             mismatched_label = torch.tensor(0.0, device=self.llrnet.device)
 
-            def _record_marginal_ly(ly_mm):
-                """Record a mismatched (label=0) light yield actually used in a
-                training pair, together with the detector point it was
-                evaluated at. This is exactly the induced marginal distribution
-                p_marginal(LY | point) the classifier is trained against."""
-                if not self.record_marginal_lys:
-                    return
-                if len(self.recorded_marginal_lys) >= self.max_marginal_ly_records:
-                    return
-                ly_val = ly_mm.item() if torch.is_tensor(ly_mm) else float(np.asarray(ly_mm).reshape(-1)[0])
-                point_key = tuple(np.round(detector_point.cpu().detach().numpy(), 3).tolist())
-                self.recorded_marginal_lys.append((point_key, ly_val))
+            def _ly_record(ly):
+                """Package [x, y, z, light_yield] for this detector point and
+                light yield, to be returned alongside (features, label) so it
+                flows back through normal DataLoader collation (safe with
+                num_workers > 0)."""
+                ly_val = ly.item() if torch.is_tensor(ly) else float(np.asarray(ly).reshape(-1)[0])
+                point_np = detector_point.cpu().detach().numpy().reshape(-1)
+                return torch.tensor(
+                    [point_np[0], point_np[1], point_np[2], ly_val], dtype=torch.float32
+                )
 
             def _build_pair(event_for_params_m, event_for_ly_m,
                             event_for_params_mm, event_for_ly_mm):
@@ -2838,7 +2871,6 @@ class LLRnet(Surrogate):
                         ly_mm = self.signal_surrogate_func(
                             opt_point=detector_point, event_params=event_for_ly_mm
                         )
-                    _record_marginal_ly(ly_mm)
                     f_m = self.llrnet.prepare_features_charge(
                         detector_point, event_for_params_m, ly_m
                     )
@@ -2848,7 +2880,7 @@ class LLRnet(Surrogate):
                     true_ly_m = ly_m if self.output_true_light_yield else None
                     true_ly_mm = ly_mm if self.output_true_light_yield else None
                 else:
-                    if self.output_true_light_yield:
+                    if self.output_true_light_yield or self.record_marginal_lys:
                         f_m, true_ly_m = self.llrnet.prepare_data_from_raw(
                             detector_point, event_for_ly_m, self.signal_surrogate_func,
                             self.event_labels, self.llrnet.signal_noise_scale,
@@ -2859,7 +2891,9 @@ class LLRnet(Surrogate):
                             self.event_labels, self.llrnet.signal_noise_scale,
                             event_for_params_mm, output_true_light_yield=True,
                         )
-                        _record_marginal_ly(true_ly_mm)
+                        ly_m, ly_mm = true_ly_m, true_ly_mm
+                        if not self.output_true_light_yield:
+                            true_ly_m = true_ly_mm = None
                     else:
                         f_m = self.llrnet.prepare_data_from_raw(
                             detector_point, event_for_ly_m, self.signal_surrogate_func,
@@ -2871,42 +2905,44 @@ class LLRnet(Surrogate):
                             self.event_labels, self.llrnet.signal_noise_scale,
                             event_for_params_mm,
                         )
-                        if self.record_marginal_lys:
-                            with torch.no_grad():
-                                ly_mm = self.signal_surrogate_func(
-                                    opt_point=detector_point, event_params=event_for_ly_mm
-                                )
-                            _record_marginal_ly(ly_mm)
                         true_ly_m = true_ly_mm = None
-                return f_m, true_ly_m, f_mm, true_ly_mm
+
+                ly_record_m = _ly_record(ly_m) if self.record_marginal_lys else None
+                ly_record_mm = _ly_record(ly_mm) if self.record_marginal_lys else None
+                return f_m, true_ly_m, f_mm, true_ly_mm, ly_record_m, ly_record_mm
+
+            def _pack(features, label, true_ly, ly_record):
+                """Build the (features, label, ...) tuple returned per item,
+                appending true_ly and/or ly_record only if enabled, in a fixed
+                order so callers can destructure predictably."""
+                item = (features, label)
+                if self.output_true_light_yield:
+                    item = item + (true_ly,)
+                if self.record_marginal_lys:
+                    item = item + (ly_record,)
+                return item
 
             if self.samples_per_event > 1:
                 all_samples = []
                 for _ in range(self.samples_per_event):
-                    f_m, tly_m, f_mm, tly_mm = _build_pair(
+                    f_m, tly_m, f_mm, tly_mm, ly_record_m, ly_record_mm = _build_pair(
                         event_for_params_matched, event_for_light_yield_matched,
                         event_for_params_mismatched, event_for_light_yield_mismatched,
                     )
-                    if self.output_true_light_yield:
-                        all_samples.append((
-                            (f_m, matched_label, tly_m),
-                            (f_mm, mismatched_label, tly_mm),
-                        ))
-                    else:
-                        all_samples.append((
-                            (f_m, matched_label),
-                            (f_mm, mismatched_label),
-                        ))
+                    all_samples.append((
+                        _pack(f_m, matched_label, tly_m, ly_record_m),
+                        _pack(f_mm, mismatched_label, tly_mm, ly_record_mm),
+                    ))
                 return all_samples
             else:
-                f_m, tly_m, f_mm, tly_mm = _build_pair(
+                f_m, tly_m, f_mm, tly_mm, ly_record_m, ly_record_mm = _build_pair(
                     event_for_params_matched, event_for_light_yield_matched,
                     event_for_params_mismatched, event_for_light_yield_mismatched,
                 )
-                if self.output_true_light_yield:
-                    return (f_m, matched_label, tly_m), (f_mm, mismatched_label, tly_mm)
-                else:
-                    return (f_m, matched_label), (f_mm, mismatched_label)
+                return (
+                    _pack(f_m, matched_label, tly_m, ly_record_m),
+                    _pack(f_mm, mismatched_label, tly_mm, ly_record_mm),
+                )
         
         def __len__(self):
             """Return the number of individual events per epoch (2 * num_samples_per_epoch * samples_per_event)."""
@@ -2927,9 +2963,12 @@ class LLRnet(Surrogate):
             
             Returns:
             --------
-            tuple : (features, label)
+            tuple : (features, label[, true_ly][, ly_record])
                 features: torch.Tensor of shape (feature_dim,) for individual event
                 label: torch.Tensor scalar (1.0 for matched, 0.0 for mismatched)
+                true_ly: included only if output_true_light_yield=True
+                ly_record: torch.Tensor [x, y, z, light_yield], included only if
+                    record_marginal_lys=True
             """
             # Detect new epoch when idx resets to 0
             if idx == 0:
