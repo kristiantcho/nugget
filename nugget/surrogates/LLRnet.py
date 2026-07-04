@@ -2730,7 +2730,7 @@ class LLRnet(Surrogate):
             # This is exactly the marginal distribution p_marginal(LY | point)
             # the classifier is implicitly trained against, available afterwards
             # via dataset.recorded_marginal_lys for building a density estimate.
-            self.record_marginal_lys = kwargs.get('record_marginal_lys', True)
+            self.record_marginal_lys = kwargs.get('record_marginal_lys', False)
             self.max_marginal_ly_records = kwargs.get('max_marginal_ly_records', 200000)
             self.recorded_marginal_lys = []  # list of (point_tuple, light_yield)
             
