@@ -25,6 +25,7 @@ from nugget.losses.fisher_info_helpers import (
     _compute_fisher_llr_over_points,
     directional_resolution,
     compute_fisher_info_single_averaged,
+    compute_fisher_info_poisson_batched_events,
     compute_fisher_info_single,
     compute_fisher_info_strings,
 )
@@ -202,7 +203,7 @@ class WeightedFisherInfoLoss(LossFunction):
         t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5,
         adaptive_grid_retry=True, adaptive_t_max_floor_ns=10.0, uninformative_fisher_value=1e-6,
         precomputed_fisher_per_string_per_event=None, recompute_bad_points=True,
-        empty_cache_after_event=False,
+        empty_cache_after_event=False, events_per_batch=1,
     ):
         n_strings = len(string_xy)
         # use_rich_features is now stored on the model — read from it if available.
@@ -290,6 +291,49 @@ class WeightedFisherInfoLoss(LossFunction):
                         adaptive_t_max_floor_ns=adaptive_t_max_floor_ns,
                         uninformative_fisher_value=uninformative_fisher_value,
                         )
+
+        # ---- event-batched fast path (non-LLR Poisson-mean only) ----------------
+        # Vectorises over events via vmap + LightSabre.call_batched instead of the
+        # Python per-event loop. Only valid for the surrogate-only (Poisson) case.
+        use_event_batching = (
+            events_per_batch is not None and events_per_batch > 1
+            and llr_net is None and not use_patd and not use_patd_quadrature
+            and not use_charge_quadrature and not have_precomp
+        )
+        if events_per_batch is not None and events_per_batch > 1 and not use_event_batching:
+            if verbose:
+                print(
+                    "events_per_batch>1 requested but not applicable "
+                    "(only supported for the non-LLR Poisson path without recompute); "
+                    "falling back to per-event loop.",
+                    flush=True,
+                )
+        if use_event_batching:
+            for b_start in range(0, n_events, events_per_batch):
+                b_end = min(b_start + events_per_batch, n_events)
+                batch = signal_event_params[b_start:b_end]
+                fisher_batch = compute_fisher_info_poisson_batched_events(
+                    fisher_info_params=self.fisher_info_params,
+                    points=points_3d,
+                    event_params_list=batch,
+                    surrogate_func=signal_surrogate_func,
+                    string_xy=string_xy,
+                    device=self.device,
+                    point_chunk_size=point_chunk_size,
+                    grad_chunk_size=grad_chunk_size,
+                    skip_zero_response=skip_zero_response,
+                    zero_response_threshold=zero_response_threshold,
+                    uninformative_fisher_value=uninformative_fisher_value,
+                    detach_fisher_tensors=detach_fisher_tensors,
+                )  # (b, n_strings, D, D)
+                fisher_per_string_per_event[b_start:b_end] += fisher_batch.to(self.device)
+                del fisher_batch
+                _fisher_chunk_cleanup(self.device if isinstance(self.device, torch.device) else torch.device(self.device))
+                if empty_cache_after_event and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if verbose:
+                    print(f"Computed Fisher info for events {b_start+1}-{b_end}/{n_events} (batched)", flush=True)
+            return fisher_per_string_per_event
 
         for i, signal_params in enumerate(signal_event_params):
             if have_precomp:

@@ -4,7 +4,7 @@ import numpy as np
 import gc
 import os
 import math
-from torch.func import jacrev, vmap, linearize
+from torch.func import jacrev, jacfwd, vmap, linearize
 from torch.func import jvp as func_jvp
 
 
@@ -1886,6 +1886,239 @@ def directional_resolution(F3, n):
         r68 = 1.515 * sigma_eff  # (N,)
 
         return r68
+
+
+def _resolve_lightsabre_instance(surrogate_func):
+    """Recover the surrogate instance exposing call_batched from a bound method.
+
+    The Fisher API is passed the *bound* method (e.g.
+    ``lightsabre_surrogate.light_yield_surrogate``). The event-batched path needs
+    the owning instance so it can call ``call_batched``. Returns the instance or
+    None if it cannot be recovered / does not support batching.
+    """
+    owner = getattr(surrogate_func, '__self__', None)
+    if owner is not None and hasattr(owner, 'call_batched'):
+        return owner
+    if hasattr(surrogate_func, 'call_batched'):
+        return surrogate_func
+    return None
+
+
+def compute_fisher_info_poisson_batched_events(
+    fisher_info_params, points, event_params_list, surrogate_func,
+    string_xy=None, device=None, point_chunk_size=None, grad_chunk_size=None,
+    skip_zero_response=True, zero_response_threshold=0.5,
+    uninformative_fisher_value=1e-6, detach_fisher_tensors=True,
+):
+    """Event-batched Poisson-mean Fisher information via forward-mode JVP.
+
+    This is the event-batched analogue of the surrogate-only (non-LLR) branch of
+    :func:`compute_fisher_info_single_averaged`. Instead of a Python loop over
+    events, it vectorises over the event axis with ``vmap`` and evaluates the
+    LightSabre surrogate through its fully-vectorised ``call_batched`` forward
+    pass, differentiating the Poisson mean λ w.r.t. the requested parameters.
+
+    For each event ``e`` and point ``i`` the per-point Fisher is
+        F_{e,i} = (∂λ_{e,i}/∂θ_e)(∂λ_{e,i}/∂θ_e)^T / λ_{e,i}
+    which is then summed over the points belonging to each string.
+
+    Parameters
+    ----------
+    fisher_info_params : list of str
+        Subset of {'energy', 'direction', 'position'} to differentiate w.r.t.
+    points : torch.Tensor, shape (n_points, 3)
+        Detector points (all events share the same geometry).
+    event_params_list : list of dict
+        One dict per event in the batch. Each must contain 'position', 'energy',
+        and either 'direction' or 'zenith'/'azimuth'.
+    surrogate_func : callable
+        Bound LightSabre surrogate method; its owning instance must expose
+        ``call_batched``.
+    string_xy : list or None
+        If provided, per-point Fishers are reduced to per-string sums.
+    point_chunk_size : int or None
+        Process points in chunks of this size to bound memory (the (E, n_pts, D)
+        Jacobian is the dominant allocation). None processes all points at once.
+    grad_chunk_size : int or None
+        Accepted for API symmetry with the per-event path but unused here: the
+        forward-mode Jacobian over the (small) parameter dimension D is computed
+        in one jacfwd call.
+
+    Returns
+    -------
+    torch.Tensor
+        (n_events, n_strings, D, D) if string_xy is provided, else
+        (n_events, n_points, D, D).
+    """
+    surrogate = _resolve_lightsabre_instance(surrogate_func)
+    if surrogate is None:
+        raise ValueError(
+            "compute_fisher_info_poisson_batched_events requires a surrogate that "
+            "exposes call_batched (e.g. LightSabre). Pass the bound "
+            "light_yield_surrogate method."
+        )
+
+    device = points.device if device is None else torch.device(device)
+    points = points.to(device)
+    n_points = points.shape[0]
+    n_events = len(event_params_list)
+
+    supported = {'energy', 'direction', 'position'}
+    for p in fisher_info_params:
+        if p not in supported:
+            raise ValueError(
+                f"Event-batched Poisson Fisher supports differentiating w.r.t. "
+                f"{sorted(supported)} only; got '{p}'. Use the per-event path for "
+                f"other parameters."
+            )
+
+    def _event_dir(ep):
+        """Return this event's direction as a (3,) tensor (from 'direction' or angles)."""
+        if 'direction' in ep and ep['direction'] is not None:
+            d = ep['direction']
+            if not isinstance(d, torch.Tensor):
+                d = torch.tensor(d, dtype=torch.float32, device=device)
+            return d.to(device).reshape(3)
+        theta = ep['zenith']
+        phi = ep['azimuth']
+        if not isinstance(theta, torch.Tensor):
+            theta = torch.tensor(theta, dtype=torch.float32, device=device)
+        if not isinstance(phi, torch.Tensor):
+            phi = torch.tensor(phi, dtype=torch.float32, device=device)
+        theta = theta.to(device).squeeze()
+        phi = phi.to(device).squeeze()
+        return torch.stack([
+            torch.sin(theta) * torch.cos(phi),
+            torch.sin(theta) * torch.sin(phi),
+            torch.cos(theta),
+        ])
+
+    def _event_scalar(ep, key):
+        v = ep[key]
+        if not isinstance(v, torch.Tensor):
+            v = torch.tensor(v, dtype=torch.float32, device=device)
+        return v.to(device).reshape(())
+
+    def _event_pos(ep):
+        pos = ep['position']
+        if not isinstance(pos, torch.Tensor):
+            pos = torch.tensor(pos, dtype=torch.float32, device=device)
+        return pos.to(device).reshape(3)
+
+    # Per-parameter layout in the flat θ vector (order follows fisher_info_params).
+    # 'energy' -> 1, 'direction' -> 3, 'position' -> 3.
+    param_sizes = {'energy': 1, 'direction': 3, 'position': 3}
+    theta_numels = [param_sizes[p] for p in fisher_info_params]
+    total_dims = int(sum(theta_numels))
+
+    # Stack per-event base values.
+    energies = torch.stack([_event_scalar(ep, 'energy') for ep in event_params_list])  # (E,)
+    dirs = torch.stack([_event_dir(ep) for ep in event_params_list])                    # (E, 3)
+    poss = torch.stack([_event_pos(ep) for ep in event_params_list])                    # (E, 3)
+
+    # Flat θ0 per event: concatenate the differentiated params in order.
+    def _flat_for_event(e):
+        parts = []
+        for p in fisher_info_params:
+            if p == 'energy':
+                parts.append(energies[e].reshape(1))
+            elif p == 'direction':
+                parts.append(dirs[e].reshape(3))
+            else:  # position
+                parts.append(poss[e].reshape(3))
+        return torch.cat(parts, dim=0)
+
+    theta0 = torch.stack([_flat_for_event(e) for e in range(n_events)])  # (E, D)
+
+    pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
+
+    # Output accumulator (per point). String reduction happens after.
+    fisher_per_point = torch.zeros(n_events, n_points, total_dims, total_dims, device=device)
+
+    # Per-event λ(θ_e) over a chunk of points, built from θ_flat + fixed values.
+    def _make_lambda_fn(pts_chunk):
+        def _lambda_e(theta_flat_e, pos_e, dir_e, energy_e):
+            # Rebuild the three call_batched inputs, substituting the
+            # differentiated pieces from theta_flat_e.
+            idx = 0
+            e_val = energy_e
+            d_val = dir_e
+            p_val = pos_e
+            for p in fisher_info_params:
+                if p == 'energy':
+                    e_val = theta_flat_e[idx:idx + 1].reshape(())
+                    idx += 1
+                elif p == 'direction':
+                    d_val = theta_flat_e[idx:idx + 3].reshape(3)
+                    idx += 3
+                else:  # position
+                    p_val = theta_flat_e[idx:idx + 3].reshape(3)
+                    idx += 3
+            # call_batched expects a leading event dim; use size-1 batch.
+            ly = surrogate.call_batched(
+                p_val.reshape(1, 3), d_val.reshape(1, 3),
+                e_val.reshape(1), pts_chunk,
+            )
+            return ly.reshape(-1)  # (n_pts_chunk,)
+        return _lambda_e
+
+    for p_start in range(0, n_points, pt_chunk):
+        p_end = min(p_start + pt_chunk, n_points)
+        pts_chunk = points[p_start:p_end]
+        lambda_fn = _make_lambda_fn(pts_chunk)
+
+        # Forward-mode Jacobian per event: jacfwd gives J (n_pts_chunk, D) and we
+        # evaluate λ separately. Both are vmapped over the event axis, so all
+        # events in the batch run in a single set of GPU kernels.
+        def _J_e(theta_flat_e, pos_e, dir_e, energy_e):
+            return jacfwd(lambda t: lambda_fn(t, pos_e, dir_e, energy_e))(theta_flat_e)
+
+        def _lambda_only_e(theta_flat_e, pos_e, dir_e, energy_e):
+            return lambda_fn(theta_flat_e, pos_e, dir_e, energy_e)
+
+        J = vmap(_J_e)(theta0, poss, dirs, energies)          # (E, n_pts, D)
+        ly = vmap(_lambda_only_e)(theta0, poss, dirs, energies)  # (E, n_pts)
+
+        # Per-point Fisher (Poisson mean): outer(J) / λ. Mirrors the per-event
+        # surrogate-only branch of compute_fisher_info_single_averaged exactly
+        # (λ clamped only), so batched and per-event modes agree numerically.
+        outer = torch.einsum('epi,epj->epij', J, J)  # (E, n_pts, D, D)
+        denom = ly.clamp(min=1e-10).unsqueeze(-1).unsqueeze(-1)
+        outer = outer / denom
+        if skip_zero_response:
+            # Hard-gate negligible-response points. The per-event Poisson branch
+            # does not gate, so leave skip_zero_response=False for exact parity;
+            # gating here matches the non-LLR quadrature convention (>= threshold).
+            mask = (ly >= zero_response_threshold).to(outer.dtype).unsqueeze(-1).unsqueeze(-1)
+            outer = outer * mask
+        fisher_per_point[:, p_start:p_end] = outer.detach() if detach_fisher_tensors else outer
+        del J, ly, outer
+        _fisher_chunk_cleanup(device)
+
+    if string_xy is None:
+        return fisher_per_point  # (E, n_points, D, D)
+
+    # Reduce points -> strings (shared geometry across events).
+    n_strings = len(string_xy)
+    point_to_string = torch.full((n_points,), -1, dtype=torch.long, device=device)
+    for s_idx in range(n_strings):
+        sx, sy = string_xy[s_idx][0], string_xy[s_idx][1]
+        sx = sx.to(device) if isinstance(sx, torch.Tensor) else torch.tensor(sx, device=device)
+        sy = sy.to(device) if isinstance(sy, torch.Tensor) else torch.tensor(sy, device=device)
+        mask = (points[:, 0] == sx) & (points[:, 1] == sy)
+        point_to_string[mask] = s_idx
+
+    fisher_by_string = torch.zeros(n_events, n_strings, total_dims, total_dims, device=device)
+    for s_idx in range(n_strings):
+        string_mask = (point_to_string == s_idx)
+        if string_mask.any():
+            fisher_by_string[:, s_idx] = fisher_per_point[:, string_mask].sum(dim=1)
+        elif uninformative_fisher_value:
+            eye = torch.eye(total_dims, device=device)
+            fisher_by_string[:, s_idx] = uninformative_fisher_value * eye
+    del fisher_per_point
+    _fisher_chunk_cleanup(device)
+    return fisher_by_string  # (E, n_strings, D, D)
 
 
 def compute_fisher_info_single_averaged(

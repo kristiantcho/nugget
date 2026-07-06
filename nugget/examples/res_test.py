@@ -16,6 +16,11 @@ radius = 600
 height = 1000
 use_patd=False
 recompute=False
+# Number of events to process per GPU batch in the non-LLR (Poisson-mean) Fisher
+# path. >1 enables the event-batched vmap + LightSabre.call_batched fast path.
+# Only used when use_llrnet=False and use_patd=False. Set to 1 for the old
+# per-event loop. Tune down if you hit OOM (memory scales ~events_per_batch).
+events_per_batch = 50 if not use_llrnet and not use_patd else 1
 extra = '_patd' if use_patd else ''
 if not use_patd:
     lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = 'track')
@@ -225,6 +230,7 @@ for geom_name in ['800main_full_hex', '340grid']:
                 precomputed_fisher_per_string_per_event=fisher_info_recompute if recompute else None,
                 recompute_bad_points=recompute,
                 empty_cache_after_event=True,
+                events_per_batch=events_per_batch,
                 )
 
     # precomputed_ly = signal_yield_loss_func.light_yield_per_string(
