@@ -187,7 +187,7 @@ class LLRnet(Surrogate):
     def __init__(self, device=None, dim=3, domain_size=2, hidden_dims=[128, 64, 32], 
                  dropout_rate=0.1, learning_rate=1e-3, use_fourier_features=True,
                  num_frequencies=64, frequency_scale=1.0, learnable_frequencies=False,
-                 num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False,
+                 num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False, log_charge_scale=4,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True, jitter_time=0.0,
                  add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True,
                  lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, rich_rel_pos_mode=False, **kwargs):
@@ -299,6 +299,7 @@ class LLRnet(Surrogate):
         # negligible relative to the geometric features); smaller values let timing dominate.
         self.time_scale_divisor = time_scale_divisor
         self.rich_rel_pos_mode = rich_rel_pos_mode
+        self.log_charge_scale = log_charge_scale  # Scale factor for log10 of charge when input_charge=True
         # Handle multiple branch configurations
         if num_parallel_branches > 1:
             # Set up frequency scales for each branch
@@ -2321,6 +2322,7 @@ class LLRnet(Surrogate):
             'flag_negative_times': self.flag_negative_times,
             'time_scale_divisor': self.time_scale_divisor,
             'input_charge': self.input_charge,
+            'log_charge_scale': self.log_charge_scale,
             'norm_pos': self.norm_pos,
             'log_scale_energy': self.log_scale_energy,
             'input_delta_time': self.input_delta_time,
@@ -2383,7 +2385,7 @@ class LLRnet(Surrogate):
         self.add_relative_pos = checkpoint.get('add_relative_pos', self.add_relative_pos)
         self.use_patd = checkpoint.get('use_patd', self.use_patd)
         self.use_rich_features = checkpoint.get('use_rich_features', self.use_rich_features)
-        
+        self.log_charge_scale = checkpoint.get('log_charge_scale', 4)
         self.domain_size = checkpoint.get('domain_size', self.domain_size)
         self.log_scale_ly = checkpoint.get('log_scale_ly', self.log_scale_ly)
         self.rel_time = checkpoint.get('rel_time', self.rel_time)

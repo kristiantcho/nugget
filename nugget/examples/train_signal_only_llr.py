@@ -39,7 +39,8 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     lr_scheduler_patience=15,  # Patience for LR scheduler
     use_rich_features=True,  # Whether to use rich features from the surrogate model
     add_vertex_distance=False,
-    rich_rel_pos_mode=True
+    rich_rel_pos_mode=True,
+    log_charge_scale=3
     )
 
 train_dataloader = llr_net.create_signal_only_dataloader(
@@ -52,10 +53,11 @@ train_dataloader = llr_net.create_signal_only_dataloader(
     shuffle=True,
     samples_per_event = 1,
     min_light_yield=0.1,         
-    max_resample_attempts=30,
+    max_resample_attempts=100,
     vary_cylinder=False,
     pin_memory=True,
     pin_memory_device=None,
+    record_marginal_lys=True
     
     # cylinder_sampler=nugget.samplers.cyl_sampler.CylinderSampler
     )
@@ -67,6 +69,7 @@ history = llr_net.train_with_dataloader(
     grad_clip=None,
     save_every_n_epochs=20,
     checkpoint_path='best_charge_llr_model_v6.pt',
+    dataset_checkpoint_path='charge_llr_v6_training_ly.pt',
 )
 
 # Save the best model for later use
