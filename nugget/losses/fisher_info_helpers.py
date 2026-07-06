@@ -1879,7 +1879,7 @@ def directional_resolution(F3, n):
             # Closed-form 2x2 eigenvalues — always numerically stable
             tr = Cov2[:, 0, 0] + Cov2[:, 1, 1]
             det = Cov2[:, 0, 0] * Cov2[:, 1, 1] - Cov2[:, 0, 1] ** 2
-            half_gap = 0.5 * torch.sqrt(torch.clamp(tr ** 2 - 4.0 * det, min=0.0))
+            half_gap = 0.5 * torch.sqrt(tr ** 2 - 4.0 * det)
             eigvals = torch.stack([0.5 * tr - half_gap, 0.5 * tr + half_gap], dim=1)  # (N, 2)
         eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
         sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) + 1e-10)  # (N,)
