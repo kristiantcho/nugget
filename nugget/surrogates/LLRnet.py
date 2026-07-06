@@ -917,7 +917,7 @@ class LLRnet(Surrogate):
             light_yield = torch.tensor(light_yield, device=self.device, dtype=torch.float32)
         else:
             light_yield = light_yield.float().to(self.device)
-        log_ly = torch.log10(torch.abs(light_yield.squeeze()) + 1e-10) / 4.0  # scalar
+        log_ly = torch.log10(torch.abs(light_yield.squeeze()) + 1e-10) / self.log_charge_scale  # scalar
 
         if self.rich_rel_pos_mode:
             # Use only relative position (detector - vertex) instead of both absolute positions

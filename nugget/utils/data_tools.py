@@ -305,3 +305,4 @@ def select_events(
 			selected_events.append(dict(event))
 
 	return selected_events
+
