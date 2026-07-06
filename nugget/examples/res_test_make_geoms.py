@@ -4,18 +4,22 @@ import nugget
 import pickle
 import os
 
+device="cuda:1"
 string_number_penalty = nugget.losses.geometry_penalties.StringNumberPenalty()
 string_boundary_penalty = nugget.losses.geometry_penalties.StringBoundaryPenaltyCircle()
 weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizationPenalty()
 weighted_angular_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
+    device=device,
     resolution_type='angular',
     fisher_info_params=['position','energy', 'direction']
     )
 weighted_energy_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
+    device=device,
     resolution_type='energy',
     fisher_info_params=['position','energy', 'direction']
 )
 rov_penalty = nugget.losses.geometry_penalties.ROVPenalty( 
+    device=device,
     rov_rec_width=230,  # ROV dimensions
     rov_height=159.9, 
     rov_tri_length=159.9
@@ -61,11 +65,11 @@ loss_params.update({
                 # 'angular_resolution_loss',
                 # 'signal_yield_loss', 
                 'rov_penalty', 
-                'string_boundary_penalty', 
-                'local_string_repulsion_penalty', 
+                # 'string_boundary_penalty', 
+                # 'local_string_repulsion_penalty', 
                 'string_number_penalty', 
                 # 'string_weights_penalty',
-                'weighted_binarization_penalty'
+                # 'weighted_binarization_penalty'
                 ],  # Constraints to enforce
     })
 loss_weights_dict = {
@@ -163,7 +167,7 @@ for i in range(6):
         loss_func_dict=loss_func_dict,          # Dictionary of loss functions to use
         loss_weights_dict=loss_weights_dict,    # Weights for combining multiple losses
         loss_params_dict=loss_params,           # Parameters for loss function computation
-        n_iter=2000,                           # Maximum number of optimization iterations
+        n_iter=1000,                           # Maximum number of optimization iterations
         print_freq=100,                          # Print progress every N iterations
         sigmoid_loss_list=loss_sigmoid_list,         # Which losses to apply sigmoid to (for better optimization dynamics)
         save_best_geom_file = f'{folder_name}geom_e{i+2}_e{i+3}.pkl',  # File to save best geometry found

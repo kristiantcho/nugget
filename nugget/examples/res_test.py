@@ -6,15 +6,15 @@ import numpy as np
 # from nugget.losses.effective_area import get_bounding_cylinder
 
 device = 'cuda:2'
-num_events = 3000
-version = 'r600_50_u_sp_1'
+num_events = 50000
+version = 'r600_50_u_1'
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
-# use_poisson = False
+use_llrnet = False
 center = [0,0,0]
 radius = 600
 height = 1000
-use_patd=True
+use_patd=False
 recompute=False
 extra = '_patd' if use_patd else ''
 if not use_patd:
@@ -54,16 +54,17 @@ light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate
     #     event['position'] = torch.tensor([0.0,0.0,0.0], device=device)  # Center events for testing
 # events_file_name = f'res_test/signal_events_{num_events}_{version}'
 # pickle.dump(signal_events, open(events_file_name +'.pkl', 'wb'))
+signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_{version}.pt')[:]
 # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'res_test/signal_events_{num_events}_{version}.pt')
 # signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_{version}.pt')
-signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e2-4_vertical.pt')
-signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e4-6_vertical.pt')
-signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e6-8_vertical.pt')
-# signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e5-6_vertical.pt')
+# signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e2-4_vertical.pt')
+# signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e4-6_vertical.pt')
 # signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e6-8_vertical.pt')
-num_events *= 3
-version += '_vertical'
-nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'res_test/signal_events_{num_events}_{version}.pt')
+# # signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e5-6_vertical.pt')
+# # signal_events += nugget.utils.data_tools.load_signal_events_parquet(f'res_test/space_test/{version}/signal_events_{num_events}_e6-8_vertical.pt')
+# num_events *= 3
+# version += '_vertical'
+# nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'res_test/signal_events_{num_events}_{version}.pt')
 for i, signal_event in enumerate(signal_events):
     for key, value in signal_event.items():
         if isinstance(value, torch.Tensor):
@@ -111,7 +112,7 @@ for geom_name in ['800main_full_hex', '340grid']:
     signal_yield_loss_func = nugget.losses.light_yield.WeightedLightYieldLoss(
         device=device,
     )
-    if not use_patd:
+    if not use_patd and use_llrnet:
         llr_net = nugget.surrogates.LLRnet.LLRnet(
             device=device,
             domain_size=2000,  # Size of the detector domain
@@ -139,7 +140,7 @@ for geom_name in ['800main_full_hex', '340grid']:
         )
 
         llr_net.load_model('best_charge_llr_model_v5.pt')
-    else:
+    elif use_patd and use_llrnet:
         llr_net = nugget.surrogates.LLRnet.LLRnet(
         device=device,
         domain_size=2000,
@@ -201,12 +202,12 @@ for geom_name in ['800main_full_hex', '340grid']:
                 points_3d=geom_dict['points_3d'],
                 signal_event_params=signal_events,
                 signal_surrogate_func=light_yield_surrogate,
-                llr_net=llr_net,
-                llr_iterations=100,
+                llr_net=llr_net if use_llrnet else None,
+                llr_iterations=100 if use_llrnet else 1,
                 skip_zero_response=True,
                 verbose=True,
                 jacrev_chunk_size=50000,
-                point_chunk_size=7000,
+                point_chunk_size=22000,
                 grad_chunk_size=7,
                 llr_autodiff_mode='jvp',
                 use_rich_features=True,
@@ -214,8 +215,8 @@ for geom_name in ['800main_full_hex', '340grid']:
                 use_patd_quadrature=use_patd,
                 t_offset_ns=0,
                 t_max_ns=5000,
-                zero_response_threshold=0.01,
-                use_charge_quadrature=not use_patd,  # for patd, charge quadrature is handled inside the surrogate
+                zero_response_threshold=0.001,
+                use_charge_quadrature=not use_patd and use_llrnet,  # for patd, charge quadrature is handled inside the surrogate
                 charge_center_on_llr_peak=not use_patd,  # for patd, the surrogate is already centered on the llr peak
                 charge_peak_scan_points=64,
                 adaptive_grid_retry=True,
@@ -223,7 +224,7 @@ for geom_name in ['800main_full_hex', '340grid']:
                 uninformative_fisher_value=1e-6,
                 precomputed_fisher_per_string_per_event=fisher_info_recompute if recompute else None,
                 recompute_bad_points=recompute,
-                empty_cache_after_event=False,
+                empty_cache_after_event=True,
                 )
 
     # precomputed_ly = signal_yield_loss_func.light_yield_per_string(
@@ -235,7 +236,7 @@ for geom_name in ['800main_full_hex', '340grid']:
 
 
     
-    # extra += '_no_pois' if not use_poisson else ''
+    extra += '_pois' if not use_llrnet else ''
     torch.save(fisher_info_per_string_per_event.cpu(), f'res_test/fisher_info_per_string_per_event_{num_events}_{geom_name}_{version}{extra}.pt')
     # torch.save(precomputed_ly.cpu(), f'res_test/light_yield_per_string_{num_events}_{geom_name}_{version}.pt')
 
