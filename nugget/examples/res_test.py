@@ -16,10 +16,7 @@ radius = 600
 height = 1000
 use_patd=False
 recompute=False
-# Number of events to process per GPU batch in the non-LLR (Poisson-mean) Fisher
-# path. >1 enables the event-batched vmap + LightSabre.call_batched fast path.
-# Only used when use_llrnet=False and use_patd=False. Set to 1 for the old
-# per-event loop. Tune down if you hit OOM (memory scales ~events_per_batch).
+
 events_per_batch = 50 if not use_llrnet and not use_patd else 1
 extra = '_patd' if use_patd else ''
 if not use_patd:

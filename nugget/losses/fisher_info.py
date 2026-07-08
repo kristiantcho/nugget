@@ -769,11 +769,11 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         # its bad (zero/NaN/Inf) strings per event instead of using it verbatim.
         recompute_bad_points = kwargs.get('recompute_bad_points', False)
         empty_cache_after_event = kwargs.get('empty_cache_after_event', False)
-
+        events_per_batch = kwargs.get('events_per_batch', None)
         # New parameters for batched loading from files
         event_paths = kwargs.get('event_paths', None)
         fisher_info_paths = kwargs.get('fisher_info_paths', None)
-        # batch_size_per_iteration = kwargs.get('batch_size_per_iteration', None)
+        
         
         # Load and batch events/Fisher info from files or subset precomputed data
         signal_event_params, precomputed_fisher_info_per_string_per_event = self._load_and_batch_events_fisher_info(
@@ -822,6 +822,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 precomputed_fisher_per_string_per_event=precomputed_fisher_info_per_string_per_event,
                 recompute_bad_points=recompute_bad_points,
                 empty_cache_after_event=empty_cache_after_event,
+                events_per_batch=events_per_batch
             )
         else:
             fisher_info_per_string_per_event = precomputed_fisher_info_per_string_per_event.to(self.device)
@@ -923,14 +924,16 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                         cov_matrix.append(torch.pinverse(regularized_fisher[i]))
                 cov_matrix = torch.stack(cov_matrix)
             
-            for i, params in enumerate(signal_event_params):
-                energy_idx = self.fisher_info_params.index('energy')
-                var_energy = cov_matrix[i][energy_idx, energy_idx]
-                energy_resolution = torch.sqrt(torch.clamp_min(var_energy, 1e-10))  # Clamp to ensure non-negative
-                if use_relative_energy:
-                    energy_resolution = energy_resolution/params['energy'].to(self.device)
-                resolution_per_event.append(energy_resolution)
-            resolution_per_event = torch.stack(resolution_per_event)
+            # Batched over events: pull the energy variance from every event's
+            # covariance matrix at once, then form the (relative) resolution.
+            energy_idx = self.fisher_info_params.index('energy')
+            var_energy = cov_matrix[:, energy_idx, energy_idx]                  # (N,)
+            resolution_per_event = torch.sqrt(torch.clamp_min(var_energy, 1e-10))  # (N,)
+            if use_relative_energy:
+                energies = torch.stack([
+                    params['energy'].to(self.device).reshape(()) for params in signal_event_params
+                ])                                                             # (N,)
+                resolution_per_event = resolution_per_event / energies
             finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
             if finite_mask.any():
                 safe_res = torch.where(
