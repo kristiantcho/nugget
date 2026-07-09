@@ -1,0 +1,3058 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+import gc
+import os
+import math
+from torch.func import jacrev, jacfwd, vmap, linearize
+from torch.func import jvp as func_jvp
+
+
+def _pos_norm_divisor_from_domain_size(domain_size, *, device, dtype=torch.float32):
+    """Match LLRnet's norm_pos scaling.
+
+    - Scalar domain_size: divide all coordinates by (domain_size/2).
+    - Tuple/list (width, height): divide x,y by (width/2) and z by (height/2).
+
+    Returns either a Python float or a (3,) torch.Tensor on `device`.
+    """
+    if isinstance(domain_size, torch.Tensor):
+        # If it's a scalar tensor.
+        domain_size = domain_size.item()
+
+    if isinstance(domain_size, (tuple, list)) and len(domain_size) == 2:
+        width, height = domain_size
+        if isinstance(width, torch.Tensor):
+            width = width.item()
+        if isinstance(height, torch.Tensor):
+            height = height.item()
+        width = float(width)
+        height = float(height)
+        return torch.tensor(
+            [width / 2.0, width / 2.0, height / 2.0],
+            device=device,
+            dtype=dtype,
+        )
+
+    return float(domain_size) / 2.0
+
+
+def _llr_mask_from_true_ly(true_ly, *, threshold=0.01, sharpness=12.0):
+    return torch.sigmoid((true_ly - threshold) * sharpness) + 1e-6
+
+
+def _fisher_chunk_cleanup(device):
+    """Release Python-side objects between chunks without forcing CUDA cache flushes.
+
+    Calling torch.cuda.empty_cache() in tight autodiff loops can surface asynchronous
+    CUDA faults at cache-flush points and usually hurts throughput. Keep cleanup to
+    Python GC and optional explicit synchronization for debugging.
+    """
+    gc.collect()
+    if device.type == 'cuda' and os.environ.get('NUGGET_FISHER_CUDA_SYNC', '0') == '1':
+        torch.cuda.synchronize(device)
+
+
+def _llr_out_single_point_all_iters(
+    pt_3,
+    *,
+    theta_vals,
+    fisher_info_params,
+    fixed_params,
+    llr_net,
+    surrogate_func,
+    llr_iterations,
+    signal_noise_scale,
+    skip_zero_response,
+    event_param_names,
+    use_rich_features=False,
+    zero_response_threshold=0.5,
+):
+    params = {fisher_info_params[i]: theta_vals[i] for i in range(len(fisher_info_params))}
+    params.update(fixed_params)
+
+    # NOTE: this function is called inside jacrev, so everything here is
+    # differentiated w.r.t. theta_vals.  The surrogate call must be hoisted
+    # outside via pre-sampled observations; only hypothesis feature assembly
+    # and the network forward pass should be inside the trace.
+    # For rich features, the caller (_fisher_one_point_jacrev) pre-samples
+    # observations and passes them in via fixed_params['_cached_rich_obs'] and
+    # fixed_params['_cached_rich_ly'].  The standard path is unchanged.
+    if use_rich_features:
+        cached_obs = fixed_params.get('_cached_rich_obs')
+        cached_ly = fixed_params.get('_cached_rich_ly')  # (L,) or (L, 1)
+
+        theta_shapes = [v.shape for v in theta_vals]
+        theta_numels = [v.numel() for v in theta_vals]
+        theta_flat = torch.cat([v.reshape(-1) for v in theta_vals])
+        # fixed_params without the cache sentinels
+        base_fixed = {k: v for k, v in fixed_params.items()
+                      if not k.startswith('_cached_rich')}
+
+        features = _build_rich_features_from_cached_obs(
+            pt_3.unsqueeze(0),
+            theta_flat=theta_flat,
+            cached_obs=cached_obs,
+            llr_net=llr_net,
+            fisher_info_params=fisher_info_params,
+            theta_shapes=theta_shapes,
+            theta_numels=theta_numels,
+            fixed_params=base_fixed,
+            device=pt_3.device,
+        )
+        ly = cached_ly.reshape(-1)
+    else:
+        features, ly = llr_net.prepare_data_from_raw(
+            pt_3.unsqueeze(0),
+            params,
+            surrogate_func,
+            noise_scale=signal_noise_scale,
+            output_true_light_yield=True,
+            event_labels=fisher_info_params if event_param_names is None else event_param_names,
+            num_samples=llr_iterations,
+        )
+
+    llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(-1)  # (L,)
+    if skip_zero_response:
+        llr_out = llr_out * _llr_mask_from_true_ly(ly.reshape(-1), threshold=zero_response_threshold)
+    return llr_out
+
+
+def _fisher_one_point_jacrev(
+    pt_3,
+    *,
+    theta_tuple,
+    fisher_info_params,
+    fixed_params,
+    llr_net,
+    surrogate_func,
+    llr_iterations,
+    signal_noise_scale,
+    skip_zero_response,
+    event_param_names,
+    jacrev_chunk_size,
+    detach_fisher_tensors=True,
+    use_rich_features=False,
+    zero_response_threshold=0.5,
+):
+    if use_rich_features:
+        # Pre-sample observations outside the jacrev trace so the surrogate is
+        # called exactly once (not once per parameter dimension).
+        params0 = {fisher_info_params[i]: theta_tuple[i].detach() for i in range(len(fisher_info_params))}
+        params0.update(fixed_params)
+        cached_obs, cached_ly = _sample_rich_observations(
+            pt_3.unsqueeze(0),
+            surrogate_func=surrogate_func,
+            params_for_sampling=params0,
+            llr_iterations=llr_iterations,
+            llr_net=llr_net,
+            device=pt_3.device,
+        )
+        # Inject into fixed_params so _llr_out_single_point_all_iters can read them.
+        augmented_fixed = dict(fixed_params)
+        augmented_fixed['_cached_rich_obs'] = cached_obs
+        augmented_fixed['_cached_rich_ly'] = cached_ly.reshape(-1)  # (L,)
+    else:
+        augmented_fixed = fixed_params
+
+    def _theta_only_fn(*theta_vals):
+        return _llr_out_single_point_all_iters(
+            pt_3,
+            theta_vals=theta_vals,
+            fisher_info_params=fisher_info_params,
+            fixed_params=augmented_fixed,
+            llr_net=llr_net,
+            surrogate_func=surrogate_func,
+            llr_iterations=llr_iterations,
+            signal_noise_scale=signal_noise_scale,
+            skip_zero_response=skip_zero_response,
+            event_param_names=event_param_names,
+            use_rich_features=use_rich_features,
+            zero_response_threshold=zero_response_threshold,
+        )
+
+    J_tuple = jacrev(
+        _theta_only_fn,
+        argnums=tuple(range(len(fisher_info_params))),
+        chunk_size=jacrev_chunk_size,
+    )(*theta_tuple)
+
+    J = torch.cat([j.reshape(llr_iterations, -1) for j in J_tuple], dim=1)
+    del J_tuple
+    F = torch.einsum('li,lj->ij', J, J) / llr_iterations
+    del J
+    return F.detach() if detach_fisher_tensors else F
+
+
+def _unflatten_theta(theta_flat, *, fisher_info_params, theta_shapes, theta_numels, fixed_params):
+    params = {}
+    idx = 0
+    for name, shape, numel in zip(fisher_info_params, theta_shapes, theta_numels):
+        params[name] = theta_flat[idx:idx + numel].reshape(shape)
+        idx += numel
+    params.update(fixed_params)
+    return params
+
+
+def _sample_detector_responses_batched(
+    pts_3,
+    *,
+    surrogate_func,
+    params_for_sampling,
+    llr_iterations,
+    signal_noise_scale,
+    llr_net,
+    device,
+):
+    """Mimic LLRnet.prepare_data_from_raw(num_samples>1) response generation.
+
+    Returns:
+      responses_processed: (L, B) after noise + optional log scaling
+      light_yields_true:   (L, B) pre-noise (used for masking)
+    """
+    pts_3 = pts_3.float().to(device)
+    B = pts_3.shape[0]
+    responses_list = []
+    ly_list = []
+    with torch.no_grad():
+        for _ in range(llr_iterations):
+            resp = surrogate_func(opt_point=pts_3, event_params=params_for_sampling)
+            if isinstance(resp, np.ndarray):
+                resp = torch.tensor(resp, device=device, dtype=torch.float32)
+            elif not isinstance(resp, torch.Tensor):
+                resp = torch.tensor(resp, device=device, dtype=torch.float32)
+            resp = resp.float().to(device).reshape(-1)
+            if resp.numel() != B:
+                if resp.numel() == 1:
+                    resp = resp.expand(B)
+                else:
+                    raise ValueError(
+                        f"surrogate_func returned {resp.numel()} responses, expected {B}. "
+                        f"pts_3 shape={tuple(pts_3.shape)}"
+                    )
+
+            ly_list.append(resp.clone())
+
+            if signal_noise_scale is not None and signal_noise_scale > 0:
+                resp = resp + torch.randn_like(resp) * signal_noise_scale
+            if bool(getattr(llr_net, 'log_scale_ly', False)):
+                resp = torch.log10(torch.abs(resp) + 1e-10)
+            responses_list.append(resp)
+
+    responses = torch.stack(responses_list, dim=0)
+    light_yields_true = torch.stack(ly_list, dim=0)
+    return responses, light_yields_true
+
+
+def _build_features_from_cached_responses(
+    pts_3,
+    *,
+    theta_flat,
+    cached_responses_processed,
+    llr_net,
+    fisher_info_params,
+    event_param_names,
+    theta_shapes,
+    theta_numels,
+    fixed_params,
+    device,
+):
+    """Rebuild features deterministically, matching prepare_data_from_raw(num_samples>1)."""
+    params = _unflatten_theta(
+        theta_flat,
+        fisher_info_params=fisher_info_params,
+        theta_shapes=theta_shapes,
+        theta_numels=theta_numels,
+        fixed_params=fixed_params,
+    )
+
+    pts_3 = pts_3.float().to(device)
+    if pts_3.dim() == 1:
+        pts_3 = pts_3.unsqueeze(0)
+    B = pts_3.shape[0]
+    L = cached_responses_processed.shape[0]
+
+    if bool(getattr(llr_net, 'norm_pos', False)):
+        domain_size = getattr(llr_net, 'domain_size', None)
+        if domain_size is None:
+            raise AttributeError("llr_net.norm_pos=True but llr_net.domain_size is missing")
+        divisor = _pos_norm_divisor_from_domain_size(domain_size, device=device, dtype=pts_3.dtype)
+        norm_points = pts_3 / divisor
+    else:
+        norm_points = pts_3
+
+    relative_pos = None
+    if bool(getattr(llr_net, 'add_relative_pos', False)) and ('position' in params):
+        event_pos = params['position']
+        if isinstance(event_pos, np.ndarray):
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
+        elif not isinstance(event_pos, torch.Tensor):
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
+        event_pos = event_pos.float().to(device)
+        if event_pos.dim() == 1:
+            event_pos = event_pos.unsqueeze(0)
+        relative_pos = pts_3 - event_pos
+
+    dist_perp = None
+    if bool(getattr(llr_net, 'add_distance_from_beam', False)) and ("direction" in params) and ("position" in params):
+        track_dir = params["direction"]
+        if isinstance(track_dir, np.ndarray):
+            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float32)
+        elif not isinstance(track_dir, torch.Tensor):
+            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float32)
+        track_dir = track_dir.float().to(device)
+        if track_dir.dim() == 1:
+            track_dir = track_dir.unsqueeze(0)
+
+        event_pos = params["position"]
+        if isinstance(event_pos, np.ndarray):
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
+        elif not isinstance(event_pos, torch.Tensor):
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
+        event_pos = event_pos.float().to(device)
+        if event_pos.dim() == 1:
+            event_pos = event_pos.unsqueeze(0)
+
+        _, dist_perp = llr_net.compute_distance_from_beam(pts_3, event_pos, track_dir)
+
+    event_labels = fisher_info_params if event_param_names is None else event_param_names
+    event_param_features = []
+    for key in event_labels:
+        if key not in params:
+            continue
+        feature = params[key]
+        if isinstance(feature, np.ndarray):
+            feature = torch.tensor(feature, device=device, dtype=torch.float32)
+        elif not isinstance(feature, torch.Tensor):
+            feature = torch.tensor(feature, device=device, dtype=torch.float32)
+        feature = feature.float().to(device)
+        if bool(getattr(llr_net, 'log_scale_energy', False)) and key == 'energy':
+            feature = torch.log10(feature + 1e-10)
+        if bool(getattr(llr_net, 'norm_pos', False)) and key == 'position':
+            domain_size = getattr(llr_net, 'domain_size', None)
+            if domain_size is None:
+                raise AttributeError("llr_net.norm_pos=True but llr_net.domain_size is missing")
+            divisor = _pos_norm_divisor_from_domain_size(domain_size, device=device, dtype=feature.dtype)
+            feature = feature / divisor
+        event_param_features.append(feature.flatten())
+
+    if event_param_features:
+        event_params_cat = torch.cat(event_param_features, dim=0)
+    else:
+        event_params_cat = torch.tensor([], device=device, dtype=pts_3.dtype)
+
+    point_event_features_list = [norm_points]
+    if relative_pos is not None:
+        point_event_features_list.append(relative_pos)
+    if dist_perp is not None:
+        point_event_features_list.append(dist_perp)
+    if event_params_cat.numel() > 0:
+        event_params_replicated = event_params_cat.unsqueeze(0).expand(B, -1)
+        point_event_features_list.append(event_params_replicated)
+
+    point_event_features = torch.cat(point_event_features_list, dim=1)
+    point_event_features_batched = point_event_features.unsqueeze(0).expand(L, -1, -1)
+    detector_responses_expanded = cached_responses_processed.unsqueeze(2)
+    features_batched = torch.cat([point_event_features_batched, detector_responses_expanded], dim=2)
+    return features_batched.reshape(L * B, -1)
+
+
+def _sample_rich_observations(
+    pts_3,
+    *,
+    surrogate_func,
+    params_for_sampling,
+    llr_iterations,
+    llr_net,
+    device,
+):
+    """Pre-sample surrogate observations for the rich-feature path.
+
+    Like _sample_detector_responses_batched but stores the full surrogate output
+    (scalar LY or PATD dict) so that _build_rich_features_from_cached_obs can
+    append the fixed observation to the differentiable hypothesis features.
+
+    Returns
+    -------
+    cached_obs : list of lists — cached_obs[l][b] is the raw surrogate output
+        for iteration l, point b. For charge: a scalar tensor. For PATD: a dict.
+    cached_ly_true : (L, B) float tensor of light yields for masking.
+    """
+    pts_3 = pts_3.float().to(device)
+    B = pts_3.shape[0]
+    is_patd = bool(getattr(llr_net, 'use_patd', False))
+
+    cached_obs = []
+    ly_rows = []
+
+    # For the non-PATD charge case we only need the light yield values as a tensor —
+    # cached_obs (list of lists) is only needed for PATD where hit_times vary per call.
+    ly_tensor_rows = []  # collect (B,) tensors directly, no Python float conversion
+
+    with torch.no_grad():
+        for _ in range(llr_iterations):
+            try:
+                batch_raw = surrogate_func(opt_point=pts_3, event_params=params_for_sampling)
+                if is_patd:
+                    if not isinstance(batch_raw, (list, tuple)) or len(batch_raw) != B:
+                        raise TypeError
+                    obs_row = list(batch_raw)
+                    ly_row_t = torch.tensor(
+                        [float(r.get('num_photons', 0).item()
+                               if isinstance(r.get('num_photons', 0), torch.Tensor)
+                               else r.get('num_photons', 0))
+                         for r in obs_row],
+                        dtype=torch.float32, device=device,
+                    )
+                else:
+                    if isinstance(batch_raw, dict):
+                        batch_raw = batch_raw.get('light_yield', next(iter(batch_raw.values())))
+                    if not isinstance(batch_raw, torch.Tensor):
+                        raise TypeError
+                    batch_raw = batch_raw.detach().float().reshape(-1)
+                    if batch_raw.numel() != B:
+                        raise ValueError
+                    obs_row = batch_raw          # keep as tensor, no per-element Python loop
+                    ly_row_t = batch_raw
+            except Exception:
+                obs_row = []
+                ly_vals = []
+                for b in range(B):
+                    raw = surrogate_func(opt_point=pts_3[b], event_params=params_for_sampling)
+                    if is_patd:
+                        n = raw.get('num_photons', 0)
+                        ly_vals.append(float(n.item()) if isinstance(n, torch.Tensor) else float(n))
+                    else:
+                        if isinstance(raw, dict):
+                            raw = raw.get('light_yield', next(iter(raw.values())))
+                        if isinstance(raw, torch.Tensor):
+                            raw = raw.detach().float()
+                        else:
+                            raw = torch.tensor(float(raw), dtype=torch.float32, device=device)
+                        ly_vals.append(float(raw.item()))
+                    obs_row.append(raw)
+                ly_row_t = torch.tensor(ly_vals, dtype=torch.float32, device=device)
+
+            cached_obs.append(obs_row)
+            ly_tensor_rows.append(ly_row_t)
+
+    cached_ly_true = torch.stack(ly_tensor_rows, dim=0)  # (L, B) — no Python float conversion
+    return cached_obs, cached_ly_true
+
+
+def _build_rich_features_from_cached_obs(
+    pts_3,
+    *,
+    theta_flat,
+    cached_obs,
+    llr_net,
+    fisher_info_params,
+    theta_shapes,
+    theta_numels,
+    fixed_params,
+    device,
+):
+    """Build rich features differentiably from cached (fixed) observations.
+
+    The observation (LY scalar or PATD hit times / t_geom_min) is pre-sampled
+    and held constant. Only the hypothesis geometry (vert, dir, energy, derived
+    geometric scalars) is rebuilt from theta_flat, so gradients flow only through
+    the hypothesis parameters — exactly as _build_features_from_cached_responses
+    does for the standard path.
+
+    Returns
+    -------
+    features : (L*B, feat_dim) tensor
+    """
+    params = _unflatten_theta(
+        theta_flat,
+        fisher_info_params=fisher_info_params,
+        theta_shapes=theta_shapes,
+        theta_numels=theta_numels,
+        fixed_params=fixed_params,
+    )
+
+    pts_3 = pts_3.float().to(device)
+    if pts_3.dim() == 1:
+        pts_3 = pts_3.unsqueeze(0)
+    B = pts_3.shape[0]
+    L = len(cached_obs)
+    is_patd = bool(getattr(llr_net, 'use_patd', False))
+
+    # --- differentiable hypothesis features — computed ONCE over B, then broadcast ---
+    norm = llr_net._pos_norm_divisor()
+
+    vert = params.get('position', params.get('vertex', None))
+    if vert is None:
+        raise KeyError("'position' not found in params for rich feature builder")
+    if isinstance(vert, np.ndarray):
+        vert = torch.tensor(vert, device=device, dtype=torch.float32)
+    vert = vert.float().to(device).reshape(1, 3) / norm  # (1, 3)
+
+    direction = params.get('direction')
+    if direction is None:
+        raise KeyError("'direction' not found in params for rich feature builder")
+    if isinstance(direction, np.ndarray):
+        direction = torch.tensor(direction, device=device, dtype=torch.float32)
+    direction = direction.float().to(device).reshape(1, 3)  # (1, 3)
+    dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)  # (1, 1)
+
+    energy = params.get('energy')
+    if energy is None:
+        raise KeyError("'energy' not found in params for rich feature builder")
+    if isinstance(energy, np.ndarray):
+        energy = torch.tensor(energy, device=device, dtype=torch.float32)
+    log_energy = torch.log10(energy.float().to(device).squeeze() + 1e-10) / 8.0  # scalar
+
+    # Batched geometry over B points — one operation, not B scalar calls
+    det = pts_3 / norm                                      # (B, 3)
+    rel = det - vert                                        # (B, 3)
+    vert_dist = torch.norm(rel, dim=-1, keepdim=True)      # (B, 1)
+    cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (dir_norm * vert_dist.clamp(min=1e-8))  # (B, 1)
+
+    # Hypothesis context: (B, ctx_dim) — does NOT depend on l
+    log_energy_expanded = log_energy.expand(B, 1)          # (B, 1)
+    ctx_parts = [
+        det,                    # (B, 3)
+        vert.expand(B, -1),     # (B, 3)
+        direction.expand(B, -1),# (B, 3)
+        log_energy_expanded,    # (B, 1)
+    ]
+    if bool(getattr(llr_net, 'add_vertex_distance', True)):
+        ctx_parts.append(vert_dist)                        # (B, 1)
+    ctx_parts.append(cos_angle)                            # (B, 1)
+    if bool(getattr(llr_net, 'add_distance_from_beam', False)):
+        vert_unnorm = vert * norm if not isinstance(norm, float) else vert * norm  # (1, 3) unnorm
+        _, dist_perp = llr_net.compute_distance_from_beam(pts_3, vert_unnorm.expand(B, -1), direction.expand(B, -1))
+        dist_perp_norm = dist_perp / (llr_net.domain_size / 2 if isinstance(llr_net.domain_size, (int, float)) else llr_net.domain_size[0] / 2)
+        ctx_parts.append(dist_perp_norm)                   # (B, 1)
+    ctx = torch.cat(ctx_parts, dim=-1)
+
+    if not is_patd:
+        # Charge path: one scalar observation per (l, b) → (L, B, 1)
+        # Build observation tensor from cache: shape (L, B, 1)
+        obs_rows = []
+        for l in range(L):
+            obs_b = []
+            for b in range(B):
+                ly_raw = cached_obs[l][b]
+                if isinstance(ly_raw, torch.Tensor):
+                    val = ly_raw.float().to(device).squeeze()
+                else:
+                    val = torch.tensor(float(ly_raw), dtype=torch.float32, device=device)
+                obs_b.append(torch.log10(torch.abs(val) + 1e-10) / 4.0)
+            obs_rows.append(torch.stack(obs_b))          # (B,)
+        log_ly = torch.stack(obs_rows).unsqueeze(-1)     # (L, B, 1) — detached constants
+
+        # Broadcast ctx across L, append observation: (L, B, 13)
+        ctx_expanded = ctx.unsqueeze(0).expand(L, -1, -1)   # (L, B, 12)
+        features_batched = torch.cat([ctx_expanded, log_ly], dim=-1)  # (L, B, 13)
+        return features_batched.reshape(L * B, -1)
+    else:
+        # PATD path: variable number of hits per (l, b) — must loop over (l, b)
+        # but geometry is read from pre-computed ctx rows, not recomputed each time.
+        all_features = []
+        for l in range(L):
+            for b in range(B):
+                raw = cached_obs[l][b]
+                hit_times = raw['hit_times'].float().to(device)
+                if bool(getattr(llr_net, 'rel_time', False)):
+                    t_geom_min = raw.get('t_geom_min', None)
+                    if t_geom_min is not None:
+                        if not isinstance(t_geom_min, torch.Tensor):
+                            t_geom_min = torch.tensor(t_geom_min, device=device, dtype=hit_times.dtype)
+                        else:
+                            t_geom_min = t_geom_min.float().to(device)
+                        hit_times = hit_times - t_geom_min
+                t_scaled = torch.where(
+                    hit_times < 0,
+                    -torch.log10(-hit_times + 1e-4) / 4.0,
+                    torch.log10(hit_times + 1e-4) / 4.0,
+                )  # (N_hits,)
+                # ctx[b] is already computed — just expand and append hit times
+                ctx_rep = ctx[b].unsqueeze(0).expand(t_scaled.shape[0], -1)  # (N_hits, 12)
+                feat = torch.cat([ctx_rep, t_scaled.unsqueeze(1)], dim=1)    # (N_hits, 13)
+                all_features.append(feat)
+        return torch.cat(all_features, dim=0)  # (total_hits, 13)
+
+
+def _fisher_points_all_iters_jvp(
+    pts_3,
+    *,
+    llr_net,
+    surrogate_func,
+    fisher_info_params,
+    event_param_names,
+    fixed_params,
+    theta0_flat,
+    theta_shapes,
+    theta_numels,
+    total_dims,
+    llr_iterations,
+    signal_noise_scale,
+    skip_zero_response,
+    basis_chunk_size,
+    device,
+    detach_fisher_tensors=True,
+    use_rich_features=False,
+    zero_response_threshold=0.5,
+):
+    # Rich-feature path: can never cache responses (surrogate dict structure differs).
+    can_cache_responses = (
+        not bool(getattr(llr_net, 'use_patd', False))
+        and not use_rich_features
+    )
+
+    if can_cache_responses:
+        params0 = _unflatten_theta(
+            theta0_flat,
+            fisher_info_params=fisher_info_params,
+            theta_shapes=theta_shapes,
+            theta_numels=theta_numels,
+            fixed_params=fixed_params,
+        )
+        cached_responses, cached_ly_true = _sample_detector_responses_batched(
+            pts_3,
+            surrogate_func=surrogate_func,
+            params_for_sampling=params0,
+            llr_iterations=llr_iterations,
+            signal_noise_scale=signal_noise_scale,
+            llr_net=llr_net,
+            device=device,
+        )
+        if detach_fisher_tensors:
+            cached_responses = cached_responses.detach()
+        cached_ly_true = cached_ly_true.detach()
+
+        def _theta_only_fn(theta_flat):
+            B = pts_3.shape[0]
+            features = _build_features_from_cached_responses(
+                pts_3,
+                theta_flat=theta_flat,
+                cached_responses_processed=cached_responses,
+                llr_net=llr_net,
+                fisher_info_params=fisher_info_params,
+                event_param_names=event_param_names,
+                theta_shapes=theta_shapes,
+                theta_numels=theta_numels,
+                fixed_params=fixed_params,
+                device=device,
+            )
+            llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(llr_iterations, B)
+            if skip_zero_response:
+                llr_out = llr_out * _llr_mask_from_true_ly(cached_ly_true, threshold=zero_response_threshold)
+            return llr_out.transpose(0, 1).contiguous()  # (B, L)
+    elif use_rich_features:
+        params0 = _unflatten_theta(
+            theta0_flat,
+            fisher_info_params=fisher_info_params,
+            theta_shapes=theta_shapes,
+            theta_numels=theta_numels,
+            fixed_params=fixed_params,
+        )
+
+        cached_obs, cached_ly_true = _sample_rich_observations(
+            pts_3,
+            surrogate_func=surrogate_func,
+            params_for_sampling=params0,
+            llr_iterations=llr_iterations,
+            llr_net=llr_net,
+            device=device,
+        )
+        cached_ly_true = cached_ly_true.detach()
+
+        B = pts_3.shape[0]
+        L = llr_iterations
+        norm_const = llr_net._pos_norm_divisor()
+        det_const = (pts_3.float().to(device) / norm_const).detach()
+
+        # cached_ly_true is already (L, B) — use it directly, no Python loop needed.
+        log_ly_const = (torch.log10(cached_ly_true.abs() + 1e-10) / 4.0).unsqueeze(-1).detach()  # (L, B, 1)
+
+        def _theta_only_fn(theta_flat):
+            params = _unflatten_theta(
+                theta_flat,
+                fisher_info_params=fisher_info_params,
+                theta_shapes=theta_shapes,
+                theta_numels=theta_numels,
+                fixed_params=fixed_params,
+            )
+            vert = params['position'].float().to(device).reshape(1, 3) / norm_const
+            direction = params['direction'].float().to(device).reshape(1, 3)
+            dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+            energy = params['energy'].float().to(device).squeeze()
+            log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
+
+            rel = det_const - vert
+            vert_dist = torch.norm(rel, dim=-1, keepdim=True)
+            cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
+                dir_norm * vert_dist.clamp(min=1e-8))
+
+            ctx_parts = [
+                det_const,
+                vert.expand(B, -1),
+                direction.expand(B, -1),
+                log_energy,
+            ]
+            if bool(getattr(llr_net, 'add_vertex_distance', True)):
+                ctx_parts.append(vert_dist)
+            ctx_parts.append(cos_angle)
+            if bool(getattr(llr_net, 'add_distance_from_beam', False)):
+                vert_unnorm = vert * norm_const
+                _, dist_perp = llr_net.compute_distance_from_beam(pts_3, vert_unnorm.expand(B, -1), direction.expand(B, -1))
+                ds = llr_net.domain_size
+                half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
+                ctx_parts.append(dist_perp / half)
+            ctx = torch.cat(ctx_parts, dim=-1)
+
+            ctx_exp = ctx.unsqueeze(0).expand(L, -1, -1)
+            features = torch.cat([ctx_exp, log_ly_const], dim=-1)
+            features = features.reshape(L * B, -1)
+
+            llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(L, B)
+            if skip_zero_response:
+                llr_out = llr_out * _llr_mask_from_true_ly(cached_ly_true, threshold=zero_response_threshold)
+            return llr_out.transpose(0, 1).contiguous()
+    else:
+        # PATD path (non-rich): call surrogate inside the trace (no caching possible).
+        def _theta_only_fn(theta_flat):
+            params = _unflatten_theta(
+                theta_flat,
+                fisher_info_params=fisher_info_params,
+                theta_shapes=theta_shapes,
+                theta_numels=theta_numels,
+                fixed_params=fixed_params,
+            )
+            B = pts_3.shape[0]
+            features, ly = llr_net.prepare_data_from_raw(
+                pts_3,
+                params,
+                surrogate_func,
+                noise_scale=signal_noise_scale,
+                output_true_light_yield=True,
+                event_labels=fisher_info_params if event_param_names is None else event_param_names,
+                num_samples=llr_iterations,
+            )
+            ly = ly.reshape(llr_iterations, B)
+            llr_out = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5).reshape(llr_iterations, B)
+            if skip_zero_response:
+                llr_out = llr_out * _llr_mask_from_true_ly(ly, threshold=zero_response_threshold)
+            return llr_out.transpose(0, 1).contiguous()
+
+    y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
+    del y0
+
+    cols_parts = []
+    for d_start in range(0, total_dims, basis_chunk_size):
+        d_end = min(d_start + basis_chunk_size, total_dims)
+        k = d_end - d_start
+
+        basis_chunk = torch.zeros(k, total_dims, device=device, dtype=theta0_flat.dtype)
+        rows = torch.arange(k, device=device)
+        cols_idx = torch.arange(d_start, d_end, device=device)
+        basis_chunk[rows, cols_idx] = 1
+
+        cols_chunk = vmap(jvp_fn, randomness='same')(basis_chunk)  # (k, B, L)
+        cols_parts.append(cols_chunk)
+        del basis_chunk, cols_chunk
+
+    cols = torch.cat(cols_parts, dim=0)
+    del cols_parts
+    J = cols.permute(1, 2, 0).contiguous()  # (B, L, D)
+    del cols
+    F = torch.einsum('bld,ble->bde', J, J) / llr_iterations
+    del J
+
+    if can_cache_responses:
+        del cached_responses, cached_ly_true
+    del jvp_fn
+    return F.detach() if detach_fisher_tensors else F
+
+
+def _fisher_points_patd_quadrature(
+    pts_3,
+    *,
+    llr_net,
+    surrogate_func,
+    fisher_info_params,
+    fixed_params,
+    theta0_flat,
+    theta_shapes,
+    theta_numels,
+    total_dims,
+    n_quadrature,
+    t_offset_ns,
+    t_max_ns,
+    llr_autodiff_mode,
+    jacrev_chunk_size,
+    grad_chunk_size,
+    device,
+    detach_fisher_tensors=True,
+    eval_patd_log_probs=None,
+    skip_zero_response=True,
+    zero_response_threshold=0.5,
+    adaptive_grid_retry=True,
+    adaptive_t_max_floor_ns=10.0,
+    uninformative_fisher_value=1e-6,
+):
+    """
+    Quadrature-based Fisher information over a log-spaced time grid.
+
+    Two modes controlled by whether llr_net is provided:
+    - llr_net mode: self-normalised ratio p̃ = exp(LLR) / Z; score has zero mean.
+    - eval_patd_log_probs mode (llr_net=None): normalised PDF supplied directly;
+      no Z step needed. eval_patd_log_probs(t_residuals, opt_point, params) -> (N,) log-prob.
+
+    Adaptive grid retry (adaptive_grid_retry=True): after computing the per-point
+    Fisher, any point whose matrix is all-zero / NaN / Inf is recomputed with its
+    grid upper bound shrunk by one decade at a time (t_max -> t_max/10) down to
+    adaptive_t_max_floor_ns. Points still bad at the floor are assigned a tiny
+    isotropic Fisher (uninformative_fisher_value * I) — finite and extremely
+    uninformative, but not exactly zero (so downstream inverses stay well-posed).
+    """
+    B = pts_3.shape[0]
+    pts_3 = pts_3.float().to(device)
+
+    if llr_net is None and eval_patd_log_probs is None:
+        raise ValueError(
+            "_fisher_points_patd_quadrature: llr_net or eval_patd_log_probs must be provided."
+        )
+
+    params0 = _unflatten_theta(
+        theta0_flat,
+        fisher_info_params=fisher_info_params,
+        theta_shapes=theta_shapes,
+        theta_numels=theta_numels,
+        fixed_params=fixed_params,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Phase 1: pre-compute everything that does NOT depend on θ           #
+    # ------------------------------------------------------------------ #
+    if llr_net is not None:
+        norm_const = llr_net._pos_norm_divisor()
+        det_const = (pts_3 / norm_const).detach()  # (B, 3)
+    else:
+        norm_const = None
+        det_const = None
+
+    # Call surrogate once per point to get t_geom_min and λ
+    t_geom_min_per_pt = torch.zeros(B, device=device)
+    lambda_per_pt = torch.zeros(B, device=device)
+
+    with torch.no_grad():
+        # Try batched call first
+        try:
+            raw_batch = surrogate_func(opt_point=pts_3, event_params=params0)
+            if isinstance(raw_batch, (list, tuple)) and len(raw_batch) == B:
+                for b, r in enumerate(raw_batch):
+                    if isinstance(r, dict):
+                        tgm = r.get('t_geom_min', torch.tensor(0.0))
+                        tgm = tgm.float().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
+                        t_geom_min_per_pt[b] = tgm
+                        n = r.get('expected_photons', r.get('num_photons', 0))
+                        lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                    else:
+                        t_geom_min_per_pt[b] = 0.0
+                        lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
+            elif isinstance(raw_batch, dict):
+                raise TypeError  # dict means single-point; fall through to loop
+            elif isinstance(raw_batch, torch.Tensor):
+                # scalar surrogate: no t_geom_min available, default to 0
+                lambda_per_pt = raw_batch.detach().float().reshape(-1)[:B]
+            else:
+                raise TypeError
+        except Exception:
+            for b in range(B):
+                r = surrogate_func(opt_point=pts_3[b], event_params=params0)
+                if isinstance(r, dict):
+                    tgm = r.get('t_geom_min', torch.tensor(0.0))
+                    tgm = tgm.float().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
+                    t_geom_min_per_pt[b] = tgm
+                    n = r.get('expected_photons', r.get('num_photons', 0))
+                    lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                else:
+                    ly = r.item() if isinstance(r, torch.Tensor) else float(r)
+                    lambda_per_pt[b] = ly
+
+    # Skip detectors with negligible expected photon count — saves Jacobian cost
+    # and matches the behaviour of skip_zero_response in the LLR-net paths.
+    if skip_zero_response:
+        active_mask = lambda_per_pt >= zero_response_threshold   # (B,) bool
+        if not active_mask.any():
+            return torch.zeros(B, total_dims, total_dims, device=device)
+    else:
+        active_mask = torch.ones(B, dtype=torch.bool, device=device)
+
+    # Restrict computation to active points only — skip the Jacobian for detectors
+    # below the zero-response threshold.  Results are scattered back at the end.
+    active_idx = active_mask.nonzero(as_tuple=True)[0]  # indices into [0, B)
+    Ba = active_idx.shape[0]                             # number of active points
+    pts_3 = pts_3[active_idx]
+    t_geom_min_per_pt = t_geom_min_per_pt[active_idx]
+    lambda_per_pt = lambda_per_pt[active_idx]
+    if norm_const is not None:
+        det_const = det_const[active_idx]
+
+    # FIX 3 (grid restriction): when the LLR net was trained with rel_time=True it
+    # only ever saw residual times t_hit - t_geom_min >= 0 (positive branch of the
+    # log-sign scaling). Evaluating the network at residuals < 0 (or ~0) probes a
+    # region with no training data, where it saturates and the likelihood is not
+    # well defined. So when rel_time is active we build the grid directly in
+    # *residual* time over [resid_floor, t_max_for_grid] and add t_geom_min back to
+    # get absolute hit times — guaranteeing every node sits in the trained domain.
+    _rel_time = bool(getattr(llr_net, 'rel_time', False)) if llr_net is not None else False
+    # Smallest residual we evaluate at. The training scaling uses log10(t + 1e-4),
+    # so residuals below ~1e-4 ns are numerically indistinguishable; floor at 1e-3.
+    resid_floor = 1e-3
+    basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims
+
+    # ------------------------------------------------------------------ #
+    # Per-subset Fisher: build the log-spaced grid over [resid_floor or       #
+    # t_start, t_max_for_grid], differentiate the (self-)normalised log-PDF,  #
+    # and assemble F = (λ ×) Σ_n w_n J_n J_n^T for the requested subset of    #
+    # active points. Returns (len(sub_idx), D, D). Wrapped so the adaptive     #
+    # retry loop can recompute only the problematic points with a tighter grid.#
+    # ------------------------------------------------------------------ #
+    def _fisher_for_subset(sub_idx, t_max_for_grid):
+        Bs = int(sub_idx.shape[0])
+        pts_s = pts_3[sub_idx]                              # (Bs, 3)
+        tgm_s = t_geom_min_per_pt[sub_idx]                  # (Bs,)
+        lam_s = lambda_per_pt[sub_idx]                      # (Bs,)
+        det_s = det_const[sub_idx] if norm_const is not None else None
+        alpha = torch.linspace(0.0, 1.0, n_quadrature, device=device)  # (N,)
+
+        if _rel_time and llr_net is not None:
+            r_start = torch.full((Bs,), resid_floor, device=device)
+            r_end = torch.full((Bs,), float(t_max_for_grid), device=device)
+            log_r_start = torch.log10(r_start)
+            log_r_end = torch.log10(r_end)
+            log_r_grid = log_r_start.unsqueeze(1) + alpha.unsqueeze(0) * (
+                log_r_end - log_r_start).unsqueeze(1)
+            resid_grid = torch.pow(10.0, log_r_grid)
+            t_grid = resid_grid + tgm_s.unsqueeze(1)
+            delta_log_t = (log_r_end - log_r_start) / max(n_quadrature - 1, 1)
+            dt_grid = resid_grid * (math.log(10.0) * delta_log_t.unsqueeze(1))
+        else:
+            t_start = (tgm_s - t_offset_ns).clamp(min=1.0)
+            t_end = torch.full((Bs,), float(t_max_for_grid), device=device)
+            # Guard: with a shrunken t_max_for_grid the upper edge may fall below
+            # t_start; ensure a strictly increasing grid.
+            t_end = torch.maximum(t_end, t_start * 1.0001)
+            log_t_start = torch.log10(t_start)
+            log_t_end = torch.log10(t_end)
+            log_t_grid = log_t_start.unsqueeze(1) + alpha.unsqueeze(0) * (
+                log_t_end - log_t_start).unsqueeze(1)
+            t_grid = torch.pow(10.0, log_t_grid)
+            delta_log_t = (log_t_end - log_t_start) / max(n_quadrature - 1, 1)
+            dt_grid = t_grid * (math.log(10.0) * delta_log_t.unsqueeze(1))
+
+        dt_grid_detached = dt_grid.detach()
+        B = Bs
+
+        # ----- Phase 2: θ-dependent (self-)normalised log-density --------
+
+        if llr_net is not None:
+            # LLR-net path: self-normalised ratio. rel_time grid already lives in
+            # residual time, so t_for_scaling = t_grid - t_geom_min recovers it.
+            t_for_scaling = t_grid - tgm_s.unsqueeze(1) if _rel_time else t_grid
+            t_scaled = torch.where(
+                t_for_scaling < 0,
+                -torch.log10(-t_for_scaling + 1e-4) / 4.0,
+                torch.log10(t_for_scaling + 1e-4) / 4.0,
+            )  # (B, N)
+            t_scaled_flat = t_scaled.reshape(B * n_quadrature, 1).detach()
+
+            def _theta_only_fn(theta_flat):
+                params = _unflatten_theta(
+                    theta_flat,
+                    fisher_info_params=fisher_info_params,
+                    theta_shapes=theta_shapes,
+                    theta_numels=theta_numels,
+                    fixed_params=fixed_params,
+                )
+                vert = params['position'].float().to(device).reshape(1, 3) / norm_const
+                direction = params['direction'].float().to(device).reshape(1, 3)
+                dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+                energy = params['energy'].float().to(device).squeeze()
+                log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
+
+                rel = det_s - vert
+                vert_dist = torch.norm(rel, dim=-1, keepdim=True)
+                cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
+                    dir_norm * vert_dist.clamp(min=1e-8))
+
+                ctx_parts = [det_s, vert.expand(B, -1), direction.expand(B, -1), log_energy]
+                if bool(getattr(llr_net, 'add_vertex_distance', True)):
+                    ctx_parts.append(vert_dist)
+                ctx_parts.append(cos_angle)
+                if bool(getattr(llr_net, 'add_distance_from_beam', False)):
+                    vert_unnorm = vert * norm_const
+                    _, dist_perp = llr_net.compute_distance_from_beam(
+                        pts_s, vert_unnorm.expand(B, -1), direction.expand(B, -1))
+                    ds = llr_net.domain_size
+                    half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
+                    ctx_parts.append(dist_perp / half)
+                ctx = torch.cat(ctx_parts, dim=-1)
+
+                ctx_rep = ctx.unsqueeze(1).expand(B, n_quadrature, -1).reshape(B * n_quadrature, -1)
+                features = torch.cat([ctx_rep, t_scaled_flat], dim=-1)
+                llr_vals = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-10)
+                # Return the RAW (un-normalised) log-ratio log r(t|θ). The score of
+                # the normalised density is  ∂_θ log p̃ = ∂_θ log r - ∂_θ log Z, and
+                # ∂_θ log Z = Σ_n w_n ∂_θ log r_n is just the weighted-mean score.
+                # The Fisher F = Σ_n w_n (∂log p̃)(∂log p̃)^T is therefore the
+                # weight-covariance of ∂log r, which Phase 4 forms explicitly via the
+                # mean-subtraction below — so we do NOT need to differentiate through
+                # log Z (the logsumexp) here. Dropping it shrinks the autodiff graph.
+                return llr_vals.reshape(B, n_quadrature)  # (B, N) raw log r
+
+            def _get_p_weights(theta_flat):
+                # Quadrature weights w_n = p̃(t_n) dt_n, computed once, no-grad.
+                # logsumexp with per-row max keeps Z finite even if the net saturates.
+                with torch.no_grad():
+                    log_r = _theta_only_fn(theta_flat)   # (B, N) raw log r
+                    m = log_r.max(dim=1, keepdim=True).values
+                    w = torch.exp(log_r - m) * dt_grid_detached
+                    Z = w.sum(dim=1, keepdim=True).clamp(min=1e-30)
+                    return (w / Z).detach()  # (B, N)
+
+        else:
+            # Analytic-PDF path: eval_patd_log_probs is normalised, no Z step needed.
+            t_residual_grid = (t_grid - tgm_s.unsqueeze(1)).detach()           # (B, N)
+            t_residual_flat = t_residual_grid.reshape(B * n_quadrature)        # (B*N,)
+
+            def _theta_only_fn(theta_flat):
+                params = _unflatten_theta(
+                    theta_flat,
+                    fisher_info_params=fisher_info_params,
+                    theta_shapes=theta_shapes,
+                    theta_numels=theta_numels,
+                    fixed_params=fixed_params,
+                )
+                log_p_rows = []
+                for b in range(B):
+                    t_b = t_residual_flat[b * n_quadrature:(b + 1) * n_quadrature]
+                    log_p_b = eval_patd_log_probs(t_b, pts_s[b], params)
+                    log_p_rows.append(log_p_b)
+                return torch.stack(log_p_rows, dim=0)  # (B, N)
+
+            def _get_p_weights(theta_flat):
+                with torch.no_grad():
+                    log_p = _theta_only_fn(theta_flat)            # (B, N)
+                    p = torch.exp(log_p)
+                    w = p * dt_grid_detached
+                    Z = w.sum(dim=1, keepdim=True).clamp(min=1e-20)
+                    return (w / Z).detach()
+
+        # ----- Phase 3: Jacobian ∂ log p(t_n|θ) / ∂θ ---------------------
+        if llr_autodiff_mode == 'jacrev':
+            J_raw = jacrev(_theta_only_fn, chunk_size=jacrev_chunk_size)(theta0_flat)
+            J = J_raw.reshape(B, n_quadrature, total_dims)
+            del J_raw
+        elif llr_net is not None:
+            y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
+            del y0
+            cols_parts = []
+            for d_start in range(0, total_dims, basis_chunk_size):
+                d_end = min(d_start + basis_chunk_size, total_dims)
+                k = d_end - d_start
+                bvecs = torch.zeros(k, total_dims, device=device, dtype=theta0_flat.dtype)
+                bvecs[torch.arange(k, device=device), torch.arange(d_start, d_end, device=device)] = 1
+                cols_parts.append(vmap(jvp_fn, randomness='same')(bvecs))  # (k, B, N)
+            del jvp_fn
+            cols = torch.cat(cols_parts, dim=0)   # (D, B, N)
+            J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
+            del cols, cols_parts
+        else:
+            cols_parts = []
+            for d_start in range(0, total_dims, basis_chunk_size):
+                d_end = min(d_start + basis_chunk_size, total_dims)
+                chunk_cols = []
+                for d in range(d_start, d_end):
+                    v = torch.zeros(total_dims, device=device, dtype=theta0_flat.dtype)
+                    v[d] = 1.0
+                    _, col = func_jvp(_theta_only_fn, (theta0_flat,), (v,))  # (B, N)
+                    chunk_cols.append(col)
+                cols_parts.append(torch.stack(chunk_cols, dim=0))  # (k, B, N)
+            cols = torch.cat(cols_parts, dim=0)   # (D, B, N)
+            J = cols.permute(1, 2, 0).contiguous()  # (B, N, D)
+            del cols, cols_parts
+
+        # ----- Phase 4: weighted Fisher = λ × weight-covariance of the score.
+        # J holds the RAW score s_n = ∂_θ log r(t_n|θ) (LLR-net path) or the score
+        # of the normalised pdf (analytic path). For the LLR-net path the Fisher of
+        # the normalised density is the covariance of s under the weights w_n:
+        #     F = Σ_n w_n s_n s_n^T - s̄ s̄^T ,   s̄ = Σ_n w_n s_n.
+        # The mean-subtraction (-s̄ s̄^T) is exactly the contribution of ∂_θ log Z,
+        # recovered here without differentiating through Z. The analytic-PDF path
+        # already differentiates a normalised pdf, so its mean score is ~0 on the
+        # grid and the subtraction is a (harmless) higher-order correction.
+        p_weights = _get_p_weights(theta0_flat)  # (Bs, N)
+        weighted_J = J * p_weights.unsqueeze(-1)                       # (Bs, N, D)
+        F_sub = torch.einsum('bnd,bne->bde', weighted_J, J)           # Σ w s s^T
+        s_bar = weighted_J.sum(dim=1)                                 # (Bs, D) = Σ w s
+        F_sub = F_sub - torch.einsum('bd,be->bde', s_bar, s_bar)     # centred covariance
+        del J, weighted_J, s_bar
+        F_sub = F_sub * lam_s.view(Bs, 1, 1)
+        return F_sub
+
+    # ------------------------------------------------------------------ #
+    # Adaptive grid retry: compute Fisher for all active points, then for #
+    # any point whose matrix is all-zero / NaN / Inf, shrink its grid     #
+    # upper bound by one decade and recompute, down to a floor. Points    #
+    # still bad at the floor get a tiny isotropic Fisher (uninformative   #
+    # but finite & non-zero, so downstream inverses stay well-posed).     #
+    # ------------------------------------------------------------------ #
+    def _bad_rows(F):
+        # F: (n, D, D). Bad = non-finite anywhere, or effectively all-zero.
+        nonfinite = ~torch.isfinite(F).all(dim=(1, 2))                  # (n,)
+        near_zero = F.abs().amax(dim=(1, 2)) <= 0.0                     # exactly zero
+        return nonfinite | near_zero
+
+    F_active = torch.zeros(Ba, total_dims, total_dims, device=device)
+    pending = torch.arange(Ba, device=device)          # active-local indices still to solve
+    t_max_cur = float(t_max_ns)
+
+    while pending.numel() > 0:
+        F_try = _fisher_for_subset(pending, t_max_cur)
+        good = ~_bad_rows(F_try)
+        if good.any():
+            F_active[pending[good]] = F_try[good]
+        pending = pending[~good]
+        # Release this iteration's heavy tensors before the next (tighter-grid)
+        # pass so the per-event memory does not accumulate across retries.
+        del F_try, good
+        _fisher_chunk_cleanup(device)
+        if pending.numel() == 0:
+            break
+        if not adaptive_grid_retry or t_max_cur <= adaptive_t_max_floor_ns:
+            # Give up: assign a tiny isotropic (extremely uninformative) Fisher.
+            eye = torch.eye(total_dims, device=device).unsqueeze(0)
+            F_active[pending] = uninformative_fisher_value * eye
+            del eye
+            break
+        # Shrink the grid by one decade (not below the floor) and retry.
+        t_max_cur = max(t_max_cur / 10.0, adaptive_t_max_floor_ns)
+
+    # Scatter active results back into a full (original B) tensor; inactive
+    # points remain zero (no photons → zero Fisher information).
+    B_orig = active_mask.shape[0]
+    if B_orig == Ba:
+        F_per_point = F_active
+    else:
+        F_per_point = torch.zeros(B_orig, total_dims, total_dims, device=device,
+                                  dtype=F_active.dtype)
+        F_per_point[active_idx] = F_active
+    del F_active
+
+    return F_per_point.detach() if detach_fisher_tensors else F_per_point
+
+
+def _find_llr_charge_peak(eval_llr_on_charges, n_points, *, device,
+                          n_scan=64, charge_floor=1e-3, charge_ceil=1e4):
+    """Locate, per detector, the charge at which the LLR-net likelihood peaks.
+
+    This depends ONLY on the network: it scans a coarse log-spaced charge grid
+    over the full physical range [charge_floor, charge_ceil], evaluates the LLR,
+    and returns the per-detector argmax charge. The surrogate output is not used.
+
+    Fully vectorised: one batched network call over (n_points * n_scan) feature
+    rows, then a per-row argmax.
+
+    Parameters
+    ----------
+    eval_llr_on_charges : callable (c_feat_flat) -> llr_flat
+        Given a (n_points*n_scan, 1) tensor of log10(charge)/4 features, returns
+        the (n_points*n_scan,) LLR values (network evaluated at the fixed θ0
+        context for each detector).
+    n_points : int
+        Number of detectors (batch size B).
+
+    Returns
+    -------
+    c_peak    : (n_points,) charge at the per-detector LLR peak (>0)
+    llr_peak  : (n_points,) the LLR value at that peak (used for zero-response
+                gating when no surrogate is available)
+    """
+    B = n_points
+    log_scan = torch.linspace(math.log10(charge_floor), math.log10(charge_ceil),
+                              n_scan, device=device)                        # (n_scan,)
+    c_scan = torch.pow(10.0, log_scan).unsqueeze(0).expand(B, n_scan)       # (B, n_scan)
+
+    with torch.no_grad():
+        c_feat = (torch.log10(c_scan + 1e-10) / 4.0).reshape(B * n_scan, 1)
+        llr = eval_llr_on_charges(c_feat).reshape(B, n_scan)               # (B, n_scan)
+        llr = torch.nan_to_num(llr, nan=-1e30, posinf=1e30, neginf=-1e30)
+        llr_peak, peak_idx = torch.max(llr, dim=1)                         # (B,), (B,)
+        c_peak = c_scan[torch.arange(B, device=device), peak_idx]          # (B,)
+    return c_peak.detach(), llr_peak.detach()
+
+
+def _charge_quadrature_grid(center_per_pt, n_quadrature, *, device,
+                            poisson_k=1.5, mag_k=0.5, w_min=0.3, w_max=3.0,
+                            charge_floor=1e-3, charge_ceil=1e4):
+    """Build a per-detector log-spaced charge grid centred on ``center_per_pt``.
+
+    ``center_per_pt`` is the per-detector charge the grid is centred on — either
+    the surrogate mean λ, or (when the LLR-net peak search is enabled) the charge
+    at which the network likelihood peaks.
+
+    The half-width (in decades) adapts to the *order of magnitude* of the centre
+    charge on two complementary axes:
+
+      1. Magnitude term (mag_k): a slab whose width grows with how many decades the
+         centre sits above the floor — log10(c / charge_floor). This makes the
+         window scale with the order of magnitude of the charge, so a centre near
+         1000 gets a proportionally wider absolute window than one near 0.1.
+      2. Poisson term (poisson_k): the statistical relative spread of a Poisson(c),
+         std √c → ≈ 0.4343/√c decades. This dominates at small c where the charge
+         PDF is broad / quasi-discrete and vanishes for large c.
+
+    The two are combined (max) and clamped to [w_min, w_max]; the lower edge is
+    clamped to charge_floor and the upper edge to charge_ceil so the grid stays
+    physical across the full ~0.01 → 1000s dynamic range.
+
+    Returns
+    -------
+    c_grid   : (B, N) charge values (>0)
+    dc_grid  : (B, N) Riemann widths in linear charge (for ∫ p dc normalisation)
+    """
+    lam = center_per_pt.clamp(min=charge_floor)                   # (B,)
+    log_lam = torch.log10(lam)                                     # (B,)
+    log_floor = math.log10(charge_floor)
+
+    # 1. Order-of-magnitude term: scales with decades above the floor.
+    mag_width = mag_k * (log_lam - log_floor)                      # (B,)
+    # 2. Poisson relative width in decades (0.4342944819 = 1/ln(10)).
+    poisson_width = poisson_k * 0.4342944819 / torch.sqrt(lam)     # (B,)
+
+    width = torch.maximum(mag_width, poisson_width).clamp(min=w_min, max=w_max)  # (B,)
+
+    log_lo = torch.clamp(log_lam - width, min=log_floor)                          # (B,)
+    log_hi = torch.clamp(log_lam + width, max=math.log10(charge_ceil))            # (B,)
+
+    alpha = torch.linspace(0.0, 1.0, n_quadrature, device=device)  # (N,)
+    log_c_grid = log_lo.unsqueeze(1) + alpha.unsqueeze(0) * (log_hi - log_lo).unsqueeze(1)  # (B, N)
+    c_grid = torch.pow(10.0, log_c_grid)                           # (B, N)
+
+    delta_log_c = (log_hi - log_lo) / max(n_quadrature - 1, 1)     # (B,)
+    dc_grid = c_grid * (math.log(10.0) * delta_log_c.unsqueeze(1)) # (B, N) linear widths
+    return c_grid, dc_grid
+
+
+def _fisher_points_charge_quadrature(
+    pts_3,
+    *,
+    llr_net,
+    surrogate_func,
+    fisher_info_params,
+    fixed_params,
+    theta0_flat,
+    theta_shapes,
+    theta_numels,
+    total_dims,
+    n_quadrature,
+    llr_autodiff_mode,
+    jacrev_chunk_size,
+    grad_chunk_size,
+    device,
+    detach_fisher_tensors=True,
+    skip_zero_response=True,
+    zero_response_threshold=0.5,
+    center_on_llr_peak=False,
+    peak_scan_points=64,
+):
+    """Quadrature-based Fisher information over a log-spaced *charge* grid.
+
+    Non-PATD analogue of _fisher_points_patd_quadrature: the observable is the
+    detector charge (light yield) rather than a photon arrival time.  The LLR
+    network gives log(p_sig/p_bg) as a function of the observed charge; we form
+    the self-normalised PDF  p̃(c|θ) = exp(LLR(c,θ)) / Z  and integrate the score
+    over a charge grid.
+
+    Two centring modes:
+    - Default (``center_on_llr_peak=False``): the grid is centred on the surrogate
+      mean λ. Requires ``surrogate_func``; skip_zero_response gates on λ.
+    - ``center_on_llr_peak=True``: the centre is the charge at which the network
+      likelihood peaks (network-only coarse scan). In this mode the surrogate is
+      NOT called at all and may be omitted (None). skip_zero_response then gates
+      on the peak charge against the SAME zero_response_threshold.
+
+    Requires an LLR net (the network defines the charge likelihood).
+    """
+    if llr_net is None:
+        raise ValueError(
+            "_fisher_points_charge_quadrature requires an llr_net (it defines the "
+            "charge likelihood ratio)."
+        )
+    if not center_on_llr_peak and surrogate_func is None:
+        raise ValueError(
+            "_fisher_points_charge_quadrature requires surrogate_func unless "
+            "center_on_llr_peak=True (which centres the grid on the network peak "
+            "and needs no surrogate)."
+        )
+
+    B = pts_3.shape[0]
+    pts_3 = pts_3.float().to(device)
+
+    norm_const = llr_net._pos_norm_divisor()
+    det_const = (pts_3 / norm_const).detach()  # (B, 3)
+
+    basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims
+
+    def _build_ctx(theta_flat):
+        """Per-detector network context (Bc, ctx_dim), excluding the charge slot.
+
+        Reads pts_3 / det_const from the enclosing scope, so it must be (re)bound
+        to the current subset before each call group. Bc is the current row count.
+        """
+        Bc = det_const.shape[0]
+        params = _unflatten_theta(
+            theta_flat,
+            fisher_info_params=fisher_info_params,
+            theta_shapes=theta_shapes,
+            theta_numels=theta_numels,
+            fixed_params=fixed_params,
+        )
+        vert = params['position'].float().to(device).reshape(1, 3) / norm_const
+        direction = params['direction'].float().to(device).reshape(1, 3)
+        dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+        energy = params['energy'].float().to(device).squeeze()
+        log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(Bc, 1)
+
+        rel = det_const - vert
+        vert_dist = torch.norm(rel, dim=-1, keepdim=True)
+        cos_angle = (direction * rel).sum(dim=-1, keepdim=True) / (
+            dir_norm * vert_dist.clamp(min=1e-8))
+
+        ctx_parts = [det_const, vert.expand(Bc, -1), direction.expand(Bc, -1), log_energy]
+        if bool(getattr(llr_net, 'add_vertex_distance', True)):
+            ctx_parts.append(vert_dist)
+        ctx_parts.append(cos_angle)
+        if bool(getattr(llr_net, 'add_distance_from_beam', False)):
+            vert_unnorm = vert * norm_const
+            _, dist_perp = llr_net.compute_distance_from_beam(
+                pts_3, vert_unnorm.expand(Bc, -1), direction.expand(Bc, -1))
+            ds = llr_net.domain_size
+            half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
+            ctx_parts.append(dist_perp / half)
+        return torch.cat(ctx_parts, dim=-1)  # (Bc, ctx_dim)
+
+    def _eval_llr_on_charges(ctx0, c_feat_flat):
+        # ctx0: (Bc, ctx_dim) fixed context; c_feat_flat: (Bc*n_scan, 1).
+        Bc = ctx0.shape[0]
+        n_scan = c_feat_flat.shape[0] // Bc
+        ctx_rep = ctx0.unsqueeze(1).expand(Bc, n_scan, -1).reshape(Bc * n_scan, -1)
+        feats = torch.cat([ctx_rep, c_feat_flat], dim=-1)
+        return llr_net.predict_log_likelihood_ratio(feats, epsilon=1e-10)
+
+    # ------------------------------------------------------------------ #
+    # Phase 1: per-detector grid centre + active mask                    #
+    # ------------------------------------------------------------------ #
+    if center_on_llr_peak:
+        # No surrogate: centre on the network likelihood peak and gate on the
+        # peak charge against zero_response_threshold.
+        ctx0_full = _build_ctx(theta0_flat).detach()  # (B, ctx_dim)
+        c_peak, _ = _find_llr_charge_peak(
+            lambda cf: _eval_llr_on_charges(ctx0_full, cf),
+            B, device=device, n_scan=peak_scan_points)
+        grid_center_full = c_peak  # (B,)
+        gate_value = c_peak        # gate on peak charge, same threshold
+        del ctx0_full
+    else:
+        # Surrogate mean charge λ per detector (no grad).
+        lambda_per_pt = torch.zeros(B, device=device)
+        params0 = _unflatten_theta(
+            theta0_flat,
+            fisher_info_params=fisher_info_params,
+            theta_shapes=theta_shapes,
+            theta_numels=theta_numels,
+            fixed_params=fixed_params,
+        )
+        with torch.no_grad():
+            try:
+                raw = surrogate_func(opt_point=pts_3, event_params=params0)
+                if isinstance(raw, torch.Tensor):
+                    lambda_per_pt = raw.detach().float().reshape(-1)[:B]
+                elif isinstance(raw, (list, tuple)) and len(raw) == B:
+                    for b, r in enumerate(raw):
+                        if isinstance(r, dict):
+                            n = r.get('expected_photons', r.get('num_photons', 0))
+                            lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                        else:
+                            lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
+                else:
+                    raise TypeError
+            except Exception:
+                for b in range(B):
+                    r = surrogate_func(opt_point=pts_3[b], event_params=params0)
+                    if isinstance(r, dict):
+                        n = r.get('expected_photons', r.get('num_photons', 0))
+                        lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
+                    else:
+                        lambda_per_pt[b] = float(r.item()) if isinstance(r, torch.Tensor) else float(r)
+        lambda_per_pt = lambda_per_pt.abs()  # charge magnitude
+        grid_center_full = lambda_per_pt
+        gate_value = lambda_per_pt
+
+    # Skip negligible-response detectors (cost + matches skip_zero_response).
+    if skip_zero_response:
+        active_mask = gate_value >= zero_response_threshold
+        if not active_mask.any():
+            return torch.zeros(B, total_dims, total_dims, device=device)
+    else:
+        active_mask = torch.ones(B, dtype=torch.bool, device=device)
+
+    active_idx = active_mask.nonzero(as_tuple=True)[0]
+    Ba = active_idx.shape[0]
+    pts_3 = pts_3[active_idx]
+    det_const = det_const[active_idx]          # _build_ctx now sees the active subset
+    grid_center = grid_center_full[active_idx]
+
+    # ------------------------------------------------------------------ #
+    # Phase 2: log-spaced charge grid + θ-dependent self-normalised PDF  #
+    # ------------------------------------------------------------------ #
+    B = Ba  # from here on B is the active subset
+
+    c_grid, dc_grid = _charge_quadrature_grid(grid_center, n_quadrature, device=device)  # (B, N)
+    dc_grid_detached = dc_grid.detach()
+
+    # The network consumes log10(charge)/4 in the observation slot, matching the
+    # charge feature layout used elsewhere (see _build_rich_features_from_cached_obs).
+    log_c_feat = (torch.log10(c_grid + 1e-10) / 4.0).reshape(B * n_quadrature, 1).detach()
+
+    def _theta_only_fn(theta_flat):
+        ctx = _build_ctx(theta_flat)
+        ctx_rep = ctx.unsqueeze(1).expand(B, n_quadrature, -1).reshape(B * n_quadrature, -1)
+        features = torch.cat([ctx_rep, log_c_feat], dim=-1)
+        llr_vals = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-10)
+        # Return the RAW (un-normalised) log-ratio log r(c|θ). The score of the
+        # normalised density is ∂_θ log p̃ = ∂_θ log r - ∂_θ log Z, and ∂_θ log Z =
+        # Σ_n w_n ∂_θ log r_n is the weighted-mean score. Phase 4 forms the
+        # weight-covariance Σ_n w_n s_n s_n^T - s̄ s̄^T explicitly, so we do not need
+        # to differentiate through Z (the logsumexp) here.
+        return llr_vals.reshape(B, n_quadrature)  # (B, N) raw log r
+
+    def _get_p_weights(theta_flat):
+        # Quadrature weights w_n = p̃(c_n) dc_n, computed once, no-grad.
+        # Per-row max keeps Z finite even if the network saturates.
+        with torch.no_grad():
+            log_r = _theta_only_fn(theta_flat)   # (B, N) raw log r
+            m = log_r.max(dim=1, keepdim=True).values
+            w = torch.exp(log_r - m) * dc_grid_detached
+            Z = w.sum(dim=1, keepdim=True).clamp(min=1e-30)
+            return (w / Z).detach()  # (B, N)
+
+    # ------------------------------------------------------------------ #
+    # Phase 3: Jacobian ∂ log p̃(c_n|θ) / ∂θ                              #
+    # ------------------------------------------------------------------ #
+    if llr_autodiff_mode == 'jacrev':
+        J_raw = jacrev(_theta_only_fn, chunk_size=jacrev_chunk_size)(theta0_flat)
+        J = J_raw.reshape(B, n_quadrature, total_dims)
+        del J_raw
+    else:
+        # LLR-net is deterministic inside the trace: linearize + vmap over basis.
+        y0, jvp_fn = linearize(_theta_only_fn, theta0_flat)
+        del y0
+        cols_parts = []
+        for d_start in range(0, total_dims, basis_chunk_size):
+            d_end = min(d_start + basis_chunk_size, total_dims)
+            k = d_end - d_start
+            bvecs = torch.zeros(k, total_dims, device=device, dtype=theta0_flat.dtype)
+            bvecs[torch.arange(k, device=device), torch.arange(d_start, d_end, device=device)] = 1
+            cols_parts.append(vmap(jvp_fn, randomness='same')(bvecs))  # (k, B, N)
+        del jvp_fn
+        cols = torch.cat(cols_parts, dim=0)        # (D, B, N)
+        J = cols.permute(1, 2, 0).contiguous()     # (B, N, D)
+        del cols, cols_parts
+
+    # ------------------------------------------------------------------ #
+    # Phase 4: weighted Fisher = weight-covariance of the raw score.      #
+    # J holds s_n = ∂_θ log r(c_n|θ). The Fisher of the normalised density #
+    # is  F = Σ_n w_n s_n s_n^T - s̄ s̄^T,  s̄ = Σ_n w_n s_n,  recovering    #
+    # the ∂_θ log Z contribution without differentiating through Z.        #
+    # (No λ multiplier: charge is the observable, so this is the full      #
+    #  charge-distribution Fisher already.)                                #
+    # ------------------------------------------------------------------ #
+    p_weights = _get_p_weights(theta0_flat)  # (Ba, N)
+    weighted_J = J * p_weights.unsqueeze(-1)                       # (Ba, N, D)
+    F_active = torch.einsum('bnd,bne->bde', weighted_J, J)         # Σ w s s^T
+    s_bar = weighted_J.sum(dim=1)                                 # (Ba, D) = Σ w s
+    F_active = F_active - torch.einsum('bd,be->bde', s_bar, s_bar)  # centred covariance
+    del J, weighted_J, s_bar
+
+    B_orig = active_mask.shape[0]
+    if B_orig == B:
+        F_per_point = F_active
+    else:
+        F_per_point = torch.zeros(B_orig, total_dims, total_dims, device=device,
+                                  dtype=F_active.dtype)
+        F_per_point[active_idx] = F_active
+        del F_active
+
+    # Release the per-point grid / feature intermediates before returning so
+    # they are not held alive across the caller's next chunk.
+    del p_weights, c_grid, dc_grid, dc_grid_detached, log_c_feat
+    del det_const, pts_3, grid_center
+
+    return F_per_point.detach() if detach_fisher_tensors else F_per_point
+
+
+def _compute_fisher_llr_over_points(
+    *,
+    point,
+    n_points,
+    total_dims,
+    fisher_info_params,
+    event_params,
+    fixed_params,
+    llr_net,
+    surrogate_func,
+    llr_iterations,
+    signal_noise_scale,
+    skip_zero_response,
+    event_param_names,
+    llr_autodiff_mode,
+    jacrev_chunk_size,
+    grad_chunk_size,
+    point_chunk_size,
+    string_xy,
+    sum_over_points,
+    device,
+    detach_fisher_tensors=True,
+    use_rich_features=False,
+    use_patd_quadrature=False,
+    use_charge_quadrature=False,
+    charge_center_on_llr_peak=False,
+    charge_peak_scan_points=64,
+    t_offset_ns=100.0,
+    t_max_ns=10000.0,
+    eval_patd_log_probs=None,
+    zero_response_threshold=0.5,
+    adaptive_grid_retry=True,
+    adaptive_t_max_floor_ns=10.0,
+    uninformative_fisher_value=1e-6,
+):
+    theta_tuple = tuple(event_params[p].detach().to(device) for p in fisher_info_params)
+    theta_shapes = [event_params[p].detach().to(device).shape for p in fisher_info_params]
+    theta_numels = [int(event_params[p].detach().to(device).numel()) for p in fisher_info_params]
+    theta0_flat = torch.cat([event_params[p].detach().to(device).reshape(-1) for p in fisher_info_params], dim=0)
+    pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
+
+    fisher_sum = None
+    fisher_per_point = None
+    if string_xy is None and sum_over_points:
+        fisher_sum = torch.zeros(total_dims, total_dims, device=device)
+    else:
+        fisher_per_point = torch.zeros(n_points, total_dims, total_dims, device=device)
+
+    llr_autodiff_mode = (llr_autodiff_mode or 'jacrev').lower()
+
+    # ---- charge quadrature path -----------------------------------------
+    if use_charge_quadrature:
+        for p_start in range(0, n_points, pt_chunk):
+            p_end = min(p_start + pt_chunk, n_points)
+            pts = point[p_start:p_end]
+            fisher_chunk = _fisher_points_charge_quadrature(
+                pts,
+                llr_net=llr_net,
+                surrogate_func=surrogate_func,
+                fisher_info_params=fisher_info_params,
+                fixed_params=fixed_params,
+                theta0_flat=theta0_flat,
+                theta_shapes=theta_shapes,
+                theta_numels=theta_numels,
+                total_dims=total_dims,
+                n_quadrature=llr_iterations,
+                llr_autodiff_mode=llr_autodiff_mode,
+                jacrev_chunk_size=jacrev_chunk_size,
+                grad_chunk_size=grad_chunk_size,
+                device=device,
+                detach_fisher_tensors=detach_fisher_tensors,
+                skip_zero_response=skip_zero_response,
+                zero_response_threshold=zero_response_threshold,
+                center_on_llr_peak=charge_center_on_llr_peak,
+                peak_scan_points=charge_peak_scan_points,
+            )
+            if fisher_sum is not None:
+                fisher_sum.add_(fisher_chunk.sum(dim=0))
+            else:
+                fisher_per_point[p_start:p_end] = fisher_chunk
+            del fisher_chunk, pts
+            _fisher_chunk_cleanup(device)
+        return fisher_sum, fisher_per_point
+
+    # ---- PATD quadrature path -------------------------------------------
+    if use_patd_quadrature:
+        basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims
+        for p_start in range(0, n_points, pt_chunk):
+            p_end = min(p_start + pt_chunk, n_points)
+            pts = point[p_start:p_end]
+            fisher_chunk = _fisher_points_patd_quadrature(
+                pts,
+                llr_net=llr_net,
+                surrogate_func=surrogate_func,
+                fisher_info_params=fisher_info_params,
+                fixed_params=fixed_params,
+                theta0_flat=theta0_flat,
+                theta_shapes=theta_shapes,
+                theta_numels=theta_numels,
+                total_dims=total_dims,
+                n_quadrature=llr_iterations,
+                t_offset_ns=t_offset_ns,
+                t_max_ns=t_max_ns,
+                llr_autodiff_mode=llr_autodiff_mode,
+                jacrev_chunk_size=jacrev_chunk_size,
+                grad_chunk_size=grad_chunk_size,
+                device=device,
+                detach_fisher_tensors=detach_fisher_tensors,
+                eval_patd_log_probs=eval_patd_log_probs,
+                skip_zero_response=skip_zero_response,
+                zero_response_threshold=zero_response_threshold,
+                adaptive_grid_retry=adaptive_grid_retry,
+                adaptive_t_max_floor_ns=adaptive_t_max_floor_ns,
+                uninformative_fisher_value=uninformative_fisher_value,
+            )
+            if fisher_sum is not None:
+                fisher_sum.add_(fisher_chunk.sum(dim=0))
+            else:
+                fisher_per_point[p_start:p_end] = fisher_chunk
+            del fisher_chunk, pts
+            _fisher_chunk_cleanup(device)
+        return fisher_sum, fisher_per_point
+    if llr_autodiff_mode == 'jacrev':
+        if use_rich_features:
+            # Pre-sample observations for all points BEFORE the per-point loop so
+            # that _sample_rich_observations (which has Python control flow) never
+            # runs inside vmap.  Each point gets its own list of L cached observations.
+            params0 = {fisher_info_params[i]: theta_tuple[i].detach() for i in range(len(fisher_info_params))}
+            params0.update(fixed_params)
+            all_cached_obs, all_cached_ly = _sample_rich_observations(
+                point,  # all n_points at once
+                surrogate_func=surrogate_func,
+                params_for_sampling=params0,
+                llr_iterations=llr_iterations,
+                llr_net=llr_net,
+                device=device,
+            )
+            # all_cached_obs[l][b] for b in 0..n_points, all_cached_ly: (L, n_points)
+
+            def _one_rich(pt_3, pt_idx):
+                # Extract per-point cache — pure Python indexing, outside jacrev trace.
+                pt_cached_obs = [[all_cached_obs[l][pt_idx]] for l in range(llr_iterations)]
+                pt_cached_ly = all_cached_ly[:, pt_idx].reshape(-1)  # (L,)
+                augmented_fixed = dict(fixed_params)
+                augmented_fixed['_cached_rich_obs'] = pt_cached_obs
+                augmented_fixed['_cached_rich_ly'] = pt_cached_ly
+
+                def _theta_only_fn(*theta_vals):
+                    return _llr_out_single_point_all_iters(
+                        pt_3,
+                        theta_vals=theta_vals,
+                        fisher_info_params=fisher_info_params,
+                        fixed_params=augmented_fixed,
+                        llr_net=llr_net,
+                        surrogate_func=surrogate_func,
+                        llr_iterations=llr_iterations,
+                        signal_noise_scale=signal_noise_scale,
+                        skip_zero_response=skip_zero_response,
+                        event_param_names=event_param_names,
+                        use_rich_features=use_rich_features,
+                    )
+
+                J_tuple = jacrev(
+                    _theta_only_fn,
+                    argnums=tuple(range(len(fisher_info_params))),
+                    chunk_size=jacrev_chunk_size,
+                )(*theta_tuple)
+                J = torch.cat([j.reshape(llr_iterations, -1) for j in J_tuple], dim=1)
+                del J_tuple
+                F = torch.einsum('li,lj->ij', J, J) / llr_iterations
+                del J
+                return F.detach() if detach_fisher_tensors else F
+
+            for p_start in range(0, n_points, pt_chunk):
+                p_end = min(p_start + pt_chunk, n_points)
+                pts = point[p_start:p_end]
+                # Sequential loop — vmap not possible due to Python-indexed cache
+                fisher_chunk = torch.stack(
+                    [_one_rich(pts[i], p_start + i) for i in range(pts.shape[0])], dim=0
+                )
+                if detach_fisher_tensors:
+                    fisher_chunk = fisher_chunk.detach()
+                if fisher_sum is not None:
+                    fisher_sum.add_(fisher_chunk.sum(dim=0))
+                else:
+                    fisher_per_point[p_start:p_end] = fisher_chunk
+                del fisher_chunk, pts
+                _fisher_chunk_cleanup(device)
+        else:
+            def _one(pt_3):
+                return _fisher_one_point_jacrev(
+                    pt_3,
+                    theta_tuple=theta_tuple,
+                    fisher_info_params=fisher_info_params,
+                    fixed_params=fixed_params,
+                    llr_net=llr_net,
+                    surrogate_func=surrogate_func,
+                    llr_iterations=llr_iterations,
+                    signal_noise_scale=signal_noise_scale,
+                    skip_zero_response=skip_zero_response,
+                    event_param_names=event_param_names,
+                    jacrev_chunk_size=jacrev_chunk_size,
+                    detach_fisher_tensors=detach_fisher_tensors,
+                    use_rich_features=False,
+                    zero_response_threshold=zero_response_threshold,
+                )
+
+            for p_start in range(0, n_points, pt_chunk):
+                p_end = min(p_start + pt_chunk, n_points)
+                pts = point[p_start:p_end]
+                try:
+                    fisher_chunk = vmap(_one, randomness='different')(pts)
+                except Exception:
+                    fisher_chunk = torch.stack([_one(pts[i]) for i in range(pts.shape[0])], dim=0)
+                if detach_fisher_tensors:
+                    fisher_chunk = fisher_chunk.detach()
+                if fisher_sum is not None:
+                    fisher_sum.add_(fisher_chunk.sum(dim=0))
+                else:
+                    fisher_per_point[p_start:p_end] = fisher_chunk
+                del fisher_chunk, pts
+                _fisher_chunk_cleanup(device)
+
+        return fisher_sum, fisher_per_point
+
+    if llr_autodiff_mode != 'jvp':
+        raise ValueError(f"Unsupported llr_autodiff_mode={llr_autodiff_mode!r}; expected 'jacrev' or 'jvp'.")
+
+    theta_shapes = [event_params[p].detach().to(device).shape for p in fisher_info_params]
+    theta_numels = [int(event_params[p].detach().to(device).numel()) for p in fisher_info_params]
+    theta0_flat = torch.cat([event_params[p].detach().to(device).reshape(-1) for p in fisher_info_params], dim=0)
+    basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims
+
+    for p_start in range(0, n_points, pt_chunk):
+        p_end = min(p_start + pt_chunk, n_points)
+        pts = point[p_start:p_end]
+        fisher_chunk = _fisher_points_all_iters_jvp(
+            pts,
+            llr_net=llr_net,
+            surrogate_func=surrogate_func,
+            fisher_info_params=fisher_info_params,
+            event_param_names=event_param_names,
+            fixed_params=fixed_params,
+            theta0_flat=theta0_flat,
+            theta_shapes=theta_shapes,
+            theta_numels=theta_numels,
+            total_dims=total_dims,
+            llr_iterations=llr_iterations,
+            signal_noise_scale=signal_noise_scale,
+            skip_zero_response=skip_zero_response,
+            basis_chunk_size=basis_chunk_size,
+            device=device,
+            detach_fisher_tensors=detach_fisher_tensors,
+            use_rich_features=use_rich_features,
+            zero_response_threshold=zero_response_threshold,
+        )
+        if detach_fisher_tensors:
+            fisher_chunk = fisher_chunk.detach()
+        if fisher_sum is not None:
+            fisher_sum.add_(fisher_chunk.sum(dim=0))
+        else:
+            fisher_per_point[p_start:p_end] = fisher_chunk
+
+        del fisher_chunk, pts
+        _fisher_chunk_cleanup(device)
+
+    return fisher_sum, fisher_per_point
+
+def directional_resolution(F3, n):
+    """Calculate angular resolution from Fisher information matrix (PyTorch version).
+    
+    Projects 3D Fisher matrix onto tangent space perpendicular to track direction.
+    
+    Args:
+        F3: Fisher information matrix of shape (3, 3) or (N, 3, 3) for batched computation
+        n: Unit track direction vector of shape (3,) or (N, 3) for batched computation
+        
+    Returns:
+        68% containment angular resolution in radians (scalar or (N,) tensor)
+    """
+    # Check if batched input
+    is_batched = F3.dim() == 3
+    
+    if not is_batched:
+        # Single input case - normalize and compute
+        n = n / torch.norm(n)
+
+        # --- Build tangent basis B (3x2) ---
+        ref = torch.tensor([0.0, 0.0, 1.0], dtype=n.dtype, device=n.device)
+        if abs(torch.dot(n, ref)) > 0.9:
+            ref = torch.tensor([1.0, 0.0, 0.0], dtype=n.dtype, device=n.device)
+        
+        b1 = torch.cross(n, ref)
+        b1 = b1 / torch.norm(b1)
+        b2 = torch.cross(n, b1)
+        b2 = b2 / torch.norm(b2)
+        B = torch.stack([b1, b2], dim=1)  # 3x2
+
+        # --- Project Fisher ---
+        F2 = B.T @ F3 @ B   # 2x2 Fisher in tangent coords
+        # Regularization must be large enough that the inverse() gradient stays
+        # finite when F2 is near-singular (zero-Fisher strings); the gradient of
+        # inverse scales like O(1/eps^2), so 1e-10 -> ~1e20. 1e-6 keeps it bounded
+        # while remaining small relative to physically-informative Fisher values.
+        F2 = F2 + 1e-6 * torch.eye(2, device=F2.device, dtype=F2.dtype)
+
+        # --- Invert to get covariance ---
+        try:
+            Cov2 = torch.inverse(F2)
+        except RuntimeError:
+            Cov2 = torch.pinverse(F2)
+
+        # --- Angular resolution (approx small-angle) ---
+        eigvals = torch.linalg.eigvalsh(Cov2)
+        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
+        # eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
+        sigma_eff = torch.sqrt(torch.mean(eigvals) + 1e-10)  # Add epsilon for numerical stability
+        r68 = 1.515 * sigma_eff
+        
+        return r68
+    
+    else:
+        # Batched computation
+        batch_size = F3.shape[0]
+        device = F3.device
+        dtype = F3.dtype
+        
+        # Normalize direction vectors (N, 3)
+        n = n / torch.norm(n, dim=1, keepdim=True)
+        
+        # --- Build tangent basis B for all directions (N, 3, 2) ---
+        # Reference vector
+        ref = torch.tensor([0.0, 0.0, 1.0], dtype=dtype, device=device).expand(batch_size, 3)
+        
+        # Check which directions are nearly parallel to ref (use different ref for those)
+        dots = torch.abs(torch.sum(n * ref, dim=1))  # (N,)
+        parallel_mask = dots > 0.9
+        ref[parallel_mask] = torch.tensor([1.0, 0.0, 0.0], dtype=dtype, device=device)
+        
+        # First tangent vector
+        b1 = torch.cross(n, ref, dim=1)  # (N, 3)
+        b1 = b1 / torch.norm(b1, dim=1, keepdim=True)
+        
+        # Second tangent vector
+        b2 = torch.cross(n, b1, dim=1)  # (N, 3)
+        b2 = b2 / torch.norm(b2, dim=1, keepdim=True)
+        
+        # Stack to form basis: (N, 3, 2)
+        B = torch.stack([b1, b2], dim=2)
+        
+        # --- Project Fisher matrices: (N, 2, 2) ---
+        # F2 = B.T @ F3 @ B for each batch element
+        F2 = torch.bmm(torch.bmm(B.transpose(1, 2), F3), B)  # (N, 2, 2)
+        
+        # Add regularization. Must be large enough that the inverse() gradient
+        # stays finite when F2 is near-singular (zero-Fisher strings); the gradient
+        # of inverse scales like O(1/eps^2), so 1e-8 -> ~1e16. 1e-6 keeps it bounded
+        # while remaining small relative to physically-informative Fisher values.
+        F2 = F2 + 1e-6 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)
+        
+        # --- Invert to get covariance (N, 2, 2) ---
+        try:
+            Cov2 = torch.inverse(F2)
+        except RuntimeError:
+            # Fall back to loop with pinverse if needed
+            Cov2 = []
+            for i in range(batch_size):
+                try:
+                    Cov2.append(torch.inverse(F2[i]))
+                except:
+                    Cov2.append(torch.pinverse(F2[i]))
+            Cov2 = torch.stack(Cov2)
+        
+        # --- Angular resolution for all events ---
+        try:
+            eigvals = torch.linalg.eigvalsh(Cov2)  # (N, 2)
+        except Exception:
+            # Closed-form 2x2 eigenvalues — always numerically stable
+            tr = Cov2[:, 0, 0] + Cov2[:, 1, 1]
+            det = Cov2[:, 0, 0] * Cov2[:, 1, 1] - Cov2[:, 0, 1] ** 2
+            half_gap = 0.5 * torch.sqrt(tr ** 2 - 4.0 * det)
+            eigvals = torch.stack([0.5 * tr - half_gap, 0.5 * tr + half_gap], dim=1)  # (N, 2)
+        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
+        sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) + 1e-10)  # (N,)
+        r68 = 1.515 * sigma_eff  # (N,)
+
+        return r68
+
+
+def _resolve_lightsabre_instance(surrogate_func):
+    """Recover the surrogate instance exposing call_batched from a bound method.
+
+    The Fisher API is passed the *bound* method (e.g.
+    ``lightsabre_surrogate.light_yield_surrogate``). The event-batched path needs
+    the owning instance so it can call ``call_batched``. Returns the instance or
+    None if it cannot be recovered / does not support batching.
+    """
+    owner = getattr(surrogate_func, '__self__', None)
+    if owner is not None and hasattr(owner, 'call_batched'):
+        return owner
+    if hasattr(surrogate_func, 'call_batched'):
+        return surrogate_func
+    return None
+
+
+def compute_fisher_info_poisson_batched_events(
+    fisher_info_params, points, event_params_list, surrogate_func,
+    string_xy=None, device=None, point_chunk_size=None, grad_chunk_size=None,
+    skip_zero_response=True, zero_response_threshold=0.5,
+    uninformative_fisher_value=1e-6, detach_fisher_tensors=True,
+):
+    """Event-batched Poisson-mean Fisher information via forward-mode JVP.
+
+    This is the event-batched analogue of the surrogate-only (non-LLR) branch of
+    :func:`compute_fisher_info_single_averaged`. Instead of a Python loop over
+    events, it vectorises over the event axis with ``vmap`` and evaluates the
+    LightSabre surrogate through its fully-vectorised ``call_batched`` forward
+    pass, differentiating the Poisson mean λ w.r.t. the requested parameters.
+
+    For each event ``e`` and point ``i`` the per-point Fisher is
+        F_{e,i} = (∂λ_{e,i}/∂θ_e)(∂λ_{e,i}/∂θ_e)^T / λ_{e,i}
+    which is then summed over the points belonging to each string.
+
+    Parameters
+    ----------
+    fisher_info_params : list of str
+        Subset of {'energy', 'direction', 'position'} to differentiate w.r.t.
+    points : torch.Tensor, shape (n_points, 3)
+        Detector points (all events share the same geometry).
+    event_params_list : list of dict
+        One dict per event in the batch. Each must contain 'position', 'energy',
+        and either 'direction' or 'zenith'/'azimuth'.
+    surrogate_func : callable
+        Bound LightSabre surrogate method; its owning instance must expose
+        ``call_batched``.
+    string_xy : list or None
+        If provided, per-point Fishers are reduced to per-string sums.
+    point_chunk_size : int or None
+        Process points in chunks of this size to bound memory (the (E, n_pts, D)
+        Jacobian is the dominant allocation). None processes all points at once.
+    grad_chunk_size : int or None
+        Accepted for API symmetry with the per-event path but unused here: the
+        forward-mode Jacobian over the (small) parameter dimension D is computed
+        in one jacfwd call.
+
+    Returns
+    -------
+    torch.Tensor
+        (n_events, n_strings, D, D) if string_xy is provided, else
+        (n_events, n_points, D, D).
+    """
+    surrogate = _resolve_lightsabre_instance(surrogate_func)
+    if surrogate is None:
+        raise ValueError(
+            "compute_fisher_info_poisson_batched_events requires a surrogate that "
+            "exposes call_batched (e.g. LightSabre). Pass the bound "
+            "light_yield_surrogate method."
+        )
+
+    device = points.device if device is None else torch.device(device)
+    points = points.to(device)
+    n_points = points.shape[0]
+    n_events = len(event_params_list)
+
+    supported = {'energy', 'direction', 'position'}
+    for p in fisher_info_params:
+        if p not in supported:
+            raise ValueError(
+                f"Event-batched Poisson Fisher supports differentiating w.r.t. "
+                f"{sorted(supported)} only; got '{p}'. Use the per-event path for "
+                f"other parameters."
+            )
+
+    def _event_dir(ep):
+        """Return this event's direction as a (3,) tensor (from 'direction' or angles)."""
+        if 'direction' in ep and ep['direction'] is not None:
+            d = ep['direction']
+            if not isinstance(d, torch.Tensor):
+                d = torch.tensor(d, dtype=torch.float32, device=device)
+            return d.to(device).reshape(3)
+        theta = ep['zenith']
+        phi = ep['azimuth']
+        if not isinstance(theta, torch.Tensor):
+            theta = torch.tensor(theta, dtype=torch.float32, device=device)
+        if not isinstance(phi, torch.Tensor):
+            phi = torch.tensor(phi, dtype=torch.float32, device=device)
+        theta = theta.to(device).squeeze()
+        phi = phi.to(device).squeeze()
+        return torch.stack([
+            torch.sin(theta) * torch.cos(phi),
+            torch.sin(theta) * torch.sin(phi),
+            torch.cos(theta),
+        ])
+
+    def _event_scalar(ep, key):
+        v = ep[key]
+        if not isinstance(v, torch.Tensor):
+            v = torch.tensor(v, dtype=torch.float32, device=device)
+        return v.to(device).reshape(())
+
+    def _event_pos(ep):
+        pos = ep['position']
+        if not isinstance(pos, torch.Tensor):
+            pos = torch.tensor(pos, dtype=torch.float32, device=device)
+        return pos.to(device).reshape(3)
+
+    # Per-parameter layout in the flat θ vector (order follows fisher_info_params).
+    # 'energy' -> 1, 'direction' -> 3, 'position' -> 3.
+    param_sizes = {'energy': 1, 'direction': 3, 'position': 3}
+    theta_numels = [param_sizes[p] for p in fisher_info_params]
+    total_dims = int(sum(theta_numels))
+
+    # Stack per-event base values.
+    energies = torch.stack([_event_scalar(ep, 'energy') for ep in event_params_list])  # (E,)
+    dirs = torch.stack([_event_dir(ep) for ep in event_params_list])                    # (E, 3)
+    poss = torch.stack([_event_pos(ep) for ep in event_params_list])                    # (E, 3)
+
+    # Flat θ0 per event: concatenate the differentiated params in order.
+    def _flat_for_event(e):
+        parts = []
+        for p in fisher_info_params:
+            if p == 'energy':
+                parts.append(energies[e].reshape(1))
+            elif p == 'direction':
+                parts.append(dirs[e].reshape(3))
+            else:  # position
+                parts.append(poss[e].reshape(3))
+        return torch.cat(parts, dim=0)
+
+    theta0 = torch.stack([_flat_for_event(e) for e in range(n_events)])  # (E, D)
+
+    pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
+
+    # Output accumulator (per point). String reduction happens after.
+    fisher_per_point = torch.zeros(n_events, n_points, total_dims, total_dims, device=device)
+
+    # Per-event λ(θ_e) over a chunk of points, built from θ_flat + fixed values.
+    def _make_lambda_fn(pts_chunk):
+        def _lambda_e(theta_flat_e, pos_e, dir_e, energy_e):
+            # Rebuild the three call_batched inputs, substituting the
+            # differentiated pieces from theta_flat_e.
+            idx = 0
+            e_val = energy_e
+            d_val = dir_e
+            p_val = pos_e
+            for p in fisher_info_params:
+                if p == 'energy':
+                    e_val = theta_flat_e[idx:idx + 1].reshape(())
+                    idx += 1
+                elif p == 'direction':
+                    d_val = theta_flat_e[idx:idx + 3].reshape(3)
+                    idx += 3
+                else:  # position
+                    p_val = theta_flat_e[idx:idx + 3].reshape(3)
+                    idx += 3
+            # call_batched expects a leading event dim; use size-1 batch.
+            ly = surrogate.call_batched(
+                p_val.reshape(1, 3), d_val.reshape(1, 3),
+                e_val.reshape(1), pts_chunk,
+            )
+            return ly.reshape(-1)  # (n_pts_chunk,)
+        return _lambda_e
+
+    for p_start in range(0, n_points, pt_chunk):
+        p_end = min(p_start + pt_chunk, n_points)
+        pts_chunk = points[p_start:p_end]
+        lambda_fn = _make_lambda_fn(pts_chunk)
+
+        # Forward-mode Jacobian per event: jacfwd gives J (n_pts_chunk, D) and we
+        # evaluate λ separately. Both are vmapped over the event axis, so all
+        # events in the batch run in a single set of GPU kernels.
+        def _J_e(theta_flat_e, pos_e, dir_e, energy_e):
+            return jacfwd(lambda t: lambda_fn(t, pos_e, dir_e, energy_e))(theta_flat_e)
+
+        def _lambda_only_e(theta_flat_e, pos_e, dir_e, energy_e):
+            return lambda_fn(theta_flat_e, pos_e, dir_e, energy_e)
+
+        J = vmap(_J_e)(theta0, poss, dirs, energies)          # (E, n_pts, D)
+        ly = vmap(_lambda_only_e)(theta0, poss, dirs, energies)  # (E, n_pts)
+
+        # Per-point Fisher (Poisson mean): outer(J) / λ. Mirrors the per-event
+        # surrogate-only branch of compute_fisher_info_single_averaged exactly
+        # (λ clamped only), so batched and per-event modes agree numerically.
+        outer = torch.einsum('epi,epj->epij', J, J)  # (E, n_pts, D, D)
+        denom = ly.clamp(min=1e-10).unsqueeze(-1).unsqueeze(-1)
+        outer = outer / denom
+        if skip_zero_response:
+            # Hard-gate negligible-response points. The per-event Poisson branch
+            # does not gate, so leave skip_zero_response=False for exact parity;
+            # gating here matches the non-LLR quadrature convention (>= threshold).
+            mask = (ly >= zero_response_threshold).to(outer.dtype).unsqueeze(-1).unsqueeze(-1)
+            outer = outer * mask
+        fisher_per_point[:, p_start:p_end] = outer.detach() if detach_fisher_tensors else outer
+        del J, ly, outer
+        _fisher_chunk_cleanup(device)
+
+    if string_xy is None:
+        return fisher_per_point  # (E, n_points, D, D)
+
+    # Reduce points -> strings (shared geometry across events).
+    n_strings = len(string_xy)
+    point_to_string = torch.full((n_points,), -1, dtype=torch.long, device=device)
+    for s_idx in range(n_strings):
+        sx, sy = string_xy[s_idx][0], string_xy[s_idx][1]
+        sx = sx.to(device) if isinstance(sx, torch.Tensor) else torch.tensor(sx, device=device)
+        sy = sy.to(device) if isinstance(sy, torch.Tensor) else torch.tensor(sy, device=device)
+        mask = (points[:, 0] == sx) & (points[:, 1] == sy)
+        point_to_string[mask] = s_idx
+
+    fisher_by_string = torch.zeros(n_events, n_strings, total_dims, total_dims, device=device)
+    for s_idx in range(n_strings):
+        string_mask = (point_to_string == s_idx)
+        if string_mask.any():
+            fisher_by_string[:, s_idx] = fisher_per_point[:, string_mask].sum(dim=1)
+        elif uninformative_fisher_value:
+            eye = torch.eye(total_dims, device=device)
+            fisher_by_string[:, s_idx] = uninformative_fisher_value * eye
+    del fisher_per_point
+    _fisher_chunk_cleanup(device)
+    return fisher_by_string  # (E, n_strings, D, D)
+
+
+def compute_fisher_info_single_averaged(
+    fisher_info_params, point, event_params, surrogate_func,
+    llr_iterations=1, llr_net=None, signal_noise_scale=None, add_relative_pos=False,
+    skip_zero_response=True, event_param_names=None, string_xy=None, sum_over_points=True,
+    device=None, grad_chunk_size=None, jacrev_chunk_size=None, point_chunk_size=None,
+    llr_autodiff_mode='jacrev', detach_fisher_tensors=True, use_patd=False,
+    eval_patd_log_probs=None, use_rich_features=False, use_patd_quadrature=False,
+    use_charge_quadrature=False, charge_center_on_llr_peak=False, charge_peak_scan_points=64,
+    t_offset_ns=100.0, t_max_ns=10000.0, zero_response_threshold=0.5,
+    adaptive_grid_retry=True, adaptive_t_max_floor_ns=10.0, uninformative_fisher_value=1e-6,
+):
+    """
+    Compute the Fisher information matrix averaged over multiple LLR iterations.
+    
+    This function computes the LLR multiple times (with noise if specified) and averages
+    the resulting Fisher matrices. More efficient than calling compute_fisher_info_single
+    multiple times as it batches the gradient computation.
+    
+    Parameters:
+    -----------
+    fisher_info_params : list of str
+        List of event parameters to compute Fisher information for.
+    point : torch.Tensor
+        The 3D point(s) to evaluate the Fisher information at. Can be:
+        - Single point: shape (3,)
+        - Multiple points: shape (n_points, 3)
+    event_params : dict
+        Dictionary containing event parameters.
+    surrogate_func : callable
+        Function that computes light yield from event parameters.
+    llr_iterations : int
+        Number of LLR iterations to compute and average over.
+    llr_net : optional
+        Neural network for computing log-likelihood ratios.
+    signal_noise_scale : float or None
+        Scale for adding noise to signal.
+    add_relative_pos : bool
+        Whether to add relative position features.
+    skip_zero_response : bool
+        Whether to skip points with zero response using soft masking.
+    event_param_names : list or None
+        Names of event parameters to use for LLR network.
+    string_xy : list of torch.Tensor or None
+        Optional list of 2D string coordinates [(x1, y1), (x2, y2), ...].
+        If provided, points are grouped by strings and Fisher matrices are summed per string.
+    sum_over_points : bool
+        If True and string_xy is None, sum Fisher matrices over all points.
+        If False, return separate Fisher matrices for each point.
+    device : torch.device, str, or None
+        Device to run on. Defaults to the device of `point`.
+    grad_chunk_size : int or None
+        Chunk size for outer-product accumulation over llr_iterations.
+        Reduce to bound GPU memory. None (default) processes all iterations at once.
+        Note: when llr_autodiff_mode='jvp', this value is instead used as the
+        chunk size over parameter-basis directions (number of JVP directions
+        processed at once). This bounds peak memory when D is large.
+    jacrev_chunk_size : int or None
+        Passed to jacrev's chunk_size. Controls how many Jacobian rows (backward
+        passes) are computed at a time within the single forward graph.
+        chunk_size=1 = one backward at a time (minimum memory, slower);
+        None (default) = all rows simultaneously.
+    llr_autodiff_mode : {'jacrev', 'jvp'}
+        Controls the autodiff strategy in the LLR-network path.
+        - 'jacrev' (default): reverse-mode Jacobian via jacrev (fast when output dim is small).
+        - 'jvp': forward-mode via JVPs. Typically better when parameter dim (D) is small and
+          output dim (L = llr_iterations) is larger.
+    point_chunk_size : int or None
+        Process points in batches of this size. Each batch gets its own jacrev
+        call, so the graph size and basis-vector allocation scale with
+        (point_chunk_size * llr_iterations) rather than (n_points * llr_iterations).
+        This is the primary knob for OOM errors with many points. None (default)
+        processes all points in a single call.
+    detach_fisher_tensors : bool
+        If True (default), detach Fisher tensors during chunk aggregation to save
+        memory and preserve historical behavior. Set False to keep graph
+        connectivity (e.g., gradients wrt geometry points/string_xy).
+    use_patd : bool
+        If True, use the photon arrival time distribution path instead of the
+        Poisson-mean or LLR-network paths. llr_net is ignored when use_patd=True.
+        Requires eval_patd_log_probs to be provided as a callable parameter.
+
+        Fisher info per detector: F_i = mean_charge_i * (1/N) sum_hits (d log p/dtheta)^2
+        where p(t|theta) = CPandel.pdf(t_residual, d=foot_length(theta)).
+        mean_charge_i is the average of num_photons over llr_iterations surrogate calls.
+        N hits are collected by sampling the surrogate until llr_iterations total
+        residual times are accumulated per detector.
+    eval_patd_log_probs : callable or None
+        Function to evaluate log-probability of photon arrival times.
+        Only used when use_patd=True. If use_patd=True and eval_patd_log_probs
+        is None, raises an error.
+
+    Returns:
+    --------
+    torch.Tensor
+        Fisher information matrices with shape depending on parameters:
+        - If string_xy provided: (n_strings, total_dims, total_dims)
+        - If string_xy is None and sum_over_points=True: (total_dims, total_dims)
+        - If string_xy is None and sum_over_points=False: (n_points, total_dims, total_dims)
+        where total_dims is the sum of dimensions of all parameters.
+        Each matrix is averaged over llr_iterations realizations.
+    """
+    if llr_iterations <= 0:
+        llr_iterations = 1
+
+    # ------------------------------------------------------------------ setup
+    # Derive device from point; the explicit `device` argument overrides only if provided.
+    device = point.device if device is None else torch.device(device)
+    if point.dim() == 1:
+        point = point.unsqueeze(0)           # (1, 3)
+    point = point.to(device)
+    n_points = point.shape[0]
+
+    # String → point mapping
+    point_to_string = None
+    n_strings = None
+    if string_xy is not None:
+        n_strings = len(string_xy)
+        point_to_string = torch.zeros(n_points, dtype=torch.long, device=device)
+        for s_idx in range(n_strings):
+            sx = string_xy[s_idx][0].to(device) if isinstance(string_xy[s_idx][0], torch.Tensor) else torch.tensor(string_xy[s_idx][0], device=device)
+            sy = string_xy[s_idx][1].to(device) if isinstance(string_xy[s_idx][1], torch.Tensor) else torch.tensor(string_xy[s_idx][1], device=device)
+            mask = (point[:, 0] == sx) & (point[:, 1] == sy)
+            point_to_string[mask] = s_idx
+
+    # Parameter dimensionality
+    param_dims = []
+    for param_name in fisher_info_params:
+        pv = event_params.get(param_name)
+        param_dims.append(1 if (pv.dim() == 0 or (pv.dim() == 1 and pv.shape[0] == 1)) else pv.numel())
+    total_dims = sum(param_dims)
+
+    # Fixed (non-gradient) params: detached and on the correct device
+    fixed_params = {k: v.detach().to(device) for k, v in event_params.items() if k not in fisher_info_params}
+
+    # -----------------------------------------------------------------------
+    if use_charge_quadrature and llr_net is None:
+        raise ValueError(
+            "use_charge_quadrature=True requires an llr_net (the network defines the "
+            "charge likelihood ratio)."
+        )
+    if use_charge_quadrature and (use_patd or use_patd_quadrature):
+        raise ValueError(
+            "use_charge_quadrature is mutually exclusive with use_patd / use_patd_quadrature."
+        )
+    if (use_charge_quadrature and not charge_center_on_llr_peak
+            and surrogate_func is None):
+        raise ValueError(
+            "use_charge_quadrature with charge_center_on_llr_peak=False requires a "
+            "surrogate_func (to centre the grid on the surrogate mean λ). Either "
+            "supply surrogate_func or set charge_center_on_llr_peak=True."
+        )
+
+    if use_patd_quadrature:
+        # ---- PATD quadrature path (via LLR net, no CPandel needed) ----------
+        # Handled inside _compute_fisher_llr_over_points — falls through to the
+        # llr_net else branch below, which calls _compute_fisher_llr_over_points
+        # with use_patd_quadrature=True. eval_patd_log_probs is not required.
+        pass
+
+    if use_patd and not use_patd_quadrature:
+        # ---- PATD path (CPandel sampling) ----------------------------
+        # Fisher info via photon arrival time distribution:
+        #   F_i = mean_charge_i * (1/N_hits) Σ_hits (∂ log p(t|θ) / ∂θ)^T (∂ log p(t|θ) / ∂θ)
+        # where p(t|θ) = CPandel.pdf(t_residual, d=foot_length(θ)) evaluated
+        # at pre-sampled (fixed) residual times.
+        #
+        # Phase 1 — no-grad sampling:
+        #   charge: call surrogate llr_iterations times, average num_photons per detector
+        #   hits:   keep calling until each detector has >= llr_iterations residual times
+        # Phase 2 — jacrev or jvp over eval_patd_log_probs (CPandel PDF with grad-enabled foot_length)
+
+        if eval_patd_log_probs is None:
+            raise ValueError(
+                "use_patd=True requires eval_patd_log_probs to be provided as a callable parameter."
+            )
+        if not callable(eval_patd_log_probs):
+            raise TypeError(
+                "eval_patd_log_probs must be callable."
+            )
+
+        # If the user accidentally passed the surrogate sampling function
+        # (e.g. LightSabrePATD.light_yield_surrogate) as eval_patd_log_probs,
+        # try to recover the correct log-prob evaluator from the surrogate
+        # instance: `surrogate_instance.eval_patd_log_probs`.
+        if eval_patd_log_probs == surrogate_func:
+            owner = getattr(surrogate_func, '__self__', None)
+            if owner is not None and hasattr(owner, 'eval_patd_log_probs'):
+                eval_patd_log_probs = getattr(owner, 'eval_patd_log_probs')
+            elif hasattr(surrogate_func, 'eval_patd_log_probs'):
+                eval_patd_log_probs = getattr(surrogate_func, 'eval_patd_log_probs')
+            else:
+                raise ValueError(
+                    "The provided eval_patd_log_probs appears to be the surrogate sampling function "
+                    "(which returns PATD dicts). For gradient computation you must provide a callable "
+                    "that evaluates log-probabilities at fixed residual times (for LightSabrePATD this is "
+                    "surrogate_instance.eval_patd_log_probs)."
+                )
+
+        patd_autodiff_mode = (llr_autodiff_mode or 'jacrev').lower()
+        if patd_autodiff_mode not in {'jacrev', 'jvp'}:
+            raise ValueError(
+                f"Unsupported llr_autodiff_mode={llr_autodiff_mode!r} for PATD path; "
+                "expected 'jacrev' or 'jvp'."
+            )
+        
+        # Allow either 'jacrev' or 'jvp' for PATD. The user must ensure the
+        # provided `eval_patd_log_probs` is fully traceable for JVP (no .item()
+        # or other data-dependent numpy/CPU ops). If it is not, jacrev will be
+        # the safe option.
+
+        theta_shapes_patd = [event_params[p].detach().to(device).shape for p in fisher_info_params]
+        theta_numels_patd = [event_params[p].detach().to(device).numel() for p in fisher_info_params]
+        theta0_flat_patd = torch.cat([
+            event_params[p].detach().to(device).reshape(-1) for p in fisher_info_params
+        ])
+        all_params_detached = {k: v.detach().to(device) for k, v in event_params.items()}
+
+        t_residuals_per_pt = [[] for _ in range(n_points)]
+        charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            # Charge: llr_iterations calls
+            # First, check if expected_photons is already in surrogate results
+            charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+            use_expected_photons = False
+            
+            # Do a single initial call to check for expected_photons
+            if n_points == 1:
+                res = surrogate_func(opt_point=point[0], event_params=all_params_detached)
+                if isinstance(res, dict) and 'expected_photons' in res:
+                    charge_sums[0] = float(res['expected_photons'])
+                    use_expected_photons = True
+            else:
+                results = surrogate_func(opt_point=point, event_params=all_params_detached)
+                if isinstance(results, list):
+                    all_have_expected = True
+                    for _i, res in enumerate(results):
+                        if isinstance(res, dict) and 'expected_photons' in res:
+                            charge_sums[_i] = float(res['expected_photons'])
+                        else:
+                            all_have_expected = False
+                    use_expected_photons = all_have_expected
+                elif isinstance(results, torch.Tensor):
+                    charge_sums = results.detach().float().reshape(-1)[:n_points]
+                    use_expected_photons = False
+            
+            # If expected_photons is not available, accumulate over iterations
+            if not use_expected_photons:
+                charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+                for iter_idx in range(llr_iterations):
+                    if n_points == 1:
+                        res = surrogate_func(opt_point=point[0], event_params=all_params_detached)
+                        if isinstance(res, dict):
+                            charge_sums[0] += float(res.get('num_photons', res.get('expected_photons', 0)))
+                        else:
+                            charge_sums[0] += float(res.item() if isinstance(res, torch.Tensor) else float(res))
+                    else:
+                        results = surrogate_func(opt_point=point, event_params=all_params_detached)
+                        if isinstance(results, list):
+                            for _i, res in enumerate(results):
+                                if isinstance(res, dict):
+                                    charge_sums[_i] += float(res.get('num_photons', res.get('expected_photons', 0)))
+                                else:
+                                    charge_sums[_i] += float(res)
+                        elif isinstance(results, torch.Tensor):
+                            charge_sums += results.detach().float().reshape(-1)[:n_points]
+                mean_charges = charge_sums / max(llr_iterations, 1)
+            else:
+                mean_charges = charge_sums  # Use pre-computed expected_photons directly
+
+            # Hits: sample until each detector has >= llr_iterations residual times
+            _max_calls = llr_iterations * 200
+            _call_count = 0
+            while _call_count < _max_calls:
+                if all(
+                    (skip_zero_response and mean_charges[_i] < zero_response_threshold) or
+                    (sum(len(_rt) for _rt in t_residuals_per_pt[_i]) >= llr_iterations)
+                    for _i in range(n_points)
+                ):
+                    break
+                _call_count += 1
+                if n_points == 1:
+                    res = surrogate_func(opt_point=point[0], event_params=all_params_detached)
+                    if isinstance(res, dict):
+                        _rt = res.get('residual_times', None)
+                        if _rt is not None and _rt.numel() > 0:
+                            t_residuals_per_pt[0].append(_rt.detach().cpu())
+                else:
+                    results = surrogate_func(opt_point=point, event_params=all_params_detached)
+                    if isinstance(results, list):
+                        for _i, res in enumerate(results):
+                            _rt = res.get('residual_times', None)
+                            if _rt is not None and _rt.numel() > 0:
+                                t_residuals_per_pt[_i].append(_rt.detach().cpu())
+
+        # Compile and truncate to llr_iterations hits per detector
+        t_residuals_compiled = []
+        for _i in range(n_points):
+            _parts = t_residuals_per_pt[_i]
+            if _parts:
+                _all_rt = torch.cat(_parts, dim=0)[:llr_iterations]
+            else:
+                _all_rt = torch.tensor([], dtype=torch.float32)
+            t_residuals_compiled.append(_all_rt.to(device))
+
+        # Grad phase: per-detector Fisher via jacrev (only mode supported for PATD)
+        # Vectorize across point chunks using vmap to avoid sequential loop
+        fisher_per_point = torch.zeros(n_points, total_dims, total_dims, device=device)
+        
+        # Determine point chunk size for vectorization
+        pt_chunk_patd = point_chunk_size if point_chunk_size is not None else n_points
+        
+        # Helper to process one point given its residual times
+        def _process_point_chunk(pts_chunk, t_residuals_chunk, n_hits_chunk):
+            """
+            Compute Jacobians and Fishers for a chunk of points via jacrev.
+            pts_chunk: (B, 3) or (3,) if B=1
+            t_residuals_chunk: list of (N_i,) tensors, one per point
+            n_hits_chunk: (B,) tensor with hit counts per point
+            Returns: (B, D, D) fisher matrix
+            """
+            B = pts_chunk.shape[0] if pts_chunk.dim() > 1 else 1
+            pts_chunk = pts_chunk.reshape(B, 3) if pts_chunk.dim() == 1 else pts_chunk
+            
+            fishers_chunk = torch.zeros(B, total_dims, total_dims, device=device)
+            
+            for _b in range(B):
+                _t_res = t_residuals_chunk[_b]
+                if _t_res.numel() == 0:
+                    continue
+
+                _n_hits = int(n_hits_chunk[_b].item())
+                _t_fixed = _t_res
+                _pt_fixed = pts_chunk[_b]
+
+                def _patd_log_probs_fn(_theta_flat, _t=_t_fixed, _pt=_pt_fixed):
+                    _params = _unflatten_theta(
+                        _theta_flat, fisher_info_params=fisher_info_params,
+                        theta_shapes=theta_shapes_patd, theta_numels=theta_numels_patd,
+                        fixed_params=fixed_params,
+                    )
+                    return eval_patd_log_probs(
+                        t_residuals_fixed=_t, opt_point=_pt, event_params=_params,
+                    )
+
+                if patd_autodiff_mode == 'jacrev':
+                    # Reverse-mode Jacobian: J is (N_hits, D)
+                    _J = jacrev(_patd_log_probs_fn, chunk_size=jacrev_chunk_size)(theta0_flat_patd)
+                    _J = _J.reshape(_n_hits, total_dims)
+                else:
+                    # Forward-mode via JVPs: linearize then apply basis vectors
+                    _basis_chunk = grad_chunk_size if grad_chunk_size is not None else total_dims
+                    _ly0, _jvp_fn = linearize(_patd_log_probs_fn, theta0_flat_patd)
+                    _cols_parts = []
+                    for _d_start in range(0, total_dims, _basis_chunk):
+                        _d_end = min(_d_start + _basis_chunk, total_dims)
+                        _k = _d_end - _d_start
+                        _bvecs = torch.zeros(_k, total_dims, device=device, dtype=theta0_flat_patd.dtype)
+                        _bvecs[torch.arange(_k, device=device), torch.arange(_d_start, _d_end, device=device)] = 1
+                        _cols_parts.append(vmap(_jvp_fn)(_bvecs))  # (k, N_hits)
+                    _J = torch.cat(_cols_parts, dim=0).permute(1, 0).contiguous()  # (N_hits, D)
+                    del _cols_parts, _jvp_fn, _ly0
+
+                # Compute Fisher: outer product divided by hit count
+                _F = torch.einsum('li,lj->ij', _J, _J) / _n_hits
+                fishers_chunk[_b] = _F.detach() if detach_fisher_tensors else _F
+            
+            return fishers_chunk
+        
+        # Process point chunks
+        for p_start in range(0, n_points, pt_chunk_patd):
+            p_end = min(p_start + pt_chunk_patd, n_points)
+            pts_chunk = point[p_start:p_end]
+            t_res_chunk = t_residuals_compiled[p_start:p_end]
+            n_hits_chunk = torch.tensor([int(t.numel()) for t in t_res_chunk], device=device, dtype=torch.float32)
+            
+            # Process chunk
+            fishers_chunk = _process_point_chunk(pts_chunk, t_res_chunk, n_hits_chunk)
+            fisher_per_point[p_start:p_end] = fishers_chunk
+            _fisher_chunk_cleanup(device)
+        
+        # Scale each detector's Fisher by its mean photon count
+        fisher_per_point = fisher_per_point * mean_charges.view(n_points, 1, 1)
+
+    elif llr_net is None and use_patd_quadrature:
+        # ---- analytic-PDF quadrature path (no LLR net) -----------------------
+        # eval_patd_log_probs supplies the normalised log-pdf; surrogate_func
+        # is still called to obtain t_geom_min and lambda per detector.
+        fisher_sum, fisher_per_point = _compute_fisher_llr_over_points(
+            point=point,
+            n_points=n_points,
+            total_dims=total_dims,
+            fisher_info_params=fisher_info_params,
+            event_params=event_params,
+            fixed_params=fixed_params,
+            llr_net=None,
+            surrogate_func=surrogate_func,
+            llr_iterations=llr_iterations,
+            signal_noise_scale=signal_noise_scale,
+            skip_zero_response=skip_zero_response,
+            event_param_names=event_param_names,
+            llr_autodiff_mode=llr_autodiff_mode,
+            jacrev_chunk_size=jacrev_chunk_size,
+            grad_chunk_size=grad_chunk_size,
+            point_chunk_size=point_chunk_size,
+            string_xy=string_xy,
+            sum_over_points=sum_over_points,
+            device=device,
+            detach_fisher_tensors=detach_fisher_tensors,
+            use_rich_features=False,
+            use_patd_quadrature=True,
+            t_offset_ns=t_offset_ns,
+            t_max_ns=t_max_ns,
+            eval_patd_log_probs=eval_patd_log_probs,
+            zero_response_threshold=zero_response_threshold,
+            adaptive_grid_retry=adaptive_grid_retry,
+            adaptive_t_max_floor_ns=adaptive_t_max_floor_ns,
+            uninformative_fisher_value=uninformative_fisher_value,
+        )
+
+    elif llr_net is None:
+        # ---- surrogate-only path -----------------------------------------------
+        # The surrogate directly returns the Poisson mean λ.
+        # We mirror the LLR-mode principle: build a Jacobian J of the vector output
+        # (one λ per point) w.r.t. the event parameters, then form per-point Fishers.
+        # Note: for a Poisson mean parameterization, Fisher per point is
+        #   F_i = (∂λ_i/∂θ)(∂λ_i/∂θ)^T / λ_i
+
+        llr_autodiff_mode_local = (llr_autodiff_mode or 'jacrev').lower()
+        if llr_autodiff_mode_local not in {'jacrev', 'jvp'}:
+            raise ValueError(
+                f"Unsupported llr_autodiff_mode={llr_autodiff_mode!r} for surrogate-only path; "
+                "expected 'jacrev' or 'jvp'."
+            )
+
+        theta_shapes = [event_params[p].detach().to(device).shape for p in fisher_info_params]
+        theta_numels = [int(event_params[p].detach().to(device).numel()) for p in fisher_info_params]
+        theta0_flat = torch.cat([event_params[p].detach().to(device).reshape(-1) for p in fisher_info_params], dim=0)
+        total_dims_local = int(theta0_flat.numel())
+
+        pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
+        fisher_per_point = torch.zeros(n_points, total_dims_local, total_dims_local, device=device)
+
+        def _surrogate_batched(pts_3, params_dict):
+            """Evaluate surrogate over a point batch; fall back to a point loop."""
+            try:
+                ly_b = surrogate_func(opt_point=pts_3, event_params=params_dict)
+                if not isinstance(ly_b, torch.Tensor):
+                    raise TypeError
+                ly_b = ly_b.reshape(-1)
+                if ly_b.numel() != pts_3.shape[0]:
+                    raise ValueError
+                return ly_b
+            except Exception:
+                ly_list = []
+                for i in range(pts_3.shape[0]):
+                    ly_list.append(surrogate_func(opt_point=pts_3[i], event_params=params_dict))
+                return torch.stack(ly_list).reshape(-1)
+
+        for p_start in range(0, n_points, pt_chunk):
+            p_end = min(p_start + pt_chunk, n_points)
+            pts = point[p_start:p_end]
+            B = pts.shape[0]
+
+            def _theta_only_fn(theta_flat):
+                params = _unflatten_theta(
+                    theta_flat,
+                    fisher_info_params=fisher_info_params,
+                    theta_shapes=theta_shapes,
+                    theta_numels=theta_numels,
+                    fixed_params=fixed_params,
+                )
+                return _surrogate_batched(pts, params)
+
+            if llr_autodiff_mode_local == 'jacrev':
+                # Reverse-mode Jacobian: J is (B, D)
+                J = jacrev(_theta_only_fn, chunk_size=jacrev_chunk_size)(theta0_flat)
+                if not isinstance(J, torch.Tensor):
+                    J = torch.as_tensor(J, device=device)
+                J = J.reshape(B, total_dims_local)
+                if detach_fisher_tensors:
+                    ly_vals = _theta_only_fn(theta0_flat).detach().reshape(-1)
+                else:
+                    ly_vals = _theta_only_fn(theta0_flat).reshape(-1)
+
+            else:
+                # Forward-mode Jacobian via JVPs.
+                # The surrogate may contain Poisson draws which linearize would
+                # capture and vmap would then error on. Hoist a single surrogate
+                # evaluation outside linearize to get the mean λ, then
+                # differentiate a surrogate that reuses those fixed mean values.
+                # For the Fisher information of a Poisson mean, what matters is
+                # ∂λ/∂θ evaluated at θ0, not the stochastic draw — so holding
+                # the Poisson draw fixed is the correct thing to do.
+                with torch.no_grad():
+                    ly_vals_fixed = _surrogate_batched(pts, _unflatten_theta(
+                        theta0_flat,
+                        fisher_info_params=fisher_info_params,
+                        theta_shapes=theta_shapes,
+                        theta_numels=theta_numels,
+                        fixed_params=fixed_params,
+                    )).detach()  # (B,)
+
+                def _theta_only_fn_det(theta_flat):
+                    # Differentiable wrapper that avoids re-calling the stochastic
+                    # surrogate: instead re-evaluates only the mean λ(θ).
+                    # We rely on the surrogate's mean being differentiable w.r.t. θ
+                    # even when the Poisson draw is removed.
+                    params_det = _unflatten_theta(
+                        theta_flat,
+                        fisher_info_params=fisher_info_params,
+                        theta_shapes=theta_shapes,
+                        theta_numels=theta_numels,
+                        fixed_params=fixed_params,
+                    )
+                    return _surrogate_batched(pts, params_det)
+
+                basis_chunk_size = grad_chunk_size if grad_chunk_size is not None else total_dims_local
+                ly_vals = ly_vals_fixed.reshape(-1)
+                _, jvp_fn = linearize(_theta_only_fn_det, theta0_flat)
+
+                cols_parts = []
+                for d_start in range(0, total_dims_local, basis_chunk_size):
+                    d_end = min(d_start + basis_chunk_size, total_dims_local)
+                    k = d_end - d_start
+                    basis_chunk = torch.zeros(k, total_dims_local, device=device, dtype=theta0_flat.dtype)
+                    rows = torch.arange(k, device=device)
+                    cols_idx = torch.arange(d_start, d_end, device=device)
+                    basis_chunk[rows, cols_idx] = 1
+                    cols_chunk = vmap(jvp_fn)(basis_chunk)  # (k, B)
+                    cols_parts.append(cols_chunk)
+
+                cols = torch.cat(cols_parts, dim=0)  # (D, B)
+                J = cols.permute(1, 0).contiguous()  # (B, D)
+                del cols_parts, cols, jvp_fn
+
+            # Per-point Fisher (Poisson mean): outer / lambda
+            outer = torch.bmm(J.unsqueeze(-1), J.unsqueeze(-2))  # (B, D, D)
+            outer = outer / ly_vals.clamp(min=1e-10).view(B, 1, 1)
+            fisher_per_point[p_start:p_end] = outer.detach() if detach_fisher_tensors else outer
+            del J, outer, ly_vals, pts
+
+    else:
+        # ---- LLR-network path -----------------------------------------------
+        # Compute per-point Jacobians (output length = llr_iterations) and vmap
+        # across points. This avoids building a huge Jacobian of size (B*L, D)
+        # from a single (B*L)-vector output.
+
+        # use_rich_features is now stored on the model — read it from there if
+        # not explicitly overridden by the caller (caller default is False).
+        if llr_net is not None and not use_rich_features:
+            use_rich_features = bool(getattr(llr_net, 'use_rich_features', False))
+
+        # Align computation device with llr_net to avoid cross-device errors.
+        llr_device = device
+        if hasattr(llr_net, 'device'):
+            llr_device = llr_net.device
+            if not isinstance(llr_device, torch.device):
+                llr_device = torch.device(llr_device)
+        if llr_device != device:
+            device = llr_device
+            point = point.to(device)
+            fixed_params = {k: v.detach().to(device) for k, v in event_params.items() if k not in fisher_info_params}
+
+        fisher_sum, fisher_per_point = _compute_fisher_llr_over_points(
+            point=point,
+            n_points=n_points,
+            total_dims=total_dims,
+            fisher_info_params=fisher_info_params,
+            event_params=event_params,
+            fixed_params=fixed_params,
+            llr_net=llr_net,
+            surrogate_func=surrogate_func,
+            llr_iterations=llr_iterations,
+            signal_noise_scale=signal_noise_scale,
+            skip_zero_response=skip_zero_response,
+            event_param_names=event_param_names,
+            llr_autodiff_mode=llr_autodiff_mode,
+            jacrev_chunk_size=jacrev_chunk_size,
+            grad_chunk_size=grad_chunk_size,
+            point_chunk_size=point_chunk_size,
+            string_xy=string_xy,
+            sum_over_points=sum_over_points,
+            device=device,
+            detach_fisher_tensors=detach_fisher_tensors,
+            use_rich_features=use_rich_features,
+            use_patd_quadrature=use_patd_quadrature,
+            use_charge_quadrature=use_charge_quadrature,
+            charge_center_on_llr_peak=charge_center_on_llr_peak,
+            charge_peak_scan_points=charge_peak_scan_points,
+            t_offset_ns=t_offset_ns,
+            t_max_ns=t_max_ns,
+            eval_patd_log_probs=eval_patd_log_probs,
+            zero_response_threshold=zero_response_threshold,
+            adaptive_grid_retry=adaptive_grid_retry,
+            adaptive_t_max_floor_ns=adaptive_t_max_floor_ns,
+            uninformative_fisher_value=uninformative_fisher_value,
+        )
+    # ---------------------------------------------- aggregate over points / strings
+    if llr_net is not None and string_xy is None and sum_over_points:
+        return fisher_sum
+    if string_xy is not None:
+        fisher_by_string = torch.zeros(n_strings, total_dims, total_dims, device=device)
+        for s_idx in range(n_strings):
+            string_mask = (point_to_string == s_idx)
+            if string_mask.any():
+                fisher_by_string[s_idx] = fisher_per_point[string_mask].sum(dim=0)
+        return fisher_by_string                          # (n_strings, total_dims, total_dims)
+    elif sum_over_points:
+        return fisher_per_point.sum(dim=0)               # (total_dims, total_dims)
+    else:
+        return fisher_per_point                          # (n_points, total_dims, total_dims)
+
+
+def compute_fisher_info_single(fisher_info_params, point, event_params, surrogate_func, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None):
+    """
+    Compute the Fisher information matrix for a single point and event parameters.
+    
+    Handles both scalar parameters (e.g., energy) and multi-dimensional parameters (e.g., position, direction).
+    
+    Parameters:
+    -----------
+    point : torch.Tensor
+        The 3D point to evaluate the Fisher information at.
+    event_params : dict
+        Dictionary containing event parameters.
+    surrogate_func : callable
+        Function that computes light yield from event parameters.
+    fisher_info_params : list of str
+        List of event parameters to compute Fisher information for.
+        
+    Returns:
+    --------
+    torch.Tensor
+        The Fisher information matrix (total_dims, total_dims) where total_dims is the sum of 
+        dimensions of all parameters in fisher_info_params.
+    """
+    # Determine dimensionality of each parameter and total dimensions
+    param_dims = []
+    param_names_expanded = []
+    for param_name in fisher_info_params:
+        param_value = event_params.get(param_name)
+        if param_value.dim() == 0 or (param_value.dim() == 1 and param_value.shape[0] == 1):
+            # Scalar parameter
+            param_dims.append(1)
+            param_names_expanded.append(param_name)
+        else:
+            # Multi-dimensional parameter (e.g., 3D vector)
+            dim_size = param_value.numel()
+            param_dims.append(dim_size)
+            for i in range(dim_size):
+                param_names_expanded.append(f"{param_name}_{i}")
+    
+    total_dims = sum(param_dims)
+        
+    # Determine device from input point
+    if isinstance(point, torch.Tensor):
+        device = point.device
+    else:
+        device = torch.device('cpu')
+    
+    fisher_matrix = torch.zeros(total_dims, total_dims, device=device)
+    
+    # Ensure parameters require gradients
+    grad_event_params = {}
+    for param_name in fisher_info_params:
+        grad_event_params[param_name] = event_params.get(param_name).clone().detach().requires_grad_(True)
+
+    for param_name in event_params.keys():
+        if param_name not in fisher_info_params:
+            grad_event_params[param_name] = event_params.get(param_name).clone().detach().requires_grad_(False)
+    
+
+    # Compute light yield mean (λ) using the signal surrogate function with gradients
+    if llr_net is None:
+        light_yield_mean = surrogate_func(opt_point=point, event_params=grad_event_params)  # Shape (1,)
+        if signal_noise_scale is not None:
+            light_yield_mean = torch.normal(0, signal_noise_scale)*light_yield_mean + light_yield_mean
+    
+    else:
+        features, ly = llr_net.prepare_data_from_raw(point, grad_event_params, surrogate_func, noise_scale=signal_noise_scale, output_true_light_yield=True, event_labels=fisher_info_params if event_param_names is None else event_param_names)
+        light_yield_mean = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5)
+        
+        # Apply soft masking for zero response points using sigmoid
+        if skip_zero_response:
+            # Sigmoid with scaling factor to smoothly mask out low/zero responses
+            # Factor of 10 gives steep transition around ly=0.5
+            # print(ly.sum())
+            mask = torch.sigmoid((ly-0.001) * 12.0) + 1e-6  # Small offset to avoid exact zero
+           
+ 
+            # Apply mask element-wise if batched, or as scalar if single
+            if light_yield_mean.dim() > 0 and light_yield_mean.shape[0] > 1:
+                # Batched case: multiply each likelihood by its mask
+                light_yield_mean = light_yield_mean * mask
+        
+        # If batched, sum the log likelihoods (equivalent to taking product of likelihoods)
+        if light_yield_mean.dim() > 0 and light_yield_mean.shape[0] > 1:
+            light_yield_mean = light_yield_mean.sum()
+    
+    # Compute gradients for each parameter (handling multi-dimensional parameters)
+    param_gradients = []
+    for param_name in fisher_info_params:
+        if param_name in grad_event_params:
+            param_tensor = grad_event_params[param_name]
+            
+            # Compute gradient ∂λ/∂θ
+            # For summed likelihood, gradient is scalar output
+            param_grad = torch.autograd.grad(
+                outputs=light_yield_mean,
+                inputs=param_tensor,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+                allow_unused=True
+            )[0]
+            
+            # Flatten gradient if multi-dimensional
+            if param_grad is not None:
+                if param_grad.dim() > 0:
+                    param_grad = param_grad.flatten()
+                else:
+                    param_grad = param_grad.unsqueeze(0)
+            else:
+                # If gradient is None, create zero gradient with appropriate size
+                param_size = param_tensor.numel()
+                param_grad = torch.zeros(param_size)
+            
+            param_gradients.append(param_grad)
+
+    # Compute Fisher Information matrix: I(θ_i, θ_j) = E[(∂λ/∂θ_i)(∂λ/∂θ_j)/λ]
+    # Now we need to handle multi-dimensional parameters
+    if len(param_gradients) == len(fisher_info_params):
+        # Flatten all gradients into a single vector
+        all_gradients = torch.cat(param_gradients)  # Shape: (total_dims,)
+        
+        # Compute Fisher matrix using vectorized outer product
+        if llr_net is None:
+            fisher_matrix = torch.outer(all_gradients, all_gradients) / light_yield_mean
+        else:
+            fisher_matrix = torch.outer(all_gradients, all_gradients)
+            
+    return fisher_matrix
+
+
+def compute_fisher_info_strings(fisher_info_params, string_xy, points_3d, event_params, surrogate_func, llr_net=None, signal_noise_scale=None, add_relative_pos=False, skip_zero_response=True, event_param_names=None, device=None):
+    """
+    Compute the Fisher information matrix for each string in the geometry.
+    
+    Processes all detector points at once for efficiency, then groups results by string.
+    This is more efficient than calling compute_fisher_info_single for each point separately.
+    
+    Parameters:
+    -----------
+    fisher_info_params : list of str
+        List of event parameters to compute Fisher information for.
+    string_xy : list of torch.Tensor
+        List of 2D coordinates for each string [(x1, y1), (x2, y2), ...].
+    points_3d : torch.Tensor
+        All 3D points in the geometry, shape (n_points, 3).
+    event_params : dict
+        Dictionary containing event parameters for a single event.
+    surrogate_func : callable
+        Function that computes light yield from event parameters.
+    llr_net : optional
+        Neural network for computing log-likelihood ratios.
+    signal_noise_scale : float or None
+        Scale for adding noise to signal.
+    add_relative_pos : bool
+        Whether to add relative position features.
+    skip_zero_response : bool
+        Whether to skip points with zero response using soft masking.
+    event_param_names : list or None
+        Names of event parameters to use for LLR network.
+    device : torch.device or None
+        Device to use for computations.
+        
+    Returns:
+    --------
+    torch.Tensor
+        Fisher information matrix per string, shape (n_strings, total_dims, total_dims)
+        where total_dims is the sum of dimensions of all parameters in fisher_info_params.
+    """
+    if device is None:
+        device = points_3d.device
+    
+    n_strings = len(string_xy)
+    n_points = points_3d.shape[0]
+    
+    # Determine dimensionality of each parameter
+    param_dims = []
+    param_names_expanded = []
+    for param_name in fisher_info_params:
+        param_value = event_params.get(param_name)
+        if param_value.dim() == 0 or (param_value.dim() == 1 and param_value.shape[0] == 1):
+            param_dims.append(1)
+            param_names_expanded.append(param_name)
+        else:
+            dim_size = param_value.numel()
+            param_dims.append(dim_size)
+            for i in range(dim_size):
+                param_names_expanded.append(f"{param_name}_{i}")
+    
+    total_dims = sum(param_dims)
+    
+    # Initialize output tensor
+    fisher_per_string = torch.zeros(n_strings, total_dims, total_dims, device=device)
+    
+    # Prepare gradient-enabled parameters
+    grad_event_params = {}
+    for param_name in fisher_info_params:
+        grad_event_params[param_name] = event_params.get(param_name).clone().detach().requires_grad_(True)
+    
+    for param_name in event_params.keys():
+        if param_name not in fisher_info_params:
+            grad_event_params[param_name] = event_params.get(param_name).clone().detach().requires_grad_(False)
+    
+    # Compute light yield for all points at once
+    if llr_net is None:
+        # Try batch computation, fall back to loop if surrogate doesn't support it
+        try:
+            light_yield_means = surrogate_func(opt_point=points_3d, event_params=grad_event_params)
+            if signal_noise_scale is not None:
+                noise = torch.normal(0, signal_noise_scale, size=light_yield_means.shape, device=device)
+                light_yield_means = noise * light_yield_means + light_yield_means
+        except:
+            # Fall back to sequential processing if batch not supported
+            light_yield_means = []
+            for point in points_3d:
+                ly = surrogate_func(opt_point=point, event_params=grad_event_params)
+                if signal_noise_scale is not None:
+                    ly = torch.normal(0, signal_noise_scale) * ly + ly
+                light_yield_means.append(ly)
+            light_yield_means = torch.stack(light_yield_means)
+    else:
+        # Use LLR network - process all points at once (batch processing)
+        # Prepare features for all points simultaneously
+        # features_list = []
+        # ly_list = []
+        
+        # Batch prepare data for all points
+        # for point in points_3d:
+        features, ly = llr_net.prepare_data_from_raw(
+            points_3d, grad_event_params, surrogate_func, 
+            noise_scale=signal_noise_scale, 
+            output_true_light_yield=True, 
+            event_labels=fisher_info_params if event_param_names is None else event_param_names
+        )
+            # # Handle PATD case where features might be batched per point
+            # if features.dim() > 1:
+            #     features_list.append(features)
+            #     ly_list.append(ly)
+            # else:
+            #     features_list.append(features.unsqueeze(0))
+            #     ly_list.append(ly.unsqueeze(0) if ly.dim() == 0 else ly)
+        
+        # Stack all features and process through LLR network in one batch
+        # features_batch = torch.cat(features_list, dim=0)
+        # ly_batch = torch.cat(ly_list, dim=0)
+        
+        # Single forward pass through LLR network for all points
+        light_yield_means = llr_net.predict_log_likelihood_ratio(features, epsilon=1e-5)
+        
+        # Apply soft masking for zero response points
+        if skip_zero_response:
+            mask = torch.sigmoid((ly - 0.5) * 12.0) + 1e-6
+            light_yield_means = light_yield_means * mask
+    
+    # Sum light yields for each string using vectorized operations
+    # Create string indices for each point
+    string_indices = torch.zeros(n_points, dtype=torch.long, device=device)
+    for s_idx in range(n_strings):
+        mask = (points_3d[:, 0] == string_xy[s_idx][0]) & (points_3d[:, 1] == string_xy[s_idx][1])
+        string_indices[mask] = s_idx
+    
+    # Use scatter_add for efficient summation by string
+    string_light_yields = torch.zeros(n_strings, device=device)
+    string_light_yields.scatter_add_(0, string_indices, light_yield_means)
+    string_light_yields = [string_light_yields[i] for i in range(n_strings)]
+    
+    # Compute gradients for each string using backward passes
+    param_gradients = []
+    for param_name in fisher_info_params:
+        if param_name in grad_event_params:
+            param_tensor = grad_event_params[param_name]
+            param_size = param_tensor.numel()
+            
+            # Collect gradients for all strings
+            string_grads = []
+            for s_idx in range(n_strings):
+                # Zero out any existing gradients
+                if param_tensor.grad is not None:
+                    param_tensor.grad.zero_()
+                
+                # Backward pass for this string
+                string_light_yields[s_idx].backward(retain_graph=True)
+                
+                # Extract and store gradient
+                if param_tensor.grad is not None:
+                    grad = param_tensor.grad.clone()
+                    # Flatten to 1D
+                    if grad.dim() > 0:
+                        grad = grad.flatten()
+                    else:
+                        grad = grad.unsqueeze(0)
+                else:
+                    grad = torch.zeros(param_size, device=device)
+                
+                string_grads.append(grad)
+            
+            # Stack gradients: (n_strings, param_size)
+            param_grad_batch = torch.stack(string_grads)
+            param_gradients.append(param_grad_batch)  # Shape: (n_strings, param_dim)
+    
+    # Compute Fisher Information matrix for each string using vectorized operations
+    if len(param_gradients) == len(fisher_info_params):
+        # Stack all parameter gradients: (n_strings, total_dims)
+        all_gradients = torch.cat(param_gradients, dim=1)
+        
+        # Vectorized computation of Fisher matrix for all strings at once
+        # Use batched outer product: bmm(grad.unsqueeze(-1), grad.unsqueeze(-2))
+        grad_outer = torch.bmm(
+            all_gradients.unsqueeze(-1),  # (n_strings, total_dims, 1)
+            all_gradients.unsqueeze(-2)   # (n_strings, 1, total_dims)
+        )  # Result: (n_strings, total_dims, total_dims)
+        
+        if llr_net is None:
+            # Divide by string light yields
+            string_ly_tensor = torch.stack([string_light_yields[i] for i in range(n_strings)])
+            fisher_per_string = grad_outer / string_ly_tensor.view(n_strings, 1, 1)
+        else:
+            fisher_per_string = grad_outer
+    
+    return fisher_per_string
+

@@ -250,7 +250,7 @@ class LightSabre(Surrogate):
                  test_points=None, **kwargs):
         """
         Calculate light yield at optical module positions from a muon track.
-        
+
         Parameters:
         -----------
         track_pos : torch.Tensor
@@ -263,7 +263,7 @@ class LightSabre(Surrogate):
             Optical module positions as array of shape (N, 3)
         test_points : torch.Tensor (optional, alias for om_positions)
             Alternative parameter name for optical module positions
-            
+
         Returns:
         --------
         torch.Tensor
@@ -272,42 +272,42 @@ class LightSabre(Surrogate):
         # Handle test_points as alias for om_positions
         if om_positions is None and test_points is not None:
             om_positions = test_points
-        
+
         # Validate inputs
         if track_pos is None or track_dir is None or track_energy is None or om_positions is None:
             raise ValueError("track_pos, track_dir, track_energy, and om_positions must be provided")
-        
+
         # Ensure tensors are on the correct device
         if isinstance(track_pos, torch.Tensor):
             track_pos = track_pos.to(self.device)
         else:
             track_pos = torch.tensor(track_pos, device=self.device)
-        
+
         if isinstance(track_dir, torch.Tensor):
             track_dir = track_dir.to(self.device)
         else:
             track_dir = torch.tensor(track_dir, device=self.device)
-        
+
         if isinstance(track_energy, torch.Tensor):
             track_energy = track_energy.to(self.device)
         else:
             track_energy = torch.tensor(track_energy, device=self.device)
-        
+
         if isinstance(om_positions, torch.Tensor):
             om_positions = om_positions.to(self.device)
         else:
             om_positions = torch.tensor(om_positions, device=self.device)
-        
+
         # Squeeze to remove batch dimensions
         track_pos = track_pos.squeeze()
         track_dir = track_dir.squeeze()
         if track_energy.dim() > 0:
             track_energy = track_energy.squeeze()
-        
+
         # Calculate perpendicular distances from track to optical modules
         if self.particle_mode == 'track':
             distances = self.distance_to_line(om_positions, track_pos, track_dir)
-            
+
             # Calculate light yield at each distance
             light_yield = self.lightyield_for_distance(distances, track_energy)
         else:
@@ -317,6 +317,141 @@ class LightSabre(Surrogate):
         light_yield = torch.nan_to_num(light_yield, nan=0.0, posinf=self.poisson_rate_cap, neginf=0.0)
         light_yield = torch.clamp(light_yield, min=0.0)
         return light_yield
+
+    def call_batched(self, track_pos, track_dir, track_energy, om_positions):
+        """
+        Compute light yield for a batch of events and all OM positions in one pass.
+
+        All heavy math (distance, attenuation, polynomial) is vectorised over the
+        (n_events, n_points) grid with no Python loop.
+
+        Parameters
+        ----------
+        track_pos : torch.Tensor, shape (n_events, 3)
+        track_dir : torch.Tensor, shape (n_events, 3)  — need not be unit vectors
+        track_energy : torch.Tensor, shape (n_events,)
+        om_positions : torch.Tensor, shape (n_points, 3)
+
+        Returns
+        -------
+        torch.Tensor, shape (n_events, n_points)
+        """
+        track_pos    = track_pos.to(self.device)
+        track_dir    = track_dir.to(self.device)
+        track_energy = track_energy.to(self.device)
+        om_positions = om_positions.to(self.device)
+
+        # Normalise directions: (n_events, 3)
+        dir_norm = track_dir.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        track_dir = track_dir / dir_norm
+
+        if self.particle_mode == 'track':
+            # diff[e, p] = om_positions[p] - track_pos[e]  →  (n_events, n_points, 3)
+            diff = om_positions.unsqueeze(0) - track_pos.unsqueeze(1)
+
+            # cross[e, p] = diff[e,p] × track_dir[e]  →  (n_events, n_points, 3)
+            cross = torch.linalg.cross(
+                diff,
+                track_dir.unsqueeze(1).expand_as(diff),
+            )
+            distances = cross.norm(dim=2)  # (n_events, n_points)
+
+            # lightyield_for_distance lifted to (n_events, n_points)
+            l0 = self.lightsabre_photons_per_m(track_energy)  # (n_events,)
+
+            theta_c    = torch.acos(torch.tensor(1.0 / self.refractive_index, device=self.device))
+            sin_theta_c = torch.sin(theta_c)
+            lambda_abs  = self.kwargs.get('lambda_abs', 44.7)
+            lambda_sca  = self.kwargs.get('lambda_sca', 57.4) / (1 - self.scattering_tau)
+            lambda_p    = torch.sqrt(torch.tensor(lambda_abs * lambda_sca / 3.0, device=self.device))
+            zeta        = torch.exp(torch.tensor(-lambda_sca / lambda_abs, device=self.device)).clamp_min(1e-12)
+            lambda_c    = lambda_sca / (3.0 * zeta)
+            lambda_mu   = (lambda_c / sin_theta_c ** 2 * 2.0 / (np.pi * lambda_p)).clamp_min(1e-12)
+
+            d_safe = distances.clamp(min=1e-6)  # (n_events, n_points)
+
+            # numerator: (n_events, 1) broadcast over points
+            numerator = (l0 * self.effective_photocathode_area / (2.0 * np.pi * sin_theta_c)).unsqueeze(1)
+            numerator = numerator * torch.exp(-d_safe / lambda_p)
+
+            denominator = (torch.sqrt(lambda_mu * d_safe) *
+                           torch.tanh(torch.sqrt(d_safe / lambda_mu))).clamp_min(1e-12)
+
+            light_yield = numerator / denominator
+        else:
+            # Cascade: distance from vertex to each OM
+            diff = om_positions.unsqueeze(0) - track_pos.unsqueeze(1)  # (n_events, n_points, 3)
+            distances = diff.norm(dim=2)                                 # (n_events, n_points)
+
+            lamda_a = self.kwargs.get('lambda_abs', 44.7)
+            lamda_e = self.kwargs.get('lambda_sca', 57.4) / (1 - self.scattering_tau)
+            lamda_p = np.sqrt(lamda_a * lamda_e / 3) / 1.07
+            Zeta    = np.exp(-lamda_e / lamda_a)
+            lamda_c = lamda_e / (3 * Zeta)
+
+            r_safe = distances.clamp(min=1e-6)
+            photon_yield = (self.n0A / (4 * np.pi) *
+                            torch.exp(-r_safe / lamda_p) /
+                            (lamda_c * r_safe * torch.tanh(r_safe / lamda_c)))
+            # scale by energy: (n_events, 1) broadcast
+            light_yield = photon_yield * (track_energy / 3e5).unsqueeze(1)
+
+        light_yield = torch.nan_to_num(light_yield, nan=0.0, posinf=self.poisson_rate_cap, neginf=0.0)
+        light_yield = light_yield.clamp(min=0.0)
+        return light_yield
+
+    def light_yield_surrogate_batched(self, om_positions, event_params_list):
+        """
+        Compute light yields for a list of events and all OM positions in one GPU call.
+
+        Parameters
+        ----------
+        om_positions : torch.Tensor, shape (n_points, 3)
+        event_params_list : list of dict
+            Each dict must contain 'position', 'energy', and either 'direction' or
+            'zenith'/'azimuth'.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_events, n_points)
+        """
+        positions, directions, energies = [], [], []
+        for ep in event_params_list:
+            pos = ep['position']
+            if not isinstance(pos, torch.Tensor):
+                pos = torch.tensor(pos, dtype=torch.float32, device=self.device)
+            positions.append(pos.to(self.device).reshape(3))
+
+            energy = ep['energy']
+            if not isinstance(energy, torch.Tensor):
+                energy = torch.tensor(energy, dtype=torch.float32, device=self.device)
+            energies.append(energy.to(self.device).reshape(()))
+
+            if 'direction' in ep:
+                d = ep['direction']
+                if not isinstance(d, torch.Tensor):
+                    d = torch.tensor(d, dtype=torch.float32, device=self.device)
+                directions.append(d.to(self.device).reshape(3))
+            else:
+                theta = ep['zenith']
+                phi   = ep['azimuth']
+                if not isinstance(theta, torch.Tensor):
+                    theta = torch.tensor(theta, dtype=torch.float32, device=self.device)
+                if not isinstance(phi, torch.Tensor):
+                    phi = torch.tensor(phi, dtype=torch.float32, device=self.device)
+                theta, phi = theta.to(self.device).squeeze(), phi.to(self.device).squeeze()
+                d = torch.stack([
+                    torch.sin(theta) * torch.cos(phi),
+                    torch.sin(theta) * torch.sin(phi),
+                    torch.cos(theta),
+                ])
+                directions.append(d)
+
+        track_pos    = torch.stack(positions)   # (n_events, 3)
+        track_dir    = torch.stack(directions)  # (n_events, 3)
+        track_energy = torch.stack(energies)    # (n_events,)
+
+        return self.call_batched(track_pos, track_dir, track_energy, om_positions)
     
     def light_yield_surrogate(self, **kwargs):
         """
@@ -650,6 +785,7 @@ class LightSabrePATD(LightSabre):
             'use_perpendicular_distance_only',
             self.kwargs.get('use_perpendicular_distance_only', False)
         )
+        throughgoing = kwargs.get('throughgoing', self.kwargs.get('throughgoing', False))
         c = 0.299792458
         v_mu = self.kwargs.get('v_mu', c)
         cpandel_params = self.kwargs.get('cpandel_params', {})
@@ -657,7 +793,7 @@ class LightSabrePATD(LightSabre):
 
         track_pos, track_dir, energy = self._parse_event_params(event_params)
 
-        if self.kwargs.get('input_photons', None) is None:
+        if self.kwargs.get('input_photons', None) is None and kwargs.get('input_photons', None) is None:
             light_yield = self.__call__(
                 track_pos=track_pos, track_dir=track_dir,
                 track_energy=energy, om_positions=detector_pos.unsqueeze(0)
@@ -665,7 +801,10 @@ class LightSabrePATD(LightSabre):
             if self.kwargs.get('use_poisson', False):
                 light_yield = torch.poisson(self._sanitize_rate_for_poisson(light_yield))
         else:
-            light_yield = torch.tensor(self.kwargs.get('input_photons'), device=self.device)
+            if kwargs.get('input_photons', None) is not None:
+                light_yield = torch.tensor(kwargs.get('input_photons'), device=self.device)
+            else:
+                light_yield = torch.tensor(self.kwargs.get('input_photons'), device=self.device)
 
         expected_N = torch.round(light_yield).int().detach().cpu().item()
         N = min(expected_N, max_photons) if (max_photons is not None and max_photons < expected_N) else expected_N
@@ -683,7 +822,16 @@ class LightSabrePATD(LightSabre):
             s = torch.zeros((num_samples,), device=self.device)
             d_geom = torch.full((num_samples,), d_vertex.clamp(min=1e-6).item(), device=self.device)
             t_geom_min = d_vertex / (c / self.refractive_index)
+        elif throughgoing:
+            # Throughgoing mode: geom_time is purely the photon travel time from the
+            # closest point on the infinite track to the detector, with no t_foot guard.
+            # d_geom = perpendicular distance; t_geom = d_geom / (c/n).
+            s = torch.full((num_samples,), t_foot.item(), device=self.device)
+            d_geom = torch.full((num_samples,), foot_length.clamp(min=1e-6).item(), device=self.device)
+            t_geom_min = foot_length / (c / self.refractive_index)
         elif use_perpendicular_distance_only:
+            if t_foot < 0:
+                return self._empty_patd_dict(expected_N)
             s = torch.full((num_samples,), t_foot.item(), device=self.device)
             d_geom = torch.full((num_samples,), foot_length.clamp(min=1e-6).item(), device=self.device)
             t_geom_min = foot_length / (c / self.refractive_index) + t_foot / v_mu
@@ -711,7 +859,10 @@ class LightSabrePATD(LightSabre):
             else:
                 t_geom_min = torch.norm(to_detector) / (c / self.refractive_index)
 
-        t_geom = d_geom / (c / self.refractive_index) + s / v_mu
+        if throughgoing and not is_cascade:
+            t_geom = d_geom / (c / self.refractive_index)
+        else:
+            t_geom = d_geom / (c / self.refractive_index) + s / v_mu
 
         cpandel = CPandel(
             tau=cpandel_params.get('tau', 557.), lambda_s=cpandel_params.get('lambda_s', 57.4),
@@ -757,6 +908,7 @@ class LightSabrePATD(LightSabre):
             'use_perpendicular_distance_only',
             self.kwargs.get('use_perpendicular_distance_only', False)
         )
+        throughgoing = kwargs.get('throughgoing', self.kwargs.get('throughgoing', False))
         c = 0.299792458
         v_mu = self.kwargs.get('v_mu', c)
         cpandel_params = self.kwargs.get('cpandel_params', {})
@@ -772,7 +924,8 @@ class LightSabrePATD(LightSabre):
             to_detector, track_dir.unsqueeze(0).expand(n_pts, 3)
         )
         foot_length = cross.norm(dim=1) / track_dir.norm().clamp_min(1e-12)            # (n_pts,)
-        valid_mask = torch.ones_like(t_foot, dtype=torch.bool) if is_cascade else (t_foot >= 0)  # (n_pts,)
+        # throughgoing mode: no t_foot guard — all detectors are valid
+        valid_mask = torch.ones_like(t_foot, dtype=torch.bool) if (is_cascade or throughgoing) else (t_foot >= 0)
         d_vertex = to_detector.norm(dim=1)                                              # (n_pts,)
 
         # ---- Vectorised light yield + Poisson ---------------------------
@@ -794,6 +947,9 @@ class LightSabrePATD(LightSabre):
         fl_safe = foot_length.clamp(min=1e-6)
         if is_cascade:
             t_geom_min_batch = d_vertex.clamp(min=1e-6) / (c / self.refractive_index)  # (n_pts,)
+        elif throughgoing:
+            # geom_time = photon travel from closest track point to detector only
+            t_geom_min_batch = fl_safe / (c / self.refractive_index)                   # (n_pts,)
         elif use_perpendicular_distance_only:
             t_geom_min_batch = fl_safe / (c / self.refractive_index) + t_foot / v_mu  # (n_pts,)
         else:
@@ -807,8 +963,8 @@ class LightSabrePATD(LightSabre):
             else:
                 t_geom_min_batch = to_detector.norm(dim=1) / (c / self.refractive_index)
 
-        # ---- Track-weight matrix (non-perp mode, computed once) ---------
-        if not is_cascade and not use_perpendicular_distance_only:
+        # ---- Track-weight matrix (non-perp, non-throughgoing mode) ------
+        if not is_cascade and not use_perpendicular_distance_only and not throughgoing:
             if not self.use_max_energy_dist:
                 S = self.kwargs.get('track_segment_length', 200.0)
                 t_min = max(0.0, float(t_foot.min().item()) - S)
@@ -843,6 +999,9 @@ class LightSabrePATD(LightSabre):
             if is_cascade:
                 s_i = torch.zeros((N_i,), device=self.device)
                 d_geom_i = torch.full((N_i,), d_vertex[i].clamp(min=1e-6).item(), device=self.device)
+            elif throughgoing:
+                s_i = torch.full((N_i,), t_foot[i].item(), device=self.device)
+                d_geom_i = torch.full((N_i,), fl_safe[i].item(), device=self.device)
             elif use_perpendicular_distance_only:
                 s_i = torch.full((N_i,), t_foot[i].item(), device=self.device)
                 d_geom_i = torch.full((N_i,), fl_safe[i].item(), device=self.device)
@@ -851,7 +1010,10 @@ class LightSabrePATD(LightSabre):
                 s_i = t_vals[sampled_idx]
                 d_geom_i = dists_matrix[sampled_idx, i]
 
-            t_geom_i = d_geom_i / (c / self.refractive_index) + s_i / v_mu
+            if throughgoing:
+                t_geom_i = d_geom_i / (c / self.refractive_index)
+            else:
+                t_geom_i = d_geom_i / (c / self.refractive_index) + s_i / v_mu
 
             hit_times, t_residual, t_geom_i, vertex_times, emission_points, t_residual_probs = \
                 self._sample_cpandel(
@@ -908,15 +1070,18 @@ class LightSabrePATD(LightSabre):
         t_residuals_fixed = t_residuals_fixed.float().to(self.device)
 
         to_detector = opt_point - track_pos
-        cross = torch.linalg.cross(to_detector, track_dir)
-        foot_length = cross.norm() / track_dir.norm().clamp_min(1e-12)
-        d_geom = foot_length.clamp(min=1e-6).expand(t_residuals_fixed.shape[0])
+        if self.particle_mode == 'cascade':
+            d_geom = to_detector.norm().clamp_min(1e-6).expand(t_residuals_fixed.shape[0])
+        else:
+            cross = torch.linalg.cross(to_detector, track_dir)
+            foot_length = cross.norm() / track_dir.norm().clamp_min(1e-12)
+            d_geom = foot_length.clamp(min=1e-6).expand(t_residuals_fixed.shape[0])
 
         cpandel_params = self.kwargs.get('cpandel_params', {})
         cpandel = CPandel(
             tau=cpandel_params.get('tau', 557.),
             lambda_s=cpandel_params.get('lambda_s', 57.4),
-            lambda_a=cpandel_params.get('lambda_a', 98.),
+            lambda_a=cpandel_params.get('lambda_a', 44.7),
             v=cpandel_params.get('v', 0.3 / 1.33),
             s=cpandel_params.get('s', 5.0),
         )

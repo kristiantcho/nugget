@@ -76,9 +76,10 @@ class Optimizer():
     def _update_alm_parameters(self):
         """Update ALM parameters according to the algorithm"""
         for constraint_name in self.constraints_list:
-            if constraint_name in self._current_uw_loss_dict:
-                # Get the latest constraint value C_i(θ)
-                constraint_value = self._current_uw_loss_dict[constraint_name].detach().item()
+            if constraint_name in self._current_loss_dict:
+                # Get the latest constraint value C_i(θ) — use the weighted loss so
+                # λ/μ updates are on the same scale as the augmented loss term.
+                constraint_value = self._current_loss_dict[constraint_name].detach().item()
                 # Update weighted moving average for lambda gradient 
                 lambda_grad_squared = constraint_value ** 2
                 self.alm_v_lambda[constraint_name] = (self.alm_alpha * self.alm_v_lambda[constraint_name] + 
@@ -250,6 +251,7 @@ class Optimizer():
         # - If provided (list/tuple/set of strings), sigmoid is applied only to those loss names.
         # - If not provided, preserves legacy behavior (sigmoid applied to all losses when enabled).
         self.sigmoid_loss_list = kwargs.get('sigmoid_loss_list', loss_params_dict.get('sigmoid_loss_list', None))
+        self.clear_cuda_cache = kwargs.get('clear_cuda_cache', False)
         # Check both kwargs and loss_params_dict for constraints_list
         self.constraints_list = kwargs.get('constraints_list', loss_params_dict.get('constraints_list', []))
         
@@ -408,6 +410,9 @@ class Optimizer():
                             continue
                     self.schedulers[key].step()
             self.geom_dict = self.geometry.update_points(**self.geom_dict)
+
+            if self.clear_cuda_cache and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             if self._geom_save_enabled:
                 local_step = (it - max_iter) + 1  # 1..n_iter for this optimize() call

@@ -1241,7 +1241,6 @@ class EffectiveAreaLoss(LossFunction):
         use_irregular_cylinder = kwargs.get('use_irregular_cylinder', False)
         use_batched_effective_area = kwargs.get('use_batched_effective_area', False)
         cylinder_kwargs = kwargs.get('cylinder_sampler_kwargs', {})
-        perfect_trigger = kwargs.get('perfect_efficiency', False)
         pc_ly_per_event_per_point_per_e_per_ct = kwargs.get('pc_ly_per_point_per_event_per_e_per_ct', None)
         event_params_list = kwargs.get('signal_event_params', None)
         signal_sampler = kwargs.get('signal_sampler', None)
@@ -1250,6 +1249,9 @@ class EffectiveAreaLoss(LossFunction):
         # If True and events are provided, compute per-event effective area and
         # set loss to reciprocal mean effective area over events.
         per_event_effective_area_loss = kwargs.get('per_event_effective_area_loss', True)
+        # If True, sample all bin events at once and bin results in post-processing
+        # instead of running a separate trigger+surrogate call per (E, cos_zenith) bin.
+        use_batched_binned_trigger = kwargs.get('use_batched_binned_trigger', False)
 
         if precomputed_light_yield_per_point_per_event is None:
             precomputed_light_yield_per_point_per_event = pc_ly_per_event_per_point_per_e_per_ct
@@ -1265,12 +1267,7 @@ class EffectiveAreaLoss(LossFunction):
         # - False: force single-event loop
         use_batched_trigger = kwargs.get('use_batched_trigger', None)
 
-        # Optional trigger overrides for sliding-bar trigger.
-        self.trigger.distance_bar_length = kwargs.get('distance_bar_length', self.trigger.distance_bar_length)
-        self.trigger.distance_bar_step = kwargs.get('distance_bar_step', self.trigger.distance_bar_step)
-        self.trigger.min_points_threshold = kwargs.get('min_points_threshold', self.trigger.min_points_threshold)
-        
-        
+
         # signal_sampler = CylinderSampler(event_type='signal', domain_size=2500, E_min=energy_range, E_max=1e8, energy_dist='log_uniform')
     
         point_weights = None
@@ -1322,17 +1319,17 @@ class EffectiveAreaLoss(LossFunction):
                 if precomputed_light_yield_per_point_per_event is not None:
                     precomputed_light_yield_per_point_per_event = precomputed_light_yield_per_point_per_event[selected_indices]
 
-            if perfect_trigger:
-                per_event_trigger = torch.ones(len(event_params_list), device=self.device, dtype=points_3d.dtype)
-            else:
-                trigger_out = self.trigger(
-                    geom_dict={'points_3d': points_3d},
-                    signal_surrogate_func=surrogate_func,
-                    signal_event_params=event_params_list,
-                    precomputed_light_yield_per_point_per_event=precomputed_light_yield_per_point_per_event,
-                    use_batched_trigger=use_batched_trigger,
-                )
-                per_event_trigger = trigger_out['t_per_event']
+            trigger_out = self.trigger(
+                {'points_3d': points_3d},
+                **{
+                    **kwargs,
+                    'signal_surrogate_func': surrogate_func,
+                    'signal_event_params': event_params_list,
+                    'precomputed_light_yield_per_point_per_event': precomputed_light_yield_per_point_per_event,
+                    'use_batched_trigger': use_batched_trigger,
+                },
+            )
+            per_event_trigger = trigger_out['t_per_event']
 
             if use_batched_effective_area:
                 per_event_energies, per_event_cos_zenith = _extract_energy_and_cos_zenith_batch(
@@ -1399,60 +1396,145 @@ class EffectiveAreaLoss(LossFunction):
         zenith_bins = torch.linspace(zenith_range[0], zenith_range[1], num_zenith_bins+1, device=self.device)
         energy_centers = 10**((energy_bins[:-1] + energy_bins[1:]) / 2)
         zenith_centers = (zenith_bins[:-1] + zenith_bins[1:]) / 2
-        
+
         effective_areas = torch.zeros((num_zenith_bins, num_energy_bins), device=self.device)
         detector_efficiencies = torch.zeros((num_zenith_bins, num_energy_bins), device=self.device)
-        for e_ind, e in enumerate(energy_centers):
-            for ct_ind, ct in enumerate(zenith_centers):
-                if perfect_trigger:
-                    detector_efficiency = 1.0
-                else:
-                    sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=energy_bins[e_ind], E_max=energy_bins[e_ind + 1], cos_range=(zenith_bins[ct_ind], zenith_bins[ct_ind + 1]), event_type='signal', **cylinder_kwargs).sample_events(num_events_per_bin)
-                    light_yield_per_event_per_point = torch.zeros((len(sampled_events), len(points_3d)), device=self.device)
-                    for i, event_params in enumerate(sampled_events):
-                        light_yield_per_event_per_point[i] = surrogate_func(opt_point=points_3d, event_params=event_params)
 
-                    # Use TriggerLoss selection logic (batched vs single)
+        if use_batched_binned_trigger:
+            # Sample all events for all bins at once, run a single batched trigger+surrogate
+            # pass, then bin results in post-processing. Avoids num_energy_bins*num_zenith_bins
+            # separate trigger calls and CylinderSampler constructions.
+            # Use binned_trigger_batch_size to cap memory per chunk (None = one big batch).
+            binned_trigger_batch_size = kwargs.get('binned_trigger_batch_size', None)
+            total_events = num_energy_bins * num_zenith_bins * num_events_per_bin
+            all_events = CylinderSampler(
+                domain_size=self.domain_size,
+                E_min=energy_range[0],
+                E_max=energy_range[1],
+                cos_range=zenith_range,
+                event_type='signal',
+                energy_dist='log_uniform',
+                uniform_zenith_sampling=True,
+                **cylinder_kwargs,
+            ).sample_events(total_events)
+
+            # Extract energies and cos_zenith for all events upfront (cheap, no surrogate)
+            all_energies = torch.stack([
+                torch.as_tensor(ep['energy'], device=self.device, dtype=points_3d.dtype).reshape(-1)[0]
+                for ep in all_events
+            ])
+            all_cos_zenith = torch.stack([
+                torch.cos(torch.as_tensor(ep['zenith'], device=self.device, dtype=points_3d.dtype).reshape(-1)[0])
+                if 'cos_zenith' not in ep else
+                torch.as_tensor(ep['cos_zenith'], device=self.device, dtype=points_3d.dtype).reshape(-1)[0]
+                for ep in all_events
+            ])
+
+            counts = torch.zeros((num_zenith_bins, num_energy_bins), device=self.device)
+
+            trigger_out = self.trigger(
+                {'points_3d': points_3d},
+                **{
+                    **kwargs,
+                    'signal_surrogate_func': surrogate_func,
+                    'signal_event_params': all_events,
+                    'precomputed_light_yield_per_point_per_event': None,
+                    'use_batched_trigger': use_batched_trigger,
+                    'binned_trigger_batch_size': binned_trigger_batch_size,
+                },
+            )
+            all_trigger = trigger_out['t_per_event']
+            if kwargs.get('detach_trigger', False):
+                all_trigger = all_trigger.detach()
+
+            log_e = torch.log10(all_energies)
+            e_idx = torch.bucketize(log_e, energy_bins[1:-1])
+            ct_idx = torch.bucketize(all_cos_zenith, zenith_bins[1:-1])
+            for k in range(total_events):
+                ei, ci = e_idx[k].item(), ct_idx[k].item()
+                if 0 <= ei < num_energy_bins and 0 <= ci < num_zenith_bins:
+                    detector_efficiencies[ci, ei] += all_trigger[k]
+                    counts[ci, ei] += 1
+
+            nonzero = counts > 0
+            detector_efficiencies[nonzero] /= counts[nonzero]
+
+            for e_ind, e in enumerate(energy_centers):
+                for ct_ind, ct in enumerate(zenith_centers):
+                    detector_efficiency = detector_efficiencies[ct_ind, e_ind]
+                    if use_irregular_cylinder:
+                        event_params_geom = {
+                            "position": center,
+                            "cos_zenith": ct,
+                            "azimuth": torch.zeros((), device=self.device, dtype=points_3d.dtype),
+                        }
+                        eff_area = neutrino_effective_area(
+                            ct, e, cyl_radius, cyl_height,
+                            self.xsec, self.transmission,
+                            flavor=self.flavor,
+                            average_nu_nubar=self.average_nu_nubar,
+                            event_params=event_params_geom,
+                            points_3d=points_3d,
+                            point_weights=point_weights,
+                        )
+                    else:
+                        eff_area = neutrino_effective_area(
+                            ct, e, cyl_radius, cyl_height,
+                            self.xsec, self.transmission,
+                            flavor=self.flavor,
+                            average_nu_nubar=self.average_nu_nubar,
+                        )
+                    effective_areas[ct_ind, e_ind] = eff_area * detector_efficiency
+
+        else:
+            for e_ind, e in enumerate(energy_centers):
+                for ct_ind, ct in enumerate(zenith_centers):
+                    sampled_events = CylinderSampler(domain_size=self.domain_size, E_min=10**energy_bins[e_ind], E_max=10**energy_bins[e_ind + 1], cos_range=(zenith_bins[ct_ind], zenith_bins[ct_ind + 1]),
+                                                     event_type='signal', energy_dist='log_uniform', uniform_zenith_sampling=True, **cylinder_kwargs).sample_events(num_events_per_bin)
+
                     trigger_out = self.trigger(
-                        geom_dict={'points_3d': points_3d},
-                        signal_surrogate_func=surrogate_func,
-                        signal_event_params=sampled_events,
-                        precomputed_light_yield_per_point_per_event=light_yield_per_event_per_point,
-                        use_batched_trigger=use_batched_trigger,
+                        {'points_3d': points_3d},
+                        **{
+                            **kwargs,
+                            'signal_surrogate_func': surrogate_func,
+                            'signal_event_params': sampled_events,
+                            'precomputed_light_yield_per_point_per_event': None,
+                            'use_batched_trigger': use_batched_trigger,
+                        },
                     )
                     detector_efficiency = trigger_out['detector_efficiency']
                     detector_efficiencies[ct_ind, e_ind] = detector_efficiency
-                if use_irregular_cylinder:
-                    event_params_geom = {
-                        "position": center,
-                        "cos_zenith": ct,
-                        "azimuth": torch.zeros((), device=self.device, dtype=points_3d.dtype),
-                    }
-                    eff_area = neutrino_effective_area(
-                        ct,
-                        e,
-                        cyl_radius,
-                        cyl_height,
-                        self.xsec,
-                        self.transmission,
-                        flavor=self.flavor,
-                        average_nu_nubar=self.average_nu_nubar,
-                        event_params=event_params_geom,
-                        points_3d=points_3d,
-                        point_weights=point_weights,
-                    )
-                else:
-                    eff_area = neutrino_effective_area(
-                        ct,
-                        e,
-                        cyl_radius,
-                        cyl_height,
-                        self.xsec,
-                        self.transmission,
-                        flavor=self.flavor,
-                        average_nu_nubar=self.average_nu_nubar,
-                    )
-                effective_areas[ct_ind, e_ind] = eff_area * detector_efficiency
+                    if use_irregular_cylinder:
+                        event_params_geom = {
+                            "position": center,
+                            "cos_zenith": ct,
+                            "azimuth": torch.zeros((), device=self.device, dtype=points_3d.dtype),
+                        }
+                        eff_area = neutrino_effective_area(
+                            ct,
+                            e,
+                            cyl_radius,
+                            cyl_height,
+                            self.xsec,
+                            self.transmission,
+                            flavor=self.flavor,
+                            average_nu_nubar=self.average_nu_nubar,
+                            event_params=event_params_geom,
+                            points_3d=points_3d,
+                            point_weights=point_weights,
+                        )
+                    else:
+                        eff_area = neutrino_effective_area(
+                            ct,
+                            e,
+                            cyl_radius,
+                            cyl_height,
+                            self.xsec,
+                            self.transmission,
+                            flavor=self.flavor,
+                            average_nu_nubar=self.average_nu_nubar,
+                        )
+                    effective_areas[ct_ind, e_ind] = eff_area * detector_efficiency
 
         effective_area_loss = 1/torch.mean(effective_areas)
         

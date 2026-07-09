@@ -2,10 +2,10 @@ import torch
 import numpy as np
 import math
 from nugget.surrogates.base_surrogate import Surrogate
-from nflows.distributions.normal import StandardNormal
-from nflows.flows.base import Flow
-from nflows.transforms.base import CompositeTransform, Transform
-from nflows.transforms.autoregressive import MaskedPiecewiseRationalQuadraticAutoregressiveTransform
+# from nflows.distributions.normal import StandardNormal
+# from nflows.flows.base import Flow
+# from nflows.transforms.base import CompositeTransform, Transform
+# from nflows.transforms.autoregressive import MaskedPiecewiseRationalQuadraticAutoregressiveTransform
 import time
 
 class LogTransform(Transform):

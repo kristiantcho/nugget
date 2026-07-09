@@ -8,90 +8,50 @@ class Hyp1f1Function(torch.autograd.Function):
     """
     Differentiable wrapper for confluent hypergeometric function hyp1f1.
     Uses the derivative formula: d/dz hyp1f1(a, b, z) = (a/b) * hyp1f1(a+1, b+1, z)
+
+    Uses the new-style setup_context API so that functorch transforms
+    (jacrev, vmap, grad, jvp, linearize, ...) work correctly.
     """
-    
+
     @staticmethod
-    def forward(ctx, a, b, z):
-        # Save for backward pass
-        ctx.save_for_backward(a, b, z)
-        
-        # Compute hyp1f1 using scipy
+    def forward(a, b, z):
         a_np = a.detach().cpu().numpy() if isinstance(a, torch.Tensor) else a
         b_np = b.detach().cpu().numpy() if isinstance(b, torch.Tensor) else b
         z_np = z.detach().cpu().numpy() if isinstance(z, torch.Tensor) else z
-        
         result = scipy.special.hyp1f1(a_np, b_np, z_np)
         return torch.as_tensor(result, dtype=z.dtype, device=z.device)
-    
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        a, b, z = inputs
+        ctx.save_for_backward(a, b, z)
+        # Also store as plain attributes for the jvp hook — save_for_backward
+        # tensors are unavailable during forward-mode AD (torch.func.jvp) because
+        # the inputs are dual tensors at that point and cannot be saved via the
+        # standard mechanism.
+        ctx._a = a
+        ctx._b = b
+        ctx._z = z
+
     @staticmethod
     def backward(ctx, grad_output):
         a, b, z = ctx.saved_tensors
-        
-        # Derivative with respect to z: d/dz hyp1f1(a, b, z) = (a/b) * hyp1f1(a+1, b+1, z)
         a_np = a.detach().cpu().numpy()
         b_np = b.detach().cpu().numpy()
         z_np = z.detach().cpu().numpy()
-        
-        # Compute derivative
         deriv_z = (a_np / b_np) * scipy.special.hyp1f1(a_np + 1, b_np + 1, z_np)
         deriv_z = torch.as_tensor(deriv_z, dtype=z.dtype, device=z.device)
-        
-        grad_z = grad_output * deriv_z
-        
-        # For simplicity, we don't compute gradients w.r.t. a and b (typically constant parameters)
-        return None, None, grad_z
+        return None, None, grad_output * deriv_z
 
     @staticmethod
     def jvp(ctx, tangents_a, tangents_b, tangents_z):
-        """
-        Forward-mode JVP implementation for Hyp1f1Function.
-
-        We support tangents only for `z` (the variable). Gradients w.r.t. `a` and `b`
-        are not implemented in backward, so we likewise return None for their
-        tangents (represented as zeros). If tangents for `a` or `b` are provided
-        we ignore them and focus on z since the analytic derivative used is
-        d/dz hyp1f1(a,b,z) = (a/b) * hyp1f1(a+1,b+1,z).
-        """
-        # Extract saved tensors (primal inputs)
-        try:
-            a, b, z = ctx.saved_tensors
-        except Exception:
-            # If saved_tensors not available (functorch path), treat inputs as provided
-            a = None
-            b = None
-            z = None
-
-        # If we have primals in ctx, use them; otherwise the tangents arguments
-        # will be tuples of (primal, tangent) when called from functorch internals.
-        # However, functorch's jvp path passes raw tangents here; we need only the
-        # tangents for z and the primals a,b,z will be available via ctx.saved_tensors
-
-        # If ctx.saved_tensors didn't exist, we cannot compute; raise for clarity
-        if a is None or b is None or z is None:
-            raise RuntimeError("Hyp1f1Function.jvp requires saved primals in ctx")
-
-        # Ensure tensors are floats
-        a_f = a
-        b_f = b
-        z_f = z
-
-        # Tangent for z (may be None)
-        tz = tangents_z
-        if tz is None:
-            # No tangent: output tangent is zero
-            out_tangent = torch.zeros_like(z_f)
-        else:
-            # Compute derivative w.r.t z: (a/b) * hyp1f1(a+1, b+1, z)
-            # Use the same Hyp1f1Function.apply to compute hyp1f1 for (a+1, b+1, z)
-            a1 = a_f + 1.0
-            b1 = b_f + 1.0
-            # Compute hyp1f1(a+1, b+1, z) using the forward path (calls SciPy)
-            h = Hyp1f1Function.apply(a1, b1, z_f)
-            deriv_z = (a_f / b_f) * h
-            out_tangent = tz * deriv_z
-
-        # Return tangents for a, b, z respectively. We don't support a/b tangents so return None
-        return None, None, out_tangent
+        a = ctx._a
+        b = ctx._b
+        z = ctx._z
+        if tangents_z is None:
+            return torch.zeros_like(z)
+        h = Hyp1f1Function.apply(a + 1.0, b + 1.0, z)
+        return tangents_z * (a / b) * h
 
 def hyp1f1(a, b, z):
     """

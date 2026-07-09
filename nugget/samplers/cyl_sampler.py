@@ -74,6 +74,30 @@ def maximum_proj_area(cyl):
     phi0 = torch.atan(2.0 * cyl.height / (torch.pi * cyl.radius))
     return projected_area(cyl, torch.cos(phi0))
 
+
+def _parse_zenith_cos_range(cos_range):
+    if isinstance(cos_range, str):
+        normalized = cos_range.strip().lower()
+        if "horizontal" in normalized:
+            return "horizontal", None, None
+        if "vertical" in normalized:
+            return "vertical", None, None
+        raise ValueError(
+            "cos_range must be a numeric pair or one of the zenith selectors 'horizontal'/'vertical'"
+        )
+
+    if isinstance(cos_range, torch.Tensor):
+        cos_range = cos_range.detach().cpu().tolist()
+
+    if not isinstance(cos_range, (tuple, list)) or len(cos_range) != 2:
+        raise TypeError(
+            "cos_range must be a length-2 sequence, a torch tensor with two values, or a zenith selector string"
+        )
+
+    cos_min = cos_range[0]
+    cos_max = cos_range[1]
+    return "numeric", cos_min, cos_max
+
 # -------------------------
 # Ray - cylinder intersection
 # -------------------------
@@ -215,13 +239,105 @@ def get_intersection_box(center, domain_size, position, direction):
         return None, None
 
 # -------------------------
+# Vertex remapping for existing events
+# -------------------------
+def remap_event_vertices(events, cyl, mode, domain_size=2.0, rng=None, device=None):
+    """
+    Reposition the vertex of each event in `events` according to `mode`.
+
+    Parameters:
+    -----------
+    events : list of dict
+        Each dict must have 'position' (1,3) and 'direction' (3,) or (1,3) tensors.
+    cyl : CylinderSurface
+        Cylinder geometry (used for cylinder modes and as domain center for box modes).
+    mode : str
+        One of:
+          'cylinder_intersection'       – entry point on the cylinder surface
+          'random_position_within_cylinder' – uniform random point along ray inside cylinder
+          'box_intersection'            – entry point on the cubic domain surface
+          'random_position_within_box'  – uniform random point along ray inside box
+    domain_size : float
+        Side length of the cubic domain (used by box modes).
+    rng : torch.Generator, optional
+        RNG for random modes.
+    device : torch.device, optional
+        Device override; falls back to the position tensor's device.
+
+    Returns:
+    --------
+    list of dict
+        Shallow copies of the input dicts with 'position' (and 'direction' if
+        the direction was flipped to find an intersection) replaced.
+    """
+    RANDOM_MODES = {'random_position_within_cylinder', 'random_position_within_box'}
+    BOX_MODES    = {'box_intersection', 'random_position_within_box'}
+    CYL_MODES    = {'cylinder_intersection', 'random_position_within_cylinder'}
+
+    if mode not in (RANDOM_MODES | BOX_MODES | CYL_MODES):
+        raise ValueError(
+            f"mode must be one of 'cylinder_intersection', 'random_position_within_cylinder', "
+            f"'box_intersection', 'random_position_within_box'; got '{mode}'"
+        )
+
+    remapped = []
+    for ev in events:
+        pos = ev['position']
+        # normalize to (3,)
+        pos_3 = pos.squeeze(0) if pos.dim() == 2 else pos
+        dev = device if device is not None else pos_3.device
+        pos_3 = pos_3.to(dev)
+
+        direction = ev['direction']
+        dir_3 = direction.squeeze(0) if direction.dim() == 2 else direction
+        dir_3 = dir_3.to(dev)
+
+        if mode in BOX_MODES:
+            t_enter, t_exit = get_intersection_box(cyl.center, domain_size, pos_3, dir_3)
+            flip = False
+            if t_enter is None:
+                t_enter, t_exit = get_intersection_box(cyl.center, domain_size, pos_3, -dir_3)
+                flip = True
+        else:  # cylinder modes
+            t_enter, t_exit = get_intersection_cylinder(cyl, pos_3, dir_3)
+            flip = False
+            if t_enter is None:
+                t_enter, t_exit = get_intersection_cylinder(cyl, pos_3, -dir_3)
+                flip = True
+
+        eff_dir = -dir_3 if flip else dir_3
+
+        if t_enter is None:
+            # No intersection found; keep original vertex
+            new_pos = pos_3
+            new_dir = dir_3
+        elif mode in RANDOM_MODES:
+            t_rand = torch.rand(1, generator=rng, device=dev, dtype=pos_3.dtype).item()
+            t_sample = t_enter + t_rand * (t_exit - t_enter)
+            new_pos = pos_3 + eff_dir * t_sample
+            new_dir = eff_dir
+        else:
+            new_pos = pos_3 + eff_dir * t_enter
+            new_dir = eff_dir
+
+        new_ev = dict(ev)
+        # restore original shape
+        new_ev['position'] = new_pos.unsqueeze(0) if pos.dim() == 2 else new_pos
+        new_ev['direction'] = new_dir.unsqueeze(0) if direction.dim() == 2 else new_dir
+        remapped.append(new_ev)
+
+    return remapped
+
+
+# -------------------------
 # Sampling rays (vectorized)
 # -------------------------
-def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]), 
+def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
                        n_samples= 1, device = None, find_exact_intersection = False,
-                       random_position_within_cylinder = False, 
+                       random_position_within_cylinder = False,
                        random_position_within_cubic_domain = False, domain_size = 2.0,
-                       uniform_zenith_sampling = False):
+                       uniform_zenith_sampling = False,
+                       box_intersection = False):
     """
     Sample multiple (position, direction) pairs in a vectorized manner.
 
@@ -232,7 +348,8 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
     cyl : CylinderSurface
         Cylinder geometry
     cos_range : tuple
-        (min, max) range for cos(theta)
+        (min, max) range for cos(theta), or the strings 'horizontal'/'vertical'
+        to match the zenith windows used by event selection.
     n_samples : int
         Number of rays to sample
     device : torch.device, optional
@@ -248,7 +365,10 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
     uniform_zenith_sampling : bool
         If True, sample zenith angles uniformly over the requested range instead
         of using the projected-area rejection sampler.
-        
+    box_intersection : bool
+        If True, use the entry point of the ray into the cubic domain (of size
+        domain_size centered at cyl.center) as the vertex position.
+
     Returns:
     --------
     tuple
@@ -261,25 +381,65 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
     
     dtype = torch.get_default_dtype()
     max_area = maximum_proj_area(cyl)
-    cos_min = torch.as_tensor(cos_range[0], device=device, dtype=dtype)
-    cos_max = torch.as_tensor(cos_range[1], device=device, dtype=dtype)
-    fixed_costheta = (torch.abs(cos_min - cos_max) < 1e-15)
+    cos_range_mode, cos_min_raw, cos_max_raw = _parse_zenith_cos_range(cos_range)
+    if cos_range_mode == "numeric":
+        cos_min = torch.as_tensor(cos_min_raw, device=device, dtype=dtype)
+        cos_max = torch.as_tensor(cos_max_raw, device=device, dtype=dtype)
+        fixed_costheta = (torch.abs(cos_min - cos_max) < 1e-15)
+    else:
+        cos_min = None
+        cos_max = None
+        fixed_costheta = False
 
     if uniform_zenith_sampling:
-        theta_min = torch.acos(torch.clamp(cos_max, -1.0, 1.0))
-        theta_max = torch.acos(torch.clamp(cos_min, -1.0, 1.0))
-        if fixed_costheta:
-            theta = torch.full((n_samples,), theta_min, dtype=dtype, device=device)
-        else:
+        if cos_range_mode == "horizontal": # selecting horizontal zenith angles (cosθ ∈ [-0.2, 0.2])
+            theta_min = torch.acos(torch.as_tensor(0.2, device=device, dtype=dtype))
+            theta_max = torch.acos(torch.as_tensor(-0.2, device=device, dtype=dtype))
+            if fixed_costheta:
+                theta = torch.full((n_samples,), theta_min, dtype=dtype, device=device)
+            else:
+                u = torch.rand(n_samples, generator=rng, device=device, dtype=dtype)
+                theta = theta_min + u * (theta_max - theta_min)
+        elif cos_range_mode == "vertical": # selecting vertical zenith angles (cosθ < -0.8 or cosθ > 0.8)
+            theta_min = torch.acos(torch.as_tensor(0.8, device=device, dtype=dtype))
+            theta_mid = torch.acos(torch.as_tensor(-0.8, device=device, dtype=dtype))
+            theta_max = torch.pi
+            side_selector = torch.rand(n_samples, generator=rng, device=device, dtype=dtype) < 0.5
             u = torch.rand(n_samples, generator=rng, device=device, dtype=dtype)
-            theta = theta_min + u * (theta_max - theta_min)
+            theta = torch.empty(n_samples, dtype=dtype, device=device)
+            theta[side_selector] = u[side_selector] * theta_min
+            theta[~side_selector] = theta_mid + u[~side_selector] * (theta_max - theta_mid)
+        else:
+            theta_min = torch.acos(torch.clamp(cos_max, -1.0, 1.0))
+            theta_max = torch.acos(torch.clamp(cos_min, -1.0, 1.0))
+            if fixed_costheta:
+                theta = torch.full((n_samples,), theta_min, dtype=dtype, device=device)
+            else:
+                u = torch.rand(n_samples, generator=rng, device=device, dtype=dtype)
+                theta = theta_min + u * (theta_max - theta_min)
         cos_theta = torch.cos(theta)
     else:
         # Rejection sample cos_theta for all samples
         cos_theta_list = []
         needed = n_samples
         while needed > 0:
-            if fixed_costheta:
+            if cos_range_mode != "numeric":
+                batch_size = needed * 3
+                u = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
+                cand = -1.0 + 2.0 * u
+                if cos_range_mode == "horizontal":
+                    range_mask = torch.abs(cand) < 0.2
+                else:
+                    range_mask = torch.abs(cand) > 0.8
+                q = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
+                proj_areas = torch.tensor([projected_area(cyl, c) for c in cand], 
+                                          dtype=dtype, device=device)
+                accepted = range_mask & (q * max_area <= proj_areas)
+                accepted_cands = cand[accepted][:needed]
+                
+                cos_theta_list.append(accepted_cands)
+                needed -= len(accepted_cands)
+            elif fixed_costheta:
                 cand = torch.full((needed,), cos_min, dtype=dtype, device=device)
                 cos_theta_list.append(cand)
                 break
@@ -427,11 +587,11 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
         # Sample random positions along rays within the cubic domain
         positions_final = []
         directions_final = []
-        
+
         for i in range(n_samples):
             pos_i = pos_world[i]
             dir_i = directions[i]
-            
+
             t_enter, t_exit = get_intersection_box(cyl.center, domain_size, pos_i, dir_i)
             if t_enter is None:
                 # Try opposite direction
@@ -452,7 +612,31 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
                 t_sample = t_enter + t_random * (t_exit - t_enter)
                 positions_final.append(pos_i + dir_i * t_sample)
                 directions_final.append(dir_i)
-        
+
+        return torch.stack(positions_final), torch.stack(directions_final)
+    elif box_intersection:
+        # Use the entry point of the ray into the cubic domain as the vertex
+        positions_final = []
+        directions_final = []
+
+        for i in range(n_samples):
+            pos_i = pos_world[i]
+            dir_i = directions[i]
+
+            t_enter, t_exit = get_intersection_box(cyl.center, domain_size, pos_i, dir_i)
+            if t_enter is None:
+                # Try opposite direction
+                t_enter2, t_exit2 = get_intersection_box(cyl.center, domain_size, pos_i, -dir_i)
+                if t_enter2 is None:
+                    positions_final.append(pos_i)
+                    directions_final.append(dir_i)
+                else:
+                    positions_final.append(pos_i + (-dir_i) * t_enter2)
+                    directions_final.append(-dir_i)
+            else:
+                positions_final.append(pos_i + dir_i * t_enter)
+                directions_final.append(dir_i)
+
         return torch.stack(positions_final), torch.stack(directions_final)
     else:
         
@@ -514,6 +698,9 @@ class CylinderSampler(Sampler):
         
         # Option to randomly sample position along ray within cubic domain
         self.random_position_within_cubic_domain = kwargs.get('random_position_within_cubic_domain', False)
+
+        # Option to use box entry point as vertex
+        self.box_intersection = kwargs.get('box_intersection', False)
 
         # Option to sample zenith uniformly instead of using the projected-area sampler
         self.uniform_zenith_sampling = kwargs.get('uniform_zenith_sampling', False)
@@ -616,7 +803,8 @@ class CylinderSampler(Sampler):
             random_position_within_cylinder=self.random_position_along_ray,
             random_position_within_cubic_domain=self.random_position_within_cubic_domain,
             domain_size=self.domain_size,
-            uniform_zenith_sampling=self.uniform_zenith_sampling
+            uniform_zenith_sampling=self.uniform_zenith_sampling,
+            box_intersection=self.box_intersection,
         )
 
         # Build bias tensor (float32)

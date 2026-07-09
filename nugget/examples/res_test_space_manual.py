@@ -1,26 +1,9 @@
-import argparse
 from pathlib import Path
 
 import nugget  # Main NUGGET package for neutrino detector optimization
 import torch
 import numpy as np
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Fisher information on a shard of signal events.")
-    parser.add_argument("--device", default="cuda:1")
-    parser.add_argument("--num-events", type=int, default=50000)
-    parser.add_argument("--version", default="r600_50_u_1")
-    parser.add_argument("--signal-events-path", type=Path, default=None)
-    parser.add_argument("--output-dir", type=Path, default=Path("res_test/space_test"))
-    parser.add_argument("--num-shards", type=int, default=1)
-    parser.add_argument("--shard-index", type=int, default=0)
-    parser.add_argument("--spacing-min", type=float, default=25.0)
-    parser.add_argument("--spacing-max", type=float, default=200.0)
-    parser.add_argument("--spacing-count", type=int, default=20)
-    parser.add_argument("--use_llrnet", type=str, default="true")
-    parser.add_argument("--use_patd", type=str, default="true")
-    return parser.parse_args()
 
 
 def move_events_to_device(signal_events, device):
@@ -32,29 +15,21 @@ def move_events_to_device(signal_events, device):
         moved_events.append(moved_event)
     return moved_events
 
+min_energy=6
+max_energy=8
+spacing_min=25.0
+spacing_max=300.0
+spacing_count=25
+use_llrnet = True
+use_patd = False
+device = "cuda:1"
+num_events = 3000
+throughgoing = True
+zenith_range = 'horizontal'
+version = f"r600_50_u_sp_1"
+output_dir = Path("res_test/space_test")
 
-def split_events(signal_events, num_shards, shard_index):
-    if num_shards < 1:
-        raise ValueError(f"num_shards must be positive, got {num_shards}")
-    if shard_index < 0 or shard_index >= num_shards:
-        raise ValueError(f"shard_index must be in [0, {num_shards}), got {shard_index}")
-
-    event_indices = np.arange(len(signal_events))
-    shard_event_indices = np.array_split(event_indices, num_shards)[shard_index]
-    shard_events = [signal_events[idx] for idx in shard_event_indices.tolist()]
-    return shard_event_indices, shard_events
-
-
-args = parse_args()
-
-use_llrnet = args.use_llrnet == "true"
-use_patd = args.use_patd == "true"
-device = args.device
-num_events = args.num_events
-version = args.version
-output_dir = args.output_dir
-
-signal_events_path = args.signal_events_path or Path(f"res_test/signal_events_{num_events}_{version}.pt")
+signal_events_path = Path(f"res_test/space_test/{version}/signal_events_{num_events}_e{min_energy}-{max_energy}_{zenith_range}.pt")
 
 print(f"Using device: {device}")
 print(f"Using signal_version: {version}")
@@ -73,8 +48,9 @@ output_dir.mkdir(parents=True, exist_ok=True)
 center = [0, 0, 0]
 radius = 600
 height = 1000
+
 if not use_patd:
-    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=True, domain_size=2500, particle_mode = 'track')
+    lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=2500, particle_mode = 'track')
 else:
     lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabrePATD(
         device=device,
@@ -86,40 +62,42 @@ else:
         particle_mode='track',
         )
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate
-# signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
-#                                                     device=None,
-#                                                     event_type='signal',
-#                                                     domain_size=2500,
-#                                                     E_min=1e2,
-#                                                     E_max=1e8,
-#                                                     find_exact_intersection=False,
-#                                                     random_position_along_ray=True,
-#                                                     energy_dist='log_uniform',
-#                                                     cylinder_center=center,
-#                                                     cylinder_radius=radius,
-#                                                     cylinder_height=height,
-#                                                     # point_towards_center=True,
-#                                                     # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
-#                                                     )
-# signal_events = signal_sampler.sample_events(num_events)
-signal_events = nugget.utils.data_tools.load_signal_events_parquet(signal_events_path)
+signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+                                                    device=None,
+                                                    event_type='signal',
+                                                    domain_size=2500,
+                                                    E_min=10**min_energy,
+                                                    E_max=10**max_energy,
+                                                    find_exact_intersection=True,
+                                                    random_position_along_ray=False,
+                                                    energy_dist='log_uniform',
+                                                    uniform_zenith_sampling=True,
+                                                    cylinder_center=center,
+                                                    cylinder_radius=radius,
+                                                    cylinder_height=height,
+                                                    # point_towards_center=True,
+                                                    cos_range=zenith_range if zenith_range in ['horizontal', 'vertical'] else torch.tensor([-1.0, 1.0]),
+                                                    )
+#check if signal events already exist, if not, sample and save them
+if signal_events_path.exists():
+    print(f"Loading signal events from {signal_events_path}")
+    signal_events = torch.load(signal_events_path)
+else:    
+    signal_events = signal_sampler.sample_events(num_events)
+    nugget.utils.data_tools.save_signal_events_parquet(signal_events, signal_events_path)
 
-shard_event_indices, signal_events = split_events(signal_events, args.num_shards, args.shard_index)
+if use_patd and throughgoing:
+    signal_events = nugget.samplers.cyl_sampler.remap_event_vertices(
+        events=signal_events,
+        cyl = {
+            'center': center,
+            'radius': radius,
+            'height': height},
+        mode = 'box_intersection',
+        domain_size=2000,   
+    )
 signal_events = move_events_to_device(signal_events, device)
-
-if len(shard_event_indices) > 0:
-    shard_start = int(shard_event_indices[0])
-    shard_stop = int(shard_event_indices[-1]) + 1
-else:
-    shard_start = 0
-    shard_stop = 0
-
-print(
-    f"Using shard {args.shard_index + 1}/{args.num_shards}: "
-    f"events {shard_start}:{shard_stop} ({len(signal_events)} events)"
-)
-
-for string_spacing in np.linspace(args.spacing_min, args.spacing_max, args.spacing_count):
+for string_spacing in np.linspace(spacing_min, spacing_max, spacing_count):
     print(f"Running fisher info calculations for string spacing: {string_spacing}m")
     geometry = nugget.geometries.SpaceString.SpaceString(
             device=device,
@@ -136,7 +114,7 @@ for string_spacing in np.linspace(args.spacing_min, args.spacing_max, args.spaci
     angular_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
         device=device,
         resolution_type='angular',
-        fisher_info_params=['position', 'energy', 'direction']
+        fisher_info_params=['energy', 'direction']
     )
 
     signal_yield_loss_func = nugget.losses.light_yield.WeightedLightYieldLoss(
@@ -171,11 +149,13 @@ for string_spacing in np.linspace(args.spacing_min, args.spacing_max, args.spaci
         rel_time=False,
         input_delta_time=False,
         use_rich_features=True,
-        add_distance_from_beam=False,
+        add_distance_from_beam=use_patd,
         use_patd=use_patd,
         )
-
-        llr_net.load_model('best_charge_llr_model_v5.pt')
+        if not use_patd:
+            llr_net.load_model('best_charge_llr_model_v5.pt')
+        else:
+            llr_net.load_model('best_hit_llr_model_v7.pt')
 
     fisher_info_per_string_per_event = angular_resolution_loss.compute_fisher_info_per_string_per_event(
                 string_xy=geom_dict['string_xy'],
@@ -183,7 +163,7 @@ for string_spacing in np.linspace(args.spacing_min, args.spacing_max, args.spaci
                 signal_event_params=signal_events,
                 signal_surrogate_func=light_yield_surrogate,
                 llr_net=llr_net if use_llrnet else None,
-                llr_iterations=100,
+                llr_iterations=200,
                 skip_zero_response=True,
                 verbose=True,
                 jacrev_chunk_size=50000,
@@ -192,15 +172,21 @@ for string_spacing in np.linspace(args.spacing_min, args.spacing_max, args.spaci
                 llr_autodiff_mode='jvp',
                 use_patd=use_patd,
                 use_rich_features=True,
-                use_patd_quadrature=True,
+                use_patd_quadrature=use_patd,
                 t_offset_ns=0.0,
                 t_max_ns=5000.0,
+                zero_response_threshold=0.01,
+                use_charge_quadrature=not use_patd,  # for patd, charge quadrature is handled inside the surrogate
+                charge_center_on_llr_peak=not use_patd,  # for patd, the surrogate is already centered on the llr peak
+                charge_peak_scan_points=64,
+                adaptive_grid_retry=True,
+                adaptive_t_max_floor_ns=10,
+                uninformative_fisher_value=1e-6,
+                empty_cache_after_event=True,
                 )
 
     output_path = output_dir / (
-        f"fisher_info_per_string_per_event_{num_events}_{int(string_spacing)}_{version}"
-        f"_shard{args.shard_index:03d}of{args.num_shards:03d}"
-        f"_events{shard_start:06d}-{shard_stop:06d}.pt"
+        f"fisher_info_per_string_per_event_{num_events}_{int(string_spacing)}_e{min_energy}-{max_energy}_{zenith_range}.pt"
     )
     torch.save(fisher_info_per_string_per_event.cpu(), output_path)
 

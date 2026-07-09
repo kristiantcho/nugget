@@ -1,6 +1,6 @@
 import torch
 from nugget.losses.base_loss import LossFunction
-
+from nugget.losses.fisher_info import WeightedResolutionLoss
 
 class TriggerLoss(LossFunction):
     """
@@ -46,6 +46,8 @@ class TriggerLoss(LossFunction):
             Temperature for t1 sigmoid (higher = sharper transition).
         t3_temperature : float
             Temperature for per-bar thresholding sigmoid (higher = sharper transition).
+        t_temperature : float
+            Temperature for aggregating bar scores (higher = more focus on max).
         use_hard_cuts : bool
             If True, use hard thresholds to produce binary trigger outputs (0/1) instead of
             smooth differentiable sigmoid/softmax aggregations.
@@ -461,10 +463,55 @@ class TriggerLoss(LossFunction):
 
   
     
+    def _compute_chunk_light_yield(self, points_3d, event_params_chunk, surrogate_func, batched_surrogate_func, detach_light_yields):
+        """Compute (or fetch) light yields for one chunk of events."""
+        if batched_surrogate_func is not None:
+            light_yield = batched_surrogate_func(om_positions=points_3d, event_params_list=event_params_chunk)
+        else:
+            light_yield = torch.stack(
+                [surrogate_func(opt_point=points_3d, event_params=ep) for ep in event_params_chunk],
+                dim=0,
+            )
+        if detach_light_yields:
+            light_yield = light_yield.detach()
+        return light_yield
+
+    def _compute_t_values(self, points_3d, event_params_list, surrogate_func, point_weights, precomputed_light_yield, use_batched_trigger):
+        """Compute per-event trigger t-values for a single (already chunked) batch of events."""
+        if use_batched_trigger is None:
+            use_batched_trigger = precomputed_light_yield is not None
+
+        if use_batched_trigger:
+            event_trigger = self.compute_trigger_probability_batched_events(
+                points_3d=points_3d,
+                event_params_list=event_params_list,
+                surrogate_func=surrogate_func,
+                string_weights=point_weights,
+                precomputed_light_yield=precomputed_light_yield,
+            )
+            return event_trigger['t_values']
+
+        t_values = []
+        for i, event_params in enumerate(event_params_list):
+            event_light_yield = None
+            if precomputed_light_yield is not None:
+                event_light_yield = precomputed_light_yield[i]
+
+            event_trigger = self.compute_trigger_probability_single_event(
+                points_3d=points_3d,
+                event_params=event_params,
+                surrogate_func=surrogate_func,
+                string_weights=point_weights,
+                precomputed_light_yield=event_light_yield,
+            )
+            t_values.append(event_trigger['t_values'])
+
+        return torch.stack(t_values)
+
     def __call__(self, geom_dict, **kwargs):
         """
-        Compute trigger loss for detector geometry (event-by-event version).
-        
+        Compute trigger loss for detector geometry, chunking over events internally to cap memory.
+
         Parameters:
         -----------
         geom_dict : dict
@@ -477,36 +524,63 @@ class TriggerLoss(LossFunction):
             - signal_event_params : list of dict (event parameters)
             Optional:
             - precomputed_light_yield_per_point_per_event : torch.Tensor, shape (n_events, n_points)
-            
+            - batched_surrogate_func : callable, used to compute light yields per chunk when
+              precomputed yields are not provided
+            - binned_trigger_batch_size : int, max number of events processed per chunk
+              (None processes all events in a single chunk)
+            - detach_light_yields : bool, detach computed light yields from the autograd graph
+            - perfect_efficiency : bool, short-circuits to a trigger value of 1 for every event
+
         Returns:
         --------
         dict
-            Contains 'trigger_loss' and 'detector_efficiency'
+            Contains 'trigger_loss', 'detector_efficiency', and 't_per_event'
         """
         points_3d = geom_dict.get('points_3d', None)
         string_xy = geom_dict.get('string_xy', None)
         string_weights = geom_dict.get('string_weights', None)
-        
+
         surrogate_func = kwargs.get('signal_surrogate_func', None)
         event_params_list = kwargs.get('signal_event_params', None)
         precomputed_light_yield = kwargs.get('precomputed_light_yield_per_point_per_event', None)
+        batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
+        chunk_size = kwargs.get('binned_trigger_batch_size', None)
+        detach_light_yields = kwargs.get('detach_light_yields', False)
 
         # Optional override: choose computation mode
         # - None: auto (batched if precomputed yields provided, else single loop)
         # - True: force batched
         # - False: force single-event loop
         use_batched_trigger = kwargs.get('use_batched_trigger', None)
-        
+
         signal_sampler = kwargs.get('signal_sampler', None)
         num_events = kwargs.get('num_events', 100)
-        
+
+        # Optional per-call overrides for sliding-bar trigger parameters.
+        self.distance_bar_length = kwargs.get('distance_bar_length', self.distance_bar_length)
+        self.distance_bar_step = kwargs.get('distance_bar_step', self.distance_bar_step)
+        self.min_points_threshold = kwargs.get('min_points_threshold', self.min_points_threshold)
+
         # Generate events if not provided
         if event_params_list is None and signal_sampler is not None:
             event_params_list = [signal_sampler.sample() for _ in range(num_events)]
-        
+
         if points_3d is None or surrogate_func is None or event_params_list is None:
             raise ValueError("points_3d, signal_surrogate_func, and signal_event_params must be provided")
-        
+
+        n_events = len(event_params_list)
+
+        # Perfect trigger short-circuit: every event triggers with probability 1.
+        if kwargs.get('perfect_efficiency', False):
+            t_values = torch.ones(n_events, device=points_3d.device, dtype=points_3d.dtype)
+            detector_efficiency = torch.mean(t_values)
+            trigger_loss = 1.0 - detector_efficiency
+            return {
+                'trigger_loss': trigger_loss,
+                'detector_efficiency': detector_efficiency,
+                't_per_event': t_values
+            }
+
         # Map string weights to point weights if string_xy is provided
         point_weights = None
         if string_weights is not None:
@@ -519,55 +593,198 @@ class TriggerLoss(LossFunction):
                     if xy_tuple not in seen:
                         seen.add(xy_tuple)
                         unique_indices.append(i)
-                
+
                 string_xy = points_3d[unique_indices, :2]
-            
+
             point_weights = self.map_string_weights_to_points(points_3d, string_xy, string_weights)
-        
-        # Compute trigger probabilities.
-        if use_batched_trigger is None:
-            use_batched_trigger = precomputed_light_yield is not None
 
-        if use_batched_trigger:
-            event_trigger = self.compute_trigger_probability_batched_events(
-                points_3d=points_3d,
-                event_params_list=event_params_list,
-                surrogate_func=surrogate_func,
-                string_weights=point_weights,
-                precomputed_light_yield=precomputed_light_yield,
-            )
-            t_values = event_trigger['t_values']
-        else:
-            t_values = []
-            for i, event_params in enumerate(event_params_list):
-                event_light_yield = None
-                if precomputed_light_yield is not None:
-                    event_light_yield = precomputed_light_yield[i]
-
-                event_trigger = self.compute_trigger_probability_single_event(
-                    points_3d=points_3d,
-                    event_params=event_params,
-                    surrogate_func=surrogate_func,
-                    string_weights=point_weights,
-                    precomputed_light_yield=event_light_yield,
+        if chunk_size is None or chunk_size >= n_events:
+            # Single pass — precompute light yields with batched surrogate if available
+            ly = precomputed_light_yield
+            if ly is None and batched_surrogate_func is not None:
+                ly = self._compute_chunk_light_yield(
+                    points_3d, event_params_list, surrogate_func, batched_surrogate_func, detach_light_yields
                 )
-                t_values.append(event_trigger['t_values'])
+            elif ly is not None and detach_light_yields:
+                ly = ly.detach()
 
-            t_values = torch.stack(t_values)
-        
+            t_values = self._compute_t_values(
+                points_3d, event_params_list, surrogate_func, point_weights, ly, use_batched_trigger
+            )
+        else:
+            # Chunked pass — process chunk_size events at a time to cap memory
+            t_values = torch.zeros(n_events, device=points_3d.device, dtype=points_3d.dtype)
+            for chunk_start in range(0, n_events, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, n_events)
+                chunk_events = event_params_list[chunk_start:chunk_end]
+
+                if precomputed_light_yield is not None:
+                    chunk_ly = precomputed_light_yield[chunk_start:chunk_end]
+                    if detach_light_yields:
+                        chunk_ly = chunk_ly.detach()
+                elif batched_surrogate_func is not None:
+                    chunk_ly = self._compute_chunk_light_yield(
+                        points_3d, chunk_events, surrogate_func, batched_surrogate_func, detach_light_yields
+                    )
+                else:
+                    chunk_ly = None
+
+                chunk_t_values = self._compute_t_values(
+                    points_3d, chunk_events, surrogate_func, point_weights, chunk_ly, use_batched_trigger
+                )
+                t_values[chunk_start:chunk_end] = chunk_t_values
+
         # Calculate detector efficiency: mean of t3 values
         detector_efficiency = torch.mean(t_values)
-        
+
         # Calculate loss: 1 - detector efficiency
         trigger_loss = 1.0 - detector_efficiency
-        
+
         if self.print_loss:
             print(f"Trigger Loss: {trigger_loss.item():.6f}")
             print(f"Detector Efficiency: {detector_efficiency.item():.6f}")
             print(f"Mean T3: {detector_efficiency.item():.6f}")
-        
+
         return {
             'trigger_loss': trigger_loss,
             'detector_efficiency': detector_efficiency,
             't_per_event': t_values
         }
+
+
+class ResolutionSelectionLoss(LossFunction):
+    """
+    Resolution selection loss based on Fisher information.
+    This loss encourages the detector geometry to achieve a desired resolution for specific event parameters.
+    Parameters:
+    -----------
+    device : torch.device or None
+        Device to use for computations.
+    resolution_type : str
+        Type of resolution to consider. Options are 'angular' or 'energy'.
+    fisher_info_params : list of str
+        List of event parameters to consider for Fisher information..
+    """
+    
+
+
+    def __init__(self, 
+                 device=None, 
+                 resolution_type='angular',
+                 fisher_info_params=['energy', 'azimuth', 'zenith'],
+                 ):
+        
+        super().__init__(device)
+        self.resolution_type = resolution_type
+        self.fisher_info_params = fisher_info_params
+      
+
+
+    def soft_between(self, selection_thresholds, lower, upper, temperature=1.0):
+
+        """
+        Compute a soft mask for whether [lower, upper] intersects the selection threshold range.
+
+        Parameters:
+        -----------
+        selection_thresholds : list
+            List containing lower and upper thresholds range, shape (2,)
+        lower : float or torch.Tensor
+            Lower bound(s), shape (n_events,) or scalar
+        upper : float or torch.Tensor
+            Upper bound(s), shape (n_events,) or scalar
+        temperature : float
+            Temperature for the soft selection (higher = sharper transition)
+        """
+        # Intersection requires lower <= thresholds[1] and upper >= thresholds[0]
+        lower_mask = torch.sigmoid(temperature * (selection_thresholds[1] - lower))
+        upper_mask = torch.sigmoid(temperature * (upper - selection_thresholds[0]))
+        return lower_mask * upper_mask
+
+    def __call__(self, geom_dict, **kwargs):
+        """
+        Compute resolution selection loss for detector geometry.
+        
+        Parameters:
+        -----------
+        geom_dict : dict
+            Dictionary containing 'points_3d' and optionally 'string_xy' and 'string_weights'.
+            If 'string_xy' and 'string_weights' are provided, weights will be mapped to points
+            based on xy positions (points at same xy get same weight).
+        **kwargs : dict
+            Must contain:
+            - signal_surrogate_func : callable
+            - signal_event_params : list of dict (event parameters)
+            Optional:
+            - precomputed_fisher_info_per_string_per_event : torch.Tensor, shape (n_events, n_strings, 3, 3)
+        """
+        selection_soft_temperature = kwargs.get('selection_soft_temperature', 1.0)
+        precalculated_resolution_loss = kwargs.get('precalculated_resolution_loss', None)
+        
+        selection_thresholds=kwargs.get('selection_thresholds', [-1, 0.1])
+        self.selection_soft_temperature = kwargs.get('selection_soft_temperature', selection_soft_temperature)
+        if precalculated_resolution_loss is None:    
+            weighted_resolution_loss=WeightedResolutionLoss(
+                device=self.device,
+                resolution_type=self.resolution_type,
+                fisher_info_params=self.fisher_info_params
+            ) 
+            loss_stuff = weighted_resolution_loss(geom_dict, **kwargs)
+            resolution_per_event = loss_stuff['resolution_per_event'].squeeze()
+            signal_event_params = loss_stuff['resolution_params']
+        else:
+            resolution_per_event = precalculated_resolution_loss['resolution_per_event'].squeeze()
+            signal_event_params = precalculated_resolution_loss['resolution_params']
+        true_params = []
+        if self.resolution_type =='angular':
+            for event in signal_event_params:
+                if 'zenith' not in event or 'azimuth' not in event:
+                    raise ValueError("For angular resolution, each event must have 'zenith' and 'azimuth' parameters.")
+                true_params.append(event['zenith'])
+        elif self.resolution_type =='energy':
+            for event in signal_event_params:
+                if 'energy' not in event:
+                    raise ValueError("For energy resolution, each event must have 'energy' parameter.")
+                true_params.append(event['energy'])
+        else:
+            raise ValueError(f"Unsupported resolution type: {self.resolution_type}. Supported types are 'angular' and 'energy'.")
+        true_params = torch.stack(true_params).to(device=self.device).squeeze()
+        if kwargs.get('hard_selection', False):
+            # check if the resolution contour around the true parameter intersects the threshold range
+            if self.resolution_type =='angular': # take cosine of zenith angle for angular resolution
+                cos_true_params = torch.cos(true_params)
+                lower_bound = cos_true_params - torch.sin(true_params) * resolution_per_event
+                upper_bound = cos_true_params + torch.sin(true_params) * resolution_per_event
+                selection_mask = (lower_bound <= selection_thresholds[1]) & (upper_bound >= selection_thresholds[0])
+            elif self.resolution_type =='energy':
+                lower_bound = true_params - resolution_per_event
+                upper_bound = true_params + resolution_per_event
+                selection_mask = (lower_bound <= selection_thresholds[1]) & (upper_bound >= selection_thresholds[0])
+        else: # use soft selection based on resolution
+            if self.resolution_type =='angular':
+                cos_true_params = torch.cos(true_params)
+                lower_bound = cos_true_params - torch.sin(true_params) * resolution_per_event
+                upper_bound = cos_true_params + torch.sin(true_params) * resolution_per_event
+                selection_mask = self.soft_between(selection_thresholds, lower_bound, upper_bound, temperature=self.selection_soft_temperature)
+            elif self.resolution_type =='energy':
+                lower_bound = true_params - resolution_per_event
+                upper_bound = true_params + resolution_per_event
+                selection_mask = self.soft_between(selection_thresholds, lower_bound, upper_bound, temperature=self.selection_soft_temperature)
+
+
+
+        selection_efficiency = torch.mean(selection_mask.float())
+        selection_loss = 1.0 - selection_efficiency
+
+        return {
+            'selection_loss': selection_loss,
+            'selection_efficiency': selection_efficiency,
+            'resolution_per_event': resolution_per_event,
+            'resolution_params': signal_event_params,
+            'selection_per_event': selection_mask
+        }          
+        
+
+    
+
+

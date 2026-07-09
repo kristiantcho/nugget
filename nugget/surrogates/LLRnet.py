@@ -187,10 +187,10 @@ class LLRnet(Surrogate):
     def __init__(self, device=None, dim=3, domain_size=2, hidden_dims=[128, 64, 32], 
                  dropout_rate=0.1, learning_rate=1e-3, use_fourier_features=True,
                  num_frequencies=64, frequency_scale=1.0, learnable_frequencies=False,
-                 num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False,
-                 shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True,
-                 add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False,
-                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False):
+                 num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False, log_charge_scale=4,
+                 shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True, jitter_time=0.0,
+                 add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True,
+                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, rich_rel_pos_mode=False, **kwargs):
         """
         Initialize the LLRnet surrogate model.
         
@@ -236,6 +236,8 @@ class LLRnet(Surrogate):
         add_distance_from_beam : bool
             If True, adds perpendicular distance from detector point to beam/track as a feature.
             Requires 'position', 'zenith', and 'azimuth' in event data.
+        add_vertex_distance : bool
+            If True, adds distance from detector point to event vertex as a feature.
         log_scale_ly : bool
             If True, applies log10 scaling to light yield values
         norm_pos : bool
@@ -256,6 +258,8 @@ class LLRnet(Surrogate):
             Number of photons to sample from each valid event in PATD mode.
             If None, defaults to min_photons. Can be set higher than min_photons to
             sample more photons from each event, or lower (but >= 1) to sample fewer.
+        jitter_time : float
+            Amount of time jitter to add to each photon arrival time (default: 0.0)
         """
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         
@@ -275,17 +279,27 @@ class LLRnet(Surrogate):
         self.add_distance_from_beam = add_distance_from_beam
         self.log_scale_ly = log_scale_ly
         self.rel_time = rel_time
+        self.flag_negative_times = flag_negative_times
         self.input_charge = input_charge  # If using PATD, we will add number of photons as an input feature
         self.norm_pos = norm_pos
         self.log_scale_energy = log_scale_energy
+        self.use_rich_features = use_rich_features
         self.reduce_lr_on_plateau = reduce_lr_on_plateau
         self.lr_scheduler_patience = lr_scheduler_patience
         self.lr_scheduler_factor = lr_scheduler_factor
         self.lr_scheduler_min_lr = lr_scheduler_min_lr
+        self.add_vertex_distance = add_vertex_distance
         self.use_patd = use_patd
         self.min_photons = min_photons
         self.input_delta_time = input_delta_time
         self.num_photons_per_sample = num_photons_per_sample if num_photons_per_sample is not None else min_photons
+        self.jitter_time = jitter_time
+        # Divisor applied to log-sign-scaled photon arrival times in prepare_features_patd.
+        # Larger values compress the timing signal into a narrower range (and can make it
+        # negligible relative to the geometric features); smaller values let timing dominate.
+        self.time_scale_divisor = time_scale_divisor
+        self.rich_rel_pos_mode = rich_rel_pos_mode
+        self.log_charge_scale = log_charge_scale  # Scale factor for log10 of charge when input_charge=True
         # Handle multiple branch configurations
         if num_parallel_branches > 1:
             # Set up frequency scales for each branch
@@ -322,6 +336,10 @@ class LLRnet(Surrogate):
         self.train_losses = []
         self.val_losses = []
         self.is_trained = False
+
+        # Accumulated [x, y, z, light_yield, label] rows recorded during
+        # training when record_marginal_lys=True (see train_with_dataloader)
+        self.recorded_lys = torch.empty((0, 5), dtype=torch.float32)
 
     def _pos_norm_divisor(self):
         """Return a divisor for normalizing (x,y,z) positions.
@@ -685,10 +703,9 @@ class LLRnet(Surrogate):
     
     def prepare_features_patd(self, point, event_data, patd_result):
         """
-        Build per-photon feature vectors from a pre-computed PATD surrogate result.
+        Build (rich) per-photon feature vectors from a pre-computed PATD surrogate result.
 
-        This is an alternative to prepare_data_from_raw_patd that mirrors the feature
-        engineering used in the NSF notebook (create_event_features / sample_detector_features).
+        This is an alternative to prepare_data_from_raw_patd
         It exposes richer geometric features that are strong discriminators for the
         hit-time LLR classifier:
 
@@ -696,18 +713,14 @@ class LLRnet(Surrogate):
            v_x,   v_y,   v_z,             normalised vertex position           (3)
            d_x,   d_y,   d_z,             unit direction vector                (3)
            log10(E)/8,                    log-scaled energy                    (1)
-           vert_dist,                     L2(detector - vertex) normalised     (1)
+           vert_dist,                     L2(detector - vertex) normalised     (1, optional)
            cos_angle,                     cos(direction ∠ vertex→detector)     (1)
-           t_geom_min / 1e5,              min geometric arrival time           (1)
-           t_hit (log-sign scaled)]       per-photon arrival time              (1)
-                                                                           total = 14
+           beam_dist_perp,                perpendicular distance from beam     (1, optional)
+           t_hit (log-sign scaled),       per-photon arrival time              (1)
+           is_negative]                   1 if t_residual < 0 else 0           (1, optional)
+                                                                           total = 12-15
 
-        The first 13 entries are the same for every photon in the event and are
-        replicated across rows.  Only the last column varies per photon.
-
-        Normalisation uses self.domain_size via _pos_norm_divisor(), so it is
-        consistent with the rest of LLRnet regardless of detector geometry.
-
+        
         Parameters
         ----------
         point : torch.Tensor or np.ndarray
@@ -715,13 +728,13 @@ class LLRnet(Surrogate):
         event_data : dict
             Event parameters.  Must contain 'position', 'energy', 'direction'.
         patd_result : dict
-            Output of the PATD surrogate.  Must contain 'hit_times', 'num_photons',
-            and 't_geom_min'.
+            Output of the PATD surrogate.  Must contain 'hit_times' and 'num_photons' and/or 'min_geom_time' if relative time (rel_time) is used.
 
         Returns
         -------
-        features : torch.Tensor, shape (num_photons, 14)
+        features : torch.Tensor, shape (num_photons, 12–15)
             Per-photon feature matrix, or None if num_photons == 0.
+            Width is 12 base + add_vertex_distance + add_distance_from_beam + flag_negative_times.
         num_photons : int
         """
         num_photons = patd_result['num_photons']
@@ -770,37 +783,169 @@ class LLRnet(Surrogate):
         cos_angle = torch.dot(direction, rel) / (torch.norm(direction) * vert_dist + 1e-8)
 
         # --- t_geom_min: minimum geometric photon arrival time ---
-        t_geom_min = patd_result['t_geom_min']
-        if isinstance(t_geom_min, np.ndarray):
-            t_geom_min = torch.tensor(t_geom_min, device=self.device, dtype=torch.float32)
+        # t_geom_min = patd_result['t_geom_min']
+        # if isinstance(t_geom_min, np.ndarray):
+        #     t_geom_min = torch.tensor(t_geom_min, device=self.device, dtype=torch.float32)
+        # else:
+        #     t_geom_min = t_geom_min.float().to(self.device)
+        # t_geom_min_scalar = t_geom_min.squeeze().mean() / 1e5  # scalar
+
+        # --- assemble the event-level context features ---
+        if self.rich_rel_pos_mode:
+            # Use only relative position (detector - vertex) instead of both absolute positions
+            event_features = [
+                rel[0], rel[1], rel[2],
+                direction[0], direction[1], direction[2],
+                log_energy,
+            ]
         else:
-            t_geom_min = t_geom_min.float().to(self.device)
-        t_geom_min_scalar = t_geom_min.squeeze().mean() / 1e5  # scalar
-
-        # --- assemble the 13 event-level context features ---
-        event_features = torch.stack([
-            det[0], det[1], det[2],
-            vert[0], vert[1], vert[2],
-            direction[0], direction[1], direction[2],
-            log_energy,
-            vert_dist,
-            cos_angle,
-            t_geom_min_scalar,
-        ])  # (13,)
-
+            event_features = [
+                det[0], det[1], det[2],
+                vert[0], vert[1], vert[2],
+                direction[0], direction[1], direction[2],
+                log_energy,
+            ]
+        if self.add_vertex_distance:
+            event_features.append(vert_dist)
+        event_features.append(cos_angle)
+        # event_features.append(t_geom_min_scalar)
+        event_features = torch.stack(event_features)
+        if self.add_distance_from_beam:
+            track_pos = vert * norm  # Convert back to original scale for distance calculation
+            track_dir = direction  # Already a unit vector
+            _, dist_perp = self.compute_distance_from_beam(point, track_pos, track_dir)
+            event_features = torch.cat(
+                [event_features, dist_perp.reshape(1) / (self.domain_size / 2)],
+                dim=0,
+            )  # Add normalized perpendicular distance
         # --- per-photon hit times: log-sign scaled ---
         hit_times = patd_result['hit_times'].float().to(self.device)  # (N,)
+        if self.rel_time:
+            # Convert to relative times by subtracting the minimum hit time
+            hit_times = hit_times - (patd_result['t_geom_min'].float().to(self.device) - self.jitter_time)
+        t_div = self.time_scale_divisor
         t_scaled = torch.where(
             hit_times < 0,
-            -torch.log10(-hit_times + 1e-4) / 4.0,
-            torch.log10(hit_times + 1e-4) / 4.0,
+            -torch.log10(-hit_times + 1e-4) / t_div,
+            torch.log10(hit_times + 1e-4) / t_div,
         )  # (N,)
 
         # --- replicate event features and append per-photon time ---
-        event_features_batch = event_features.unsqueeze(0).expand(num_photons, -1)  # (N, 13)
-        features = torch.cat([event_features_batch, t_scaled.unsqueeze(1)], dim=1)  # (N, 14)
+        event_features_batch = event_features.unsqueeze(0).expand(num_photons, -1)
+        if self.flag_negative_times:
+            is_neg = (hit_times < 0).float().unsqueeze(1)  # (N, 1)
+            features = torch.cat([event_features_batch, t_scaled.unsqueeze(1), is_neg], dim=1)
+        else:
+            features = torch.cat([event_features_batch, t_scaled.unsqueeze(1)], dim=1)  # (N, 14)
 
         return features.clone().detach(), num_photons
+
+    def prepare_features_charge(self, point, event_data, light_yield):
+        """
+        Build a feature vector for the charge (non-PATD) LLR network from a
+        pre-computed light yield value.
+
+        This is the charge analogue of prepare_features_patd
+
+        Feature layout (10 features total):
+          [det_x, det_y, det_z,       normalised detector position     (3)
+           v_x,   v_y,   v_z,         normalised vertex position       (3)
+           d_x,   d_y,   d_z,         unit direction vector            (3)
+           log10(E)/8,                log-scaled energy                (1)
+           vert_dist,                 L2(detector - vertex) normalised (1, optional)
+           cos_angle,                 cos(direction ∠ vertex→detector) (1)
+           dist_perp,                 perp. distance to beam normalised(1, optional)
+           log_ly]                    log-scaled light yield           (1)
+                                                                                                                             total = 12, 13 or 14
+
+        Normalisation uses self.domain_size via _pos_norm_divisor().
+
+        Parameters
+        ----------
+        point : torch.Tensor or np.ndarray
+            Detector position, shape (3,) or (1, 3).
+        event_data : dict
+            Event parameters. Must contain 'position', 'energy', 'direction'.
+        light_yield : torch.Tensor or float
+            Pre-computed light yield scalar (the observation).
+
+        Returns
+        -------
+        features : torch.Tensor, shape (13,) or (12,)
+        """
+        if isinstance(point, np.ndarray):
+            point = torch.tensor(point, device=self.device, dtype=torch.float32)
+        else:
+            point = point.float().to(self.device)
+        point = point.squeeze()  # (3,)
+
+        norm = self._pos_norm_divisor()  # scalar or (3,) tensor
+
+        # --- detector and vertex positions, normalised ---
+        det = point / norm  # (3,)
+
+        vert = event_data['position']
+        if isinstance(vert, np.ndarray):
+            vert = torch.tensor(vert, device=self.device, dtype=torch.float32)
+        else:
+            vert = vert.float().to(self.device)
+        vert = vert.squeeze() / norm  # (3,)
+
+        # --- direction (already a unit vector) ---
+        direction = event_data['direction']
+        if isinstance(direction, np.ndarray):
+            direction = torch.tensor(direction, device=self.device, dtype=torch.float32)
+        else:
+            direction = direction.float().to(self.device)
+        direction = direction.squeeze()  # (3,)
+
+        # --- log-scaled energy ---
+        energy = event_data['energy']
+        if isinstance(energy, np.ndarray):
+            energy = torch.tensor(energy, device=self.device, dtype=torch.float32)
+        else:
+            energy = energy.float().to(self.device)
+        log_energy = torch.log10(energy.squeeze() + 1e-10) / 8.0  # scalar
+
+        # --- derived geometric scalars ---
+        rel = det - vert
+        vert_dist = torch.norm(rel)
+        cos_angle = torch.dot(direction, rel) / (torch.norm(direction) * vert_dist + 1e-8)
+
+        # --- log-scaled light yield ---
+        if not isinstance(light_yield, torch.Tensor):
+            light_yield = torch.tensor(light_yield, device=self.device, dtype=torch.float32)
+        else:
+            light_yield = light_yield.float().to(self.device)
+        log_ly = torch.log10(torch.abs(light_yield.squeeze()) + 1e-10) / self.log_charge_scale  # scalar
+
+        if self.rich_rel_pos_mode:
+            # Use only relative position (detector - vertex) instead of both absolute positions
+            feature_values = [
+                rel[0], rel[1], rel[2],
+                direction[0], direction[1], direction[2],
+                log_energy,
+            ]
+        else:
+            feature_values = [
+                det[0], det[1], det[2],
+                vert[0], vert[1], vert[2],
+                direction[0], direction[1], direction[2],
+                log_energy,
+            ]
+        if self.add_vertex_distance:
+            feature_values.append(vert_dist)
+        feature_values.append(cos_angle)
+        if self.add_distance_from_beam:
+            track_pos = vert * norm  # back to original scale for distance calculation
+            track_dir = direction    # already a unit vector
+            _, dist_perp = self.compute_distance_from_beam(point, track_pos, track_dir)
+            feature_values.append(dist_perp.reshape(()) / (self.domain_size / 2))
+        feature_values.append(log_ly)
+
+        features = torch.stack(feature_values)
+
+        return features.clone().detach()
 
     def prepare_data_from_raw_patd(self, point, event_data, surrogate_func, event_labels=['position', 'energy', 'zenith', 'azimuth'], signal_event_data=None, num_samples=1, input_photons=None):
         """
@@ -984,9 +1129,15 @@ class LLRnet(Surrogate):
             base_features_batch = base_features.unsqueeze(0).repeat(num_photons_int, 1)
             
             # Concatenate base features with hit times
-            if self.input_delta_time:
+            if self.flag_negative_times:
+                is_neg = (hit_times < 0).float().view(-1, 1).sort(dim=0).values
+                if self.input_delta_time:
+                    features_batch = torch.cat([base_features_batch, hit_times_processed, delta_times_processed, is_neg], dim=1)
+                else:
+                    features_batch = torch.cat([base_features_batch, hit_times_processed, is_neg], dim=1)
+            elif self.input_delta_time:
                 features_batch = torch.cat([base_features_batch, hit_times_processed, delta_times_processed], dim=1)
-            else:    
+            else:
                 features_batch = torch.cat([base_features_batch, hit_times_processed], dim=1)
             
             all_features_batches.append(features_batch)
@@ -1364,15 +1515,16 @@ class LLRnet(Surrogate):
         
     def train_with_dataloader(self, train_dataloader, val_dataloader=None, epochs=100,
                              verbose=True, early_stopping_patience=10, input_dim=None,
-                             grad_clip=1.0):
+                             grad_clip=None, save_every_n_epochs=None,
+                             checkpoint_path=None, dataset_checkpoint_path=None):
         """
         Train the LLR network using PyTorch DataLoader with balanced signal/background events.
-        
+
         This method is designed to work with EventDataset that dynamically generates
         balanced signal and background events. The dataset ensures that for every signal
         event there is a corresponding background event with the same detector point and
         shared parameters, differing only in detector response.
-        
+
         Parameters:
         -----------
         train_dataloader : torch.utils.data.DataLoader
@@ -1380,25 +1532,51 @@ class LLRnet(Surrogate):
         val_dataloader : torch.utils.data.DataLoader, optional
             DataLoader for validation data. If None, no validation is performed.
         epochs : int
-            Number of training epochs  
+            Number of training epochs
         verbose : bool
             Whether to print training progress
         early_stopping_patience : int
             Number of epochs to wait for improvement before early stopping
-            
+        save_every_n_epochs : int or None
+            If set, save a checkpoint every N epochs during training.
+        checkpoint_path : str or None
+            File path to overwrite on each periodic save. Required when
+            save_every_n_epochs is set.
+        dataset_checkpoint_path : str or None
+            If set, save self.recorded_lys (accumulated [x, y, z, light_yield,
+            label] rows from SignalOnlyDataset, requires record_marginal_lys=True)
+            to this path on the same save_every_n_epochs cadence. Requires
+            save_every_n_epochs to be set.
+
         Returns:
         --------
         dict : Training history with 'train_loss' and 'val_loss' keys
         """
+        if save_every_n_epochs is not None and save_every_n_epochs <= 0:
+            raise ValueError("save_every_n_epochs must be a positive integer or None")
+        if save_every_n_epochs is not None and checkpoint_path is None:
+            raise ValueError("checkpoint_path must be provided when save_every_n_epochs is set")
+        if dataset_checkpoint_path is not None and save_every_n_epochs is None:
+            raise ValueError("save_every_n_epochs must be provided when dataset_checkpoint_path is set")
+        record_marginal_lys = getattr(train_dataloader.dataset, 'record_marginal_lys', False)
+        if dataset_checkpoint_path is not None and not record_marginal_lys:
+            raise ValueError(
+                "dataset_checkpoint_path was set but train_dataloader.dataset was not "
+                "created with record_marginal_lys=True; pass it to "
+                "create_signal_only_dataloader to enable recording."
+            )
+        recorded_ly_batches = []  # list of (N, 5) tensors [x, y, z, light_yield, label], merged periodically
+
         # Build network if not already built
         # We need to get a sample to determine the feature dimension
         if self.mlp_branches is None and self.shared_branch_mlp is None:
             if input_dim is None:
                 sample_batch = next(iter(train_dataloader))
                 # print(f"Sampled batch in {time.time() - start_time:.4f} seconds")
-                sample_features, _ = sample_batch
+                sample_features = sample_batch[0]
                 # Features are now (batch_size, feature_dim) since each sample is an individual event
                 feature_dim = sample_features.shape[1]
+                
                 print(f"Number of datapoints per batch: {sample_features.shape[0]}")
                 self._build_network(feature_dim)
             else:
@@ -1425,9 +1603,18 @@ class LLRnet(Surrogate):
             
             # Iterate through batches of individual events
             time_start = time.time()
-            for batch_features, batch_labels in train_dataloader:
-                
-                
+            for batch in train_dataloader:
+                batch_features, batch_labels = batch[0], batch[1]
+                if record_marginal_lys:
+                    # ly_record is always the last element of the batch tuple
+                    # (see SignalOnlyDataset.__getitem__ / _pack): shape (B, 4)
+                    # columns [x, y, z, light_yield]. Append the label column so
+                    # each accumulated batch is [x, y, z, light_yield, label].
+                    batch_ly_record = batch[-1]
+                    recorded_ly_batches.append(
+                        torch.cat([batch_ly_record, batch_labels.reshape(-1, 1)], dim=1).cpu()
+                    )
+
                 # Debug: Check device and dtype before transfer
                 if n_batches == 0 and epoch == 0:
                     print(f"Batch loaded in {time.time() - time_start:.4f} seconds")
@@ -1437,18 +1624,18 @@ class LLRnet(Surrogate):
                     # print(f"  Features min: {batch_features[:,-1].min().item():.4f}, max: {batch_features[:,-1].max().item():.4f}")
                     # print(f"  Features mean: {batch_features[:,-1].mean().item():.4f}, std: {batch_features[:,-1].std().item():.4f}")
                     time_start = time.time()
-                
-                    # 
+
+                    #
                 # Each sample is now an individual event
                 # batch_features shape: (batch_size, feature_dim)
                 # batch_labels shape: (batch_size,)
                 batch_features = batch_features.to(self.device)
                 batch_labels = batch_labels.to(self.device)
-                
+
                 # if n_batches == 0 and epoch == 0:
                 #     print(f"  Features device after .to(): {batch_features.device}")
                 #     print(f"  Labels device after .to(): {batch_labels.device}")
-                
+
                 self.optimizer.zero_grad()
                 outputs = self._forward_pass(batch_features)
             
@@ -1550,7 +1737,23 @@ class LLRnet(Surrogate):
                     for i, fourier_layer in enumerate(self.fourier_features_list):
                         fourier_layer.load_state_dict(self.best_state_dict['fourier_features_list'][i])
                 break
-        
+
+            if record_marginal_lys and recorded_ly_batches:
+                self.recorded_lys = torch.cat([self.recorded_lys, *recorded_ly_batches], dim=0)
+                recorded_ly_batches = []
+
+            if save_every_n_epochs is not None and ((epoch + 1) % save_every_n_epochs == 0 or (epoch+1) == epochs):
+                checkpoint_dirname = os.path.dirname(checkpoint_path)
+                if checkpoint_dirname:
+                    os.makedirs(checkpoint_dirname, exist_ok=True)
+                self._save_model_state(checkpoint_path)
+
+                if dataset_checkpoint_path is not None:
+                    dataset_checkpoint_dirname = os.path.dirname(dataset_checkpoint_path)
+                    if dataset_checkpoint_dirname:
+                        os.makedirs(dataset_checkpoint_dirname, exist_ok=True)
+                    torch.save(self.recorded_lys, dataset_checkpoint_path)
+
         self.is_trained = True
         
         return {
@@ -1660,69 +1863,273 @@ class LLRnet(Surrogate):
         if return_probabilities:
             return probabilities
         else:
-            # Convert probabilities to LLR: log(p/(1-p))
-            epsilon = 1e-7  # Small value to prevent log(0)
-            prob_clamped = torch.clamp(probabilities, epsilon, 1 - epsilon)
-            return torch.log(prob_clamped / (1 - prob_clamped))
+            # Convert probabilities to LLR = logit(p) = log(p/(1-p)).
+            # Do NOT clamp before logit: clamp has zero gradient in the clamped
+            # region, which kills Fisher info for saturated outputs. nn.Sigmoid
+            # never produces exactly 0 or 1 in float32, so logit stays finite.
+            return torch.logit(probabilities)
 
-    def evaluate_patd_likelihood(self, point, event_data, signal_surrogate_func, 
-                                 event_labels=['position', 'energy', 'zenith', 'azimuth']):
+    def evaluate_patd_likelihood(self, point, event_data, signal_surrogate_func,
+                                 event_labels=['position', 'energy', 'zenith', 'azimuth'],
+                                patd_result=None, **kwargs):
         """
         Evaluate joint log-likelihood for all photon hits at a detector position.
-        
-        This method computes the sum of log-likelihoods for all individual photon hits,
-        which gives the joint log-likelihood under the assumption of independent hits.
-        
-        Parameters:
-        -----------
+
+        Computes the sum of per-photon log-likelihood ratios log(p/(1-p)), which equals
+        the joint log-LLR under the assumption of independent hits.
+
+        Parameters
+        ----------
         point : torch.Tensor or np.ndarray
-            Detector point coordinates
+            Detector point coordinates.
         event_data : dict
-            Event parameters (hypothesis)
+            Event parameters (hypothesis).
         signal_surrogate_func : callable
-            Function to calculate PATD
+            Function to calculate PATD.  Called once as
+            ``signal_surrogate_func(opt_point=point, event_params=event_data)``
+            unless patd_result is provided.
         event_labels : list
-            List of event parameter keys
-            
-        Returns:
-        --------
-        dict
-            Dictionary containing:
-            - 'joint_log_likelihood': Sum of log-likelihoods for all hits
-            - 'num_photons': Number of photon hits
-            - 'individual_llrs': Tensor of individual log-likelihood ratios for each hit
+            Event parameter keys passed to prepare_data_from_raw_patd.
+            Ignored when use_rich_features=True.
+        use_rich_features : bool
+            If True, uses prepare_features_patd (14-feature geometry-rich builder).
+            Must match the flag used during training.
+        patd_result : dict or None
+            Pre-computed surrogate result dict (with 'hit_times', 'num_photons',
+            't_geom_min', ...).  When provided the surrogate is NOT called and
+            these fixed photon times are used as the observation — event_data is
+            used only for the hypothesis features.  This is the correct mode for
+            NLL landscape evaluation where the observation must be held fixed while
+            only the hypothesis parameters change.
+
+        Returns
+        -------
+        dict with keys:
+            'joint_log_likelihood' : scalar Tensor, sum of per-photon log-LLRs
+            'num_photons'          : int
+            'individual_llrs'      : Tensor of shape (num_photons,)
         """
         if not self.use_patd:
             raise ValueError("evaluate_patd_likelihood can only be used when use_patd=True")
-        
-        # Prepare features for all hits (this also calls the surrogate function internally)
-        features_batch, num_photons = self.prepare_data_from_raw(
-            point=point,
-            event_data=event_data,
-            surrogate_func=signal_surrogate_func,
-            event_labels=event_labels
-        )
-        
-        # Handle case when no photons were detected
+
+        if isinstance(point, np.ndarray):
+            point_t = torch.tensor(point, device=self.device, dtype=torch.float32)
+        else:
+            point_t = point.float().to(self.device)
+
+        if self.use_rich_features:
+            if patd_result is None:
+                with torch.no_grad():
+                    patd_result = signal_surrogate_func(opt_point=point_t, event_params=event_data)
+            features_batch, num_photons = self.prepare_features_patd(
+                point=point_t,
+                event_data=event_data,
+                patd_result=patd_result,
+            )
+        else:
+            if patd_result is not None:
+                features_batch, num_photons = self.prepare_data_from_raw_patd(
+                    point=point_t,
+                    event_data=event_data,
+                    surrogate_func=lambda **kwargs: patd_result,
+                    event_labels=event_labels,
+                )
+            else:
+                features_batch, num_photons = self.prepare_data_from_raw_patd(
+                    point=point_t,
+                    event_data=event_data,
+                    surrogate_func=signal_surrogate_func,
+                    event_labels=event_labels,
+                )
+
         if num_photons == 0 or features_batch is None:
             return {
                 'joint_log_likelihood': torch.tensor(0.0, device=self.device),
                 'num_photons': 0,
-                'individual_llrs': torch.tensor([], device=self.device)
+                'individual_llrs': torch.tensor([], device=self.device),
             }
-        
-        # Get log-likelihood ratios for all hits
+
         individual_llrs = self.predict_log_likelihood_ratio(features_batch)
-        
-        # Sum to get joint log-likelihood
         joint_log_likelihood = torch.sum(individual_llrs)
-        
+
         return {
             'joint_log_likelihood': joint_log_likelihood,
             'num_photons': num_photons,
-            'individual_llrs': individual_llrs
+            'individual_llrs': individual_llrs,
         }
     
+    def precompute_patd_observations(self, detector_points, patd_results):
+        """
+        Pre-compute the fixed (observation-side) quantities from PATD results for all
+        detector points. Returns a list of dicts, one per detector, containing:
+          - 't_scaled'   : (N_hits,) log-sign scaled hit times — fixed, does not vary with θ
+          - 'det_normed' : (3,) normalised detector position — fixed
+          - 'num_photons': int
+          - 'skip'       : bool, True if this detector should be skipped (zero photons)
+
+        These can be passed to evaluate_patd_likelihood_batched_hypothesis to avoid
+        recomputing t_scaled for every hypothesis in the NLL landscape grid.
+
+        Parameters
+        ----------
+        detector_points : list of torch.Tensor, each (3,)
+        patd_results    : list of dicts (one per detector, as returned by the surrogate)
+
+        Returns
+        -------
+        list of dicts
+        """
+        norm = self._pos_norm_divisor()
+        precomputed = []
+        for det_point, patd in zip(detector_points, patd_results):
+            if isinstance(det_point, np.ndarray):
+                det_point = torch.tensor(det_point, device=self.device, dtype=torch.float32)
+            else:
+                det_point = det_point.float().to(self.device)
+            det_point = det_point.squeeze()
+
+            if not isinstance(patd, dict):
+                precomputed.append({'skip': True, 'num_photons': 0})
+                continue
+
+            num_photons = patd.get('num_photons', 0)
+            if isinstance(num_photons, torch.Tensor):
+                num_photons = int(num_photons.item())
+
+            if num_photons == 0:
+                precomputed.append({'skip': True, 'num_photons': 0})
+                continue
+
+            hit_times = patd['hit_times'].float().to(self.device)
+            if self.rel_time:
+                hit_times = hit_times - (patd.get('t_geom_min', 0.0).float().to(self.device) - self.jitter_time)
+            t_div = self.time_scale_divisor
+            t_scaled = torch.where(
+                hit_times < 0,
+                -torch.log10(-hit_times + 1e-4) / t_div,
+                torch.log10(hit_times + 1e-4) / t_div,
+            )  # (N_hits,)
+
+            precomputed.append({
+                'skip': False,
+                'det_normed': (det_point / norm).detach(),  # (3,)
+                't_scaled': t_scaled.detach(),               # (N_hits,)
+                'hit_times_shifted': hit_times.detach(),     # (N_hits,) after rel_time shift, for flag_negative_times
+                'num_photons': num_photons,
+                'det_point': det_point,
+                'patd': patd,
+            })
+        return precomputed
+
+    def evaluate_patd_likelihood_batched_hypothesis(
+        self, hypothesis_event, precomputed_obs, skip_zero_response=True
+    ):
+        """
+        Evaluate the joint log-LLR summed across all detector points for one hypothesis,
+        using pre-computed observation features from precompute_patd_observations.
+
+        All active detector points are processed in a single batched network forward pass,
+        making this much faster than calling evaluate_patd_likelihood per detector.
+
+        Parameters
+        ----------
+        hypothesis_event : dict
+            The hypothesis parameters (position, energy, direction).
+        precomputed_obs  : list of dicts
+            Output of precompute_patd_observations.
+
+        Returns
+        -------
+        float : sum of joint log-LLRs across all detectors
+        """
+        norm = self._pos_norm_divisor()
+
+        # Build hypothesis features once (scalar quantities shared across all detectors)
+        vert = hypothesis_event['position']
+        if isinstance(vert, np.ndarray):
+            vert = torch.tensor(vert, device=self.device, dtype=torch.float32)
+        else:
+            vert = vert.float().to(self.device)
+        vert = vert.squeeze() / norm  # (3,)
+
+        direction = hypothesis_event['direction']
+        if isinstance(direction, np.ndarray):
+            direction = torch.tensor(direction, device=self.device, dtype=torch.float32)
+        else:
+            direction = direction.float().to(self.device)
+        direction = direction.squeeze()  # (3,)
+        dir_norm_val = torch.norm(direction).clamp(min=1e-8)
+
+        energy = hypothesis_event['energy']
+        if isinstance(energy, np.ndarray):
+            energy = torch.tensor(energy, device=self.device, dtype=torch.float32)
+        else:
+            energy = energy.float().to(self.device)
+        log_energy = torch.log10(energy.squeeze() + 1e-10) / 8.0  # scalar
+
+        # Concatenate all photon feature rows across all active detectors
+        all_features = []
+        photons_per_detector = []
+
+        for obs in precomputed_obs:
+            if obs['skip']:
+                photons_per_detector.append(0)
+                continue
+            det = obs['det_normed']                  # (3,) — pre-computed constant
+            t_scaled = obs['t_scaled']               # (N_hits,) — pre-computed constant
+            N = obs['num_photons']
+            rel = det - vert
+            vert_dist = torch.norm(rel)
+            cos_angle = torch.dot(direction, rel) / (dir_norm_val * vert_dist.clamp(min=1e-8))
+            if self.rich_rel_pos_mode:
+                if self.add_vertex_distance:
+                    ctx_parts = [rel, direction, log_energy.unsqueeze(0), vert_dist.unsqueeze(0), cos_angle.unsqueeze(0)]
+                else:
+                    ctx_parts = [rel, direction, log_energy.unsqueeze(0), cos_angle.unsqueeze(0)]
+            else:
+                if self.add_vertex_distance:
+                    ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), vert_dist.unsqueeze(0), cos_angle.unsqueeze(0)]
+                else:
+                    ctx_parts = [det, vert, direction, log_energy.unsqueeze(0), cos_angle.unsqueeze(0)]
+            if self.add_distance_from_beam:
+                vert_unnorm = vert * norm
+                _, dist_perp = self.compute_distance_from_beam(
+                    det * norm,
+                    vert_unnorm.unsqueeze(0),
+                    direction.unsqueeze(0),
+                )
+                ds = self.domain_size
+                half = ds / 2 if isinstance(ds, (int, float)) else ds[0] / 2
+                ctx_parts.append((dist_perp.squeeze() / half).unsqueeze(0))
+
+            ctx = torch.cat([p.reshape(-1) for p in ctx_parts])
+            ctx_rep = ctx.unsqueeze(0).expand(N, -1)
+            if self.flag_negative_times:
+                is_neg = (obs['hit_times_shifted'] < 0).float().unsqueeze(1)  # (N, 1)
+                feat = torch.cat([ctx_rep, t_scaled.unsqueeze(1), is_neg], dim=1)
+            else:
+                feat = torch.cat([ctx_rep, t_scaled.unsqueeze(1)], dim=1)
+            all_features.append(feat)
+            photons_per_detector.append(N)
+
+        if not all_features:
+            return 0.0
+
+        # Single batched forward pass for all photons across all detectors
+        all_feat_cat = torch.cat(all_features, dim=0)  # (total_hits, feat_dim)
+        with torch.no_grad():
+            all_llrs = self.predict_log_likelihood_ratio(all_feat_cat)  # (total_hits,)
+
+        # Split and sum per detector
+        total_llr = 0.0
+        idx = 0
+        for N in photons_per_detector:
+            if N > 0:
+                total_llr += all_llrs[idx:idx + N].sum().item()
+                idx += N
+
+        return total_llr
+
     def predict_log_likelihood_ratio(self, features, epsilon=1e-7):
         """
         Compute the Log-Likelihood Ratio using the sigmoid trick.
@@ -1757,12 +2164,12 @@ class LLRnet(Surrogate):
         
         # Get probabilities from the network (already has sigmoid)
         probabilities = self._forward_pass(features)
-        
-        # Compute LLR: log(p/(1-p))
-        # epsilon = 1e-7  # Small value to prevent log(0)
-        prob_clamped = torch.clamp(probabilities, epsilon, 1 - epsilon)
-        llr = torch.log(prob_clamped / (1 - prob_clamped))
-        # llr = torch.log(probabilities + 1e-10) - torch.log(1 - (probabilities + 1e-10))
+
+        # Compute LLR = logit(p) = log(p/(1-p)).
+        # Do NOT clamp before logit: clamp has zero gradient in the clamped region,
+        # which kills Fisher info for saturated (out-of-distribution) outputs.
+        # nn.Sigmoid never produces exactly 0 or 1 in float32, so logit stays finite.
+        llr = torch.logit(probabilities)
         return llr
     
     def predict_likelihood_ratio(self, features):
@@ -1883,11 +2290,7 @@ class LLRnet(Surrogate):
         plt.grid(True, alpha=0.3)
         plt.show()
     
-    def save_model(self, filepath):
-        """Save the trained model."""
-        if not self.is_trained:
-            raise RuntimeError("Model must be trained before saving.")
-        
+    def _save_model_state(self, filepath):
         save_dict = {
             'mlp_branches_state_dict': [branch.state_dict() for branch in self.mlp_branches] if not self.shared_mlp else None,
             'shared_branch_mlp_state_dict': self.shared_branch_mlp.state_dict() if self.shared_mlp else None,
@@ -1908,6 +2311,26 @@ class LLRnet(Surrogate):
             'frequency_scales': self.frequency_scales,
             'num_frequencies_per_branch': self.num_frequencies_per_branch,
             'shared_mlp': self.shared_mlp,
+            'signal_noise_scale': self.signal_noise_scale,
+            'background_noise_scale': self.background_noise_scale,
+            'add_relative_pos': self.add_relative_pos,
+            'use_patd': self.use_patd,
+            'use_rich_features': self.use_rich_features,
+            'log_scale_ly': self.log_scale_ly,
+            'rel_time': self.rel_time,
+            'jitter_time': self.jitter_time,
+            'flag_negative_times': self.flag_negative_times,
+            'time_scale_divisor': self.time_scale_divisor,
+            'input_charge': self.input_charge,
+            'log_charge_scale': self.log_charge_scale,
+            'norm_pos': self.norm_pos,
+            'log_scale_energy': self.log_scale_energy,
+            'input_delta_time': self.input_delta_time,
+            'min_photons': self.min_photons,
+            'num_photons_per_sample': self.num_photons_per_sample,
+            'add_distance_from_beam': self.add_distance_from_beam,
+            'add_vertex_distance': self.add_vertex_distance,
+            'rich_rel_pos_mode': self.rich_rel_pos_mode,
             'reduce_lr_on_plateau': self.reduce_lr_on_plateau,
             'lr_scheduler_patience': self.lr_scheduler_patience,
             'lr_scheduler_factor': self.lr_scheduler_factor,
@@ -1919,8 +2342,14 @@ class LLRnet(Surrogate):
             save_dict['fourier_features_list_state_dict'] = [fourier.state_dict() for fourier in self.fourier_features_list]
         else:
             save_dict['fourier_features_list_state_dict'] = None
-            
+
         torch.save(save_dict, filepath)
+
+    def save_model(self, filepath):
+        """Save the trained model."""
+        if not self.is_trained:
+            raise RuntimeError("Model must be trained before saving.")
+        self._save_model_state(filepath)
     
     def load_model(self, filepath):
         """Load a saved model."""
@@ -1951,6 +2380,27 @@ class LLRnet(Surrogate):
         self.lr_scheduler_factor = checkpoint.get('lr_scheduler_factor', 0.5)
         self.lr_scheduler_min_lr = checkpoint.get('lr_scheduler_min_lr', 1e-6)
         
+        self.signal_noise_scale = checkpoint.get('signal_noise_scale', self.signal_noise_scale)
+        self.background_noise_scale = checkpoint.get('background_noise_scale', self.background_noise_scale)
+        self.add_relative_pos = checkpoint.get('add_relative_pos', self.add_relative_pos)
+        self.use_patd = checkpoint.get('use_patd', self.use_patd)
+        self.use_rich_features = checkpoint.get('use_rich_features', self.use_rich_features)
+        self.log_charge_scale = checkpoint.get('log_charge_scale', 4)
+        self.domain_size = checkpoint.get('domain_size', self.domain_size)
+        self.log_scale_ly = checkpoint.get('log_scale_ly', self.log_scale_ly)
+        self.rel_time = checkpoint.get('rel_time', self.rel_time)
+        self.input_charge = checkpoint.get('input_charge', self.input_charge)
+        self.norm_pos = checkpoint.get('norm_pos', self.norm_pos)
+        self.log_scale_energy = checkpoint.get('log_scale_energy', self.log_scale_energy)
+        self.input_delta_time = checkpoint.get('input_delta_time', self.input_delta_time)
+        self.min_photons = checkpoint.get('min_photons', self.min_photons)
+        self.num_photons_per_sample = checkpoint.get('num_photons_per_sample', self.num_photons_per_sample)
+        self.jitter_time = checkpoint.get('jitter_time', 0.0)
+        self.flag_negative_times = checkpoint.get('flag_negative_times', False)
+        self.time_scale_divisor = checkpoint.get('time_scale_divisor', 4.0)
+        self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
+        self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
+        self.rich_rel_pos_mode = checkpoint.get('rich_rel_pos_mode', False)
         # Determine if this is old format (single MLP) or new format (parallel branches)
         is_old_format = 'model_state_dict' in checkpoint
         
@@ -2283,8 +2733,13 @@ class LLRnet(Surrogate):
                     Useful when surrogate_func includes randomness (e.g., Poisson sampling).
                     Default is 1 (no resampling). If > 1, each unique event/detector pair
                     will be sampled multiple times with different random realizations.
+                use_rich_features : bool, optional (default False)
+                    If True, uses prepare_features_charge instead of prepare_data_from_raw.
+                    Produces a 13-feature vector per event with richer geometry:
+                    det(3) + vertex(3) + dir(3) + log_E(1) + vert_dist(1) + cos_angle(1)
+                    + log_ly(1).  event_labels is ignored in this mode.
             """
-            
+
             self.llrnet = llrnet_instance
             self.signal_sampler = signal_sampler
             self.signal_surrogate_func = signal_surrogate_func
@@ -2294,8 +2749,9 @@ class LLRnet(Surrogate):
             self.presampled_events = kwargs.get('presampled_events', None)
             self.presampled_detector_points = kwargs.get('presampled_detector_points', None)
             self.samples_per_event = kwargs.get('samples_per_event', 1)
-            self.vary_cylinder= kwargs.get('vary_cylinder', False)
+            self.vary_cylinder = kwargs.get('vary_cylinder', False)
             self.cylinder_sampler = kwargs.get('cylinder_sampler', None)
+            self.use_rich_features = llrnet_instance.use_rich_features if hasattr(llrnet_instance, 'use_rich_features') else kwargs.get('use_rich_features', False)
             self.domain_size = llrnet_instance.domain_size
             # Resampling configuration: discard near-zero light yield pairs (uninformative)
             # min_light_yield: if provided, pairs where BOTH matched & mismatched light yields have
@@ -2308,7 +2764,13 @@ class LLRnet(Surrogate):
             # Track which events from each pair have been accessed
             self.pair_access_tracker = {}
             self.current_epoch_id = 0
-            
+
+            # If True, __getitem__ returns an extra [x, y, z, light_yield]
+            # tensor per item (matched or mismatched), which flows back through
+            # normal DataLoader collation -- safe with num_workers > 0. See
+            # LLRnet.train_with_dataloader.
+            self.record_marginal_lys = kwargs.get('record_marginal_lys', False)
+
         def _generate_pair_data(self, pair_idx):
             """
             Generate matched/mismatched pair data for a specific pair index.
@@ -2388,93 +2850,101 @@ class LLRnet(Surrogate):
             matched_label = torch.tensor(1.0, device=self.llrnet.device)
             mismatched_label = torch.tensor(0.0, device=self.llrnet.device)
 
-            # Generate multiple samples if samples_per_event > 1
+            def _ly_record(ly):
+                """Package [x, y, z, light_yield] for this detector point and
+                light yield, to be returned alongside (features, label) so it
+                flows back through normal DataLoader collation (safe with
+                num_workers > 0)."""
+                ly_val = ly.item() if torch.is_tensor(ly) else float(np.asarray(ly).reshape(-1)[0])
+                point_np = detector_point.cpu().detach().numpy().reshape(-1)
+                return torch.tensor(
+                    [point_np[0], point_np[1], point_np[2], ly_val], dtype=torch.float32
+                )
+
+            def _build_pair(event_for_params_m, event_for_ly_m,
+                            event_for_params_mm, event_for_ly_mm):
+                """Return (matched_features, matched_true_ly, mismatched_features, mismatched_true_ly).
+                matched_true_ly / mismatched_true_ly are None when not requested."""
+                if self.use_rich_features:
+                    with torch.no_grad():
+                        ly_m = self.signal_surrogate_func(
+                            opt_point=detector_point, event_params=event_for_ly_m
+                        )
+                        ly_mm = self.signal_surrogate_func(
+                            opt_point=detector_point, event_params=event_for_ly_mm
+                        )
+                    f_m = self.llrnet.prepare_features_charge(
+                        detector_point, event_for_params_m, ly_m
+                    )
+                    f_mm = self.llrnet.prepare_features_charge(
+                        detector_point, event_for_params_mm, ly_mm
+                    )
+                    true_ly_m = ly_m if self.output_true_light_yield else None
+                    true_ly_mm = ly_mm if self.output_true_light_yield else None
+                else:
+                    if self.output_true_light_yield or self.record_marginal_lys:
+                        f_m, true_ly_m = self.llrnet.prepare_data_from_raw(
+                            detector_point, event_for_ly_m, self.signal_surrogate_func,
+                            self.event_labels, self.llrnet.signal_noise_scale,
+                            event_for_params_m, output_true_light_yield=True,
+                        )
+                        f_mm, true_ly_mm = self.llrnet.prepare_data_from_raw(
+                            detector_point, event_for_ly_mm, self.signal_surrogate_func,
+                            self.event_labels, self.llrnet.signal_noise_scale,
+                            event_for_params_mm, output_true_light_yield=True,
+                        )
+                        ly_m, ly_mm = true_ly_m, true_ly_mm
+                        if not self.output_true_light_yield:
+                            true_ly_m = true_ly_mm = None
+                    else:
+                        f_m = self.llrnet.prepare_data_from_raw(
+                            detector_point, event_for_ly_m, self.signal_surrogate_func,
+                            self.event_labels, self.llrnet.signal_noise_scale,
+                            event_for_params_m,
+                        )
+                        f_mm = self.llrnet.prepare_data_from_raw(
+                            detector_point, event_for_ly_mm, self.signal_surrogate_func,
+                            self.event_labels, self.llrnet.signal_noise_scale,
+                            event_for_params_mm,
+                        )
+                        true_ly_m = true_ly_mm = None
+
+                ly_record_m = _ly_record(ly_m) if self.record_marginal_lys else None
+                ly_record_mm = _ly_record(ly_mm) if self.record_marginal_lys else None
+                return f_m, true_ly_m, f_mm, true_ly_mm, ly_record_m, ly_record_mm
+
+            def _pack(features, label, true_ly, ly_record):
+                """Build the (features, label, ...) tuple returned per item,
+                appending true_ly and/or ly_record only if enabled, in a fixed
+                order so callers can destructure predictably."""
+                item = (features, label)
+                if self.output_true_light_yield:
+                    item = item + (true_ly,)
+                if self.record_marginal_lys:
+                    item = item + (ly_record,)
+                return item
+
             if self.samples_per_event > 1:
                 all_samples = []
-                for sample_idx in range(self.samples_per_event):
-                    if not self.output_true_light_yield:
-                        matched_features = self.llrnet.prepare_data_from_raw(
-                            detector_point,
-                            event_for_light_yield_matched,
-                            self.signal_surrogate_func,
-                            self.event_labels,
-                            self.llrnet.signal_noise_scale,
-                            event_for_params_matched
-                        )
-
-                        mismatched_features = self.llrnet.prepare_data_from_raw(
-                            detector_point,
-                            event_for_light_yield_mismatched,      # LY from different event
-                            self.signal_surrogate_func,
-                            self.event_labels,
-                            self.llrnet.signal_noise_scale,
-                            event_for_params_mismatched            # Θ from event1
-                        )
-
-                        all_samples.append(((matched_features, matched_label), (mismatched_features, mismatched_label)))
-                    else:
-                        matched_features, matched_true_ly = self.llrnet.prepare_data_from_raw(
-                            detector_point,
-                            event_for_light_yield_matched,
-                            self.signal_surrogate_func,
-                            self.event_labels,
-                            self.llrnet.signal_noise_scale,
-                            event_for_params_matched,
-                            output_true_light_yield=True
-                        )
-                        mismatched_features, mismatched_true_ly = self.llrnet.prepare_data_from_raw(
-                            detector_point,
-                            event_for_light_yield_mismatched,
-                            self.signal_surrogate_func,
-                            self.event_labels,
-                            self.llrnet.signal_noise_scale,
-                            event_for_params_mismatched,
-                            output_true_light_yield=True
-                        )
-                        all_samples.append(((matched_features, matched_label, matched_true_ly), (mismatched_features, mismatched_label, mismatched_true_ly)))
+                for _ in range(self.samples_per_event):
+                    f_m, tly_m, f_mm, tly_mm, ly_record_m, ly_record_mm = _build_pair(
+                        event_for_params_matched, event_for_light_yield_matched,
+                        event_for_params_mismatched, event_for_light_yield_mismatched,
+                    )
+                    all_samples.append((
+                        _pack(f_m, matched_label, tly_m, ly_record_m),
+                        _pack(f_mm, mismatched_label, tly_mm, ly_record_mm),
+                    ))
                 return all_samples
             else:
-                # Original behavior for samples_per_event=1
-                if not self.output_true_light_yield:
-                    matched_features = self.llrnet.prepare_data_from_raw(
-                        detector_point,
-                        event_for_light_yield_matched,
-                        self.signal_surrogate_func,
-                        self.event_labels,
-                        self.llrnet.signal_noise_scale,
-                        event_for_params_matched
-                    )
-
-                    mismatched_features = self.llrnet.prepare_data_from_raw(
-                        detector_point,
-                        event_for_light_yield_mismatched,      # LY from different event
-                        self.signal_surrogate_func,
-                        self.event_labels,
-                        self.llrnet.signal_noise_scale,
-                        event_for_params_mismatched            # Θ from event1
-                    )
-
-                    return (matched_features, matched_label), (mismatched_features, mismatched_label)
-                else:
-                    matched_features, matched_true_ly = self.llrnet.prepare_data_from_raw(
-                        detector_point,
-                        event_for_light_yield_matched,
-                        self.signal_surrogate_func,
-                        self.event_labels,
-                        self.llrnet.signal_noise_scale,
-                        event_for_params_matched,
-                        output_true_light_yield=True
-                    )
-                    mismatched_features, mismatched_true_ly = self.llrnet.prepare_data_from_raw(
-                        detector_point,
-                        event_for_light_yield_mismatched,
-                        self.signal_surrogate_func,
-                        self.event_labels,
-                        self.llrnet.signal_noise_scale,
-                        event_for_params_mismatched,
-                        output_true_light_yield=True
-                    )
-                    return (matched_features, matched_label, matched_true_ly), (mismatched_features, mismatched_label, mismatched_true_ly)
+                f_m, tly_m, f_mm, tly_mm, ly_record_m, ly_record_mm = _build_pair(
+                    event_for_params_matched, event_for_light_yield_matched,
+                    event_for_params_mismatched, event_for_light_yield_mismatched,
+                )
+                return (
+                    _pack(f_m, matched_label, tly_m, ly_record_m),
+                    _pack(f_mm, mismatched_label, tly_mm, ly_record_mm),
+                )
         
         def __len__(self):
             """Return the number of individual events per epoch (2 * num_samples_per_epoch * samples_per_event)."""
@@ -2495,9 +2965,12 @@ class LLRnet(Surrogate):
             
             Returns:
             --------
-            tuple : (features, label)
+            tuple : (features, label[, true_ly][, ly_record])
                 features: torch.Tensor of shape (feature_dim,) for individual event
                 label: torch.Tensor scalar (1.0 for matched, 0.0 for mismatched)
+                true_ly: included only if output_true_light_yield=True
+                ly_record: torch.Tensor [x, y, z, light_yield], included only if
+                    record_marginal_lys=True
             """
             # Detect new epoch when idx resets to 0
             if idx == 0:
@@ -2585,10 +3058,10 @@ class LLRnet(Surrogate):
         
         def __init__(self, signal_sampler, signal_surrogate_func, llrnet_instance,
                      num_samples_per_epoch=1000, event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                     min_photons=1, num_photons_per_sample=None, shuffle_photons=False, **kwargs):
+                     min_photons=1, num_photons_per_sample=None, shuffle_photons=False, manual_photons=False, **kwargs):
             """
             Initialize PATD iterable dataset.
-            
+
             Parameters:
             -----------
             signal_sampler : Sampler
@@ -2610,6 +3083,14 @@ class LLRnet(Surrogate):
             shuffle_photons : bool
                 If False (default): Returns all photons from one event together (event mode)
                 If True: Returns individual photons one at a time, shuffled across batches (photon mode)
+            manual_photons : bool
+                If True, passes num_photons_per_sample as a fixed photon count (input_photons) to
+                the surrogate, bypassing the physics-based light yield calculation. Every
+                detector/event pair will receive exactly num_photons_per_sample photons, except
+                when the detector lies behind the interaction vertex for track events (in which
+                case the surrogate returns 0 photons and the pair is skipped). min_photons is
+                still respected as the acceptance threshold.
+                If False (default), uses normal surrogate behaviour (max_photons cap).
             **kwargs:
                 vary_cylinder : bool, optional
                     If True, randomly vary cylinder dimensions for each pair
@@ -2632,29 +3113,61 @@ class LLRnet(Surrogate):
             self.min_photons = min_photons
             self.num_photons_per_sample = num_photons_per_sample
             self.shuffle_photons = shuffle_photons
+            self.manual_photons = manual_photons
             self.vary_cylinder = kwargs.get('vary_cylinder', False)
             self.cylinder_sampler = kwargs.get('cylinder_sampler', None)
-            self.use_rich_features = kwargs.get('use_rich_features', False)
+            self.use_rich_features = self.llrnet.use_rich_features if hasattr(self.llrnet, 'use_rich_features') else kwargs.get('use_rich_features', False)
             self.domain_size = llrnet_instance.domain_size
         
         def _generate_event_with_photons(self, detector_pos=None):
-            """Generate an event that produces at least min_photons hits."""
+            """Generate an event that produces at least min_photons hits.
+
+            In manual_photons mode the surrogate receives a fixed photon count via
+            input_photons rather than computing the physics-based light yield.  The
+            detector-behind-vertex check is still applied by the surrogate (it returns
+            0 photons for such configurations), in which case this method returns None
+            to signal that the pair should be skipped.
+            """
             while True:
                 # Sample event and detector position
                 event_params = self.signal_sampler.sample_events(1)[0]
                 if detector_pos is None:
                     detector_pos = self.signal_sampler.sample_detector_points(1)
-                
-                # Get PATD - pass num_photons_per_sample to limit photons if specified
-                patd_result = self.signal_surrogate_func(
-                    opt_point=detector_pos, 
-                    event_params=event_params,
-                    max_photons=self.num_photons_per_sample
-                )
-                num_photons = patd_result['num_photons']
-                
-                if num_photons >= self.min_photons:
+
+                if self.manual_photons and self.num_photons_per_sample is not None:
+                    # Pass a fixed photon count; the surrogate still performs the
+                    # behind-vertex check and returns 0 photons when appropriate.
+                    patd_result = self.signal_surrogate_func(
+                        opt_point=detector_pos,
+                        event_params=event_params,
+                        # max_photons=self.num_photons_per_sample,
+                    )
+                    num_photons = patd_result['num_photons']
+                    # Detector is behind the vertex — signal caller to skip this pair.
+                    if num_photons >= self.min_photons:
+                        if num_photons > self.num_photons_per_sample:
+                            # Cap the photon count in the result dict to num_photons_per_sample
+                            patd_result['num_photons'] = self.num_photons_per_sample
+                            if 'hit_times' in patd_result:
+                                patd_result['hit_times'] = patd_result['hit_times'][:self.num_photons_per_sample]
+                        else:
+                            patd_result = self.signal_surrogate_func(
+                                opt_point=detector_pos,
+                                event_params=event_params,
+                                input_photons=self.num_photons_per_sample,
+                            )
                     return event_params, detector_pos, patd_result
+                else:
+                    # Get PATD - pass num_photons_per_sample to limit photons if specified
+                    patd_result = self.signal_surrogate_func(
+                        opt_point=detector_pos,
+                        event_params=event_params,
+                        max_photons=self.num_photons_per_sample,
+                    )
+                    num_photons = patd_result['num_photons']
+
+                    if num_photons >= self.min_photons:
+                        return event_params, detector_pos, patd_result
                 
         def _generate_pair_data(self, pair_idx):
             """
@@ -2680,10 +3193,15 @@ class LLRnet(Surrogate):
             
             # Sample detector point (shared for this pair)
             detector_point = self.signal_sampler.sample_detector_points(1).squeeze()
-            
+
             # Generate MATCHED sample (hypothesis and observation from same event)
             event_params_matched, _, patd_result_matched = self._generate_event_with_photons(detector_point)
-            
+
+            # In manual_photons mode the detector may lie behind the vertex, in which
+            # case _generate_event_with_photons returns event_params=None.  Skip the pair.
+            if event_params_matched is None:
+                return None
+
             # Create feature vectors for all photon hits
             if self.use_rich_features:
                 matched_features_batch, _ = self.llrnet.prepare_features_patd(
@@ -2699,17 +3217,26 @@ class LLRnet(Surrogate):
                     event_labels=self.event_labels,
                 )
 
+            if matched_features_batch is None:
+                return None
+
             # Create labels for all matched photons (all are class 1)
             num_matched_photons = matched_features_batch.shape[0]
             matched_labels = torch.ones(num_matched_photons, dtype=torch.float32, device=self.llrnet.device)
 
-            # Generate MISMATCHED sample: observation from a different event, hypothesis from matched event.
+            # Generate MISMATCHED sample: SAME hypothesis (event_params_matched), but the
+            # observation photon times come from a DIFFERENT event. This is the key design
+            # choice: the hypothesis (geometry) columns are held fixed between the matched and
+            # mismatched member of the pair, so the ONLY thing that flips the label is the
+            # photon arrival-time distribution. This forces the network to learn the timing
+            # likelihood rather than a hypothesis-self-consistency proxy that ignores time.
             event_params_obs, _, patd_result_obs = self._generate_event_with_photons(detector_point)
 
             if self.use_rich_features:
                 # Hypothesis features come from event_params_matched; observation times from patd_result_obs.
-                # prepare_features_patd only takes one event_data dict, so we build a merged view:
-                # keep all params from matched (hypothesis) but swap in the obs hit_times via patd_result_obs.
+                # prepare_features_patd uses event_data only for the hypothesis/geometry columns
+                # and patd_result for the per-photon times, so passing matched params + obs times
+                # gives (hypothesis=matched, observation=different event).
                 mismatched_features_batch, _ = self.llrnet.prepare_features_patd(
                     point=detector_point,
                     event_data=event_params_matched,   # hypothesis: position, energy, direction from matched
@@ -2725,13 +3252,12 @@ class LLRnet(Surrogate):
                     signal_event_data=event_params_matched, # hypothesis: parameters from matched event
                     event_labels=self.event_labels,
                 )
-            
             # Create labels for all mismatched photons (all are class 0)
             num_mismatched_photons = mismatched_features_batch.shape[0]
             mismatched_labels = torch.zeros(num_mismatched_photons, dtype=torch.float32, device=self.llrnet.device)
-            
+
             # Clone and detach to ensure clean tensors without computational graph
-            return ((matched_features_batch.clone().detach(), matched_labels), 
+            return ((matched_features_batch.clone().detach(), matched_labels),
                     (mismatched_features_batch.clone().detach(), mismatched_labels))
         
         def __iter__(self):
@@ -2771,10 +3297,14 @@ class LLRnet(Surrogate):
                     # Photon mode: build separate pools for matched and mismatched photons
                     matched_pool = []
                     mismatched_pool = []
-                    
+
                     for pair_idx in range(pairs_per_worker):
                         pair_data = self._generate_pair_data(pair_idx)
-                        
+
+                        # None means the detector was behind the vertex (manual_photons mode)
+                        if pair_data is None:
+                            continue
+
                         # Extract matched photons
                         matched_features_batch, matched_labels = pair_data[0]
                         for i in range(matched_features_batch.shape[0]):
@@ -2782,7 +3312,7 @@ class LLRnet(Surrogate):
                                 matched_features_batch[i].clone().detach(),
                                 matched_labels[i]
                             ))
-                        
+
                         # Extract mismatched photons
                         mismatched_features_batch, mismatched_labels = pair_data[1]
                         for i in range(mismatched_features_batch.shape[0]):
@@ -2809,10 +3339,14 @@ class LLRnet(Surrogate):
                     # Event mode: yield all photons from one event together
                     for pair_idx in range(pairs_per_worker):
                         pair_data = self._generate_pair_data(pair_idx)
-                        
+
+                        # None means the detector was behind the vertex (manual_photons mode)
+                        if pair_data is None:
+                            continue
+
                         # Yield matched event (all photons together)
                         yield pair_data[0]
-                        
+
                         # Yield mismatched event (all photons together)
                         yield pair_data[1]
     
@@ -2954,7 +3488,7 @@ class LLRnet(Surrogate):
                               num_samples_per_epoch=1000, batch_size=32,
                               num_workers=0,
                               event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                              shuffle_photons=False, use_rich_features=False, other_kwargs={}):
+                              shuffle_photons=False, manual_photons=False, other_kwargs={}):
         """
         Create a DataLoader for PATD training using IterableDataset.
         
@@ -2985,7 +3519,10 @@ class LLRnet(Surrogate):
         shuffle_photons : bool
             If False (default): Event mode - returns all photons from one event together
             If True: Photon mode - returns individual photons shuffled across batches
-            
+        manual_photons : bool
+            If True, forces exactly num_photons_per_sample photons per detector/event pair
+            by passing it as input_photons to the surrogate. Behind-vertex pairs are skipped.
+
         Returns:
         --------
         DataLoader
@@ -3077,7 +3614,8 @@ class LLRnet(Surrogate):
             min_photons=self.min_photons,
             num_photons_per_sample=self.num_photons_per_sample,
             shuffle_photons=shuffle_photons,
-            use_rich_features=use_rich_features,
+            manual_photons=manual_photons,
+            use_rich_features=self.use_rich_features,
             **other_kwargs
         )
         
@@ -3108,11 +3646,61 @@ class LLRnet(Surrogate):
         # Since the dataset returns a full batch at once, batch_size for DataLoader must be None
         # or 1 (if we squeeze later). Usually None disables automatic batching.
         return DataLoader(dataset, batch_size=None, num_workers=num_workers)
-    
+
+    def _resolve_pin_memory(self, pin_memory=None, pin_memory_device=None):
+        """Resolve (pin_memory, pin_memory_device) for a DataLoader.
+
+        pin_memory speeds up host->GPU transfers, but the pin-memory thread
+        allocates CUDA pinned host memory against a specific device. If that
+        device (default: cuda:0) is full or unusable it raises
+        cudaErrorMemoryAllocation — even when the tensors live on CPU.
+
+        Parameters
+        ----------
+        pin_memory : bool or None
+            None  -> auto: enable only if CUDA is available (works for CPU
+                     training too, since pinning is host-side, as long as some
+                     CUDA device can be addressed).
+            True  -> force on (use pin_memory_device to pick which GPU to pin to).
+            False -> force off.
+        pin_memory_device : str / int / torch.device or None
+            Which CUDA device the pin-memory thread targets. Defaults to this
+            model's device if it is CUDA, else 'cuda:0'. Pass e.g. 'cuda:1' to
+            avoid a full device 0. Ignored when pin_memory is False.
+
+        Returns
+        -------
+        (pin_memory: bool, pin_memory_device: str)  — device is '' when disabled.
+        """
+        cuda_ok = torch.cuda.is_available()
+        model_dev = getattr(self, 'device', None)
+        if model_dev is not None and not isinstance(model_dev, torch.device):
+            model_dev = torch.device(model_dev)
+
+        if pin_memory is None:
+            pin_memory = bool(cuda_ok)
+
+        if not pin_memory or not cuda_ok:
+            return False, ''
+
+        # Pick the target device for pinning.
+        if pin_memory_device is None:
+            if model_dev is not None and model_dev.type == 'cuda':
+                pin_memory_device = f'cuda:{model_dev.index if model_dev.index is not None else 0}'
+            else:
+                pin_memory_device = 'cuda:0'
+        elif isinstance(pin_memory_device, int):
+            pin_memory_device = f'cuda:{pin_memory_device}'
+        else:
+            pin_memory_device = str(pin_memory_device)
+
+        return True, pin_memory_device
+
     def create_event_dataloader(self, signal_sampler, background_sampler, signal_surrogate_func, background_surrogate_func,
-                               num_samples_per_epoch=1000, batch_size=32, 
+                               num_samples_per_epoch=1000, batch_size=32,
                                shuffle=True, num_workers=0, output_true_light_yield=False,
-                               event_labels=['position', 'energy', 'zenith', 'azimuth']):
+                               event_labels=['position', 'energy', 'zenith', 'azimuth'],
+                               pin_memory=None, pin_memory_device=None):
         """
         Create a DataLoader for balanced signal/background training using the EventDataset class.
         
@@ -3177,22 +3765,25 @@ class LLRnet(Surrogate):
             num_samples_per_epoch=num_samples_per_epoch,
             event_labels=event_labels, output_true_light_yield=output_true_light_yield
         )
-        
-        dataloader = DataLoader(
+
+        pin_memory, pin_memory_device = self._resolve_pin_memory(pin_memory, pin_memory_device)
+        dl_kwargs = dict(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=True  # Speed up GPU transfers
+            pin_memory=pin_memory,
         )
-        
-        return dataloader
+        if pin_memory and pin_memory_device:
+            dl_kwargs['pin_memory_device'] = pin_memory_device
+
+        return DataLoader(**dl_kwargs)
     
     def create_signal_only_dataloader(self, signal_sampler, signal_surrogate_func,
                                      num_samples_per_epoch=1000, batch_size=32,
                                      shuffle=True, num_workers=0, output_true_light_yield=False,
                                      event_labels=['position', 'energy', 'zenith', 'azimuth'],
-                                     **other_kwargs):
+                                     pin_memory=None, pin_memory_device=None, **other_kwargs):
         """
         Create a DataLoader for signal-only training with matched/mismatched light yields.
         
@@ -3252,19 +3843,21 @@ class LLRnet(Surrogate):
             num_samples_per_epoch=num_samples_per_epoch,
             event_labels=event_labels,
             output_true_light_yield=output_true_light_yield,
+            use_rich_features=self.use_rich_features,
             **other_kwargs
-            # **dataset_kwargs
-            # presampled_detector_points=presampled_detector_points
         )
-        
-        dataloader = DataLoader(
+
+        pin_memory, pin_memory_device = self._resolve_pin_memory(pin_memory, pin_memory_device)
+        dl_kwargs = dict(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=True  # Speed up GPU transfers
+            pin_memory=pin_memory,
         )
-        
-        return dataloader
+        if pin_memory and pin_memory_device:
+            dl_kwargs['pin_memory_device'] = pin_memory_device
+
+        return DataLoader(**dl_kwargs)
 
 

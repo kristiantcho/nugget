@@ -4,11 +4,11 @@ import torch
 import numpy as np
 import os
 import warnings
-import h5py
-from nflows.distributions.normal import StandardNormal
-from nflows.transforms.nonlinearities import PiecewiseRationalQuadraticCDF
-from nflows.flows.base import Flow
-from nflows.transforms.base import CompositeTransform, Transform
+# import h5py
+# from nflows.distributions.normal import StandardNormal
+# from nflows.transforms.nonlinearities import PiecewiseRationalQuadraticCDF
+# from nflows.flows.base import Flow
+# from nflows.transforms.base import CompositeTransform, Transform
 
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
