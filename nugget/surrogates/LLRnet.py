@@ -3969,11 +3969,13 @@ class LLRnet(Surrogate):
                 - pmt_direction = hit-PMT direction (used only when the model has
                                   add_pmt_direction=True)
 
-        Balanced training, mirroring SignalOnlyDataset:
-            * matched   (label 1): row's own event params with its own count.
-            * mismatched(label 0): row's event params, but the light-yield count
-                                   taken from a uniformly random *other* row
-                                   anywhere in the file.
+        Balanced training, mirroring SignalOnlyDataset. A "params" row is drawn
+        at random (with replacement) on every __getitem__ call, so the epoch
+        length (num_samples_per_epoch) is decoupled from the number of rows:
+            * matched   (label 1): the drawn row's event params with its own count.
+            * mismatched(label 0): the drawn row's event params, but the
+                                   light-yield count taken from a uniformly random
+                                   *other* row anywhere in the file.
 
         Optional zero light-yield augmentation (zero_ly_prob > 0): with low
         probability any item (matched OR mismatched slot) is replaced by a
@@ -4147,11 +4149,12 @@ class LLRnet(Surrogate):
             return self.num_samples_per_epoch * 2
 
         def __getitem__(self, idx):
-            # Even idx -> matched, odd idx -> mismatched. The pair index selects
-            # the "params" row; both share the same event params.
-            pair_idx = idx // 2
+            # Even idx -> matched, odd idx -> mismatched. The "params" row is
+            # drawn at random (with replacement) each call, so the epoch length
+            # (num_samples_per_epoch) is independent of the file size and every
+            # item is an i.i.d. draw rather than a fixed permutation of rows.
             is_matched = (idx % 2 == 0)
-            row = pair_idx % self._n_rows
+            row = int(self._rng.integers(0, self._n_rows))
 
             # With low probability, emit a zero-LY sample instead (for BOTH the
             # matched and mismatched slots): the event's params observed at a PMT
