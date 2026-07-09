@@ -873,5 +873,71 @@ class CylinderSampler(Sampler):
             point = torch.tensor([x, y, z], device=self.device)
             point = point + self.cylinder.center
             points.append(point)
-        
+
         return torch.stack(points)
+
+    def _load_pmt_directions(self, geometry_csv_path):
+        """Load and cache the PMT direction table from a geometry CSV.
+
+        The CSV is the one produced by ``extract_geom.py`` and must contain the
+        columns ``pmt_dir_x``, ``pmt_dir_y``, ``pmt_dir_z``.  Directions are
+        cached per file path so repeated sampling calls don't re-read the file.
+
+        Parameters
+        ----------
+        geometry_csv_path : str
+            Path to the geometry CSV file.
+
+        Returns
+        -------
+        torch.Tensor
+            All PMT directions, shape (n_pmts, 3), on self.device.
+        """
+        if not hasattr(self, '_pmt_direction_cache'):
+            self._pmt_direction_cache = {}
+        if geometry_csv_path not in self._pmt_direction_cache:
+            import pandas as pd
+            df = pd.read_csv(geometry_csv_path)
+            missing = {'pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z'} - set(df.columns)
+            if missing:
+                raise ValueError(
+                    f"geometry CSV '{geometry_csv_path}' is missing column(s): "
+                    f"{sorted(missing)}"
+                )
+            dirs = df[['pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z']].to_numpy()
+            self._pmt_direction_cache[geometry_csv_path] = torch.tensor(
+                dirs, device=self.device, dtype=torch.float32
+            )
+        return self._pmt_direction_cache[geometry_csv_path]
+
+    def sample_pmt_direction(self, geometry_csv_path, num_samples=1, seed=None):
+        """Sample random PMT direction(s) from a geometry CSV file.
+
+        Draws uniformly (with replacement) from the PMT pointing directions
+        listed in the geometry CSV produced by ``extract_geom.py``.
+
+        Parameters
+        ----------
+        geometry_csv_path : str
+            Path to the geometry CSV (with pmt_dir_x/y/z columns).
+        num_samples : int
+            Number of PMT directions to sample (default 1).
+        seed : int or None
+            Optional seed for a reproducible draw. If None, uses global RNG state.
+
+        Returns
+        -------
+        torch.Tensor
+            Sampled unit direction(s), shape (num_samples, 3), on self.device.
+        """
+        directions = self._load_pmt_directions(geometry_csv_path)
+        n_pmts = directions.shape[0]
+        if n_pmts == 0:
+            raise ValueError(f"geometry CSV '{geometry_csv_path}' contains no PMT directions")
+
+        if seed is not None:
+            rng = torch.Generator(device=self.device).manual_seed(seed)
+        else:
+            rng = None
+        idx = torch.randint(0, n_pmts, (num_samples,), generator=rng, device=self.device)
+        return directions[idx]

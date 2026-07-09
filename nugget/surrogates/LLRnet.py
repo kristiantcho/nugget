@@ -190,7 +190,7 @@ class LLRnet(Surrogate):
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False, log_charge_scale=4,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True, jitter_time=0.0,
                  add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True,
-                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, rich_rel_pos_mode=False, **kwargs):
+                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, rich_rel_pos_mode=False, add_pmt_direction=False, **kwargs):
         """
         Initialize the LLRnet surrogate model.
         
@@ -299,6 +299,15 @@ class LLRnet(Surrogate):
         # negligible relative to the geometric features); smaller values let timing dominate.
         self.time_scale_divisor = time_scale_divisor
         self.rich_rel_pos_mode = rich_rel_pos_mode
+        # If True, prepare_features_charge appends the hit-PMT direction (a unit
+        # vector, relative to the optical module) as 3 extra features. The
+        # direction is read from event_data['pmt_direction'].
+        self.add_pmt_direction = add_pmt_direction
+        # All unique PMT directions seen when add_pmt_direction is used, as a
+        # (n_unique, 3) tensor. Populated by the light-yield parquet dataset from
+        # the geometry CSV, and persisted via save_model / load_model. None until
+        # a dataset with add_pmt_direction populates it.
+        self.pmt_directions = None
         self.log_charge_scale = log_charge_scale  # Scale factor for log10 of charge when input_charge=True
         # Handle multiple branch configurations
         if num_parallel_branches > 1:
@@ -855,8 +864,12 @@ class LLRnet(Surrogate):
            vert_dist,                 L2(detector - vertex) normalised (1, optional)
            cos_angle,                 cos(direction ∠ vertex→detector) (1)
            dist_perp,                 perp. distance to beam normalised(1, optional)
+           pmt_dir_x, pmt_dir_y, pmt_dir_z,  hit-PMT direction        (3, optional)
            log_ly]                    log-scaled light yield           (1)
-                                                                                                                             total = 12, 13 or 14
+                                                                       total = 12 .. 17
+
+        The pmt_dir block is included only when self.add_pmt_direction is True,
+        in which case event_data must provide 'pmt_direction' (a 3-vector).
 
         Normalisation uses self.domain_size via _pos_norm_divisor().
 
@@ -941,6 +954,15 @@ class LLRnet(Surrogate):
             track_dir = direction    # already a unit vector
             _, dist_perp = self.compute_distance_from_beam(point, track_pos, track_dir)
             feature_values.append(dist_perp.reshape(()) / (self.domain_size / 2))
+        # --- hit-PMT direction (unit vector relative to the optical module) ---
+        if self.add_pmt_direction:
+            pmt_dir = event_data['pmt_direction']
+            if isinstance(pmt_dir, np.ndarray):
+                pmt_dir = torch.tensor(pmt_dir, device=self.device, dtype=torch.float32)
+            else:
+                pmt_dir = pmt_dir.float().to(self.device)
+            pmt_dir = pmt_dir.squeeze()  # (3,)
+            feature_values.extend([pmt_dir[0], pmt_dir[1], pmt_dir[2]])
         feature_values.append(log_ly)
 
         features = torch.stack(feature_values)
@@ -2290,6 +2312,60 @@ class LLRnet(Surrogate):
         plt.grid(True, alpha=0.3)
         plt.show()
     
+    def set_pmt_directions_from_csv(self, geometry_csv_path):
+        """Populate self.pmt_directions from a geometry CSV.
+
+        Reads the ``pmt_dir_x/y/z`` columns of the geometry CSV produced by
+        ``extract_geom.py`` and stores the unique PMT pointing directions on the
+        model as a (n_unique, 3) tensor. This lets a model know the geometry's
+        PMT directions without building a dataloader (e.g. at inference time).
+        The stored value is persisted via save_model / load_model.
+
+        Parameters
+        ----------
+        geometry_csv_path : str
+            Path to the geometry CSV (with pmt_dir_x/y/z columns).
+
+        Returns
+        -------
+        torch.Tensor
+            The unique PMT directions, shape (n_unique, 3), on self.device.
+        """
+        import pandas as pd
+        df = pd.read_csv(geometry_csv_path)
+        missing = {'pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z'} - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"geometry CSV '{geometry_csv_path}' is missing column(s): {sorted(missing)}"
+            )
+        dirs = df[['pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z']].to_numpy()
+        return self.set_pmt_directions(dirs)
+
+    def set_pmt_directions(self, directions):
+        """Set self.pmt_directions to the unique directions in `directions`.
+
+        Parameters
+        ----------
+        directions : array-like or torch.Tensor
+            PMT directions, shape (n, 3). Duplicates are collapsed (rounded to
+            6 decimals) so only unique pointing vectors are stored.
+
+        Returns
+        -------
+        torch.Tensor
+            The unique PMT directions, shape (n_unique, 3), on self.device.
+        """
+        if isinstance(directions, torch.Tensor):
+            arr = directions.detach().cpu().numpy()
+        else:
+            arr = np.asarray(directions)
+        arr = arr.reshape(-1, 3)
+        unique_dirs = np.unique(np.round(arr, 6), axis=0)
+        self.pmt_directions = torch.tensor(
+            unique_dirs, device=self.device, dtype=torch.float32
+        )
+        return self.pmt_directions
+
     def _save_model_state(self, filepath):
         save_dict = {
             'mlp_branches_state_dict': [branch.state_dict() for branch in self.mlp_branches] if not self.shared_mlp else None,
@@ -2330,6 +2406,8 @@ class LLRnet(Surrogate):
             'num_photons_per_sample': self.num_photons_per_sample,
             'add_distance_from_beam': self.add_distance_from_beam,
             'add_vertex_distance': self.add_vertex_distance,
+            'add_pmt_direction': self.add_pmt_direction,
+            'pmt_directions': self.pmt_directions.detach().cpu() if self.pmt_directions is not None else None,
             'rich_rel_pos_mode': self.rich_rel_pos_mode,
             'reduce_lr_on_plateau': self.reduce_lr_on_plateau,
             'lr_scheduler_patience': self.lr_scheduler_patience,
@@ -2400,6 +2478,9 @@ class LLRnet(Surrogate):
         self.time_scale_divisor = checkpoint.get('time_scale_divisor', 4.0)
         self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
         self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
+        self.add_pmt_direction = checkpoint.get('add_pmt_direction', False)
+        pmt_directions = checkpoint.get('pmt_directions', None)
+        self.pmt_directions = pmt_directions.to(self.device) if pmt_directions is not None else None
         self.rich_rel_pos_mode = checkpoint.get('rich_rel_pos_mode', False)
         # Determine if this is old format (single MLP) or new format (parallel branches)
         is_old_format = 'model_state_dict' in checkpoint
@@ -3860,4 +3941,474 @@ class LLRnet(Surrogate):
 
         return DataLoader(**dl_kwargs)
 
+    class LightYieldParquetDataset(Dataset):
+        """
+        Balanced matched/mismatched dataset for the charge (light-yield) LLRnet,
+        sourced from a parquet file produced by ``extract_accepted_photons.py``
+        in light-yield mode plus a geometry CSV from ``extract_geom.py``.
+
+        Each parquet row is one hit PMT in one event and carries:
+
+            string, om, pmt, count, muon_x, muon_y, muon_z,
+            muon_energy, neutrino_energy, zenith, azimuth
+
+        where muon_x/y/z is the muon interaction vertex, muon_energy the muon
+        (CC daughter) energy, and zenith/azimuth the primary-neutrino direction.
+
+        The geometry CSV maps ``(string, om, pmt)`` to the optical-module
+        position (``om_x/y/z``) and the hit-PMT direction (``pmt_dir_x/y/z``).
+
+        For every row we build an observation for ``prepare_features_charge``:
+
+            * point           = OM position (detector position),   from the CSV
+            * light_yield     = count (number of accepted photons), from parquet
+            * event_data:
+                - position    = muon interaction vertex (muon_x/y/z)
+                - energy      = neutrino_energy
+                - direction   = unit vector from neutrino (zenith, azimuth)
+                - pmt_direction = hit-PMT direction (used only when the model has
+                                  add_pmt_direction=True)
+
+        Balanced training, mirroring SignalOnlyDataset:
+            * matched   (label 1): row's own event params with its own count.
+            * mismatched(label 0): row's event params, but the light-yield count
+                                   taken from a uniformly random *other* row
+                                   anywhere in the file.
+
+        Optional zero light-yield augmentation (zero_ly_prob > 0): with low
+        probability any item (matched OR mismatched slot) is replaced by a
+        *zero-LY* sample -- the event's params observed at a (string, om, pmt)
+        that was NOT hit in that event (sampled from the geometry keys), with
+        light yield zero and label 0. This teaches the network that an unhit PMT
+        is inconsistent with the event. Requires run_id/event_id columns in the
+        parquet to group hits per event (otherwise each row is treated as its
+        own event).
+
+        The dataset yields individual events (even idx = matched, odd = mismatched)
+        so it collates through a normal DataLoader.
+        """
+
+        def __init__(self, llrnet_instance, parquet_path, geometry_csv_path,
+                     num_samples_per_epoch=None, seed=None,
+                     zero_ly_prob=0.0, zero_ly_value=0.0):
+            """
+            Parameters
+            ----------
+            llrnet_instance : LLRnet
+                Parent model; provides prepare_features_charge, device, flags.
+            parquet_path : str
+                Path to the light-yield parquet file.
+            geometry_csv_path : str
+                Path to the geometry CSV (string, om, pmt -> om pos + pmt dir).
+            num_samples_per_epoch : int or None
+                Number of matched/mismatched pairs per epoch. Defaults to the
+                number of usable parquet rows (one matched pair per row).
+            seed : int or None
+                Seed for the mismatch RNG (reproducible pairing).
+            zero_ly_prob : float
+                Probability (per matched item) of instead emitting a zero
+                light-yield sample: the event's params observed at a PMT that was
+                NOT hit in that event (sampled from the geometry), with light
+                yield ``zero_ly_value`` and label 0. Default 0.0 (disabled).
+            zero_ly_value : float
+                Light-yield value used for zero-LY samples (default 0.0).
+            """
+            import pandas as pd
+
+            self.llrnet = llrnet_instance
+            self.device = llrnet_instance.device
+            self.zero_ly_prob = float(zero_ly_prob)
+            self.zero_ly_value = float(zero_ly_value)
+
+            # ---- load geometry CSV -> (string, om, pmt) lookup ----
+            geo = pd.read_csv(geometry_csv_path)
+            self._om_pos = {}
+            self._pmt_dir = {}
+            for r in geo.itertuples(index=False):
+                key = (int(r.string), int(r.om), int(r.pmt))
+                self._om_pos[key] = np.array([r.om_x, r.om_y, r.om_z], dtype=np.float32)
+                self._pmt_dir[key] = np.array(
+                    [r.pmt_dir_x, r.pmt_dir_y, r.pmt_dir_z], dtype=np.float32
+                )
+            # All geometry keys, in a fixed order, for sampling unhit PMTs.
+            self._geo_keys = list(self._om_pos.keys())
+
+            # ---- load parquet and keep only rows with a matching geometry ----
+            df = pd.read_parquet(parquet_path)
+            has_event_id = {'run_id', 'event_id'}.issubset(df.columns)
+            keep = []
+            for r in df.itertuples(index=False):
+                key = (int(r.string), int(r.om), int(r.pmt))
+                if key in self._om_pos:
+                    keep.append(r)
+            if len(keep) == 0:
+                raise ValueError(
+                    "No parquet rows matched the geometry CSV; check that the "
+                    "files correspond to the same detector."
+                )
+
+            # Precompute per-row arrays (as numpy; converted to tensors per item).
+            n = len(keep)
+            self._point = np.empty((n, 3), dtype=np.float32)   # OM position
+            self._pmt_direction = np.empty((n, 3), dtype=np.float32)
+            self._muon_pos = np.empty((n, 3), dtype=np.float32)
+            self._energy = np.empty((n,), dtype=np.float32)
+            self._zenith = np.empty((n,), dtype=np.float32)
+            self._azimuth = np.empty((n,), dtype=np.float32)
+            self._count = np.empty((n,), dtype=np.float32)     # light yield
+            # Per-event set of hit (string, om, pmt) keys, so a zero-LY sample can
+            # pick a PMT that was NOT hit in the same event. Keyed by event id.
+            self._event_hit_keys = {}
+            self._row_event = [None] * n
+            for i, r in enumerate(keep):
+                key = (int(r.string), int(r.om), int(r.pmt))
+                self._point[i] = self._om_pos[key]
+                self._pmt_direction[i] = self._pmt_dir[key]
+                self._muon_pos[i] = (r.muon_x, r.muon_y, r.muon_z)
+                self._energy[i] = r.neutrino_energy
+                self._zenith[i] = r.zenith
+                self._azimuth[i] = r.azimuth
+                self._count[i] = r.count
+                # Event identity: (run_id, event_id) if present, else the row
+                # itself (each row is then treated as its own event).
+                ev = (int(r.run_id), int(r.event_id)) if has_event_id else i
+                self._row_event[i] = ev
+                self._event_hit_keys.setdefault(ev, set()).add(key)
+
+            self._n_rows = n
+            self.num_samples_per_epoch = (
+                num_samples_per_epoch if num_samples_per_epoch is not None else n
+            )
+            # Dedicated RNG so mismatch pairing is reproducible and independent
+            # of global torch/numpy state (also safe across DataLoader workers).
+            self._rng = np.random.default_rng(seed)
+
+            # When the model uses the PMT direction as a feature, record all the
+            # unique PMT directions from the geometry on the model itself, so they
+            # are available at inference time and persisted via save/load_model.
+            if getattr(llrnet_instance, 'add_pmt_direction', False):
+                all_dirs = np.stack(list(self._pmt_dir.values()), axis=0)  # (n_pmts, 3)
+                llrnet_instance.set_pmt_directions(all_dirs)
+
+        def _event_data(self, i, pmt_direction=None):
+            """Build the event_data dict (hypothesis params) for row i.
+
+            If ``pmt_direction`` (a (3,) array) is given it overrides the row's
+            own PMT direction -- used for zero-LY samples observed at a PMT that
+            was not hit in the event.
+            """
+            zenith = torch.tensor(self._zenith[i], device=self.device, dtype=torch.float32)
+            azimuth = torch.tensor(self._azimuth[i], device=self.device, dtype=torch.float32)
+            direction = sph_to_cart(zenith, azimuth)  # (3,), unit vector
+            pmt_dir = self._pmt_direction[i] if pmt_direction is None else pmt_direction
+            return {
+                'position': torch.tensor(self._muon_pos[i], device=self.device, dtype=torch.float32),
+                'energy': torch.tensor(self._energy[i], device=self.device, dtype=torch.float32),
+                'direction': direction,
+                'pmt_direction': torch.tensor(pmt_dir, device=self.device, dtype=torch.float32),
+            }
+
+        def _features(self, i, light_yield, point=None, pmt_direction=None):
+            """Feature vector for row i's params observed with the given light yield.
+
+            ``point`` and ``pmt_direction`` optionally override the detector
+            position / PMT direction (used for zero-LY samples at an unhit PMT).
+            """
+            pt = self._point[i] if point is None else point
+            point_t = torch.tensor(pt, device=self.device, dtype=torch.float32)
+            ly = torch.tensor(light_yield, device=self.device, dtype=torch.float32)
+            return self.llrnet.prepare_features_charge(
+                point_t, self._event_data(i, pmt_direction=pmt_direction), ly
+            )
+
+        def _sample_unhit_key(self, row):
+            """Sample a geometry (string, om, pmt) key NOT hit in row's event.
+
+            Returns None if the event hit every PMT in the geometry (no unhit
+            PMT available).
+            """
+            hit = self._event_hit_keys.get(self._row_event[row], ())
+            n_geo = len(self._geo_keys)
+            if len(hit) >= n_geo:
+                return None
+            # Rejection sampling: unhit PMTs vastly outnumber hit ones in practice.
+            for _ in range(100):
+                k = self._geo_keys[int(self._rng.integers(0, n_geo))]
+                if k not in hit:
+                    return k
+            # Fallback: scan for any unhit key (guaranteed to exist here).
+            for k in self._geo_keys:
+                if k not in hit:
+                    return k
+            return None
+
+        def __len__(self):
+            # Two individual events (matched + mismatched) per pair.
+            return self.num_samples_per_epoch * 2
+
+        def __getitem__(self, idx):
+            # Even idx -> matched, odd idx -> mismatched. The pair index selects
+            # the "params" row; both share the same event params.
+            pair_idx = idx // 2
+            is_matched = (idx % 2 == 0)
+            row = pair_idx % self._n_rows
+
+            # With low probability, emit a zero-LY sample instead (for BOTH the
+            # matched and mismatched slots): the event's params observed at a PMT
+            # that was NOT hit in the event -> the network should learn this is
+            # inconsistent (label 0).
+            if self.zero_ly_prob > 0.0 and self._rng.random() < self.zero_ly_prob:
+                unhit = self._sample_unhit_key(row)
+                if unhit is not None:
+                    features = self._features(
+                        row, self.zero_ly_value,
+                        point=self._om_pos[unhit],
+                        pmt_direction=self._pmt_dir[unhit],
+                    )
+                    label = torch.tensor(0.0, device=self.device)
+                    return features, label
+
+            if is_matched:
+                features = self._features(row, self._count[row])
+                label = torch.tensor(1.0, device=self.device)
+            else:
+                # Mismatched: same event params, light yield from a random other row.
+                other = int(self._rng.integers(0, self._n_rows))
+                if self._n_rows > 1:
+                    while other == row:
+                        other = int(self._rng.integers(0, self._n_rows))
+                features = self._features(row, self._count[other])
+                label = torch.tensor(0.0, device=self.device)
+
+            return features, label
+
+        def light_yield_value_counts(self, include_zeros=True):
+            """Return the marginal light-yield distribution as (values, weights).
+
+            Pools light yields over every (string, om, pmt), event, and event
+            parameter, returning the unique values and how many times each occurs
+            (so the caller can build a weighted CDF/PDF without materialising the
+            full sample).
+
+            When ``include_zeros`` is True, every (string, om, pmt) that was NOT
+            hit in an event contributes a zero. The number of such zeros is
+            counted arithmetically -- n_events * n_geometry_keys minus the number
+            of hit rows -- rather than by enumerating each unhit PMT.
+
+            Parameters
+            ----------
+            include_zeros : bool
+                If True, include the implicit zeros from unhit PMTs.
+
+            Returns
+            -------
+            values : np.ndarray
+                Sorted unique light-yield values (float64).
+            weights : np.ndarray
+                Occurrence count for each value (float64), same length as values.
+            """
+            values, counts = np.unique(self._count.astype(np.float64), return_counts=True)
+            values = values.astype(np.float64)
+            weights = counts.astype(np.float64)
+
+            if include_zeros:
+                n_events = len(self._event_hit_keys)
+                n_geo = len(self._geo_keys)
+                n_zeros = n_events * n_geo - self._n_rows
+                if n_zeros > 0:
+                    if values.size and values[0] == 0.0:
+                        # Fold into the existing zero bucket.
+                        weights[0] += n_zeros
+                    else:
+                        values = np.concatenate([[0.0], values])
+                        weights = np.concatenate([[float(n_zeros)], weights])
+                # Keep values sorted (a prepended 0 already is).
+            return values, weights
+
+    def create_light_yield_parquet_dataloader(self, parquet_path, geometry_csv_path,
+                                              num_samples_per_epoch=None, batch_size=32,
+                                              shuffle=True, num_workers=0, seed=None,
+                                              zero_ly_prob=0.05, zero_ly_value=0.0,
+                                              pin_memory=None, pin_memory_device=None):
+        """
+        Create a DataLoader for the charge LLRnet from a light-yield parquet file
+        and a geometry CSV.
+
+        See LightYieldParquetDataset for the data model and the matched/mismatched
+        balancing. Set the model's ``add_pmt_direction=True`` to include the
+        hit-PMT direction in the feature vector.
+
+        Parameters
+        ----------
+        parquet_path : str
+            Light-yield parquet file (from extract_accepted_photons.py --ly_mode).
+        geometry_csv_path : str
+            Geometry CSV (from extract_geom.py).
+        num_samples_per_epoch : int or None
+            Matched/mismatched pairs per epoch (defaults to number of rows).
+        batch_size, shuffle, num_workers, pin_memory, pin_memory_device
+            Standard DataLoader options.
+        seed : int or None
+            Seed for reproducible mismatch pairing.
+        zero_ly_prob : float
+            Probability of replacing any item (matched or mismatched) with a
+            zero light-yield sample: the event's params observed at a PMT NOT hit
+            in that event, with light yield zero_ly_value and label 0. Default
+            0.0 (disabled).
+        zero_ly_value : float
+            Light-yield value used for zero-LY samples (default 0.0).
+
+        Returns
+        -------
+        torch.utils.data.DataLoader
+        """
+        dataset = self.LightYieldParquetDataset(
+            llrnet_instance=self,
+            parquet_path=parquet_path,
+            geometry_csv_path=geometry_csv_path,
+            num_samples_per_epoch=num_samples_per_epoch,
+            seed=seed,
+            zero_ly_prob=zero_ly_prob,
+            zero_ly_value=zero_ly_value,
+        )
+
+        pin_memory, pin_memory_device = self._resolve_pin_memory(pin_memory, pin_memory_device)
+        dl_kwargs = dict(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        if pin_memory and pin_memory_device:
+            dl_kwargs['pin_memory_device'] = pin_memory_device
+
+        return DataLoader(**dl_kwargs)
+
+    def compute_light_yield_pdf(self, parquet_path, geometry_csv_path,
+                                include_zeros=True, num_points=512):
+        """Estimate the marginal light-yield PDF p(light_yield) from a dataset.
+
+        Pools the light yields over every (string, om, pmt), event, and event
+        parameter (i.e. ignores all of them) into one 1-D distribution and builds
+        a single continuous density -- including light yield 0.
+
+        Light yield spans orders of magnitude and is strongly zero-inflated (most
+        PMTs are unhit), so the CDF is built and interpolated in
+        ``u = log10(light_yield + 1)`` space rather than plain ``log10``. This
+        maps 0 -> u=0 (so zero is part of the continuous density, not a separate
+        atom) while keeping even resolution across the decades; values between 0
+        and 1 fall in ``u in (0, log10(2))`` and interpolate normally. Weights
+        stay on the linear probability axis so the CDF is monotone and normalised.
+
+        When ``include_zeros`` is True, every (string, om, pmt) that was NOT hit
+        in an event contributes a light yield of zero.
+
+        The returned ``pdf``/``cdf`` callables take light yield in **linear**
+        units (they apply the log1p internally) and are valid for x >= 0:
+
+            u(x)   = log10(x + 1)
+            cdf(x) = F(u(x))                       (0 at x<0, ->1 at the max)
+            pdf(x) = dF/du * du/dx,  du/dx = 1 / ((x + 1) * ln10)
+
+        Parameters
+        ----------
+        parquet_path : str
+            Light-yield parquet file (from extract_accepted_photons.py --ly_mode).
+        geometry_csv_path : str
+            Geometry CSV (from extract_geom.py).
+        include_zeros : bool
+            If True, include the implicit zeros from unhit PMTs.
+        num_points : int
+            Number of grid points (even in u = log10(x+1)) used to interpolate
+            the PDF between the observed CDF knots.
+
+        Returns
+        -------
+        dict with keys:
+            'pdf'    : callable, pdf(x) -> probability density at x (x>=0)
+            'cdf'    : callable, cdf(x) -> cumulative probability at x
+            'x'      : np.ndarray, linear light-yield grid (starts at 0)
+            'pdf_values' : np.ndarray, pdf evaluated on 'x'
+            'cdf_values' : np.ndarray, cdf evaluated on 'x'
+            'values' : np.ndarray, unique light-yield values used
+            'weights': np.ndarray, occurrence counts for those values
+        """
+        from scipy import interpolate
+
+        dataset = self.LightYieldParquetDataset(
+            llrnet_instance=self,
+            parquet_path=parquet_path,
+            geometry_csv_path=geometry_csv_path,
+        )
+        values, weights = dataset.light_yield_value_counts(include_zeros=include_zeros)
+
+        if values.size == 0:
+            raise ValueError("No light-yield values available to build a PDF.")
+
+        order = np.argsort(values)
+        values = values[order].astype(np.float64)
+        weights = weights[order].astype(np.float64)
+        total = weights.sum()
+
+        ln10 = np.log(10.0)
+
+        # Empirical CDF knots in u = log10(value + 1). Zero maps to u = 0, so it
+        # sits at the left edge of the continuous density (no separate atom).
+        u = np.log10(values + 1.0)
+        cum = np.cumsum(weights) / total  # empirical CDF value at each u knot
+
+        if values.size == 1:
+            # All mass at one value: represent as a narrow ramp in u so pdf/cdf
+            # remain callable and interpolable around it.
+            u0 = u[0]
+            u_knots = np.array([max(0.0, u0 - 1e-3), u0, u0 + 1e-3])
+            cdf_knots = np.array([0.0, 1.0, 1.0])
+        else:
+            # Anchor the CDF at 0 just below the smallest u (>= 0).
+            eps_u = max(1e-9, (u[-1] - u[0]) * 1e-6)
+            u_knots = np.concatenate([[max(0.0, u[0] - eps_u)], u])
+            cdf_knots = np.concatenate([[0.0], cum])
+            u_knots, uniq_idx = np.unique(u_knots, return_index=True)
+            cdf_knots = cdf_knots[uniq_idx]
+
+        # Monotone (shape-preserving) interpolant of the CDF in u.
+        cdf_interp = interpolate.PchipInterpolator(u_knots, cdf_knots, extrapolate=False)
+        cdf_deriv = cdf_interp.derivative()
+
+        u_lo, u_hi = u_knots[0], u_knots[-1]
+
+        # Dense grid even in u, returned in linear light-yield units (x = 10^u - 1).
+        u_grid = np.linspace(u_lo, u_hi, int(num_points))
+        x = np.power(10.0, u_grid) - 1.0
+        x = np.clip(x, 0.0, None)
+
+        cdf_values = np.clip(np.nan_to_num(cdf_interp(u_grid), nan=0.0), 0.0, 1.0)
+        # pdf wrt linear x: dF/dx = dF/du * du/dx, du/dx = 1 / ((x + 1) ln10)
+        pdf_values = np.nan_to_num(cdf_deriv(u_grid), nan=0.0) / ((x + 1.0) * ln10)
+        pdf_values = np.clip(pdf_values, 0.0, None)
+
+        def cdf_fn(q, _lo=u_lo, _hi=u_hi, _c=cdf_interp):
+            q = np.asarray(q, dtype=np.float64)
+            out = np.zeros(q.shape, dtype=np.float64)   # x < 0 -> 0
+            valid = q >= 0.0
+            if np.any(valid):
+                uu = np.clip(np.log10(q[valid] + 1.0), _lo, _hi)
+                out[valid] = np.clip(np.nan_to_num(_c(uu), nan=0.0), 0.0, 1.0)
+            return out
+
+        def pdf_fn(q, _lo=u_lo, _hi=u_hi, _d=cdf_deriv, _ln10=ln10):
+            q = np.asarray(q, dtype=np.float64)
+            out = np.zeros(q.shape, dtype=np.float64)
+            uu_all = np.log10(np.clip(q, 0.0, None) + 1.0)
+            inside = (q >= 0.0) & (uu_all >= _lo) & (uu_all <= _hi)
+            if np.any(inside):
+                qi = q[inside]
+                dens = np.nan_to_num(_d(uu_all[inside]), nan=0.0) / ((qi + 1.0) * _ln10)
+                out[inside] = np.clip(dens, 0.0, None)
+            return out
+
+        return {'pdf': pdf_fn, 'cdf': cdf_fn, 'x': x,
+                'pdf_values': pdf_values, 'cdf_values': cdf_values,
+                'values': values, 'weights': weights}
 

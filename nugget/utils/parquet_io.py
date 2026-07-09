@@ -17,12 +17,13 @@ There are two output modes, each with its own schema.
     string                int64     string id of the hit module
     om                    int64     om id of the hit module
     pmt                   int64     hit PMT number (1-16)
-    muon_x                float64   injection position x [m]
-    muon_y                float64   injection position y [m]
-    muon_z                float64   injection position z [m]
-    muon_energy           float64   muon energy [GeV]
-    muon_zenith           float64   muon zenith [rad]
-    muon_azimuth          float64   muon azimuth [rad]
+    muon_x                float64   muon interaction-vertex position x [m]
+    muon_y                float64   muon interaction-vertex position y [m]
+    muon_z                float64   muon interaction-vertex position z [m]
+    muon_energy           float64   muon (CC daughter) energy [GeV]
+    neutrino_energy       float64   primary neutrino energy [GeV]
+    zenith                float64   primary neutrino zenith [rad]
+    azimuth               float64   primary neutrino azimuth [rad]
 
 **Light-yield mode** -- one row per hit PMT per event, no per-photon times.
 The ``time`` column is replaced by an integer ``count`` giving the number of
@@ -30,7 +31,7 @@ accepted photons that reached that (string, om, pmt) in the event::
 
     run_id, event_id, frame_index, string, om, pmt,
     count                 int64     number of accepted photons at this PMT
-    muon_x ... muon_azimuth         (as above)
+    muon_x ... azimuth              (as above)
 
 Both schemas may optionally also carry the optical-module position relative to
 the detector centre (``om_x/y/z``) and the hit-PMT direction relative to the
@@ -65,8 +66,9 @@ COLUMN_ORDER = [
     "muon_y",
     "muon_z",
     "muon_energy",
-    "muon_zenith",
-    "muon_azimuth",
+    "neutrino_energy",
+    "zenith",
+    "azimuth",
 ]
 
 
