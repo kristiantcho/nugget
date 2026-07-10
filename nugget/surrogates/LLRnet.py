@@ -189,7 +189,7 @@ class LLRnet(Surrogate):
                  num_frequencies=64, frequency_scale=1.0, learnable_frequencies=False,
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False, log_charge_scale=4,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True, jitter_time=0.0,
-                 add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True,
+                 add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True, ly_eps = 1e-10,
                  lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, rich_rel_pos_mode=False, add_pmt_direction=False, **kwargs):
         """
         Initialize the LLRnet surrogate model.
@@ -260,6 +260,8 @@ class LLRnet(Surrogate):
             sample more photons from each event, or lower (but >= 1) to sample fewer.
         jitter_time : float
             Amount of time jitter to add to each photon arrival time (default: 0.0)
+        ly_eps : float
+            Small epsilon value to prevent taking log of zero in light yield scaling
         """
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         
@@ -289,6 +291,7 @@ class LLRnet(Surrogate):
         self.lr_scheduler_factor = lr_scheduler_factor
         self.lr_scheduler_min_lr = lr_scheduler_min_lr
         self.add_vertex_distance = add_vertex_distance
+        self.ly_eps = ly_eps
         self.use_patd = use_patd
         self.min_photons = min_photons
         self.input_delta_time = input_delta_time
@@ -923,7 +926,7 @@ class LLRnet(Surrogate):
             energy = torch.tensor(energy, device=self.device, dtype=torch.float32)
         else:
             energy = energy.float().to(self.device)
-        log_energy = torch.log10(energy.squeeze() + 1e-10) / 8.0  # scalar
+        log_energy = torch.log10(energy.squeeze() + self.ly_eps) / 8.0  # scalar
 
         # --- derived geometric scalars ---
         rel = det - vert
@@ -935,7 +938,7 @@ class LLRnet(Surrogate):
             light_yield = torch.tensor(light_yield, device=self.device, dtype=torch.float32)
         else:
             light_yield = light_yield.float().to(self.device)
-        log_ly = torch.log10(torch.abs(light_yield.squeeze()) + 1e-10) / self.log_charge_scale  # scalar
+        log_ly = torch.log10(torch.abs(light_yield.squeeze()) + self.ly_eps) / self.log_charge_scale  # scalar
 
         if self.rich_rel_pos_mode:
             # Use only relative position (detector - vertex) instead of both absolute positions
@@ -2404,6 +2407,7 @@ class LLRnet(Surrogate):
             'time_scale_divisor': self.time_scale_divisor,
             'input_charge': self.input_charge,
             'log_charge_scale': self.log_charge_scale,
+            'ly_eps': self.ly_eps,
             'norm_pos': self.norm_pos,
             'log_scale_energy': self.log_scale_energy,
             'input_delta_time': self.input_delta_time,
@@ -2470,6 +2474,7 @@ class LLRnet(Surrogate):
         self.use_patd = checkpoint.get('use_patd', self.use_patd)
         self.use_rich_features = checkpoint.get('use_rich_features', self.use_rich_features)
         self.log_charge_scale = checkpoint.get('log_charge_scale', 4)
+        self.ly_eps = checkpoint.get('ly_eps', 1e-10)
         self.domain_size = checkpoint.get('domain_size', self.domain_size)
         self.log_scale_ly = checkpoint.get('log_scale_ly', self.log_scale_ly)
         self.rel_time = checkpoint.get('rel_time', self.rel_time)

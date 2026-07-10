@@ -1,22 +1,22 @@
 import nugget  # Main NUGGET package for neutrino detector optimization
 import pickle 
 
-lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=2000, particle_mode='track')
-light_yield_surrogate = lightsabre.light_yield_surrogate
-signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
-            event_type='signal', 
-            domain_size=2000, 
-            E_min=1e2, 
-            E_max=1e8, 
-            energy_dist='log_uniform', 
-            find_exact_intersection=False, 
-            random_position_along_ray=True,
-            uniform_zenith_sampling=True
-            )
+# lightsabre = nugget.surrogates.LightSabre.LightSabre(use_poisson=True, domain_size=2000, particle_mode='track')
+# light_yield_surrogate = lightsabre.light_yield_surrogate
+# signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+#             event_type='signal', 
+#             domain_size=2000, 
+#             E_min=1e2, 
+#             E_max=1e8, 
+#             energy_dist='log_uniform', 
+#             find_exact_intersection=False, 
+#             random_position_along_ray=True,
+#             uniform_zenith_sampling=True
+#             )
 
 
 llr_net = nugget.surrogates.LLRnet.LLRnet(
-    domain_size=2000,  # Size of the detector domain
+    domain_size=10000,  # Size of the detector domain
     dim=3,  # 3D spatial coordinates
     hidden_dims=[64, 64, 64, 64, 64, 64],  # Neural network architecture
     use_fourier_features=False,  # Use Fourier features for better spatial encoding
@@ -40,40 +40,50 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     use_rich_features=True,  # Whether to use rich features from the surrogate model
     add_vertex_distance=False,
     rich_rel_pos_mode=True,
-    log_charge_scale=3
+    log_charge_scale=6,
+    ly_eps=1e-6,
+    add_pmt_direction=True
     )
 
-train_dataloader = llr_net.create_signal_only_dataloader(
-    signal_sampler=signal_sampler, 
-    signal_surrogate_func=light_yield_surrogate,
+# train_dataloader = llr_net.create_signal_only_dataloader(
+#     signal_sampler=signal_sampler, 
+#     signal_surrogate_func=light_yield_surrogate,
+#     num_samples_per_epoch=2048,
+#     batch_size=16,       # Size of each batch (N pairs)
+#     num_workers=4,
+#     event_labels=['position','energy', 'direction'],
+#     shuffle=True,
+#     samples_per_event = 1,
+#     min_light_yield=0.1,         
+#     max_resample_attempts=200,
+#     vary_cylinder=False,
+#     pin_memory=True,
+#     pin_memory_device=None,
+#     record_marginal_lys=True
+    
+#     # cylinder_sampler=nugget.samplers.cyl_sampler.CylinderSampler
+#     )
+
+train_dataloader = llr_net.create_light_yield_parquet_dataloader(
+    parquet_path='new_accepted_photons_ly_all.parquet',
+    geometry_csv_path='../other/800_40_40_geom.csv',
     num_samples_per_epoch=2048,
     batch_size=16,       # Size of each batch (N pairs)
     num_workers=4,
-    event_labels=['position','energy', 'direction'],
     shuffle=True,
-    samples_per_event = 1,
-    min_light_yield=0.1,         
-    max_resample_attempts=200,
-    vary_cylinder=False,
-    pin_memory=True,
-    pin_memory_device=None,
-    record_marginal_lys=True
-    
-    # cylinder_sampler=nugget.samplers.cyl_sampler.CylinderSampler
+    zero_ly_prob=0.00,
     )
-
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     epochs=1500,
-    input_dim=10,
+    input_dim=13,
     grad_clip=None,
     save_every_n_epochs=20,
-    checkpoint_path='best_charge_llr_model_v6.pt',
-    dataset_checkpoint_path='charge_llr_v6_training_ly.pt',
+    checkpoint_path='best_mc_ly_muon_llr_model_v1.pt',
 )
 
 # Save the best model for later use
 # llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('charge_llr_v6_training_history.pkl', 'wb'))
+pickle.dump(history, open('mc_ly_muon_llr_v1_training_history.pkl', 'wb'))

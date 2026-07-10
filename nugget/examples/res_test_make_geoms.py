@@ -11,7 +11,7 @@ weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizat
 weighted_angular_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
     device=device,
     resolution_type='angular',
-    fisher_info_params=['energy', 'direction']
+    fisher_info_params=['position','energy', 'direction']
     )
 weighted_energy_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
     device=device,
@@ -24,9 +24,9 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
     rov_height=159.9, 
     rov_tri_length=159.9
 )
-version = '_u_sp_1_vertical'
+version = '_u_1'
 use_rov = 'no_rov'
-num_events = 9000
+num_events = 50000
 folder_name = f'res_test/opt_geoms/opt_geoms_full_hex_{num_events}_r600_50{version}_{use_rov}/'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
@@ -123,18 +123,18 @@ loss_func_dict = {
 if use_rov == 'rov':
     loss_func_dict['rov_penalty'] = rov_penalty
 
-for i in range(3):
+for i in range(15):
     # print(f"Running optimization iteration {i+1}/15")
-    selection_limits = {
-        'energy': (10**((i*2)+2), 10**(2*(i+1) + 2)),  # Example energy range
-        }
-    selection_inds = nugget.utils.data_tools.select_event_indices(
-            nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events/signal_events_{num_events}_r600_50{version}.pt')[:],
-            limits=selection_limits  # Example limit
-            )
-    signal_events = nugget.utils.data_tools.select_events(nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events/signal_events_{num_events}_r600_50{version}.pt'),limits=selection_limits)
-    fisher_info = torch.load(f'res_test/fisher_info/fisher_info_per_string_per_event_{num_events}_800main_full_hex_r600_50{version}.pt')[selection_inds]
-    # signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events/signal_events_{num_events}_r600_50{version}.pt')
+    # selection_limits = {
+    #     'energy': (10**((i*2)+2), 10**(2*(i+1) + 2)),  # Example energy range
+    #     }
+    # selection_inds = nugget.utils.data_tools.select_event_indices(
+    #         nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events/signal_events_{num_events}_r600_50{version}.pt')[:],
+    #         limits=selection_limits  # Example limit
+    #         )
+    # signal_events = nugget.utils.data_tools.select_events(nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events/signal_events_{num_events}_r600_50{version}.pt'),limits=selection_limits)
+    fisher_info = torch.load(f'res_test/fisher_info/fisher_info_per_string_per_event_{num_events}_800main_full_hex_r600_50{version}.pt')#[selection_inds]
+    signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events/signal_events_{num_events}_r600_50{version}.pt')
     loss_params.update({
         'signal_event_params': signal_events,
         'precomputed_fisher_info_per_string_per_event': fisher_info
@@ -175,7 +175,7 @@ for i in range(3):
         n_iter=1000,                           # Maximum number of optimization iterations
         print_freq=100,                          # Print progress every N iterations
         sigmoid_loss_list=loss_sigmoid_list,         # Which losses to apply sigmoid to (for better optimization dynamics)
-        save_best_geom_file = f'{folder_name}geom_e{(2*i)+2}_e{2*(i+1) + 2}.pkl',  # File to save best geometry found
-        # save_best_geom_file = f'{folder_name}/geom_{i}.pkl',  # File to save best geometry found
+        # save_best_geom_file = f'{folder_name}geom_e{(2*i)+2}_e{2*(i+1) + 2}.pkl',  # File to save best geometry found
+        save_best_geom_file = f'{folder_name}/geom_{i}.pkl',  # File to save best geometry found
         save_last_geom = True, 
     )
