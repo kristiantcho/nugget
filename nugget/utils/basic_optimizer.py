@@ -423,7 +423,7 @@ class Optimizer():
                         pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
             if self.save_best_geom_file is not None and (self.total_loss[-1] == min(self.total_loss) or self.save_last_geom):
                 with open(self.save_best_geom_file, 'wb') as f:
-                    pickle.dump(self.geom_dict, f)
+                    pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
             # print(self.geom_dict['string_weights'])
             vis_kwargs.update(self.geom_dict)
             if it % print_freq == 0 or it == n_iter - 1:
