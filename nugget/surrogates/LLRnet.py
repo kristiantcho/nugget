@@ -311,11 +311,6 @@ class LLRnet(Surrogate):
         # the geometry CSV, and persisted via save_model / load_model. None until
         # a dataset with add_pmt_direction populates it.
         self.pmt_directions = None
-        # Cached marginal light-yield PDF fit (a picklable dict of knots), set by
-        # compute_light_yield_pdf and persisted via save_model / load_model. Used
-        # by eval_light_yield_pdf / expected_over_light_yield without re-reading
-        # the parquet/geometry or re-fitting. None until fitted.
-        self.light_yield_pdf = None
         self.log_charge_scale = log_charge_scale  # Scale factor for log10 of charge when input_charge=True
         # Handle multiple branch configurations
         if num_parallel_branches > 1:
@@ -2417,7 +2412,6 @@ class LLRnet(Surrogate):
             'add_vertex_distance': self.add_vertex_distance,
             'add_pmt_direction': self.add_pmt_direction,
             'pmt_directions': self.pmt_directions.detach().cpu() if self.pmt_directions is not None else None,
-            'light_yield_pdf': self.light_yield_pdf,
             'rich_rel_pos_mode': self.rich_rel_pos_mode,
             'reduce_lr_on_plateau': self.reduce_lr_on_plateau,
             'lr_scheduler_patience': self.lr_scheduler_patience,
@@ -2492,8 +2486,6 @@ class LLRnet(Surrogate):
         self.add_pmt_direction = checkpoint.get('add_pmt_direction', False)
         pmt_directions = checkpoint.get('pmt_directions', None)
         self.pmt_directions = pmt_directions.to(self.device) if pmt_directions is not None else None
-        self.light_yield_pdf = checkpoint.get('light_yield_pdf', None)
-        self._ly_pdf_interp = None  # force rebuild of interpolators from loaded fit
         self.rich_rel_pos_mode = checkpoint.get('rich_rel_pos_mode', False)
         # Determine if this is old format (single MLP) or new format (parallel branches)
         is_old_format = 'model_state_dict' in checkpoint
@@ -4302,30 +4294,15 @@ class LLRnet(Surrogate):
         return DataLoader(**dl_kwargs)
 
     def compute_light_yield_pdf(self, parquet_path, geometry_csv_path,
-                                include_zeros=True, num_points=512):
-        """Estimate the marginal light-yield PDF p(light_yield) from a dataset.
+                                num_points=512):
+        """Estimate the marginal light-yield PDF p(light_yield) for LY >= 1.
 
         Pools the light yields over every (string, om, pmt), event, and event
-        parameter (i.e. ignores all of them) into one 1-D distribution and builds
-        a single continuous density -- including light yield 0.
-
-        Light yield spans orders of magnitude and is strongly zero-inflated (most
-        PMTs are unhit), so the CDF is built and interpolated in
-        ``u = log10(light_yield + 1)`` space rather than plain ``log10``. This
-        maps 0 -> u=0 (so zero is part of the continuous density, not a separate
-        atom) while keeping even resolution across the decades; values between 0
-        and 1 fall in ``u in (0, log10(2))`` and interpolate normally. Weights
-        stay on the linear probability axis so the CDF is monotone and normalised.
-
-        When ``include_zeros`` is True, every (string, om, pmt) that was NOT hit
-        in an event contributes a light yield of zero.
-
-        The returned ``pdf``/``cdf`` callables take light yield in **linear**
-        units (they apply the log1p internally) and are valid for x >= 0:
-
-            u(x)   = log10(x + 1)
-            cdf(x) = F(u(x))                       (0 at x<0, ->1 at the max)
-            pdf(x) = dF/du * du/dx,  du/dx = 1 / ((x + 1) * ln10)
+        parameter into one 1-D distribution, restricted to light yield >= 1
+        (the zero / unhit population is excluded here). Builds an empirical CDF
+        with SciPy, interpolated in ``u = log10(light_yield)`` space for
+        numerical stability across the decades, and returns interpolated
+        ``pdf``/``cdf`` callables (the PDF is the derivative of the CDF).
 
         Parameters
         ----------
@@ -4333,265 +4310,95 @@ class LLRnet(Surrogate):
             Light-yield parquet file (from extract_accepted_photons.py --ly_mode).
         geometry_csv_path : str
             Geometry CSV (from extract_geom.py).
-        include_zeros : bool
-            If True, include the implicit zeros from unhit PMTs.
         num_points : int
-            Number of grid points (even in u = log10(x+1)) used to interpolate
-            the PDF between the observed CDF knots.
-
-        Because light yield 0 is a genuine point mass (the unhit PMTs), this also
-        returns the exact mixture decomposition, which is what you need for an
-        *expectation* over light yield (e.g. E[Fisher info]):
-
-            p(x) = p0 * delta(x) + (1 - p0) * p_cont(x | x>0)
-
-        so   E[g(LY)] = p0 * g(0) + (1 - p0) * integral g(x) p_cont(x|x>0) dx.
-
-        Do NOT approximate the atom with the finite spike of the full continuous
-        ``pdf`` in such an expectation -- use ``p0`` for the g(0) term and
-        ``pdf_cont`` (conditional density over positive x, interpolated in
-        log10(x)) for the integral.
-
-        Parameters
-        ----------
-        parquet_path : str
-            Light-yield parquet file (from extract_accepted_photons.py --ly_mode).
-        geometry_csv_path : str
-            Geometry CSV (from extract_geom.py).
-        include_zeros : bool
-            If True, include the implicit zeros from unhit PMTs.
-        num_points : int
-            Number of grid points (even in u = log10(x+1)) used to interpolate
-            the PDF between the observed CDF knots.
-
-        Fit once, evaluate many times: the fit is a small, picklable dict of
-        knots stored on ``self.light_yield_pdf`` (and persisted via
-        save_model / load_model). Evaluate later with ``eval_light_yield_pdf``
-        (and take expectations with ``expected_over_light_yield``) WITHOUT
-        re-reading the parquet/geometry or re-fitting.
-
-        Parameters
-        ----------
-        parquet_path : str
-            Light-yield parquet file (from extract_accepted_photons.py --ly_mode).
-        geometry_csv_path : str
-            Geometry CSV (from extract_geom.py).
-        include_zeros : bool
-            If True, include the implicit zeros from unhit PMTs.
-        num_points : int
-            Number of knots stored for each interpolant.
+            Number of grid points (even in u = log10 x) used to interpolate the
+            PDF between the observed CDF knots.
 
         Returns
         -------
-        dict (also stored on self.light_yield_pdf) -- picklable fit with keys:
-            'p0'          : float, P(light yield == 0), the atom weight
-            # full continuous density including 0 (u = log10(x+1) space)
-            'u_knots', 'cdf_knots' : CDF knots for the full density
-            # conditional continuous density over x>0 (v = log10(x) space)
-            'v_knots', 'cond_knots': CDF knots for p(x | x>0)
-            'num_points'  : int
-            'values', 'weights' : raw unique values and their counts
-        Use eval_light_yield_pdf(x, ...) to get pdf/cdf values from this fit.
+        dict with keys:
+            'pdf'    : callable, pdf(x) -> probability density at x (x >= 1)
+            'cdf'    : callable, cdf(x) -> cumulative probability at x
+            'x'      : np.ndarray, linear light-yield grid (log-spaced, x >= 1)
+            'pdf_values' : np.ndarray, pdf evaluated on 'x'
+            'cdf_values' : np.ndarray, cdf evaluated on 'x'
+            'values' : np.ndarray, unique light-yield values used (>= 1)
+            'weights': np.ndarray, occurrence counts for those values
         """
+        from scipy import interpolate
+
         dataset = self.LightYieldParquetDataset(
             llrnet_instance=self,
             parquet_path=parquet_path,
             geometry_csv_path=geometry_csv_path,
         )
-        values, weights = dataset.light_yield_value_counts(include_zeros=include_zeros)
+        # Only the hit rows matter here (LY >= 1); no implicit zeros.
+        values, weights = dataset.light_yield_value_counts(include_zeros=False)
 
+        # Restrict to light yield >= 1.
+        mask = values >= 1.0
+        values = values[mask].astype(np.float64)
+        weights = weights[mask].astype(np.float64)
         if values.size == 0:
-            raise ValueError("No light-yield values available to build a PDF.")
+            raise ValueError("No light-yield values >= 1 available to build a PDF.")
 
         order = np.argsort(values)
-        values = values[order].astype(np.float64)
-        weights = weights[order].astype(np.float64)
+        values = values[order]
+        weights = weights[order]
         total = weights.sum()
 
-        # Exact atom weight P(LY == 0). This is the TRUE data zero fraction --
-        # independent of any training zero_ly_prob. Use it for expectations.
-        p0 = float(weights[values <= 0.0].sum() / total)
+        ln10 = np.log(10.0)
 
-        # --- full density knots in u = log10(value + 1) (0 maps to u=0) ---
-        u = np.log10(values + 1.0)
+        # Empirical CDF knots in u = log10(value).
+        u = np.log10(values)
         cum = np.cumsum(weights) / total
+
         if values.size == 1:
             u0 = u[0]
-            u_knots = np.array([max(0.0, u0 - 1e-3), u0, u0 + 1e-3])
+            u_knots = np.array([u0 - 1e-3, u0, u0 + 1e-3])
             cdf_knots = np.array([0.0, 1.0, 1.0])
         else:
+            # Anchor the CDF at 0 just below the smallest u.
             eps_u = max(1e-9, (u[-1] - u[0]) * 1e-6)
-            u_knots = np.concatenate([[max(0.0, u[0] - eps_u)], u])
+            u_knots = np.concatenate([[u[0] - eps_u], u])
             cdf_knots = np.concatenate([[0.0], cum])
             u_knots, uniq_idx = np.unique(u_knots, return_index=True)
             cdf_knots = cdf_knots[uniq_idx]
 
-        # --- conditional (x>0) density knots in v = log10(value) ---
-        pos_mask = values > 0.0
-        pos_values = values[pos_mask]
-        pos_weights = weights[pos_mask]
-        if pos_values.size == 0:
-            v_knots = None
-            cond_knots = None
-        elif pos_values.size == 1:
-            v0 = np.log10(pos_values[0])
-            v_knots = np.array([v0 - 1e-3, v0, v0 + 1e-3])
-            cond_knots = np.array([0.0, 0.5, 1.0])
-        else:
-            v = np.log10(pos_values)
-            cond_cum = np.cumsum(pos_weights) / pos_weights.sum()
-            eps_v = max(1e-9, (v[-1] - v[0]) * 1e-6)
-            v_knots = np.concatenate([[v[0] - eps_v], v])
-            cond_knots = np.concatenate([[0.0], cond_cum])
-            v_knots, vuniq = np.unique(v_knots, return_index=True)
-            cond_knots = cond_knots[vuniq]
+        # Monotone (shape-preserving) interpolant of the CDF in u.
+        cdf_interp = interpolate.PchipInterpolator(u_knots, cdf_knots, extrapolate=False)
+        cdf_deriv = cdf_interp.derivative()
+        u_lo, u_hi = u_knots[0], u_knots[-1]
 
-        fit = {
-            'p0': p0,
-            'u_knots': u_knots, 'cdf_knots': cdf_knots,
-            'v_knots': v_knots, 'cond_knots': cond_knots,
-            'num_points': int(num_points),
-            'values': values, 'weights': weights,
-        }
-        self.light_yield_pdf = fit
-        # Drop any memoised interpolators built from an older fit.
-        self._ly_pdf_interp = None
-        return fit
+        # Dense grid even in u, returned in linear light-yield units (x = 10^u).
+        u_grid = np.linspace(u_lo, u_hi, int(num_points))
+        x = np.power(10.0, u_grid)
+        cdf_values = np.clip(np.nan_to_num(cdf_interp(u_grid), nan=0.0), 0.0, 1.0)
+        # pdf wrt linear x: dF/dx = dF/du * du/dx, du/dx = 1 / (x ln10)
+        pdf_values = np.nan_to_num(cdf_deriv(u_grid), nan=0.0) / (x * ln10)
+        pdf_values = np.clip(pdf_values, 0.0, None)
 
-    def _light_yield_interpolators(self):
-        """Build (and memoise) scipy interpolators from the cached PDF fit.
-
-        Returns a dict of callables/derivatives rebuilt from self.light_yield_pdf.
-        Cheap to call repeatedly -- the interpolators are cached until the fit
-        changes (see compute_light_yield_pdf / load_model).
-        """
-        fit = self.light_yield_pdf
-        if fit is None:
-            raise RuntimeError(
-                "No light-yield PDF fit available. Call compute_light_yield_pdf(...) "
-                "or load a model that has one."
-            )
-        cache = getattr(self, '_ly_pdf_interp', None)
-        if cache is not None and cache.get('_fit') is fit:
-            return cache
-
-        from scipy import interpolate
-        full = interpolate.PchipInterpolator(fit['u_knots'], fit['cdf_knots'],
-                                             extrapolate=False)
-        cache = {
-            '_fit': fit,
-            'full_cdf': full,
-            'full_pdf': full.derivative(),
-            'u_lo': float(fit['u_knots'][0]),
-            'u_hi': float(fit['u_knots'][-1]),
-            'cond_cdf': None, 'cond_pdf': None, 'v_lo': None, 'v_hi': None,
-        }
-        if fit['v_knots'] is not None:
-            cond = interpolate.PchipInterpolator(fit['v_knots'], fit['cond_knots'],
-                                                 extrapolate=False)
-            cache['cond_cdf'] = cond
-            cache['cond_pdf'] = cond.derivative()
-            cache['v_lo'] = float(fit['v_knots'][0])
-            cache['v_hi'] = float(fit['v_knots'][-1])
-        self._ly_pdf_interp = cache
-        return cache
-
-    def eval_light_yield_pdf(self, x, kind='full'):
-        """Evaluate the cached marginal light-yield PDF/CDF at light yields x.
-
-        Requires a prior compute_light_yield_pdf(...) (or a loaded model that has
-        one). No parquet/geometry I/O and no re-fit -- just interpolation.
-
-        Parameters
-        ----------
-        x : array-like
-            Light-yield value(s) in linear units (x >= 0).
-        kind : str
-            'full' : single continuous density including 0 (in log10(x+1) space).
-                     Good for gradients / plotting across [0, inf).
-            'cont' : conditional density p(x | x>0) (in log10(x) space),
-                     integrates to 1 over x>0. Use with 'p0' for expectations.
-
-        Returns
-        -------
-        dict with keys 'pdf' and 'cdf': np.ndarray, same shape as x.
-        """
-        c = self._light_yield_interpolators()
-        ln10 = np.log(10.0)
-        x = np.asarray(x, dtype=np.float64)
-
-        if kind == 'full':
-            lo, hi, cdf_i, pdf_i = c['u_lo'], c['u_hi'], c['full_cdf'], c['full_pdf']
-            uu = np.log10(np.clip(x, 0.0, None) + 1.0)
-            cdf = np.zeros(x.shape, dtype=np.float64)
-            pdf = np.zeros(x.shape, dtype=np.float64)
-            valid = x >= 0.0
+        def cdf_fn(q, _lo=u_lo, _hi=u_hi, _c=cdf_interp):
+            q = np.asarray(q, dtype=np.float64)
+            out = np.zeros(q.shape, dtype=np.float64)   # x < 1 -> 0
+            valid = q >= 1.0
             if np.any(valid):
-                uu_c = np.clip(uu[valid], lo, hi)
-                cdf[valid] = np.clip(np.nan_to_num(cdf_i(uu_c), nan=0.0), 0.0, 1.0)
-            inside = valid & (uu >= lo) & (uu <= hi)
+                uu = np.clip(np.log10(q[valid]), _lo, _hi)
+                out[valid] = np.clip(np.nan_to_num(_c(uu), nan=0.0), 0.0, 1.0)
+            return out
+
+        def pdf_fn(q, _lo=u_lo, _hi=u_hi, _d=cdf_deriv, _ln10=ln10):
+            q = np.asarray(q, dtype=np.float64)
+            out = np.zeros(q.shape, dtype=np.float64)
+            uu_all = np.log10(np.where(q >= 1.0, q, 1.0))
+            inside = (q >= 1.0) & (uu_all >= _lo) & (uu_all <= _hi)
             if np.any(inside):
-                pdf[inside] = np.clip(
-                    np.nan_to_num(pdf_i(uu[inside]), nan=0.0) / ((x[inside] + 1.0) * ln10),
-                    0.0, None)
-            return {'pdf': pdf, 'cdf': cdf}
+                qi = q[inside]
+                dens = np.nan_to_num(_d(uu_all[inside]), nan=0.0) / (qi * _ln10)
+                out[inside] = np.clip(dens, 0.0, None)
+            return out
 
-        elif kind == 'cont':
-            if c['cond_cdf'] is None:
-                # No positive support: conditional density is empty.
-                return {'pdf': np.zeros(x.shape), 'cdf': np.where(x > 0.0, 1.0, 0.0)}
-            lo, hi, cdf_i, pdf_i = c['v_lo'], c['v_hi'], c['cond_cdf'], c['cond_pdf']
-            vv = np.log10(np.where(x > 0.0, x, 1.0))
-            cdf = np.zeros(x.shape, dtype=np.float64)
-            pdf = np.zeros(x.shape, dtype=np.float64)
-            pos = x > 0.0
-            if np.any(pos):
-                cdf[pos] = np.clip(np.nan_to_num(cdf_i(np.clip(vv[pos], lo, hi)), nan=0.0), 0.0, 1.0)
-            inside = pos & (vv >= lo) & (vv <= hi)
-            if np.any(inside):
-                pdf[inside] = np.clip(
-                    np.nan_to_num(pdf_i(vv[inside]), nan=0.0) / (x[inside] * ln10),
-                    0.0, None)
-            return {'pdf': pdf, 'cdf': cdf}
-
-        raise ValueError("kind must be 'full' or 'cont'")
-
-    def expected_over_light_yield(self, g, num_grid=1024):
-        """Expectation E[g(LY)] under the cached marginal light-yield distribution.
-
-        Uses the exact mixture decomposition so the zero atom is handled
-        correctly (not smeared into a finite spike):
-
-            E[g(LY)] = p0 * g(0) + (1 - p0) * integral g(x) p(x|x>0) dx
-
-        The continuous integral is done by trapezoid over a log-spaced grid on
-        the positive support. Requires a prior compute_light_yield_pdf(...).
-
-        Parameters
-        ----------
-        g : callable
-            Function of light yield (linear units), accepting a numpy array and
-            returning a numpy array of the same shape. E.g. the per-value Fisher
-            information I(x).
-        num_grid : int
-            Number of log-spaced grid points for the continuous integral.
-
-        Returns
-        -------
-        float : the expectation E[g(LY)].
-        """
-        c = self._light_yield_interpolators()
-        p0 = float(self.light_yield_pdf['p0'])
-
-        total = p0 * float(np.asarray(g(np.array([0.0]))).reshape(-1)[0])
-
-        if c['cond_cdf'] is not None and (1.0 - p0) > 0.0:
-            v_grid = np.linspace(c['v_lo'], c['v_hi'], int(num_grid))
-            x_grid = np.power(10.0, v_grid)
-            dens = self.eval_light_yield_pdf(x_grid, kind='cont')['pdf']
-            gx = np.asarray(g(x_grid), dtype=np.float64)
-            integral = np.trapz(gx * dens, x_grid)
-            total += (1.0 - p0) * float(integral)
-
-        return total
+        return {'pdf': pdf_fn, 'cdf': cdf_fn, 'x': x,
+                'pdf_values': pdf_values, 'cdf_values': cdf_values,
+                'values': values, 'weights': weights}
 
