@@ -3976,11 +3976,16 @@ class LLRnet(Surrogate):
 
         Balanced training, mirroring SignalOnlyDataset. A "params" row is drawn
         at random (with replacement) on every __getitem__ call, so the epoch
-        length (num_samples_per_epoch) is decoupled from the number of rows:
+        length (num_samples_per_epoch) is decoupled from the number of rows.
+        With uniform_energy_zenith=True the draw is stratified so the network
+        sees (neutrino energy, cos zenith) approximately uniformly (pick a
+        non-empty log10-energy x cos-zenith bin uniformly, then a row within it):
             * matched   (label 1): the drawn row's event params with its own count.
             * mismatched(label 0): the drawn row's event params, but the
-                                   light-yield count taken from a uniformly random
-                                   *other* row anywhere in the file.
+                                   light-yield count taken from a DIFFERENT event
+                                   (a fresh stratified/uniform draw, rejecting any
+                                   row from the same event so the params are never
+                                   accidentally self-consistent).
 
         Optional zero light-yield augmentation (zero_ly_prob > 0): with low
         probability any item (matched OR mismatched slot) is replaced by a
@@ -3997,7 +4002,9 @@ class LLRnet(Surrogate):
 
         def __init__(self, llrnet_instance, parquet_path, geometry_csv_path,
                      num_samples_per_epoch=None, seed=None,
-                     zero_ly_prob=0.0, zero_ly_value=0.0):
+                     zero_ly_prob=0.0, zero_ly_value=0.0,
+                     uniform_energy_zenith=False, n_energy_bins=20,
+                     n_coszen_bins=20):
             """
             Parameters
             ----------
@@ -4019,6 +4026,17 @@ class LLRnet(Surrogate):
                 yield ``zero_ly_value`` and label 0. Default 0.0 (disabled).
             zero_ly_value : float
                 Light-yield value used for zero-LY samples (default 0.0).
+            uniform_energy_zenith : bool
+                If True, the event-params row is drawn by importance sampling so
+                the network sees (neutrino energy, cos zenith) approximately
+                uniformly: each __getitem__ first picks a non-empty
+                (log10 energy, cos zenith) bin uniformly at random, then a row
+                uniformly from the rows in that bin. Default False (uniform over
+                rows). See _build_energy_coszen_bins for the binning.
+            n_energy_bins : int
+                Number of bins in log10(neutrino_energy) for uniform sampling.
+            n_coszen_bins : int
+                Number of bins in cos(zenith) for uniform sampling.
             """
             import pandas as pd
 
@@ -4082,6 +4100,16 @@ class LLRnet(Surrogate):
                 self._row_event[i] = ev
                 self._event_hit_keys.setdefault(ev, set()).add(key)
 
+            # Distinct events, for the mismatched fallback (pick a row from a
+            # different event when a stratified draw keeps hitting the same one).
+            self._events = list(self._event_hit_keys.keys())
+            self._n_events = len(self._events)
+            # event -> np.array of row indices belonging to it.
+            self._event_rows = {}
+            for i, ev in enumerate(self._row_event):
+                self._event_rows.setdefault(ev, []).append(i)
+            self._event_rows = {k: np.asarray(v) for k, v in self._event_rows.items()}
+
             self._n_rows = n
             self.num_samples_per_epoch = (
                 num_samples_per_epoch if num_samples_per_epoch is not None else n
@@ -4090,12 +4118,81 @@ class LLRnet(Surrogate):
             # of global torch/numpy state (also safe across DataLoader workers).
             self._rng = np.random.default_rng(seed)
 
+            # Importance sampling to flatten (energy, cos zenith): group rows into
+            # (log10 energy, cos zenith) bins so a params row can be drawn by
+            # first picking a non-empty bin uniformly, then a row within it.
+            self.uniform_energy_zenith = bool(uniform_energy_zenith)
+            if self.uniform_energy_zenith:
+                self._build_energy_coszen_bins(int(n_energy_bins), int(n_coszen_bins))
+
             # When the model uses the PMT direction as a feature, record all the
             # unique PMT directions from the geometry on the model itself, so they
             # are available at inference time and persisted via save/load_model.
             if getattr(llrnet_instance, 'add_pmt_direction', False):
                 all_dirs = np.stack(list(self._pmt_dir.values()), axis=0)  # (n_pmts, 3)
                 llrnet_instance.set_pmt_directions(all_dirs)
+
+        def _build_energy_coszen_bins(self, n_energy_bins, n_coszen_bins):
+            """Group row indices into (log10 energy, cos zenith) bins.
+
+            Builds ``self._bin_rows``: a list of int arrays, one per NON-EMPTY
+            2-D bin, each holding the indices of the rows that fall in that bin.
+            Uniform sampling then picks one of these lists uniformly, then a row
+            uniformly from within it -- flattening the empirical (energy, cos
+            zenith) distribution the network sees over the occupied grid.
+            """
+            log_e = np.log10(np.clip(self._energy, 1e-12, None))
+            coszen = np.cos(self._zenith)
+
+            # Bin edges spanning the observed range (guard against zero width).
+            def _edges(vals, nb):
+                lo, hi = float(np.min(vals)), float(np.max(vals))
+                if hi <= lo:
+                    hi = lo + 1e-6
+                return np.linspace(lo, hi, nb + 1)
+
+            e_edges = _edges(log_e, n_energy_bins)
+            c_edges = _edges(coszen, n_coszen_bins)
+
+            # Bin index per row (clipped to the last bin at the upper edge).
+            ei = np.clip(np.digitize(log_e, e_edges) - 1, 0, n_energy_bins - 1)
+            ci = np.clip(np.digitize(coszen, c_edges) - 1, 0, n_coszen_bins - 1)
+            flat = ei * n_coszen_bins + ci  # unique id per 2-D bin
+
+            order = np.argsort(flat, kind='stable')
+            flat_sorted = flat[order]
+            # Split the sorted row indices at bin boundaries into per-bin groups.
+            boundaries = np.flatnonzero(np.diff(flat_sorted)) + 1
+            self._bin_rows = np.split(order, boundaries)
+            self._n_bins = len(self._bin_rows)
+
+        def _sample_params_row(self):
+            """Draw an event-params row index according to the sampling scheme."""
+            if getattr(self, 'uniform_energy_zenith', False) and self._n_bins > 0:
+                # Uniform over non-empty bins, then uniform within the bin.
+                b = int(self._rng.integers(0, self._n_bins))
+                group = self._bin_rows[b]
+                return int(group[int(self._rng.integers(0, len(group)))])
+            return int(self._rng.integers(0, self._n_rows))
+
+        def _other_event_row(self, exclude_event):
+            """Return a random row from any event other than ``exclude_event``.
+
+            Used as a guaranteed fallback for the mismatched draw when the
+            stratified sampler keeps landing on the same event. Returns None if
+            no other event exists in the dataset.
+            """
+            if self._n_events <= 1:
+                return None
+            ev = self._events[int(self._rng.integers(0, self._n_events))]
+            attempts = 0
+            while ev == exclude_event and attempts < 50:
+                ev = self._events[int(self._rng.integers(0, self._n_events))]
+                attempts += 1
+            if ev == exclude_event:
+                return None
+            rows = self._event_rows[ev]
+            return int(rows[int(self._rng.integers(0, len(rows)))])
 
         def _event_data(self, i, pmt_direction=None):
             """Build the event_data dict (hypothesis params) for row i.
@@ -4158,8 +4255,10 @@ class LLRnet(Surrogate):
             # drawn at random (with replacement) each call, so the epoch length
             # (num_samples_per_epoch) is independent of the file size and every
             # item is an i.i.d. draw rather than a fixed permutation of rows.
+            # With uniform_energy_zenith the draw is stratified over
+            # (log10 energy, cos zenith) bins (see _sample_params_row).
             is_matched = (idx % 2 == 0)
-            row = int(self._rng.integers(0, self._n_rows))
+            row = self._sample_params_row()
 
             # With low probability, emit a zero-LY sample instead (for BOTH the
             # matched and mismatched slots): the event's params observed at a PMT
@@ -4180,11 +4279,24 @@ class LLRnet(Surrogate):
                 features = self._features(row, self._count[row])
                 label = torch.tensor(1.0, device=self.device)
             else:
-                # Mismatched: same event params, light yield from a random other row.
-                other = int(self._rng.integers(0, self._n_rows))
-                if self._n_rows > 1:
-                    while other == row:
-                        other = int(self._rng.integers(0, self._n_rows))
+                # Mismatched: this row's event params observed with a light yield
+                # from a DIFFERENT event. The "other" row is drawn with a fresh
+                # bin draw (same stratified scheme as the params row) so a
+                # completely different (energy, zenith) region can supply the
+                # mismatched count -- and we reject any draw from the SAME event
+                # so the params are never accidentally self-consistent.
+                row_event = self._row_event[row]
+                other = self._sample_params_row()
+                attempts = 0
+                while self._row_event[other] == row_event and attempts < 50:
+                    other = self._sample_params_row()
+                    attempts += 1
+                if self._row_event[other] == row_event:
+                    # Degenerate (e.g. a single event in the file / bin): fall
+                    # back to any row from a different event if one exists.
+                    other = self._other_event_row(row_event)
+                    if other is None:
+                        other = row  # last resort: no other event available
                 features = self._features(row, self._count[other])
                 label = torch.tensor(0.0, device=self.device)
 
@@ -4237,6 +4349,8 @@ class LLRnet(Surrogate):
                                               num_samples_per_epoch=None, batch_size=32,
                                               shuffle=True, num_workers=0, seed=None,
                                               zero_ly_prob=0.05, zero_ly_value=0.0,
+                                              uniform_energy_zenith=False,
+                                              n_energy_bins=20, n_coszen_bins=20,
                                               pin_memory=None, pin_memory_device=None):
         """
         Create a DataLoader for the charge LLRnet from a light-yield parquet file
@@ -4265,6 +4379,12 @@ class LLRnet(Surrogate):
             0.0 (disabled).
         zero_ly_value : float
             Light-yield value used for zero-LY samples (default 0.0).
+        uniform_energy_zenith : bool
+            If True, importance-sample the event-params row so the network sees
+            (neutrino energy, cos zenith) approximately uniformly (stratified
+            over log10-energy x cos-zenith bins). Default False.
+        n_energy_bins, n_coszen_bins : int
+            Bin counts for the uniform (energy, cos zenith) sampling.
 
         Returns
         -------
@@ -4278,6 +4398,9 @@ class LLRnet(Surrogate):
             seed=seed,
             zero_ly_prob=zero_ly_prob,
             zero_ly_value=zero_ly_value,
+            uniform_energy_zenith=uniform_energy_zenith,
+            n_energy_bins=n_energy_bins,
+            n_coszen_bins=n_coszen_bins,
         )
 
         pin_memory, pin_memory_device = self._resolve_pin_memory(pin_memory, pin_memory_device)
