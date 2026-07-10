@@ -4004,7 +4004,7 @@ class LLRnet(Surrogate):
                      num_samples_per_epoch=None, seed=None,
                      zero_ly_prob=0.0, zero_ly_value=0.0,
                      uniform_energy_zenith=False, n_energy_bins=20,
-                     n_coszen_bins=20):
+                     n_coszen_bins=20, filter_vertex_in_domain=True):
             """
             Parameters
             ----------
@@ -4037,6 +4037,13 @@ class LLRnet(Surrogate):
                 Number of bins in log10(neutrino_energy) for uniform sampling.
             n_coszen_bins : int
                 Number of bins in cos(zenith) for uniform sampling.
+            filter_vertex_in_domain : bool
+                If True (default), drop any row whose muon interaction vertex
+                (muon_x/y/z) falls outside the model's domain. The domain is a
+                box centred at the origin with half-extents derived from
+                llrnet_instance.domain_size: a scalar gives a cube of side
+                domain_size (|x|,|y|,|z| <= domain_size/2); a (width, height)
+                pair gives |x|,|y| <= width/2 and |z| <= height/2.
             """
             import pandas as pd
 
@@ -4058,19 +4065,49 @@ class LLRnet(Surrogate):
             # All geometry keys, in a fixed order, for sampling unhit PMTs.
             self._geo_keys = list(self._om_pos.keys())
 
-            # ---- load parquet and keep only rows with a matching geometry ----
+            # Per-axis half-extents of the domain box (centred at origin), from
+            # the model's domain_size. Scalar -> cube; (width, height) -> box.
+            self.filter_vertex_in_domain = bool(filter_vertex_in_domain)
+            ds = llrnet_instance.domain_size
+            if isinstance(ds, torch.Tensor):
+                ds = ds.tolist() if ds.dim() > 0 else ds.item()
+            if isinstance(ds, (tuple, list)) and len(ds) == 2:
+                width, height = float(ds[0]), float(ds[1])
+                half_extent = np.array([width / 2.0, width / 2.0, height / 2.0],
+                                       dtype=np.float64)
+            else:
+                half = float(ds) / 2.0
+                half_extent = np.array([half, half, half], dtype=np.float64)
+            self._domain_half_extent = half_extent
+
+            # ---- load parquet and keep only rows with a matching geometry and,
+            #      optionally, whose muon vertex lies inside the domain ----
             df = pd.read_parquet(parquet_path)
             has_event_id = {'run_id', 'event_id'}.issubset(df.columns)
             keep = []
+            n_out_of_domain = 0
             for r in df.itertuples(index=False):
                 key = (int(r.string), int(r.om), int(r.pmt))
-                if key in self._om_pos:
-                    keep.append(r)
+                if key not in self._om_pos:
+                    continue
+                if self.filter_vertex_in_domain:
+                    if (abs(float(r.muon_x)) > half_extent[0] or
+                            abs(float(r.muon_y)) > half_extent[1] or
+                            abs(float(r.muon_z)) > half_extent[2]):
+                        n_out_of_domain += 1
+                        continue
+                keep.append(r)
             if len(keep) == 0:
                 raise ValueError(
-                    "No parquet rows matched the geometry CSV; check that the "
-                    "files correspond to the same detector."
+                    "No usable parquet rows: none matched the geometry CSV "
+                    "(and/or all muon vertices were outside the domain). Check "
+                    "that the files correspond to the same detector and that "
+                    "domain_size is large enough."
                 )
+            if self.filter_vertex_in_domain and n_out_of_domain > 0:
+                print(f"LightYieldParquetDataset: dropped {n_out_of_domain} row(s) "
+                      f"with muon vertex outside domain half-extents "
+                      f"{half_extent.tolist()}.")
 
             # Precompute per-row arrays (as numpy; converted to tensors per item).
             n = len(keep)
@@ -4351,6 +4388,7 @@ class LLRnet(Surrogate):
                                               zero_ly_prob=0.05, zero_ly_value=0.0,
                                               uniform_energy_zenith=False,
                                               n_energy_bins=20, n_coszen_bins=20,
+                                              filter_vertex_in_domain=True,
                                               pin_memory=None, pin_memory_device=None):
         """
         Create a DataLoader for the charge LLRnet from a light-yield parquet file
@@ -4385,6 +4423,10 @@ class LLRnet(Surrogate):
             over log10-energy x cos-zenith bins). Default False.
         n_energy_bins, n_coszen_bins : int
             Bin counts for the uniform (energy, cos zenith) sampling.
+        filter_vertex_in_domain : bool
+            If True (default), drop rows whose muon interaction vertex lies
+            outside the model's domain (box from self.domain_size, centred at
+            the origin).
 
         Returns
         -------
@@ -4401,6 +4443,7 @@ class LLRnet(Surrogate):
             uniform_energy_zenith=uniform_energy_zenith,
             n_energy_bins=n_energy_bins,
             n_coszen_bins=n_coszen_bins,
+            filter_vertex_in_domain=filter_vertex_in_domain,
         )
 
         pin_memory, pin_memory_device = self._resolve_pin_memory(pin_memory, pin_memory_device)
