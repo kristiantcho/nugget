@@ -6597,7 +6597,15 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        min_detector_response=0.0, max_detector_resample_attempts=1000,
                        plot_opposite_direction_true_params=False,
                        use_rich_features=False,
-                       progress_print_every_n_points=None):
+                       progress_print_every_n_points=None,
+                       parquet_dataset=None, parquet_event_seed=None):
+    # parquet_dataset : LLRnet.LightYieldParquetDataset or None
+    #     If provided, the true event, detector points (OM positions) and the
+    #     observed light yields are taken from a randomly chosen event in this
+    #     dataset instead of being sampled via signal_surrogate_func. The number
+    #     of detector points used is min(num_detector_points, PMTs hit in that
+    #     event); pass num_detector_points=None (or <=0) to use all hit PMTs.
+    #     parquet_event_seed seeds the random event choice for reproducibility.
     """
     Plot negative log-likelihood landscape for a trained signal-only LLRnet.
     
@@ -6701,6 +6709,69 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     #     if param_name not in event_labels and param_name not in ['position', 'x', 'y', 'z']:
     #         raise ValueError(f"Parameter '{param_name}' not in event_labels or position coordinates: {event_labels}")
     
+    # ---- Optionally take the true event + detector points + observed light
+    #      yields from a randomly chosen event in a LightYieldParquetDataset ----
+    parquet_light_yields = None  # per-detector observed light yields (list of tensors)
+    if parquet_dataset is not None:
+        pq = parquet_dataset
+        prng = np.random.default_rng(parquet_event_seed)
+
+        # Pick a random event that has at least one hit PMT.
+        ev = pq._events[int(prng.integers(0, pq._n_events))]
+        rows = np.asarray(pq._event_rows[ev])  # row indices (one per hit PMT) for this event
+
+        # How many detector points (PMTs) to use: min(requested, available), or
+        # all available when num_detector_points is None/<=0.
+        n_avail = len(rows)
+        if num_detector_points is None or int(num_detector_points) <= 0:
+            n_use = n_avail
+        else:
+            n_use = min(int(num_detector_points), n_avail)
+        if n_use < n_avail:
+            sel = prng.choice(n_avail, size=n_use, replace=False)
+            rows = rows[np.sort(sel)]
+
+        # Build the true event dict from the first row (event params are shared
+        # across all rows of the same event). Add zenith/azimuth scalars so the
+        # landscape's direction-varying logic works.
+        rep = int(rows[0])
+        true_event = pq._event_data(rep)
+        true_event['zenith'] = torch.tensor(
+            [float(pq._zenith[rep])], device=llrnet.device, dtype=torch.float32)
+        true_event['azimuth'] = torch.tensor(
+            [float(pq._azimuth[rep])], device=llrnet.device, dtype=torch.float32)
+
+        # Detector points = OM positions of the hit PMTs; observed light yields =
+        # their recorded counts. Per-PMT direction is carried in per-row event dicts.
+        detector_point = [
+            torch.tensor(pq._point[int(i)], device=llrnet.device, dtype=torch.float32)
+            for i in rows
+        ]
+        parquet_light_yields = [
+            torch.tensor(float(pq._count[int(i)]), device=llrnet.device, dtype=torch.float32)
+            for i in rows
+        ]
+        # Per-PMT event dicts (differ only in 'pmt_direction') for feature building.
+        parquet_pmt_event_data = [pq._event_data(int(i)) for i in rows]
+        for ed in parquet_pmt_event_data:
+            ed['zenith'] = true_event['zenith']
+            ed['azimuth'] = true_event['azimuth']
+
+        print("plot_nll_landscape: using parquet event "
+              f"{ev} with {n_use}/{n_avail} hit PMT(s).")
+        print(f"  neutrino energy : {float(pq._energy[rep]):.4g} GeV")
+        print(f"  zenith          : {float(pq._zenith[rep]):.4f} rad "
+              f"(cos = {np.cos(float(pq._zenith[rep])):.4f})")
+        print(f"  azimuth         : {float(pq._azimuth[rep]):.4f} rad")
+        print(f"  muon vertex     : "
+              f"({float(pq._muon_pos[rep][0]):.2f}, "
+              f"{float(pq._muon_pos[rep][1]):.2f}, "
+              f"{float(pq._muon_pos[rep][2]):.2f}) m")
+        print(f"  light yields    : "
+              f"min {min(float(l) for l in parquet_light_yields):.1f}, "
+              f"max {max(float(l) for l in parquet_light_yields):.1f}, "
+              f"sum {sum(float(l) for l in parquet_light_yields):.1f}")
+
     # Sample true event and detector point if not provided
     if true_event is None:
         true_event = signal_sampler.sample_events(1)[0]
@@ -6772,6 +6843,19 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             return None, None
         return float(np.pi - zen), float(np.mod(azi + np.pi, 2 * np.pi))
 
+    def _charge_event(event, det_idx):
+        """Event dict for prepare_features_charge at detector index det_idx.
+
+        For a parquet event, inject that PMT's own 'pmt_direction' (each hit PMT
+        has a different direction) while keeping the varied hypothesis params.
+        Otherwise return the event unchanged.
+        """
+        if parquet_light_yields is None or not getattr(llrnet, 'add_pmt_direction', False):
+            return event
+        merged = dict(event)
+        merged['pmt_direction'] = parquet_pmt_event_data[det_idx]['pmt_direction']
+        return merged
+
     # Normalize detector point inputs into a list of tensors.
     def _to_detector_points_list(detector_point_input):
         if isinstance(detector_point_input, list):
@@ -6838,7 +6922,11 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         true_detector_responses = selected_responses
     else:
         detector_points = _to_detector_points_list(detector_point)
-    
+        # For a parquet event the observed responses are the recorded light
+        # yields (used for skip_zero_response / effective-point counting).
+        if parquet_light_yields is not None:
+            true_detector_responses = [float(l) for l in parquet_light_yields]
+
     # num_detector_points = len(detector_points)
     
     if true_event.get('azimuth') is not None:
@@ -6936,16 +7024,21 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         else:
             # Standard mode using light yield features.
             # Pre-compute true light yields once so the observation is held fixed
-            # across the grid (same semantics as the PATD path above).
-            true_light_yields = []
-            for det_point in detector_points:
-                with torch.no_grad():
-                    ly = signal_surrogate_func(opt_point=det_point, event_params=true_event)
-                true_light_yields.append(ly)
+            # across the grid (same semantics as the PATD path above). For a
+            # parquet event these are the recorded per-PMT counts.
+            if parquet_light_yields is not None:
+                true_light_yields = list(parquet_light_yields)
+            else:
+                true_light_yields = []
+                for det_point in detector_points:
+                    with torch.no_grad():
+                        ly = signal_surrogate_func(opt_point=det_point, event_params=true_event)
+                    true_light_yields.append(ly)
 
-            for det_point, true_ly in zip(detector_points, true_light_yields):
+            for det_idx, (det_point, true_ly) in enumerate(zip(detector_points, true_light_yields)):
                 if use_rich_features:
-                    true_features = llrnet.prepare_features_charge(det_point, true_event, true_ly)
+                    true_features = llrnet.prepare_features_charge(
+                        det_point, _charge_event(true_event, det_idx), true_ly)
                 else:
                     true_features = llrnet.prepare_data_from_raw(
                         point=det_point,
@@ -7027,9 +7120,9 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             else:
                 patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
                 ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
-                for det_point, true_response, true_patd, true_ly in zip(
+                for det_idx, (det_point, true_response, true_patd, true_ly) in enumerate(zip(
                     detector_points, true_detector_responses, patd_iter, ly_iter
-                ):
+                )):
                     if skip_zero_response and true_response == 0.0:
                         continue
                     with torch.no_grad():
@@ -7045,7 +7138,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                             llr_sum += llr_result['joint_log_likelihood']
                         elif use_rich_features:
                             features = llrnet.prepare_features_charge(
-                                det_point, modified_event, true_ly
+                                det_point, _charge_event(modified_event, det_idx), true_ly
                             )
                             llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
                         else:
