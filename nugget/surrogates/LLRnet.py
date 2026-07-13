@@ -1743,9 +1743,9 @@ class LLRnet(Surrogate):
             
             if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
                 if val_loss is not None:
-                    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+                    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}", flush=True)
                 else:
-                    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}")
+                    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}", flush=True)
             
             # Early stopping (only if validation data provided)
             if val_dataloader is not None and patience_counter >= early_stopping_patience:

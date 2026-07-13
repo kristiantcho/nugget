@@ -16,9 +16,9 @@ import pickle
 
 
 llr_net = nugget.surrogates.LLRnet.LLRnet(
-    domain_size=10000,  # Size of the detector domain
+    domain_size=30000,  # Size of the detector domain
     dim=3,  # 3D spatial coordinates
-    hidden_dims=[64, 64, 64, 64, 64, 64],  # Neural network architecture
+    hidden_dims=[128, 128, 128, 128, 128, 128],  # Neural network architecture
     use_fourier_features=False,  # Use Fourier features for better spatial encoding
     num_parallel_branches=1,  # Multiple branches for ensemble learning
     frequency_scales=[0.1, 0.4],  # Different frequency scales for fourier features
@@ -34,13 +34,13 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     log_scale_ly=True,  # Whether to log-scale the light yield inputs
     norm_pos=True,  # Whether to normalize position inputs
     log_scale_energy=True,  # Whether to log-scale the energy inputs
-    add_distance_from_beam=True,  # Whether to include distance from beam as a feature
+    add_distance_from_beam=False,  # Whether to include distance from beam as a feature
     reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
     lr_scheduler_patience=15,  # Patience for LR scheduler
     use_rich_features=True,  # Whether to use rich features from the surrogate model
     add_vertex_distance=False,
     rich_rel_pos_mode=True,
-    log_charge_scale=6,
+    log_charge_scale=4,
     ly_eps=1e-6,
     add_pmt_direction=True
     )
@@ -68,22 +68,26 @@ train_dataloader = llr_net.create_light_yield_parquet_dataloader(
     parquet_path='new_accepted_photons_ly_all.parquet',
     geometry_csv_path='../other/800_40_40_geom.csv',
     num_samples_per_epoch=2048,
-    batch_size=16,       # Size of each batch (N pairs)
+    batch_size=32,       # Size of each batch (N pairs)
     num_workers=4,
     shuffle=True,
     zero_ly_prob=0.00,
+    uniform_energy_zenith=True,
+    n_energy_bins=20,
+    n_coszen_bins=20,
+    filter_vertex_in_domain=True,
     )
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
     epochs=1500,
-    input_dim=13,
+    input_dim=12,
     grad_clip=None,
     save_every_n_epochs=20,
-    checkpoint_path='best_mc_ly_muon_llr_model_v1.pt',
+    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v1.pt',
 )
 
 # Save the best model for later use
 # llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('mc_ly_muon_llr_v1_training_history.pkl', 'wb'))
+pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v1_training_history.pkl', 'wb'))

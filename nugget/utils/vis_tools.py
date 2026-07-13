@@ -6591,6 +6591,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        event_labels=['position', 'energy', 'zenith', 'azimuth'],
                        true_event=None, detector_point=None, figsize=(10, 8),
                        contour_levels=[0, 1, 4, 9], cmap='viridis',
+                       nll_cbar_max=None,
                        use_mollweide=False, skip_zero_response=False, use_patd=False,
                        num_detector_points=1, min_detector_points=1,
                        min_detector_response=0.0, max_detector_resample_attempts=1000,
@@ -6659,6 +6660,10 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         NLL contour levels to plot (default: [0, 1, 4, 9])
     cmap : str
         Colormap for the plot
+    nll_cbar_max : float or None
+        Maximum value for the contour fill color scale in the 2D landscape plot.
+        Values above this threshold are clipped for color mapping so colorbars can
+        be kept consistent across multiple plots. If None, uses the data maximum.
     use_mollweide : bool
         If True and param_names are ['zenith', 'azimuth'] or ['azimuth', 'zenith'],
         use Mollweide projection for plotting (default: False)
@@ -7295,6 +7300,20 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         # Normalize to minimum NLL value
         min_nll = np.min(nll_grid)
         nll_grid = nll_grid - min_nll
+
+        # Optional fixed color scale for contour fill/colorbar consistency across plots.
+        nll_grid_for_fill = nll_grid
+        fixed_fill_levels = None
+        fixed_fill_vmax = None
+        if nll_cbar_max is not None:
+            try:
+                nll_cbar_max = float(nll_cbar_max)
+            except Exception:
+                nll_cbar_max = None
+            if nll_cbar_max is not None and np.isfinite(nll_cbar_max) and nll_cbar_max > 0.0:
+                fixed_fill_vmax = float(nll_cbar_max)
+                nll_grid_for_fill = np.clip(nll_grid, 0.0, fixed_fill_vmax)
+                fixed_fill_levels = np.linspace(0.0, fixed_fill_vmax, 21)
         
         # Find minimum location
         min_idx = np.unravel_index(np.argmin(nll_grid), nll_grid.shape)
@@ -7323,8 +7342,27 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             ax = fig.add_subplot(111, projection='mollweide')
             
             # Plot filled contours
-            contourf = ax.contourf(lon_grid, lat_grid, nll_grid, 
-                                   levels=20, cmap=cmap, alpha=0.7)
+            if fixed_fill_levels is not None and fixed_fill_vmax is not None:
+                contourf = ax.contourf(
+                    lon_grid,
+                    lat_grid,
+                    nll_grid_for_fill,
+                    levels=fixed_fill_levels,
+                    vmin=0.0,
+                    vmax=fixed_fill_vmax,
+                    cmap=cmap,
+                    alpha=0.7,
+                    extend='max',
+                )
+            else:
+                contourf = ax.contourf(
+                    lon_grid,
+                    lat_grid,
+                    nll_grid_for_fill,
+                    levels=20,
+                    cmap=cmap,
+                    alpha=0.7,
+                )
             
             # Plot contour lines at specific levels
             contour = ax.contour(lon_grid, lat_grid, nll_grid, 
@@ -7442,8 +7480,27 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             fig, ax = plt.subplots(figsize=figsize)
             
             # Plot filled contours
-            contourf = ax.contourf(param1_grid, param2_grid, nll_grid, 
-                                   levels=20, cmap=cmap, alpha=0.7)
+            if fixed_fill_levels is not None and fixed_fill_vmax is not None:
+                contourf = ax.contourf(
+                    param1_grid,
+                    param2_grid,
+                    nll_grid_for_fill,
+                    levels=fixed_fill_levels,
+                    vmin=0.0,
+                    vmax=fixed_fill_vmax,
+                    cmap=cmap,
+                    alpha=0.7,
+                    extend='max',
+                )
+            else:
+                contourf = ax.contourf(
+                    param1_grid,
+                    param2_grid,
+                    nll_grid_for_fill,
+                    levels=20,
+                    cmap=cmap,
+                    alpha=0.7,
+                )
             
             # Plot contour lines at specific levels
             contour = ax.contour(param1_grid, param2_grid, nll_grid, 
