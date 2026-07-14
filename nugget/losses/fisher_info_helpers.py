@@ -2032,14 +2032,18 @@ def compute_fisher_info_poisson_batched_events(
 
     pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
 
-    # Per-chunk Fisher tensors are collected here and concatenated once at the
-    # end, rather than written in-place into a pre-allocated torch.zeros(...)
-    # accumulator. In-place slice assignment into a plain (non-graph) tensor
-    # does not connect the written values back into autograd, which would
-    # silently break backprop through this function whenever
-    # detach_fisher_tensors=False. torch.cat over a list of chunk tensors that
-    # DO carry graph history preserves it correctly.
-    fisher_chunks = []
+    # When detaching, no autograd graph needs to survive, so chunks can be
+    # written directly into a pre-allocated accumulator (cheapest option: no
+    # Python list of chunk tensors, no final torch.cat copy). When NOT
+    # detaching, in-place slice assignment into a plain torch.zeros(...)
+    # tensor would silently disconnect the written values from autograd (the
+    # base tensor was never part of the graph), so chunks are instead
+    # collected in a list and joined via torch.cat, which does preserve graph
+    # history from each chunk.
+    if detach_fisher_tensors:
+        fisher_per_point = torch.zeros(n_events, n_points, total_dims, total_dims, device=device)
+    else:
+        fisher_chunks = []
 
     # Per-event λ(θ_e) over a chunk of points, built from θ_flat + fixed values.
     def _make_lambda_fn(pts_chunk):
@@ -2097,15 +2101,18 @@ def compute_fisher_info_poisson_batched_events(
             # gating here matches the non-LLR quadrature convention (>= threshold).
             mask = (ly >= zero_response_threshold).to(outer.dtype).unsqueeze(-1).unsqueeze(-1)
             outer = outer * mask
-        chunk_fisher = outer.detach() if detach_fisher_tensors else outer
-        fisher_chunks.append(chunk_fisher)
+        if detach_fisher_tensors:
+            fisher_per_point[:, p_start:p_end] = outer.detach()
+        else:
+            fisher_chunks.append(outer)
         del J, ly, outer
         _fisher_chunk_cleanup(device)
 
-    # torch.cat preserves autograd history from each chunk (when not detached),
-    # unlike writing into a pre-allocated torch.zeros(...) accumulator.
-    fisher_per_point = torch.cat(fisher_chunks, dim=1)  # (E, n_points, D, D)
-    del fisher_chunks
+    if not detach_fisher_tensors:
+        # torch.cat preserves autograd history from each chunk, unlike writing
+        # into a pre-allocated torch.zeros(...) accumulator.
+        fisher_per_point = torch.cat(fisher_chunks, dim=1)  # (E, n_points, D, D)
+        del fisher_chunks
 
     if string_xy is None:
         return fisher_per_point  # (E, n_points, D, D)
