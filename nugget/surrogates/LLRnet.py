@@ -972,6 +972,87 @@ class LLRnet(Surrogate):
 
         return features.clone().detach()
 
+    def prepare_features_charge_batched(self, points, event_data, light_yields,
+                                        pmt_directions=None):
+        """Batched charge features for many detector points, one hypothesis event.
+
+        Vectorised equivalent of prepare_features_charge over a set of detector
+        points that share the same hypothesis event params (position, energy,
+        direction). Used to evaluate all detector points of an event in a single
+        network forward pass (e.g. the parquet path of plot_nll_landscape).
+
+        Parameters
+        ----------
+        points : torch.Tensor or np.ndarray, shape (n_det, 3)
+            Detector (OM) positions.
+        event_data : dict
+            Hypothesis event params; must contain 'position', 'energy',
+            'direction' (shared across all detector points).
+        light_yields : torch.Tensor or array-like, shape (n_det,)
+            Observed light yield at each detector point.
+        pmt_directions : torch.Tensor or np.ndarray, shape (n_det, 3) or None
+            Per-detector PMT directions; required when self.add_pmt_direction.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_det, feature_dim)
+            Same column layout as prepare_features_charge.
+        """
+        dev = self.device
+
+        def _t(x):
+            if isinstance(x, torch.Tensor):
+                return x.float().to(dev)
+            return torch.tensor(x, device=dev, dtype=torch.float32)
+
+        pts = _t(points).reshape(-1, 3)              # (n, 3)
+        n = pts.shape[0]
+        norm = self._pos_norm_divisor()              # scalar or (3,)
+
+        det = pts / norm                             # (n, 3)
+        vert = (_t(event_data['position']).squeeze() / norm).reshape(3)   # (3,)
+        direction = _t(event_data['direction']).squeeze().reshape(3)      # (3,)
+        log_energy = torch.log10(_t(event_data['energy']).squeeze() + self.ly_eps) / 8.0  # scalar
+
+        rel = det - vert.unsqueeze(0)                                 # (n, 3)
+        vert_dist = torch.norm(rel, dim=1)                            # (n,)
+        cos_angle = (rel @ direction) / (torch.norm(direction) * vert_dist + 1e-8)  # (n,)
+
+        ly = _t(light_yields).reshape(-1)                            # (n,)
+        log_ly = torch.log10(torch.abs(ly) + self.ly_eps) / self.log_charge_scale  # (n,)
+
+        dir_rep = direction.unsqueeze(0).expand(n, -1)               # (n, 3)
+        log_e_rep = log_energy.expand(n).unsqueeze(1)                # (n, 1)
+
+        cols = []
+        if self.rich_rel_pos_mode:
+            cols.append(rel)                    # (n, 3)
+            cols.append(dir_rep)                # (n, 3)
+            cols.append(log_e_rep)              # (n, 1)
+        else:
+            cols.append(det)                    # (n, 3)
+            cols.append(vert.unsqueeze(0).expand(n, -1))  # (n, 3)
+            cols.append(dir_rep)                # (n, 3)
+            cols.append(log_e_rep)              # (n, 1)
+        if self.add_vertex_distance:
+            cols.append(vert_dist.unsqueeze(1))     # (n, 1)
+        cols.append(cos_angle.unsqueeze(1))         # (n, 1)
+        if self.add_distance_from_beam:
+            track_pos = vert * norm                 # (3,) original scale
+            _, dist_perp = self.compute_distance_from_beam(
+                det * norm, track_pos.unsqueeze(0), direction.unsqueeze(0)
+            )  # dist_perp: (n, 1)
+            half = self.domain_size / 2
+            cols.append(dist_perp.reshape(n, 1) / half)
+        if self.add_pmt_direction:
+            if pmt_directions is None:
+                raise ValueError("pmt_directions is required when add_pmt_direction=True")
+            cols.append(_t(pmt_directions).reshape(n, 3))  # (n, 3)
+        cols.append(log_ly.unsqueeze(1))            # (n, 1)
+
+        features = torch.cat(cols, dim=1)           # (n, feature_dim)
+        return features.clone().detach()
+
     def prepare_data_from_raw_patd(self, point, event_data, surrogate_func, event_labels=['position', 'energy', 'zenith', 'azimuth'], signal_event_data=None, num_samples=1, input_photons=None):
         """
         Prepare training data from raw neutrino event data in PATD mode.
@@ -4485,8 +4566,11 @@ class LLRnet(Surrogate):
             train_event_filter = {unique_events[i] for i in range(n_events) if i not in test_idx}
 
             # Mask of rows whose event is held out for testing, and write them.
-            ev_arr = np.array(ev_series, dtype=object)
-            test_mask = np.array([ev in test_events for ev in ev_arr], dtype=bool)
+            # Build the per-row event key as a pandas Series (avoids turning a
+            # list of (run_id, event_id) tuples into a 2-D numpy array, which
+            # would make membership tests iterate over unhashable row arrays).
+            ev_col = pd.Series(ev_series, index=df.index, dtype=object)
+            test_mask = ev_col.isin(test_events).to_numpy()
             df.loc[test_mask].to_parquet(test_save_path, index=False)
             print(f"create_light_yield_parquet_dataloader: held out "
                   f"{len(test_events)}/{n_events} events "

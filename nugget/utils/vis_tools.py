@@ -6757,6 +6757,18 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             ed['zenith'] = true_event['zenith']
             ed['azimuth'] = true_event['azimuth']
 
+        # Pre-stacked constants for the batched charge-feature path (these do NOT
+        # change across the parameter grid; only the hypothesis event does):
+        #   points (n_det, 3), light yields (n_det,), pmt directions (n_det, 3).
+        parquet_points_stacked = torch.stack(detector_point).to(llrnet.device)   # (n_det, 3)
+        parquet_ly_stacked = torch.stack([l.reshape(()) for l in parquet_light_yields]).to(llrnet.device)  # (n_det,)
+        parquet_pmt_dir_stacked = None
+        if getattr(llrnet, 'add_pmt_direction', False):
+            parquet_pmt_dir_stacked = torch.stack([
+                torch.as_tensor(pq._pmt_direction[int(i)], device=llrnet.device, dtype=torch.float32)
+                for i in rows
+            ])  # (n_det, 3)
+
         print("plot_nll_landscape: using parquet event "
               f"{ev} with {n_use}/{n_avail} hit PMT(s).")
         print(f"  neutrino energy : {float(pq._energy[rep]):.4g} GeV")
@@ -6855,6 +6867,21 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         merged = dict(event)
         merged['pmt_direction'] = parquet_pmt_event_data[det_idx]['pmt_direction']
         return merged
+
+    def _parquet_charge_llr_sum(event):
+        """Summed log-LLR over all parquet detector points for one hypothesis.
+
+        Builds features for every detector point in a single batch and runs one
+        network forward pass, instead of looping per detector. Only used on the
+        parquet charge path (use_rich_features, not PATD).
+        """
+        feats = llrnet.prepare_features_charge_batched(
+            parquet_points_stacked, event, parquet_ly_stacked,
+            pmt_directions=parquet_pmt_dir_stacked,
+        )  # (n_det, feat_dim)
+        with torch.no_grad():
+            log_llrs = llrnet.predict_log_likelihood_ratio(feats)  # (n_det,)
+        return float(log_llrs.reshape(-1).sum().item())
 
     # Normalize detector point inputs into a list of tensors.
     def _to_detector_points_list(detector_point_input):
@@ -7035,19 +7062,23 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                         ly = signal_surrogate_func(opt_point=det_point, event_params=true_event)
                     true_light_yields.append(ly)
 
-            for det_idx, (det_point, true_ly) in enumerate(zip(detector_points, true_light_yields)):
-                if use_rich_features:
-                    true_features = llrnet.prepare_features_charge(
-                        det_point, _charge_event(true_event, det_idx), true_ly)
-                else:
-                    true_features = llrnet.prepare_data_from_raw(
-                        point=det_point,
-                        event_data=true_event,
-                        surrogate_func=signal_surrogate_func,
-                        event_labels=event_labels,
-                        noise_scale=llrnet.signal_noise_scale,
-                    )
-                true_llr_sum += llrnet.predict_log_likelihood_ratio(true_features.unsqueeze(0)).item()
+            if parquet_light_yields is not None and use_rich_features:
+                # Fast batched path: one forward pass over all detector points.
+                true_llr_sum = _parquet_charge_llr_sum(true_event)
+            else:
+                for det_idx, (det_point, true_ly) in enumerate(zip(detector_points, true_light_yields)):
+                    if use_rich_features:
+                        true_features = llrnet.prepare_features_charge(
+                            det_point, _charge_event(true_event, det_idx), true_ly)
+                    else:
+                        true_features = llrnet.prepare_data_from_raw(
+                            point=det_point,
+                            event_data=true_event,
+                            surrogate_func=signal_surrogate_func,
+                            event_labels=event_labels,
+                            noise_scale=llrnet.signal_noise_scale,
+                        )
+                    true_llr_sum += llrnet.predict_log_likelihood_ratio(true_features.unsqueeze(0)).item()
     
     # Create parameter grids
     if len(param_names) == 1:
@@ -7117,6 +7148,10 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                     llr_sum = llrnet.evaluate_patd_likelihood_batched_hypothesis(
                         modified_event, patd_precomputed_obs
                     )
+            elif parquet_light_yields is not None and use_rich_features and not use_patd:
+                # Fast batched charge path for parquet events: one forward pass
+                # over all detector points for this hypothesis.
+                llr_sum = _parquet_charge_llr_sum(modified_event)
             else:
                 patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
                 ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
