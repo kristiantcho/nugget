@@ -2032,8 +2032,14 @@ def compute_fisher_info_poisson_batched_events(
 
     pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
 
-    # Output accumulator (per point). String reduction happens after.
-    fisher_per_point = torch.zeros(n_events, n_points, total_dims, total_dims, device=device)
+    # Per-chunk Fisher tensors are collected here and concatenated once at the
+    # end, rather than written in-place into a pre-allocated torch.zeros(...)
+    # accumulator. In-place slice assignment into a plain (non-graph) tensor
+    # does not connect the written values back into autograd, which would
+    # silently break backprop through this function whenever
+    # detach_fisher_tensors=False. torch.cat over a list of chunk tensors that
+    # DO carry graph history preserves it correctly.
+    fisher_chunks = []
 
     # Per-event λ(θ_e) over a chunk of points, built from θ_flat + fixed values.
     def _make_lambda_fn(pts_chunk):
@@ -2091,31 +2097,68 @@ def compute_fisher_info_poisson_batched_events(
             # gating here matches the non-LLR quadrature convention (>= threshold).
             mask = (ly >= zero_response_threshold).to(outer.dtype).unsqueeze(-1).unsqueeze(-1)
             outer = outer * mask
-        fisher_per_point[:, p_start:p_end] = outer.detach() if detach_fisher_tensors else outer
+        chunk_fisher = outer.detach() if detach_fisher_tensors else outer
+        fisher_chunks.append(chunk_fisher)
         del J, ly, outer
         _fisher_chunk_cleanup(device)
+
+    # torch.cat preserves autograd history from each chunk (when not detached),
+    # unlike writing into a pre-allocated torch.zeros(...) accumulator.
+    fisher_per_point = torch.cat(fisher_chunks, dim=1)  # (E, n_points, D, D)
+    del fisher_chunks
 
     if string_xy is None:
         return fisher_per_point  # (E, n_points, D, D)
 
-    # Reduce points -> strings (shared geometry across events).
+    # Reduce points -> strings (shared geometry across events), fully
+    # vectorized: build point_to_string with one comparison against all
+    # strings at once (no Python loop, no per-string .any() host sync), then
+    # scatter-add per-point Fishers into their string via index_add_.
     n_strings = len(string_xy)
-    point_to_string = torch.full((n_points,), -1, dtype=torch.long, device=device)
-    for s_idx in range(n_strings):
-        sx, sy = string_xy[s_idx][0], string_xy[s_idx][1]
-        sx = sx.to(device) if isinstance(sx, torch.Tensor) else torch.tensor(sx, device=device)
-        sy = sy.to(device) if isinstance(sy, torch.Tensor) else torch.tensor(sy, device=device)
-        mask = (points[:, 0] == sx) & (points[:, 1] == sy)
-        point_to_string[mask] = s_idx
 
-    fisher_by_string = torch.zeros(n_events, n_strings, total_dims, total_dims, device=device)
-    for s_idx in range(n_strings):
-        string_mask = (point_to_string == s_idx)
-        if string_mask.any():
-            fisher_by_string[:, s_idx] = fisher_per_point[:, string_mask].sum(dim=1)
-        elif uninformative_fisher_value:
-            eye = torch.eye(total_dims, device=device)
-            fisher_by_string[:, s_idx] = uninformative_fisher_value * eye
+    def _to_scalar_tensor(v):
+        return v.to(device) if isinstance(v, torch.Tensor) else torch.tensor(v, device=device, dtype=points.dtype)
+
+    string_xy_tensor = torch.stack([
+        torch.stack([_to_scalar_tensor(sx), _to_scalar_tensor(sy)]) for sx, sy in string_xy
+    ]).detach()  # (n_strings, 2); detached since this reduction (== comparison)
+                 # carries no gradient regardless of whether string_xy entries require grad
+    # matches[s, p] True if point p belongs to string s
+    matches = (
+        (points[:, 0].unsqueeze(0) == string_xy_tensor[:, 0].unsqueeze(1)) &
+        (points[:, 1].unsqueeze(0) == string_xy_tensor[:, 1].unsqueeze(1))
+    )  # (n_strings, n_points)
+    has_match = matches.any(dim=1)  # (n_strings,) -- one sync for the whole
+                                     # batch of strings, not one per string
+    # -1 sentinel for points that match no string (should not normally occur)
+    point_to_string = torch.where(
+        matches.any(dim=0), matches.float().argmax(dim=0), torch.full((n_points,), -1, device=device)
+    ).long()  # (n_points,)
+
+    if detach_fisher_tensors:
+        fisher_by_string = torch.zeros(n_events, n_strings, total_dims, total_dims, device=device)
+        valid_mask = point_to_string >= 0
+        fisher_by_string.index_add_(
+            1, point_to_string[valid_mask].clamp(min=0),
+            fisher_per_point[:, valid_mask],
+        )
+    else:
+        # index_add_ is in-place and does not track a clean autograd graph the
+        # way out-of-place scatter does; use a one-hot matmul instead so the
+        # string reduction stays differentiable when requested.
+        one_hot = F.one_hot(point_to_string.clamp(min=0), num_classes=n_strings).to(fisher_per_point.dtype)  # (n_points, n_strings)
+        one_hot = one_hot * (point_to_string >= 0).to(fisher_per_point.dtype).unsqueeze(-1)
+        fisher_by_string = torch.einsum('epij,ps->esij', fisher_per_point, one_hot)
+
+    if uninformative_fisher_value:
+        # Unconditional broadcasted fill for strings with no matching points;
+        # a no-op where `missing` is all False, without an extra host sync to
+        # check that first.
+        eye = torch.eye(total_dims, device=device)
+        missing = ~has_match  # (n_strings,)
+        fill = (uninformative_fisher_value * eye).view(1, 1, total_dims, total_dims)
+        fisher_by_string = torch.where(missing.view(1, -1, 1, 1), fill, fisher_by_string)
+
     del fisher_per_point
     _fisher_chunk_cleanup(device)
     return fisher_by_string  # (E, n_strings, D, D)
