@@ -34,11 +34,11 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     log_scale_ly=True,  # Whether to log-scale the light yield inputs
     norm_pos=True,  # Whether to normalize position inputs
     log_scale_energy=True,  # Whether to log-scale the energy inputs
-    add_distance_from_beam=False,  # Whether to include distance from beam as a feature
+    add_distance_from_beam=True,  # Whether to include distance from beam as a feature
     reduce_lr_on_plateau=True,  # Reduce learning rate on plateau
     lr_scheduler_patience=15,  # Patience for LR scheduler
     use_rich_features=True,  # Whether to use rich features from the surrogate model
-    add_vertex_distance=False,
+    add_vertex_distance=True,
     rich_rel_pos_mode=True,
     log_charge_scale=4,
     ly_eps=1e-6,
@@ -76,18 +76,20 @@ train_dataloader = llr_net.create_light_yield_parquet_dataloader(
     n_energy_bins=20,
     n_coszen_bins=20,
     filter_vertex_in_domain=True,
+    test_save_path='./llrnet_models/mc_ly_muon_llr_v2_test_samples.parquet',
+    test_frac=0.1,
     )
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
-    epochs=1500,
-    input_dim=12,
+    epochs=2000,
+    input_dim=14,
     grad_clip=None,
     save_every_n_epochs=20,
-    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v1.pt',
+    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v2.pt',
 )
 
 # Save the best model for later use
 # llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v1_training_history.pkl', 'wb'))
+pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v2_training_history.pkl', 'wb'))
