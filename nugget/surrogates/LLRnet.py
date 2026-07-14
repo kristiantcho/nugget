@@ -4004,7 +4004,8 @@ class LLRnet(Surrogate):
                      num_samples_per_epoch=None, seed=None,
                      zero_ly_prob=0.0, zero_ly_value=0.0,
                      uniform_energy_zenith=False, n_energy_bins=20,
-                     n_coszen_bins=20, filter_vertex_in_domain=True):
+                     n_coszen_bins=20, filter_vertex_in_domain=True,
+                     event_filter=None):
             """
             Parameters
             ----------
@@ -4044,6 +4045,10 @@ class LLRnet(Surrogate):
                 llrnet_instance.domain_size: a scalar gives a cube of side
                 domain_size (|x|,|y|,|z| <= domain_size/2); a (width, height)
                 pair gives |x|,|y| <= width/2 and |z| <= height/2.
+            event_filter : set or None
+                If given, keep only rows whose event id is in this set (event
+                id is (run_id, event_id) when those columns exist, else the row
+                index). Used to restrict the dataset to a train/test subset.
             """
             import pandas as pd
 
@@ -4084,9 +4089,14 @@ class LLRnet(Surrogate):
             #      optionally, whose muon vertex lies inside the domain ----
             df = pd.read_parquet(parquet_path)
             has_event_id = {'run_id', 'event_id'}.issubset(df.columns)
+            # Optional event-level subset (e.g. train/test split): keep only rows
+            # whose event id is in this set. Keys match the event identity used
+            # below: (run_id, event_id) when present, else the row index.
+            self.event_filter = set(event_filter) if event_filter is not None else None
             keep = []
             n_out_of_domain = 0
-            for r in df.itertuples(index=False):
+            n_filtered_events = 0
+            for row_idx, r in enumerate(df.itertuples(index=False)):
                 key = (int(r.string), int(r.om), int(r.pmt))
                 if key not in self._om_pos:
                     continue
@@ -4095,6 +4105,11 @@ class LLRnet(Surrogate):
                             abs(float(r.muon_y)) > half_extent[1] or
                             abs(float(r.muon_z)) > half_extent[2]):
                         n_out_of_domain += 1
+                        continue
+                if self.event_filter is not None:
+                    ev = (int(r.run_id), int(r.event_id)) if has_event_id else row_idx
+                    if ev not in self.event_filter:
+                        n_filtered_events += 1
                         continue
                 keep.append(r)
             if len(keep) == 0:
@@ -4389,6 +4404,8 @@ class LLRnet(Surrogate):
                                               uniform_energy_zenith=False,
                                               n_energy_bins=20, n_coszen_bins=20,
                                               filter_vertex_in_domain=True,
+                                              test_save_path=None, test_frac=0.1,
+                                              split_seed=None,
                                               pin_memory=None, pin_memory_device=None):
         """
         Create a DataLoader for the charge LLRnet from a light-yield parquet file
@@ -4427,11 +4444,55 @@ class LLRnet(Surrogate):
             If True (default), drop rows whose muon interaction vertex lies
             outside the model's domain (box from self.domain_size, centred at
             the origin).
+        test_save_path : str or None
+            If given, hold out ``test_frac`` of the EVENTS as a test set: the
+            held-out events' rows are written to this parquet path, and the
+            returned DataLoader is built from the remaining (train) events only.
+            The split is by event (all rows of an event go to the same side).
+            If None (default), no split is done and the whole file is used.
+        test_frac : float
+            Fraction of events to hold out for testing (default 0.1).
+        split_seed : int or None
+            Seed for the train/test event split (falls back to ``seed`` if None),
+            so the split is reproducible.
 
         Returns
         -------
         torch.utils.data.DataLoader
         """
+        # Optional event-level train/test split. Choose the held-out events from
+        # the parquet's event ids, write their rows to test_save_path, and build
+        # the training dataset from only the remaining (train) events.
+        train_event_filter = None
+        if test_save_path is not None:
+            import pandas as pd
+            df = pd.read_parquet(parquet_path)
+            has_event_id = {'run_id', 'event_id'}.issubset(df.columns)
+            if has_event_id:
+                ev_series = list(zip(df['run_id'].astype(int), df['event_id'].astype(int)))
+                unique_events = sorted(set(ev_series))
+            else:
+                # No event ids: treat each row as its own event.
+                ev_series = list(range(len(df)))
+                unique_events = list(ev_series)
+
+            rng = np.random.default_rng(split_seed if split_seed is not None else seed)
+            n_events = len(unique_events)
+            n_test = int(round(test_frac * n_events))
+            perm = rng.permutation(n_events)
+            test_idx = set(perm[:n_test].tolist())
+            test_events = {unique_events[i] for i in test_idx}
+            train_event_filter = {unique_events[i] for i in range(n_events) if i not in test_idx}
+
+            # Mask of rows whose event is held out for testing, and write them.
+            ev_arr = np.array(ev_series, dtype=object)
+            test_mask = np.array([ev in test_events for ev in ev_arr], dtype=bool)
+            df.loc[test_mask].to_parquet(test_save_path, index=False)
+            print(f"create_light_yield_parquet_dataloader: held out "
+                  f"{len(test_events)}/{n_events} events "
+                  f"({int(test_mask.sum())} rows) for testing -> {test_save_path}. "
+                  f"Training on the remaining {len(train_event_filter)} events.")
+
         dataset = self.LightYieldParquetDataset(
             llrnet_instance=self,
             parquet_path=parquet_path,
@@ -4444,6 +4505,7 @@ class LLRnet(Surrogate):
             n_energy_bins=n_energy_bins,
             n_coszen_bins=n_coszen_bins,
             filter_vertex_in_domain=filter_vertex_in_domain,
+            event_filter=train_event_filter,
         )
 
         pin_memory, pin_memory_device = self._resolve_pin_memory(pin_memory, pin_memory_device)
