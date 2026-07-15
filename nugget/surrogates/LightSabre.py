@@ -354,7 +354,12 @@ class LightSabre(Surrogate):
                 diff,
                 track_dir.unsqueeze(1).expand_as(diff),
             )
-            distances = cross.norm(dim=2)  # (n_events, n_points)
+            # Use sqrt(sum(x^2) + eps) rather than .norm(): the Jacobian of
+            # .norm() is x/||x||, which is 0/0 = NaN when the perpendicular
+            # distance is exactly 0 (detector point lying on the track line).
+            # This NaN gradient propagates through jacfwd in the Poisson Fisher
+            # path. The eps inside the sqrt keeps the gradient finite at 0.
+            distances = torch.sqrt((cross ** 2).sum(dim=2) + 1e-12)  # (n_events, n_points)
 
             # lightyield_for_distance lifted to (n_events, n_points)
             l0 = self.lightsabre_photons_per_m(track_energy)  # (n_events,)
@@ -381,7 +386,10 @@ class LightSabre(Surrogate):
         else:
             # Cascade: distance from vertex to each OM
             diff = om_positions.unsqueeze(0) - track_pos.unsqueeze(1)  # (n_events, n_points, 3)
-            distances = diff.norm(dim=2)                                 # (n_events, n_points)
+            # sqrt(sum(x^2) + eps) rather than .norm(): keeps the gradient
+            # finite when a detector point coincides with the vertex (0/0 in
+            # the .norm() backward), which otherwise NaNs the Poisson Fisher JVP.
+            distances = torch.sqrt((diff ** 2).sum(dim=2) + 1e-12)       # (n_events, n_points)
 
             lamda_a = self.kwargs.get('lambda_abs', 44.7)
             lamda_e = self.kwargs.get('lambda_sca', 57.4) / (1 - self.scattering_tau)

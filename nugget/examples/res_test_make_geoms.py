@@ -44,7 +44,6 @@ loss_params = {
     # 'signal_event_params': nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_r600_50{version}.pt')[:],
     'num_events': 300,  # Number of events to sample per optimization step
     'boundary_range': 1200,  # Size of boundary region
-    'skip_zero_response': True,
     'use_relative_energy': True,
     # 'precomputed_signal_yield_per_string': torch.load(f'res_test/light_yield_per_string_{num_events}_800main_full_hex_r600_50{version}.pt')[:],
     # 'precomputed_fisher_info_per_string_per_event': torch.load(f'res_test/fisher_info_per_string_per_event_{num_events}_800main_full_hex_r600_50{version}.pt')[:]
