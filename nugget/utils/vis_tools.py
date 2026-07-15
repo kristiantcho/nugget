@@ -2831,7 +2831,7 @@ class Visualizer:
                     
                     # Normalize penalties for colormap
                     vmin = np.min(rov_penalty_np)
-                    vmax = np.max(rov_penalty_np)
+                    vmax = max(np.max(rov_penalty_np), 1.0)
                     norm = Normalize(vmin=vmin, vmax=vmax)
                     
                     # Plot strings colored by ROV penalty with alpha based on weights
@@ -2891,7 +2891,7 @@ class Visualizer:
 
                         cmap = plt.cm.RdYlGn_r  # Red for high penalty, green for low penalty
                         vmin = 0
-                        vmax = np.max(local_repulsion_np) if np.max(local_repulsion_np) > 0 else 1.0
+                        vmax = max(np.max(local_repulsion_np), 1.0) if np.max(local_repulsion_np) > 0 else 1.0
                         norm = Normalize(vmin=vmin, vmax=vmax)
 
                         sc = ax.scatter(
