@@ -1716,7 +1716,7 @@ class ChargeNet(Surrogate):
             ly = float(light_yield)
             if self.chargenet.log_scale_ly:
                 # log10(count + 1.0): keeps zeros representable (-> 0.0).
-                target = np.log10(ly + 1.0)
+                target = np.log10(ly + 1.0)/self.chargenet.log_charge_scale
             else:
                 # Raw count.
                 target = ly
@@ -2071,7 +2071,7 @@ class ChargeNetSurrogate(Surrogate):
 
                 # Convert from log scale if necessary (inverse of log10(count+1)).
                 if self.chargenet.log_scale_ly:
-                    pred = 10 ** pred - 1.0
+                    pred = 10 ** (pred* self.chargenet.log_charge_scale) - 1.0
 
                 predictions.append(pred)
 
@@ -2097,7 +2097,7 @@ class ChargeNetSurrogate(Surrogate):
 
             # Convert from log scale if necessary (inverse of log10(count+1)).
             if self.chargenet.log_scale_ly:
-                light_yield = 10 ** light_yield - 1.0
+                light_yield = 10 ** (light_yield * self.chargenet.log_charge_scale) - 1.0
 
             light_yield = light_yield.squeeze()
         

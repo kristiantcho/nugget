@@ -174,10 +174,10 @@ loss_params.update({
     'signal_sampler': signal_sampler,
     })
 
-# for i in range(15):
-    # print(f"Running optimization iteration {i+1}/15")
-for i in range(6):
-    print(f"Running optimization iteration in energy range e{i+2}-e{i+3}")
+for i in range(15):
+    print(f"Running optimization iteration {i+1}/15")
+# for i in range(6):
+#     print(f"Running optimization iteration in energy range e{i+2}-e{i+3}")
     # if the geometry in the folder already exists, skip this iteration
     # if os.path.exists(f'{folder_name}/geom_{i}.pkl'):
     #     print(f"Geometry for iteration {i} already exists, skipping optimization.")
@@ -202,21 +202,21 @@ for i in range(6):
     #     'signal_event_params': signal_events,
     #     'precomputed_fisher_info_per_string_per_event': fisher_info
     # })
-    signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
-    device=device,
-    event_type='signal', 
-    domain_size=2000, 
-    E_min=10**(i+2), 
-    E_max=10**(i+3), 
-    energy_dist='log_uniform', 
-    find_exact_intersection=True,
-    random_position_along_ray=False,
-    uniform_zenith_sampling=True,
-    # cos_range=torch.tensor((np.cos(np.pi/2),np.cos(np.pi/2)))
-    )
-    loss_params.update({
-        'signal_sampler': signal_sampler,
-        })
+    # signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+    # device=device,
+    # event_type='signal', 
+    # domain_size=2000, 
+    # E_min=10**(i+2), 
+    # E_max=10**(i+3), 
+    # energy_dist='log_uniform', 
+    # find_exact_intersection=True,
+    # random_position_along_ray=False,
+    # uniform_zenith_sampling=True,
+    # # cos_range=torch.tensor((np.cos(np.pi/2),np.cos(np.pi/2)))
+    # )
+    # loss_params.update({
+    #     'signal_sampler': signal_sampler,
+    #     })
     geometry = nugget.geometries.EvanescentString.EvanescentString(
             device=device,
             hex_type='hexagonal',
@@ -254,7 +254,7 @@ for i in range(6):
         print_freq=100,                          # Print progress every N iterations
         sigmoid_loss_list=loss_sigmoid_list,         # Which losses to apply sigmoid to (for better optimization dynamics)
         # save_best_geom_file = f'{folder_name}geom_e{(2*i)+2}_e{2*(i+1) + 2}.pkl',  # File to save best geometry found
-        # save_best_geom_file = f'{folder_name}/geom_{i}.pkl',  # File to save best geometry found
-        save_best_geom_file = f'{folder_name}geom_e{i+2}_e{i+3}.pkl',
+        save_best_geom_file = f'{folder_name}/geom_{i}.pkl',  # File to save best geometry found
+        # save_best_geom_file = f'{folder_name}geom_e{i+2}_e{i+3}.pkl',
         save_last_geom = True, 
     )
