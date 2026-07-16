@@ -410,13 +410,14 @@ class ChargeNet(Surrogate):
         
         # Initialize learning rate scheduler if requested
         if self.reduce_lr_on_plateau:
+            # Note: the `verbose` argument was deprecated and removed from
+            # ReduceLROnPlateau in newer PyTorch versions, so it is not passed.
             self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode='min',
                 factor=self.lr_scheduler_factor,
                 patience=self.lr_scheduler_patience,
                 min_lr=self.lr_scheduler_min_lr,
-                verbose=True
             )
         
         print(f"  Total trainable parameters: {sum(p.numel() for p in all_params if p.requires_grad):,}")
