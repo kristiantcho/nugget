@@ -66,7 +66,6 @@ loss_params.update({
      # 'fisher_info_llr_net': llr_net,
     # 'fisher_info_llr_iterations':50,
     # 'llr_event_labels': ['position','energy', 'direction'],
-    'fisher_info_event_batch_size': 1,
     'fisher_info_grad_chunk_size': 14,
     'fisher_info_jacrev_chunk_size': 50000,
     'fisher_info_point_chunk_size': 41000,

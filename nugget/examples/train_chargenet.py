@@ -70,8 +70,8 @@ history = chargenet.train_with_dataloader(
     train_dataloader=train_dataloader,
     epochs=2000,
     input_dim=12,
-    grad_clip=None,
     save_every_n_epochs=20,
+    early_stopping_patience=2000,
     checkpoint_path='llrnet_models/best_mc_muon_lynet_model_v1.pt',
 )
 

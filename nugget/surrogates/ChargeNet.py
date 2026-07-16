@@ -166,7 +166,7 @@ class ChargeNet(Surrogate):
                  reduce_lr_on_plateau=False, lr_scheduler_patience=10, lr_scheduler_factor=0.5,
                  lr_scheduler_min_lr=1e-6, use_rich_features=False, rich_rel_pos_mode=False,
                  add_vertex_distance=True, add_pmt_direction=False, log_charge_scale=4,
-                 ly_eps=1e-10):
+                 ly_eps=1e-10, **kwargs):
         """
         Initialize the ChargeNet surrogate model.
         
