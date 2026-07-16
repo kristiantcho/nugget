@@ -4,7 +4,7 @@ import nugget
 import pickle
 import os
 
-device="cuda:3"
+device="cuda:2"
 string_number_penalty = nugget.losses.geometry_penalties.StringNumberPenalty(device=device)
 string_boundary_penalty = nugget.losses.geometry_penalties.StringBoundaryPenaltyCircle(device=device)
 weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizationPenalty(device=device)
@@ -26,9 +26,9 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
     rov_tri_length=160
 )
 version = '_poisson'
-use_rov = 'rov'
+use_rov = 'no_rov'
 num_events = 'inf'
-folder_name = f'res_test/opt_geoms/opt_geoms_full_hex_{num_events}_r600_50{version}_{use_rov}/'
+folder_name = f'res_test/opt_geoms/opt_geoms_127_full_hex_{num_events}_r600_50{version}_{use_rov}/'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -49,7 +49,7 @@ loss_params = {
     # 'precomputed_fisher_info_per_string_per_event': torch.load(f'res_test/fisher_info_per_string_per_event_{num_events}_800main_full_hex_r600_50{version}.pt')[:]
     }
 loss_params.update({
-    'eva_min_num_strings': 62,  # Minimum number of active strings
+    'eva_min_num_strings': 127,  # Minimum number of active strings
     'string_number_use_binarization_weight': False,
     'max_radius': 80,  # Maximum radius for string placement
     'num_angles': 360,  # Number of angles (divided into 360 degrees) to test for rov
@@ -69,7 +69,7 @@ loss_params.update({
     'fisher_info_event_batch_size': 1,
     'fisher_info_grad_chunk_size': 14,
     'fisher_info_jacrev_chunk_size': 50000,
-    'fisher_info_point_chunk_size': 21000,
+    'fisher_info_point_chunk_size': 41000,
     'fisher_info_llr_autodiff_mode': 'jvp',
     'fisher_info_detach_tensors': True,
     'fisher_info_use_patd': False,
@@ -174,8 +174,20 @@ loss_params.update({
     'signal_sampler': signal_sampler,
     })
 
-for i in range(15):
+# for i in range(15):
     # print(f"Running optimization iteration {i+1}/15")
+for i in range(6):
+    print(f"Running optimization iteration in energy range e{i+2}-e{i+3}")
+    # if the geometry in the folder already exists, skip this iteration
+    # if os.path.exists(f'{folder_name}/geom_{i}.pkl'):
+    #     print(f"Geometry for iteration {i} already exists, skipping optimization.")
+    #     continue
+    # same for energy range, if the geometry for this energy range already exists, skip this iteration
+    # if os.path.exists(f'{folder_name}geom_e{i+2}_e{i+3}.pkl'):
+    #     print(f"Geometry for energy range e{i+2}-e{i+3} already exists, skipping optimization.")
+    #     continue
+
+    
     # selection_limits = {
     #     'energy': (10**((i*2)+2), 10**(2*(i+1) + 2)),  # Example energy range
     #     }
@@ -190,27 +202,27 @@ for i in range(15):
     #     'signal_event_params': signal_events,
     #     'precomputed_fisher_info_per_string_per_event': fisher_info
     # })
-    # signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
-    # device=device,
-    # event_type='signal', 
-    # domain_size=2000, 
-    # E_min=10**(i+2), 
-    # E_max=10**(i+3), 
-    # energy_dist='log_uniform', 
-    # find_exact_intersection=True,
-    # random_position_along_ray=False,
-    # uniform_zenith_sampling=True,
-    # # cos_range=torch.tensor((np.cos(np.pi/2),np.cos(np.pi/2)))
-    # )
-    # loss_params.update({
-    #     'signal_sampler': signal_sampler,
-    #     })
+    signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+    device=device,
+    event_type='signal', 
+    domain_size=2000, 
+    E_min=10**(i+2), 
+    E_max=10**(i+3), 
+    energy_dist='log_uniform', 
+    find_exact_intersection=True,
+    random_position_along_ray=False,
+    uniform_zenith_sampling=True,
+    # cos_range=torch.tensor((np.cos(np.pi/2),np.cos(np.pi/2)))
+    )
+    loss_params.update({
+        'signal_sampler': signal_sampler,
+        })
     geometry = nugget.geometries.EvanescentString.EvanescentString(
             device=device,
             hex_type='hexagonal',
-            domain_size=1600,  # Size of detector domain
+            domain_size=2000,  # Size of detector domain
             dim=3,  # 3D geometry
-            n_strings=1027,  # Initial number of detector strings
+            n_strings=1951,  # Initial number of detector strings
             points_per_string=20,  # Number of PMTs/sensors per string
             custom_z_spacing=50,
             random_weights=True
@@ -242,7 +254,7 @@ for i in range(15):
         print_freq=100,                          # Print progress every N iterations
         sigmoid_loss_list=loss_sigmoid_list,         # Which losses to apply sigmoid to (for better optimization dynamics)
         # save_best_geom_file = f'{folder_name}geom_e{(2*i)+2}_e{2*(i+1) + 2}.pkl',  # File to save best geometry found
-        save_best_geom_file = f'{folder_name}/geom_{i}.pkl',  # File to save best geometry found
-        # save_best_geom_file = f'{folder_name}geom_e{i+2}_e{i+3}.pkl',
+        # save_best_geom_file = f'{folder_name}/geom_{i}.pkl',  # File to save best geometry found
+        save_best_geom_file = f'{folder_name}geom_e{i+2}_e{i+3}.pkl',
         save_last_geom = True, 
     )
