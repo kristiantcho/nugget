@@ -894,9 +894,13 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 # Replace bad entries with a large sentinel WITHIN the graph (not via
                 # boolean indexing) so their 1/r^2 contribution is ~0 AND no NaN/inf
                 # gradient flows back through string_weights for those events.
+                # nan_to_num FIRST so the torch.where "kept" branch is always finite;
+                # otherwise where's backward leaks 0*NaN = NaN into string_weights.grad
+                # for the sentinel-selected entries even though the forward looks safe.
+                res_clean = torch.nan_to_num(resolution_per_event, nan=1e6, posinf=1e6, neginf=1e6)
                 safe_res = torch.where(
                     finite_mask,
-                    torch.clamp_min(resolution_per_event, 1e-12),
+                    torch.clamp_min(res_clean, 1e-12),
                     torch.full_like(resolution_per_event, 1e6),
                 )
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
@@ -936,9 +940,12 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 resolution_per_event = resolution_per_event / energies
             finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
             if finite_mask.any():
+                # nan_to_num FIRST so torch.where's backward can't leak 0*NaN = NaN
+                # (see the angular branch above for the full rationale).
+                res_clean = torch.nan_to_num(resolution_per_event, nan=1e6, posinf=1e6, neginf=1e6)
                 safe_res = torch.where(
                     finite_mask,
-                    torch.clamp_min(resolution_per_event, 1e-12),
+                    torch.clamp_min(res_clean, 1e-12),
                     torch.full_like(resolution_per_event, 1e6),
                 )
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))

@@ -1783,18 +1783,19 @@ def directional_resolution(F3, n):
     is_batched = F3.dim() == 3
     
     if not is_batched:
-        # Single input case - normalize and compute
-        n = n / torch.norm(n)
+        # Single input case - normalize and compute. Epsilon-guard the norm so a
+        # degenerate (zero) direction does not give 0/0 = NaN.
+        n = n / torch.norm(n).clamp_min(1e-12)
 
         # --- Build tangent basis B (3x2) ---
         ref = torch.tensor([0.0, 0.0, 1.0], dtype=n.dtype, device=n.device)
         if abs(torch.dot(n, ref)) > 0.9:
             ref = torch.tensor([1.0, 0.0, 0.0], dtype=n.dtype, device=n.device)
-        
+
         b1 = torch.cross(n, ref)
-        b1 = b1 / torch.norm(b1)
+        b1 = b1 / torch.norm(b1).clamp_min(1e-12)
         b2 = torch.cross(n, b1)
-        b2 = b2 / torch.norm(b2)
+        b2 = b2 / torch.norm(b2).clamp_min(1e-12)
         B = torch.stack([b1, b2], dim=1)  # 3x2
 
         # --- Project Fisher ---
@@ -1812,12 +1813,21 @@ def directional_resolution(F3, n):
             Cov2 = torch.pinverse(F2)
 
         # --- Angular resolution (approx small-angle) ---
-        eigvals = torch.linalg.eigvalsh(Cov2)
+        # Closed-form 2x2 symmetric eigenvalues instead of torch.linalg.eigvalsh,
+        # whose backward has 1/(lambda_i - lambda_j) terms that NaN for degenerate
+        # eigenvalues (Cov2 ~ (1/eps)*I when the Fisher matrix is near-zero, e.g.
+        # all sigmoided string weights ~0). Discriminant is a sum of squares so
+        # sqrt never sees a negative arg; +1e-12 keeps its gradient finite.
+        c00 = Cov2[0, 0]
+        c11 = Cov2[1, 1]
+        c01 = Cov2[0, 1]
+        half_tr = 0.5 * (c00 + c11)
+        half_gap = torch.sqrt((0.5 * (c00 - c11)) ** 2 + c01 ** 2 + 1e-12)
+        eigvals = torch.stack([half_tr - half_gap, half_tr + half_gap])
         eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
-        # eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
         sigma_eff = torch.sqrt(torch.mean(eigvals) + 1e-10)  # Add epsilon for numerical stability
         r68 = 1.515 * sigma_eff
-        
+
         return r68
     
     else:
@@ -1826,26 +1836,37 @@ def directional_resolution(F3, n):
         device = F3.device
         dtype = F3.dtype
         
-        # Normalize direction vectors (N, 3)
-        n = n / torch.norm(n, dim=1, keepdim=True)
-        
+        # Normalize direction vectors (N, 3). Guard the norm with an epsilon so a
+        # degenerate (zero) direction does not produce 0/0 = NaN that then
+        # poisons the entire tangent basis and resolution.
+        n = n / torch.norm(n, dim=1, keepdim=True).clamp_min(1e-12)
+
         # --- Build tangent basis B for all directions (N, 3, 2) ---
-        # Reference vector
-        ref = torch.tensor([0.0, 0.0, 1.0], dtype=dtype, device=device).expand(batch_size, 3)
-        
+        # Reference vector, per-row so we can safely swap it for directions that
+        # are nearly parallel to the default ref. NOTE: a plain
+        # torch.tensor(...).expand(batch_size, 3) is a stride-0 broadcast VIEW;
+        # writing into it in-place (ref[mask] = ...) is undefined behaviour and
+        # was corrupting the ref for parallel directions, leaving cross(n, ref)=0
+        # -> b1 = 0/0 = NaN. Build a real (N, 3) tensor instead.
+        ref = torch.zeros(batch_size, 3, dtype=dtype, device=device)
+        ref[:, 2] = 1.0  # default reference [0, 0, 1] for every row
+
         # Check which directions are nearly parallel to ref (use different ref for those)
         dots = torch.abs(torch.sum(n * ref, dim=1))  # (N,)
         parallel_mask = dots > 0.9
+        # Swap those rows to [1, 0, 0] (guaranteed not parallel to a near-z direction)
         ref[parallel_mask] = torch.tensor([1.0, 0.0, 0.0], dtype=dtype, device=device)
-        
-        # First tangent vector
+
+        # First tangent vector. Epsilon-guarded normalization: with the per-row
+        # ref swap above, ||b1|| is bounded away from 0 for valid unit
+        # directions, but the clamp keeps it finite even for degenerate inputs.
         b1 = torch.cross(n, ref, dim=1)  # (N, 3)
-        b1 = b1 / torch.norm(b1, dim=1, keepdim=True)
-        
+        b1 = b1 / torch.norm(b1, dim=1, keepdim=True).clamp_min(1e-12)
+
         # Second tangent vector
         b2 = torch.cross(n, b1, dim=1)  # (N, 3)
-        b2 = b2 / torch.norm(b2, dim=1, keepdim=True)
-        
+        b2 = b2 / torch.norm(b2, dim=1, keepdim=True).clamp_min(1e-12)
+
         # Stack to form basis: (N, 3, 2)
         B = torch.stack([b1, b2], dim=2)
         
@@ -1873,14 +1894,23 @@ def directional_resolution(F3, n):
             Cov2 = torch.stack(Cov2)
         
         # --- Angular resolution for all events ---
-        try:
-            eigvals = torch.linalg.eigvalsh(Cov2)  # (N, 2)
-        except Exception:
-            # Closed-form 2x2 eigenvalues — always numerically stable
-            tr = Cov2[:, 0, 0] + Cov2[:, 1, 1]
-            det = Cov2[:, 0, 0] * Cov2[:, 1, 1] - Cov2[:, 0, 1] ** 2
-            half_gap = 0.5 * torch.sqrt(tr ** 2 - 4.0 * det)
-            eigvals = torch.stack([0.5 * tr - half_gap, 0.5 * tr + half_gap], dim=1)  # (N, 2)
+        # Closed-form 2x2 symmetric eigenvalues instead of torch.linalg.eigvalsh.
+        # eigvalsh's BACKWARD contains 1/(lambda_i - lambda_j) terms that blow up
+        # to NaN/Inf for degenerate (equal) eigenvalues -- exactly the situation
+        # when the Fisher matrix is near-zero (e.g. all sigmoided string weights
+        # close to 0), where Cov2 ~ (1/eps) * I has two equal eigenvalues.
+        #
+        # Use the discriminant form ((c00 - c11)/2)^2 + c01^2, which is a SUM OF
+        # SQUARES and therefore provably >= 0 (the tr^2 - 4*det form can go
+        # slightly negative from float error at degeneracy -> sqrt NaN). The
+        # +1e-12 inside the sqrt keeps the gradient finite at exact degeneracy,
+        # where sqrt'(0) would otherwise be infinite.
+        c00 = Cov2[:, 0, 0]
+        c11 = Cov2[:, 1, 1]
+        c01 = Cov2[:, 0, 1]
+        half_tr = 0.5 * (c00 + c11)
+        half_gap = torch.sqrt((0.5 * (c00 - c11)) ** 2 + c01 ** 2 + 1e-12)
+        eigvals = torch.stack([half_tr - half_gap, half_tr + half_gap], dim=1)  # (N, 2)
         eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
         sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) + 1e-10)  # (N,)
         r68 = 1.515 * sigma_eff  # (N,)
@@ -2165,6 +2195,24 @@ def compute_fisher_info_poisson_batched_events(
         missing = ~has_match  # (n_strings,)
         fill = (uninformative_fisher_value * eye).view(1, 1, total_dims, total_dims)
         fisher_by_string = torch.where(missing.view(1, -1, 1, 1), fill, fisher_by_string)
+
+    # Sanitize any non-finite (NaN/Inf) per-(event, string) Fisher matrix by
+    # replacing it with the uninformative default. Without this, a single
+    # degenerate geometry (e.g. a detector point on a track line producing an
+    # overflowing J, or any other numerical edge case) yields a NaN/Inf Fisher
+    # that then propagates into the resolution: crucially, downstream the Fisher
+    # is combined as sum_s sigmoid(w_s) * Fisher[s], and 0 * NaN = NaN, so even
+    # driving a string's weight to ~0 does NOT neutralize a non-finite Fisher.
+    # This guarantees a finite Fisher regardless of the string weights.
+    sanitize_fill = (uninformative_fisher_value if uninformative_fisher_value else 0.0)
+    eye = torch.eye(total_dims, device=device)
+    fill = (sanitize_fill * eye).view(1, 1, total_dims, total_dims)
+    finite_mask = torch.isfinite(fisher_by_string).all(dim=(2, 3), keepdim=True)  # (E, S, 1, 1)
+    # Zero out non-finite entries FIRST so the torch.where "kept" branch is
+    # always finite -- otherwise torch.where's backward leaks 0*NaN = NaN even
+    # where the mask selects `fill` (matters when detach_fisher_tensors=False).
+    fisher_clean = torch.nan_to_num(fisher_by_string, nan=0.0, posinf=0.0, neginf=0.0)
+    fisher_by_string = torch.where(finite_mask, fisher_clean, fill)
 
     del fisher_per_point
     _fisher_chunk_cleanup(device)
