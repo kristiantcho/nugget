@@ -840,10 +840,11 @@ class ChargeNet(Surrogate):
         return features, light_yield.squeeze()
     
     def train_with_dataloader(self, train_dataloader, val_dataloader=None, epochs=100,
-                             verbose=True, early_stopping_patience=10, input_dim=None):
+                             verbose=True, early_stopping_patience=10, input_dim=None,
+                             save_every_n_epochs=None, checkpoint_path=None):
         """
         Train the ChargeNet network using PyTorch DataLoader.
-        
+
         Parameters:
         -----------
         train_dataloader : torch.utils.data.DataLoader
@@ -851,18 +852,29 @@ class ChargeNet(Surrogate):
         val_dataloader : torch.utils.data.DataLoader, optional
             DataLoader for validation data
         epochs : int
-            Number of training epochs  
+            Number of training epochs
         verbose : bool
             Whether to print training progress
         early_stopping_patience : int
             Number of epochs to wait for improvement before early stopping
         input_dim : int, optional
             Input dimension (will be inferred from first batch if not provided)
-            
+        save_every_n_epochs : int or None
+            If set, save a checkpoint every N epochs during training (and at the
+            final epoch). Requires checkpoint_path.
+        checkpoint_path : str or None
+            File path to overwrite on each periodic save. Required when
+            save_every_n_epochs is set.
+
         Returns:
         --------
         dict : Training history with 'train_loss' and 'val_loss' keys
         """
+        if save_every_n_epochs is not None and save_every_n_epochs <= 0:
+            raise ValueError("save_every_n_epochs must be a positive integer or None")
+        if save_every_n_epochs is not None and checkpoint_path is None:
+            raise ValueError("checkpoint_path must be provided when save_every_n_epochs is set")
+
         # Build network if not already built
         if self.mlp_branches is None and self.shared_branch_mlp is None:
             if input_dim is None:
@@ -872,7 +884,7 @@ class ChargeNet(Surrogate):
                     input_dim = sample_features.shape[-1]
                 else:
                     raise ValueError("Could not determine input dimension from dataloader")
-            
+
             self._build_network(input_dim)
         
         # Training loop
@@ -960,11 +972,24 @@ class ChargeNet(Surrogate):
                 
                 if patience_counter >= early_stopping_patience:
                     print(f"Early stopping at epoch {epoch+1}")
+                    # Save a final checkpoint before breaking out of training.
+                    if save_every_n_epochs is not None:
+                        checkpoint_dirname = os.path.dirname(checkpoint_path)
+                        if checkpoint_dirname:
+                            os.makedirs(checkpoint_dirname, exist_ok=True)
+                        self.save_model(checkpoint_path)
                     break
             else:
                 if verbose and (epoch + 1) % 10 == 0:
                     print(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}")
-        
+
+            # Periodic checkpointing (also fires on the final epoch).
+            if save_every_n_epochs is not None and ((epoch + 1) % save_every_n_epochs == 0 or (epoch + 1) == epochs):
+                checkpoint_dirname = os.path.dirname(checkpoint_path)
+                if checkpoint_dirname:
+                    os.makedirs(checkpoint_dirname, exist_ok=True)
+                self.save_model(checkpoint_path)
+
         self.is_trained = True
         
         return {
