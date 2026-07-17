@@ -58,11 +58,13 @@ train_dataloader = chargenet.create_light_yield_parquet_dataloader(
                 seed=None,
                 zero_ly_prob=0.05, 
                 zero_ly_value=0.0,
-                uniform_energy_zenith=False,
+                uniform_energy_zenith=True,
+                uniform_light_yield=True,
+                n_ly_bins=20,
                 n_energy_bins=20, 
                 n_coszen_bins=20,
                 filter_vertex_in_domain=True,
-                test_save_path='./llrnet_models/mc_muon_lynet_v1_test_samples.parquet', 
+                test_save_path='./llrnet_models/mc_muon_lynet_v2_test_samples.parquet', 
                 test_frac=0.1,
                 )
 
@@ -72,10 +74,10 @@ history = chargenet.train_with_dataloader(
     input_dim=12,
     save_every_n_epochs=20,
     early_stopping_patience=2000,
-    checkpoint_path='llrnet_models/best_mc_muon_lynet_model_v1.pt',
+    checkpoint_path='llrnet_models/best_mc_muon_lynet_model_v2.pt',
 )
 
 
 
 # #save history as pickle
-pickle.dump(history, open('mc_muon_lynet_v1_training_history.pkl', 'wb'))
+pickle.dump(history, open('mc_muon_lynet_v2_training_history.pkl', 'wb'))
