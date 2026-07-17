@@ -794,11 +794,12 @@ class ChargeNet(Surrogate):
         
         
         # Log scale light yield if requested (for better convergence). We use
-        # log10(count + 1) so a zero light yield maps to 0.0 (representable) and
-        # the inverse is 10**pred - 1 (see predict / the surrogate). This matches
-        # the parquet dataset's target transform.
+        # log10(count + 1) / log_charge_scale so a zero light yield maps to 0.0
+        # (representable) and the target stays O(1); the inverse is
+        # 10**(pred * log_charge_scale) - 1 (see predict / the surrogate). This
+        # matches the parquet dataset's target transform (_transform_target).
         if self.log_scale_ly:
-            light_yield = torch.log10(torch.abs(light_yield) + 1.0)
+            light_yield = torch.log10(torch.abs(light_yield) + 1.0) / self.log_charge_scale
        
         # Construct feature vector
         feature_list = []
@@ -1104,9 +1105,10 @@ class ChargeNet(Surrogate):
         predictions = self(features)
         
         # Convert back from log scale if necessary. Forward transform is
-        # log10(count + 1), so the inverse is 10**pred - 1.
+        # log10(count + 1) / log_charge_scale, so the inverse is
+        # 10**(pred * log_charge_scale) - 1.
         if self.log_scale_ly:
-            predictions = 10 ** predictions - 1.0
+            predictions = 10 ** (predictions * self.log_charge_scale) - 1.0
             predictions = torch.clamp(predictions, min=0.0)
         else:
             predictions = torch.clamp(predictions, min=0.0)  # Ensure non-negative
@@ -1361,9 +1363,9 @@ class ChargeNet(Surrogate):
                     ly_value = float(target)
                 
                 # If we're using log scale, convert back to check threshold
-                # (inverse of log10(count + 1)).
+                # (inverse of log10(count + 1) / log_charge_scale).
                 if self.chargenet_model.log_scale_ly:
-                    ly_value = 10 ** ly_value - 1.0
+                    ly_value = 10 ** (ly_value * self.chargenet_model.log_charge_scale) - 1.0
                 
                 if ly_value >= self.min_light_yield:
                     return features, target
@@ -1735,14 +1737,16 @@ class ChargeNet(Surrogate):
         def _transform_target(self, light_yield):
             """Apply the model's target transform to a raw light-yield value.
 
-            If chargenet.log_scale_ly is True the target is log10(count + 1.0)
-            (so a zero count is representable as 0.0); otherwise the raw count is
-            used. Returns a scalar float32 tensor.
+            If chargenet.log_scale_ly is True the target is
+            log10(count + 1.0) / log_charge_scale (so a zero count is
+            representable as 0.0, and the scale keeps the target O(1)); otherwise
+            the raw count is used. Returns a scalar float32 tensor. The inverse
+            (used by predict / the surrogate) is 10**(pred * log_charge_scale) - 1.
             """
             ly = float(light_yield)
             if self.chargenet.log_scale_ly:
-                # log10(count + 1.0): keeps zeros representable (-> 0.0).
-                target = np.log10(ly + 1.0)/self.chargenet.log_charge_scale
+                # log10(count + 1.0) / log_charge_scale: zeros -> 0.0, O(1) target.
+                target = np.log10(ly + 1.0) / self.chargenet.log_charge_scale
             else:
                 # Raw count.
                 target = ly
