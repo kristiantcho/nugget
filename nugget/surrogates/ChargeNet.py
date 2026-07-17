@@ -975,22 +975,26 @@ class ChargeNet(Surrogate):
                 if patience_counter >= early_stopping_patience:
                     print(f"Early stopping at epoch {epoch+1}")
                     # Save a final checkpoint before breaking out of training.
+                    # mark_trained=True so the saved file is usable, without
+                    # setting self.is_trained on the live (still-training) model.
                     if save_every_n_epochs is not None:
                         checkpoint_dirname = os.path.dirname(checkpoint_path)
                         if checkpoint_dirname:
                             os.makedirs(checkpoint_dirname, exist_ok=True)
-                        self.save_model(checkpoint_path)
+                        self.save_model(checkpoint_path, mark_trained=True)
                     break
             else:
                 if verbose and (epoch + 1) % 10 == 0:
                     print(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}")
 
-            # Periodic checkpointing (also fires on the final epoch).
+            # Periodic checkpointing (also fires on the final epoch). Mark the
+            # saved file as trained so it loads as usable, without flipping
+            # self.is_trained on the model that is still being trained.
             if save_every_n_epochs is not None and ((epoch + 1) % save_every_n_epochs == 0 or (epoch + 1) == epochs):
                 checkpoint_dirname = os.path.dirname(checkpoint_path)
                 if checkpoint_dirname:
                     os.makedirs(checkpoint_dirname, exist_ok=True)
-                self.save_model(checkpoint_path)
+                self.save_model(checkpoint_path, mark_trained=True)
 
         self.is_trained = True
         
@@ -1161,8 +1165,21 @@ class ChargeNet(Surrogate):
             'rmse': np.sqrt(mse)
         }
     
-    def save_model(self, filepath):
-        """Save model state to file."""
+    def save_model(self, filepath, mark_trained=None):
+        """Save model state to file.
+
+        Parameters
+        ----------
+        filepath : str
+            Destination path.
+        mark_trained : bool or None
+            Value to record for ``is_trained`` in the saved file. If None
+            (default), the model's current ``self.is_trained`` is used. Pass
+            True to write a usable (loadable-as-trained) checkpoint mid-training
+            WITHOUT mutating the live model's ``self.is_trained`` (which should
+            only become True once training actually finishes).
+        """
+        is_trained_flag = self.is_trained if mark_trained is None else bool(mark_trained)
         state = {
             'hidden_dims': self.hidden_dims,
             'dropout_rate': self.dropout_rate,
@@ -1190,7 +1207,7 @@ class ChargeNet(Surrogate):
             'pmt_directions': self.pmt_directions.detach().cpu() if self.pmt_directions is not None else None,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
-            'is_trained': self.is_trained,
+            'is_trained': is_trained_flag,
         }
         
         if self.fourier_features_list is not None:
@@ -1480,7 +1497,8 @@ class ChargeNet(Surrogate):
                      num_samples_per_epoch=None, seed=None,
                      zero_ly_prob=0.0, zero_ly_value=0.0,
                      uniform_energy_zenith=False, n_energy_bins=20,
-                     n_coszen_bins=20, filter_vertex_in_domain=True,
+                     n_coszen_bins=20, uniform_light_yield=False, n_ly_bins=20,
+                     filter_vertex_in_domain=True,
                      event_filter=None):
             """
             Parameters
@@ -1506,14 +1524,21 @@ class ChargeNet(Surrogate):
             uniform_energy_zenith : bool
                 If True, the event-params row is drawn by importance sampling so
                 the network sees (neutrino energy, cos zenith) approximately
-                uniformly: each __getitem__ first picks a non-empty
-                (log10 energy, cos zenith) bin uniformly at random, then a row
-                uniformly from the rows in that bin. Default False (uniform over
-                rows). See _build_energy_coszen_bins for the binning.
+                uniformly: each __getitem__ first picks a non-empty bin uniformly
+                at random, then a row uniformly from the rows in that bin.
+                Default False (uniform over rows). See
+                _build_uniform_sampling_bins for the binning.
             n_energy_bins : int
                 Number of bins in log10(neutrino_energy) for uniform sampling.
             n_coszen_bins : int
                 Number of bins in cos(zenith) for uniform sampling.
+            uniform_light_yield : bool
+                If True, add a log10(count + 1) axis to the stratified sampling
+                so light yield is also seen approximately uniformly in log space.
+                Combines with uniform_energy_zenith (whichever axes are enabled
+                are jointly flattened). Default False.
+            n_ly_bins : int
+                Number of bins in log10(count + 1) when uniform_light_yield.
             filter_vertex_in_domain : bool
                 If True (default), drop any row whose muon interaction vertex
                 (muon_x/y/z) falls outside the model's domain. The domain is a
@@ -1646,12 +1671,19 @@ class ChargeNet(Surrogate):
             # torch/numpy state (also safe across DataLoader workers).
             self._rng = np.random.default_rng(seed)
 
-            # Importance sampling to flatten (energy, cos zenith): group rows into
-            # (log10 energy, cos zenith) bins so a params row can be drawn by
-            # first picking a non-empty bin uniformly, then a row within it.
+            # Importance sampling to flatten (energy, cos zenith) and optionally
+            # log10 light yield: group rows into (log10 energy, cos zenith[, log10
+            # LY]) bins so a params row can be drawn by first picking a non-empty
+            # bin uniformly, then a row within it.
             self.uniform_energy_zenith = bool(uniform_energy_zenith)
-            if self.uniform_energy_zenith:
-                self._build_energy_coszen_bins(int(n_energy_bins), int(n_coszen_bins))
+            self.uniform_light_yield = bool(uniform_light_yield)
+            self._use_binned_sampling = self.uniform_energy_zenith or self.uniform_light_yield
+            if self._use_binned_sampling:
+                self._build_uniform_sampling_bins(
+                    int(n_energy_bins), int(n_coszen_bins),
+                    uniform_light_yield=self.uniform_light_yield,
+                    n_ly_bins=int(n_ly_bins),
+                )
 
             # When the model uses the PMT direction as a feature, record all the
             # unique PMT directions from the geometry on the model itself, so they
@@ -1660,32 +1692,45 @@ class ChargeNet(Surrogate):
                 all_dirs = np.stack(list(self._pmt_dir.values()), axis=0)  # (n_pmts, 3)
                 chargenet_instance.set_pmt_directions(all_dirs)
 
-        def _build_energy_coszen_bins(self, n_energy_bins, n_coszen_bins):
-            """Group row indices into (log10 energy, cos zenith) bins.
+        def _build_uniform_sampling_bins(self, n_energy_bins, n_coszen_bins,
+                                         uniform_light_yield=False, n_ly_bins=20):
+            """Group row indices into (log10 energy, cos zenith[, log10 LY]) bins.
 
             Builds ``self._bin_rows``: a list of int arrays, one per NON-EMPTY
-            2-D bin, each holding the indices of the rows that fall in that bin.
+            bin, each holding the indices of the rows that fall in that bin.
             Uniform sampling then picks one of these lists uniformly, then a row
-            uniformly from within it -- flattening the empirical (energy, cos
-            zenith) distribution the network sees over the occupied grid.
-            """
-            log_e = np.log10(np.clip(self._energy, 1e-12, None))
-            coszen = np.cos(self._zenith)
+            uniformly from within it -- flattening the empirical distribution the
+            network sees over the occupied grid.
 
-            # Bin edges spanning the observed range (guard against zero width).
+            The grid always covers (log10 energy, cos zenith). When
+            ``uniform_light_yield`` is True a third axis over log10(count + 1) is
+            added, so the network additionally sees light yield roughly uniformly
+            in log space (the +1 keeps zeros representable, matching the target
+            transform).
+            """
             def _edges(vals, nb):
                 lo, hi = float(np.min(vals)), float(np.max(vals))
                 if hi <= lo:
                     hi = lo + 1e-6
                 return np.linspace(lo, hi, nb + 1)
 
-            e_edges = _edges(log_e, n_energy_bins)
-            c_edges = _edges(coszen, n_coszen_bins)
+            def _bin_idx(vals, nb):
+                edges = _edges(vals, nb)
+                return np.clip(np.digitize(vals, edges) - 1, 0, nb - 1)
 
-            # Bin index per row (clipped to the last bin at the upper edge).
-            ei = np.clip(np.digitize(log_e, e_edges) - 1, 0, n_energy_bins - 1)
-            ci = np.clip(np.digitize(coszen, c_edges) - 1, 0, n_coszen_bins - 1)
-            flat = ei * n_coszen_bins + ci  # unique id per 2-D bin
+            # Build the per-row bin index for each active dimension, then combine
+            # them into a single flat bin id via a mixed-radix encoding.
+            log_e = np.log10(np.clip(self._energy, 1e-12, None))
+            coszen = np.cos(self._zenith)
+            dims = [(_bin_idx(log_e, n_energy_bins), n_energy_bins),
+                    (_bin_idx(coszen, n_coszen_bins), n_coszen_bins)]
+            if uniform_light_yield:
+                log_ly = np.log10(np.clip(self._count, 0.0, None) + 1.0)
+                dims.append((_bin_idx(log_ly, n_ly_bins), n_ly_bins))
+
+            flat = np.zeros(self._n_rows, dtype=np.int64)
+            for idx, nb in dims:
+                flat = flat * nb + idx  # unique id per multi-D bin
 
             order = np.argsort(flat, kind='stable')
             flat_sorted = flat[order]
@@ -1696,7 +1741,7 @@ class ChargeNet(Surrogate):
 
         def _sample_params_row(self):
             """Draw an event-params row index according to the sampling scheme."""
-            if getattr(self, 'uniform_energy_zenith', False) and self._n_bins > 0:
+            if getattr(self, '_use_binned_sampling', False) and self._n_bins > 0:
                 # Uniform over non-empty bins, then uniform within the bin.
                 b = int(self._rng.integers(0, self._n_bins))
                 group = self._bin_rows[b]
@@ -1810,6 +1855,7 @@ class ChargeNet(Surrogate):
                                               zero_ly_prob=0.05, zero_ly_value=0.0,
                                               uniform_energy_zenith=False,
                                               n_energy_bins=20, n_coszen_bins=20,
+                                              uniform_light_yield=False, n_ly_bins=20,
                                               filter_vertex_in_domain=True,
                                               test_save_path=None, test_frac=0.1,
                                               split_seed=None,
@@ -1848,6 +1894,13 @@ class ChargeNet(Surrogate):
             over log10-energy x cos-zenith bins). Default False.
         n_energy_bins, n_coszen_bins : int
             Bin counts for the uniform (energy, cos zenith) sampling.
+        uniform_light_yield : bool
+            If True, add log10(count + 1) as a third stratified-sampling axis, so
+            the network additionally sees light yield approximately uniformly in
+            log space. Combines with uniform_energy_zenith: whichever axes are
+            enabled are jointly flattened over their occupied grid. Default False.
+        n_ly_bins : int
+            Bin count for the log10 light-yield axis when uniform_light_yield.
         filter_vertex_in_domain : bool
             If True (default), drop rows whose muon interaction vertex lies
             outside the model's domain (box from self.domain_size, centred at
@@ -1915,6 +1968,8 @@ class ChargeNet(Surrogate):
             uniform_energy_zenith=uniform_energy_zenith,
             n_energy_bins=n_energy_bins,
             n_coszen_bins=n_coszen_bins,
+            uniform_light_yield=uniform_light_yield,
+            n_ly_bins=n_ly_bins,
             filter_vertex_in_domain=filter_vertex_in_domain,
             event_filter=train_event_filter,
         )
