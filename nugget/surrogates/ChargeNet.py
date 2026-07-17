@@ -1495,7 +1495,7 @@ class ChargeNet(Surrogate):
 
         def __init__(self, chargenet_instance, parquet_path, geometry_csv_path,
                      num_samples_per_epoch=None, seed=None,
-                     zero_ly_prob=0.0, zero_ly_value=0.0,
+                     zero_ly_prob=0.0, zero_ly_value=0.0, zero_ly_max_count=2.0,
                      uniform_energy_zenith=False, n_energy_bins=20,
                      n_coszen_bins=20, uniform_light_yield=False, n_ly_bins=20,
                      filter_vertex_in_domain=True,
@@ -1521,6 +1521,10 @@ class ChargeNet(Surrogate):
                 ``zero_ly_value``. Default 0.0 (disabled).
             zero_ly_value : float
                 Light-yield value used for zero-LY samples (default 0.0).
+            zero_ly_max_count : float
+                When uniform_light_yield is True, only emit zero-LY samples for
+                bins whose light-yield lower edge (in count units) is below this
+                value (default 2.0). No effect when uniform_light_yield is False.
             uniform_energy_zenith : bool
                 If True, the event-params row is drawn by importance sampling so
                 the network sees (neutrino energy, cos zenith) approximately
@@ -1557,6 +1561,9 @@ class ChargeNet(Surrogate):
             self.device = chargenet_instance.device
             self.zero_ly_prob = float(zero_ly_prob)
             self.zero_ly_value = float(zero_ly_value)
+            # Zero-LY samples are only emitted (when uniform_light_yield is on)
+            # for bins whose LY lower edge is below this count. See __getitem__.
+            self._zero_ly_max_count = float(zero_ly_max_count)
 
             # ---- load geometry CSV -> (string, om, pmt) lookup ----
             geo = pd.read_csv(geometry_csv_path)
@@ -1739,14 +1746,32 @@ class ChargeNet(Surrogate):
             self._bin_rows = np.split(order, boundaries)
             self._n_bins = len(self._bin_rows)
 
+            # Per-bin minimum light-yield count. When the LY axis is active all
+            # rows in a bin share the same log10(count+1) sub-bin, so this is the
+            # bin's LY lower edge (in count units). Used to gate the zero-LY
+            # augmentation to only low-yield bins (see __getitem__). When the LY
+            # axis is off this still holds a per-bin min count (a bin then spans
+            # all yields, so its min is just informational).
+            self._bin_ly_min_count = np.array(
+                [float(self._count[g].min()) if len(g) else np.inf
+                 for g in self._bin_rows],
+                dtype=np.float64,
+            )
+
         def _sample_params_row(self):
-            """Draw an event-params row index according to the sampling scheme."""
+            """Draw a params row index and the bin it came from.
+
+            Returns
+            -------
+            (row_index, bin_index) : (int, int)
+                bin_index is -1 when binned sampling is not in use.
+            """
             if getattr(self, '_use_binned_sampling', False) and self._n_bins > 0:
                 # Uniform over non-empty bins, then uniform within the bin.
                 b = int(self._rng.integers(0, self._n_bins))
                 group = self._bin_rows[b]
-                return int(group[int(self._rng.integers(0, len(group)))])
-            return int(self._rng.integers(0, self._n_rows))
+                return int(group[int(self._rng.integers(0, len(group)))]), b
+            return int(self._rng.integers(0, self._n_rows)), -1
 
         def _event_data(self, i, pmt_direction=None):
             """Build the event_data dict (hypothesis params) for row i.
@@ -1826,15 +1851,26 @@ class ChargeNet(Surrogate):
             # the epoch length (num_samples_per_epoch) is independent of the file
             # size and every item is an i.i.d. draw rather than a fixed
             # permutation of rows. With uniform_energy_zenith the draw is
-            # stratified over (log10 energy, cos zenith) bins (see
-            # _sample_params_row).
-            row = self._sample_params_row()
+            # stratified over (log10 energy, cos zenith[, log10 LY]) bins (see
+            # _sample_params_row), which also returns the chosen bin index.
+            row, bin_idx = self._sample_params_row()
 
-            # With low probability, emit a zero-LY sample instead: the event's
-            # params observed at a PMT that was NOT hit in the event, with a
-            # (transformed) zero light yield -> the network should learn this is
-            # (near) zero yield.
-            if self.zero_ly_prob > 0.0 and self._rng.random() < self.zero_ly_prob:
+            # Zero-LY augmentation. When the light-yield axis is active, zeros are
+            # only emitted for LOW-yield bins -- specifically when the selected
+            # bin's LY lower edge is below a count of 2 (i.e. the bin covers the
+            # count<2 region). This keeps the network from ever mapping a
+            # high-yield region's event params to a zero observation. When the LY
+            # axis is off, the gate is not applied (any draw may become a zero).
+            allow_zero = True
+            if self.uniform_light_yield and bin_idx >= 0:
+                allow_zero = self._bin_ly_min_count[bin_idx] < self._zero_ly_max_count
+
+            # With low probability (and if allowed for this bin), emit a zero-LY
+            # sample instead: the event's params observed at a PMT that was NOT
+            # hit in the event, with a (transformed) zero light yield -> the
+            # network should learn this is (near) zero yield.
+            if (allow_zero and self.zero_ly_prob > 0.0
+                    and self._rng.random() < self.zero_ly_prob):
                 unhit = self._sample_unhit_key(row)
                 if unhit is not None:
                     features = self._features(
@@ -1853,6 +1889,7 @@ class ChargeNet(Surrogate):
                                               num_samples_per_epoch=None, batch_size=32,
                                               shuffle=True, num_workers=0, seed=None,
                                               zero_ly_prob=0.05, zero_ly_value=0.0,
+                                              zero_ly_max_count=2.0,
                                               uniform_energy_zenith=False,
                                               n_energy_bins=20, n_coszen_bins=20,
                                               uniform_light_yield=False, n_ly_bins=20,
@@ -1888,6 +1925,11 @@ class ChargeNet(Surrogate):
             yield zero_ly_value. Default 0.0 (disabled).
         zero_ly_value : float
             Light-yield value used for zero-LY samples (default 0.0).
+        zero_ly_max_count : float
+            When uniform_light_yield is True, zero-LY samples are only emitted
+            for bins whose light-yield lower edge is below this count (default
+            2.0, i.e. only the count<2 bins). Ignored when uniform_light_yield
+            is False (any draw may then become a zero).
         uniform_energy_zenith : bool
             If True, importance-sample the event-params row so the network sees
             (neutrino energy, cos zenith) approximately uniformly (stratified
@@ -1965,6 +2007,7 @@ class ChargeNet(Surrogate):
             seed=seed,
             zero_ly_prob=zero_ly_prob,
             zero_ly_value=zero_ly_value,
+            zero_ly_max_count=zero_ly_max_count,
             uniform_energy_zenith=uniform_energy_zenith,
             n_energy_bins=n_energy_bins,
             n_coszen_bins=n_coszen_bins,
