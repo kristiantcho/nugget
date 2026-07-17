@@ -773,6 +773,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         # New parameters for batched loading from files
         event_paths = kwargs.get('event_paths', None)
         fisher_info_paths = kwargs.get('fisher_info_paths', None)
+        fisher_use_fom = kwargs.get('fisher_use_fom', True)
         
         
         # Load and batch events/Fisher info from files or subset precomputed data
@@ -903,7 +904,10 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     torch.clamp_min(res_clean, 1e-12),
                     torch.full_like(resolution_per_event, 1e6),
                 )
-                total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                if fisher_use_fom:
+                    total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                else:
+                    total_resolution = torch.mean(safe_res)
             else:
                 # Keep optimization stable when all events are invalid/singular.
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
@@ -948,7 +952,10 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     torch.clamp_min(res_clean, 1e-12),
                     torch.full_like(resolution_per_event, 1e6),
                 )
-                total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                if fisher_use_fom:
+                    total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                else:
+                    total_resolution = torch.mean(safe_res)
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
             return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
