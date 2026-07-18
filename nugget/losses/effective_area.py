@@ -1126,11 +1126,15 @@ def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.
     # Weighted xy center.
     center_xy = torch.sum(w.unsqueeze(1) * xy_positions, dim=0) / torch.sum(w)
 
-    # Smooth radius via weighted log-sum-exp over radial distances.
+    # Smooth radius via weighted log-sum-exp over radial distances. Folding log(w)
+    # into the exponent (rather than taking d_ref as the unweighted max distance)
+    # ensures a far but near-zero-weight (inactive) point can't anchor the scale
+    # or dominate the resulting radius.
     distances_xy = torch.sqrt(torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1))
-    d_ref = torch.max(distances_xy).detach()
     log_w = torch.log(w)
-    radius = d_ref + temperature * torch.logsumexp((distances_xy - d_ref) / temperature + log_w, dim=0)
+    weighted_terms = distances_xy / temperature + log_w
+    d_ref = torch.max(weighted_terms).detach()
+    radius = temperature * (d_ref + torch.logsumexp(weighted_terms - d_ref, dim=0))
     # radius = torch.sqrt(torch.sum(w * torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1)) / torch.sum(w))
 
     # Smooth z-bounds via weighted log-sum-exp (stable references).
