@@ -548,7 +548,7 @@ class Visualizer:
         rov_penalty=None,
         *,
         alpha=0.18,
-        line_alpha=0.8,
+        line_alpha=0,
         linewidth=1.8,
         zorder=2,
         color='purple',
@@ -3880,7 +3880,8 @@ class Visualizer:
                     xy_np = string_xy.clone().detach().cpu().numpy()
                     weights_np = string_weights
                     # Create alpha values: 1 if weight > 0.7, else 0.5
-                    alphas = [1 if weights_np[i] > 0.7 else 0.6 for i in range(len(weights_np))]
+                    # alphas = [1 if weights_np[i] > 0.7 else 0.6 for i in range(len(weights_np))]
+                    alphas = [1 for i in range(len(weights_np))]  # For now, set all alphas to 1 for visibility
                     # edge_colors=['k' if weights_np[i] > 0.7 else 'none' for i in range(len(weights_np))]
                     # Create scatter plot with explicit normalization
                     

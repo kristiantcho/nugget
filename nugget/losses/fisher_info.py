@@ -773,7 +773,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         # New parameters for batched loading from files
         event_paths = kwargs.get('event_paths', None)
         fisher_info_paths = kwargs.get('fisher_info_paths', None)
-        fisher_use_fom = kwargs.get('fisher_use_fom', True)
+        fisher_res_metric = kwargs.get('fisher_res_metric', 'fom') # 'fom' 'median' 'mean' 
         
         
         # Load and batch events/Fisher info from files or subset precomputed data
@@ -904,8 +904,10 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     torch.clamp_min(res_clean, 1e-15),
                     torch.full_like(resolution_per_event, 1e6),
                 )
-                if fisher_use_fom:
+                if fisher_res_metric == 'fom':
                     total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                elif fisher_res_metric == 'median':
+                    total_resolution = torch.median(safe_res)
                 else:
                     total_resolution = torch.mean(safe_res)
             else:
@@ -952,8 +954,10 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     torch.clamp_min(res_clean, 1e-12),
                     torch.full_like(resolution_per_event, 1e6),
                 )
-                if fisher_use_fom:
+                if fisher_res_metric == 'fom':
                     total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                elif fisher_res_metric == 'median':
+                    total_resolution = torch.median(safe_res)
                 else:
                     total_resolution = torch.mean(safe_res)
             else:

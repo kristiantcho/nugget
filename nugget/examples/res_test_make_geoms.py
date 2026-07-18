@@ -25,10 +25,11 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
     rov_height=160, 
     rov_tri_length=160
 )
+fisher_res_metric = 'median'  # 'fom' 'median' 'mean'
 version = '_poisson'
 use_rov = 'no_rov'
 num_events = 'inf'
-folder_name = f'res_test/opt_geoms/opt_geoms_127_full_hex_{num_events}_r600_50{version}_{use_rov}/'
+folder_name = f'res_test/opt_geoms/opt_geoms_127_full_hex_{num_events}_r600_50{version}_{use_rov}_{fisher_res_metric}/'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -85,7 +86,7 @@ loss_params.update({
     'uninformative_fisher_value':1e-6,
     'empty_cache_after_event': False,
     'events_per_batch': 300,
-
+    'fisher_res_metric': fisher_res_metric,  # 'fom' 'median' 'mean'
     'constraints_list': [
                 # 'energy_resolution_loss',
                 # 'angular_resolution_loss',
@@ -110,7 +111,7 @@ loss_weights_dict = {
     # 'string_repulsion_penalty': 0.000001,
     # 'string_weights_penalty': 0,     # Encourage sparse solutions
     'string_weights_penalty': 0.05,     # Encourage sparse solutions
-    'string_number_penalty': 1,      # Limit detector complexity
+    'string_number_penalty': 10,      # Limit detector complexity
     'weight_binarization_penalty': 0.1,
     'rov_penalty': 1,
     'diversity_penalty': 0.001
@@ -255,5 +256,7 @@ for i in range(15):
         # save_best_geom_file = f'{folder_name}geom_e{(2*i)+2}_e{2*(i+1) + 2}.pkl',  # File to save best geometry found
         save_best_geom_file = f'{folder_name}/geom_{i}.pkl',  # File to save best geometry found
         # save_best_geom_file = f'{folder_name}geom_e{i+2}_e{i+3}.pkl',
-        save_last_geom = True, 
+        save_last_geom = True,
+        revert_on_nan=True,                      # Revert geometry if loss becomes NaN
+        max_nan_retries=5,  
     )
