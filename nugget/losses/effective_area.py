@@ -1129,7 +1129,8 @@ def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.
     center_xy = torch.tensor([0.0, 0.0], device=device, dtype=dtype)
     distances_xy = torch.sqrt(torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1))
     log_w = torch.log(w)
-    weighted_terms = distances_xy / temperature + log_w
+
+    weighted_terms = (distances_xy + log_w) / temperature
     d_ref = torch.max(weighted_terms).detach()
     radius = temperature * (d_ref + torch.logsumexp(weighted_terms - d_ref, dim=0))
     # radius = torch.sqrt(torch.sum(w * torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1)) / torch.sum(w))
