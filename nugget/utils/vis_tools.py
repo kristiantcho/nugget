@@ -34,6 +34,15 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
+# Try importing shapely for polygon union operations (e.g. unioning ROV safe
+# spaces across strings), but don't fail if not available.
+try:
+    from shapely.geometry import Polygon as ShapelyPolygon
+    from shapely.ops import unary_union
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    SHAPELY_AVAILABLE = False
+
 def sph_to_cart(theta, phi):
     """Converts spherical coordinates (zenith, azimuth) to a 3D Cartesian vector."""
     st, ct = torch.sin(theta), torch.cos(theta)
@@ -444,33 +453,26 @@ class Visualizer:
             # Best-effort sizing; keep default fontsize on failure.
             pass
 
-    def _draw_rov_safe_space_at_string(
-        self,
-        ax,
-        origin_xy,
-        angle_rad,
-        rov_penalty=None,
-        *,
-        alpha=0.12,
-        line_alpha=0.55,
-        linewidth=1.5,
-        zorder=2,
-    ):
-        """Draw a rotated ROV safe-space corridor anchored at a string.
+    def _rov_safe_space_vertices_at_string(self, origin_xy, angle_rad, rov_penalty=None):
+        """Compute the world-space vertices of a string's ROV safe-space corridor.
 
         The geometry matches `ROVPenalty`.
         Note: the angle convention is the one used in `ROVPenalty`'s rotation
         (local->world is a rotation by `-angle_rad`).
+
+        Returns
+        -------
+        np.ndarray of shape (5, 2), or None if inputs are invalid.
         """
         if rov_penalty is None or origin_xy is None or angle_rad is None:
-            return
+            return None
 
         try:
             x0 = float(origin_xy[0])
             y0 = float(origin_xy[1])
             a = float(angle_rad)
         except Exception:
-            return
+            return None
 
         L_rect = float(rov_penalty.rov_rec_width)
         W_rect = float(rov_penalty.rov_height)
@@ -497,6 +499,30 @@ class Visualizer:
         poly_world[:, 0] += x0
         poly_world[:, 1] += y0
 
+        return poly_world
+
+    def _draw_rov_safe_space_at_string(
+        self,
+        ax,
+        origin_xy,
+        angle_rad,
+        rov_penalty=None,
+        *,
+        alpha=0.12,
+        line_alpha=0.55,
+        linewidth=1.5,
+        zorder=2,
+    ):
+        """Draw a rotated ROV safe-space corridor anchored at a string.
+
+        The geometry matches `ROVPenalty`.
+        Note: the angle convention is the one used in `ROVPenalty`'s rotation
+        (local->world is a rotation by `-angle_rad`).
+        """
+        poly_world = self._rov_safe_space_vertices_at_string(origin_xy, angle_rad, rov_penalty)
+        if poly_world is None:
+            return
+
         poly_world_closed = np.vstack([poly_world, poly_world[0]])
         ax.plot(
             poly_world_closed[:, 0],
@@ -513,6 +539,97 @@ class Visualizer:
             alpha=float(np.clip(alpha, 0.0, 1.0)),
             zorder=zorder,
         )
+
+    def _draw_rov_safe_space_union(
+        self,
+        ax,
+        origins_xy,
+        angles_rad,
+        rov_penalty=None,
+        *,
+        alpha=0.18,
+        line_alpha=0.8,
+        linewidth=1.8,
+        zorder=2,
+        color='purple',
+        label='Unioned ROV Safe Space',
+    ):
+        """Draw the unioned shape of multiple strings' ROV safe-space corridors.
+
+        Parameters
+        ----------
+        origins_xy : array-like of shape (N, 2)
+            String XY positions to anchor each safe-space corridor at.
+        angles_rad : array-like of shape (N,)
+            Orientation (radians) for each string's corridor, e.g. the
+            least-blocked angle for that string.
+        rov_penalty : ROVPenalty object or None
+            Used to get corridor dimensions.
+
+        Requires the optional `shapely` package. No-ops (with a message drawn
+        on the axes) if it is not installed.
+        """
+        if not SHAPELY_AVAILABLE:
+            ax.text(
+                0.5, 0.02,
+                "shapely not installed: cannot draw unioned ROV safe space",
+                ha='center', va='bottom', transform=ax.transAxes,
+                fontsize=8, color='red',
+            )
+            return
+
+        if rov_penalty is None or origins_xy is None or angles_rad is None:
+            return
+
+        polygons = []
+        for origin_xy, angle_rad in zip(origins_xy, angles_rad):
+            verts = self._rov_safe_space_vertices_at_string(origin_xy, angle_rad, rov_penalty)
+            if verts is None:
+                continue
+            poly = ShapelyPolygon(verts)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if not poly.is_empty:
+                polygons.append(poly)
+
+        if not polygons:
+            return
+
+        union_shape = unary_union(polygons)
+        geoms = list(union_shape.geoms) if hasattr(union_shape, 'geoms') else [union_shape]
+
+        first = True
+        for geom in geoms:
+            if geom.is_empty:
+                continue
+            exterior_coords = np.asarray(geom.exterior.coords)
+            ax.fill(
+                exterior_coords[:, 0],
+                exterior_coords[:, 1],
+                color=color,
+                alpha=float(np.clip(alpha, 0.0, 1.0)),
+                zorder=zorder,
+                label=label if first else None,
+            )
+            ax.plot(
+                exterior_coords[:, 0],
+                exterior_coords[:, 1],
+                color=color,
+                linewidth=linewidth,
+                alpha=float(np.clip(line_alpha, 0.0, 1.0)),
+                zorder=zorder,
+            )
+            for interior in geom.interiors:
+                interior_coords = np.asarray(interior.coords)
+                ax.plot(
+                    interior_coords[:, 0],
+                    interior_coords[:, 1],
+                    color=color,
+                    linewidth=linewidth,
+                    alpha=float(np.clip(line_alpha, 0.0, 1.0)),
+                    zorder=zorder,
+                )
+            first = False
 
     def _safe_griddata_interpolation(self, points_xy, values, grid_points, resolution, method='linear', fill_value=None):
         """
@@ -716,6 +833,13 @@ class Visualizer:
                         - rov_draw_safe_space_on_violations: bool, optional. If True, the `string_xy_rov_penalty` plot will
                             draw a per-string ROV safe-space corridor for strings with violation >= 1, oriented by
                             `rov_least_blocked_angle_per_string` (both are expected to be present in kwargs from `ROVPenalty`).
+                        - rov_draw_safe_space_active_only: bool, optional. If True, further restricts
+                            `rov_draw_safe_space_on_violations` to only draw the per-string corridor for active strings
+                            (string_weights >= weight_threshold).
+                        - rov_draw_safe_space_union: bool, optional. If True, the `string_xy_rov_penalty` plot will draw
+                            the unioned shape of the best (least-blocked-angle) ROV safe spaces across all active strings
+                            (string_weights >= weight_threshold, or all strings if string_weights is not provided).
+                            Requires the optional `shapely` package.
             - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range] 
               instead of the default domain boundaries [-half_domain, half_domain]
             - plot_with_surrogate: bool, optional. If True and 'light_surrogate_func' and 'surrogate_event_params' 
@@ -2786,6 +2910,8 @@ class Visualizer:
                 rov_least_blocked_angle_per_string = kwargs.get('rov_least_blocked_angle_per_string', None)
                 string_weights = kwargs.get('string_weights', None)
                 draw_rov_safe_space_on_violations = bool(kwargs.get('rov_draw_safe_space_on_violations', False))
+                draw_rov_safe_space_active_only = bool(kwargs.get('rov_draw_safe_space_active_only', False))
+                draw_rov_safe_space_union = bool(kwargs.get('rov_draw_safe_space_union', False))
                 weight_threshold = kwargs.get('weight_threshold', 0.7)
                 if rov_penalty_per_string is not None:
                     # Convert ROV penalty per string to numpy
@@ -2795,29 +2921,60 @@ class Visualizer:
                         rov_penalty_np = np.array(rov_penalty_per_string)
                     rov_penalty_np*= len(xy_np)
 
+                    # Active-string mask (weight >= threshold), matching the
+                    # convention used by the other string_xy plots.
+                    active_mask = None
+                    if string_weights is not None:
+                        string_weights_np = np.array(
+                            [string_weights[idx] for idx in range(len(xy_np))]
+                        )
+                        active_mask = string_weights_np >= weight_threshold
+
                     # Optionally draw the per-string ROV safe-space corridor for
                     # strings with a (displayed) violation >= 1, oriented by the
-                    # least-blocked angle.
-                    if draw_rov_safe_space_on_violations:
-                        rov_penalty_func = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
-                        if rov_penalty_func is not None and rov_least_blocked_angle_per_string is not None:
-                            if torch.is_tensor(rov_least_blocked_angle_per_string):
-                                rov_angles_np = rov_least_blocked_angle_per_string.detach().cpu().numpy()
-                            else:
-                                rov_angles_np = np.array(rov_least_blocked_angle_per_string)
+                    # least-blocked angle. When `rov_draw_safe_space_active_only`
+                    # is set, this is further restricted to active strings only.
+                    rov_angles_np = None
+                    if rov_least_blocked_angle_per_string is not None:
+                        if torch.is_tensor(rov_least_blocked_angle_per_string):
+                            rov_angles_np = rov_least_blocked_angle_per_string.detach().cpu().numpy()
+                        else:
+                            rov_angles_np = np.array(rov_least_blocked_angle_per_string)
+                        if rov_angles_np.shape[0] != xy_np.shape[0]:
+                            rov_angles_np = None
 
-                            if rov_angles_np.shape[0] == xy_np.shape[0]:
-                                violation_mask = rov_penalty_np >= weight_threshold
-                                viol_idx = np.where(violation_mask)[0]
-                                for i in viol_idx:
-                                    self._draw_rov_safe_space_at_string(
-                                        ax,
-                                        origin_xy=xy_np[i],
-                                        angle_rad=rov_angles_np[i],
-                                        rov_penalty=rov_penalty_func,
-                                        zorder=1,
-                                    )
-                    
+                    rov_penalty_func = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
+
+                    if draw_rov_safe_space_on_violations:
+                        if rov_penalty_func is not None and rov_angles_np is not None:
+                            violation_mask = rov_penalty_np >= weight_threshold
+                            if draw_rov_safe_space_active_only and active_mask is not None:
+                                violation_mask = violation_mask & active_mask
+                            viol_idx = np.where(violation_mask)[0]
+                            for i in viol_idx:
+                                self._draw_rov_safe_space_at_string(
+                                    ax,
+                                    origin_xy=xy_np[i],
+                                    angle_rad=rov_angles_np[i],
+                                    rov_penalty=rov_penalty_func,
+                                    zorder=1,
+                                )
+
+                    # Optionally draw the unioned shape of all (active) strings'
+                    # best (least-blocked-angle) ROV safe spaces.
+                    if draw_rov_safe_space_union:
+                        if rov_penalty_func is not None and rov_angles_np is not None:
+                            union_idx_mask = active_mask if active_mask is not None else np.ones(len(xy_np), dtype=bool)
+                            union_idx = np.where(union_idx_mask)[0]
+                            if union_idx.size > 0:
+                                self._draw_rov_safe_space_union(
+                                    ax,
+                                    origins_xy=xy_np[union_idx],
+                                    angles_rad=rov_angles_np[union_idx],
+                                    rov_penalty=rov_penalty_func,
+                                    zorder=1,
+                                )
+
                     # Use string weights for alpha transparency (no threshold filtering)
                     if string_weights is not None:
                         alpha_vals = np.array([string_weights[idx] for idx in string_indices])

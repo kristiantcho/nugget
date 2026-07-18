@@ -220,6 +220,62 @@ class Optimizer():
                 snapshot[key] = value
         return snapshot
 
+    def _geom_dict_has_nan(self):
+        """Check whether any tensor in the current geom_dict contains NaNs."""
+        for value in self.geom_dict.values():
+            if torch.is_tensor(value) and torch.isnan(value).any():
+                return True
+        return False
+
+    def _checkpoint_state(self):
+        """Save a restorable checkpoint of the geometry and optimizer state.
+
+        Unlike `_snapshot_geom_dict`, this keeps tensors on-device and also
+        captures each torch optimizer's internal state (e.g. Adam's running
+        moment estimates), since reverting only the parameter values while
+        leaving poisoned optimizer state in place can immediately reproduce
+        the same NaN on the very next step.
+        """
+        geom_checkpoint = {}
+        for key, value in self.geom_dict.items():
+            if torch.is_tensor(value):
+                geom_checkpoint[key] = value.detach().clone()
+            else:
+                geom_checkpoint[key] = value
+        optimizer_checkpoint = {
+            name: pickle.loads(pickle.dumps(optimizer.state_dict()))
+            for name, optimizer in self.optimizers.items()
+        }
+        return {'geom_dict': geom_checkpoint, 'optimizer_states': optimizer_checkpoint}
+
+    def _restore_checkpoint(self, checkpoint):
+        """Restore geometry parameters and optimizer state from a checkpoint.
+
+        Restored parameter tensors are re-created as fresh leaf tensors (with
+        `requires_grad` matching the live tensor they replace) so the
+        optimizers keep referencing valid, grad-eligible parameters.
+        """
+        restored_geom_dict = {}
+        for key, value in checkpoint['geom_dict'].items():
+            if torch.is_tensor(value):
+                new_tensor = value.clone().to(self.device)
+                if key in self.optimizers:
+                    new_tensor.requires_grad = True
+                restored_geom_dict[key] = new_tensor
+            else:
+                restored_geom_dict[key] = value
+        self.geom_dict = restored_geom_dict
+
+        for name, optimizer in self.optimizers.items():
+            if name not in restored_geom_dict:
+                continue
+            new_optimizer = torch.optim.Adam([restored_geom_dict[name]], lr=optimizer.param_groups[0]['lr'])
+            if name in checkpoint['optimizer_states']:
+                new_optimizer.load_state_dict(checkpoint['optimizer_states'][name])
+            self.optimizers[name] = new_optimizer
+
+        self.geom_dict = self.geometry.update_points(**self.geom_dict)
+
     def optimize(self, loss_func_dict, loss_dict=None, uw_loss_dict=None, loss_weights_dict=None, loss_params_dict=None, n_iter=100, print_freq=10, vis_freq=None, vis_kwargs=None, gif_freq=None, **kwargs):
         
         if loss_dict is None:
@@ -247,6 +303,9 @@ class Optimizer():
         self.save_geom_folder = kwargs.get('save_geom_folder', None)
         self.save_geom_freq = kwargs.get('save_geom_freq', 100)
         self.continue_saving = kwargs.get('continue_saving', False)  # Whether to continue incrementing geom save index from existing files in save_geom_folder
+        # Optional: detect when the geometry becomes NaN and revert to the last good checkpoint.
+        self.revert_on_nan = kwargs.get('revert_on_nan', False)
+        self.max_nan_retries = kwargs.get('max_nan_retries', 5)
         # Optional: only apply sigmoid to a subset of losses.
         # - If provided (list/tuple/set of strings), sigmoid is applied only to those loss names.
         # - If not provided, preserves legacy behavior (sigmoid applied to all losses when enabled).
@@ -321,8 +380,25 @@ class Optimizer():
             for key in self.optimizers:
                 self.optimizer_phases[key] = False
         
-        max_iter = max([len(v) for v in self.loss_iterations_dict.values()]) if len(self.loss_iterations_dict) > 0 else 0     
+        max_iter = max([len(v) for v in self.loss_iterations_dict.values()]) if len(self.loss_iterations_dict) > 0 else 0
+        self._stopped_early_on_nan = False
         for it in range(max_iter, max_iter+n_iter):
+          if self._stopped_early_on_nan:
+              break
+          nan_retries = 0
+          while True:
+            if self.revert_on_nan:
+                pre_step_checkpoint = self._checkpoint_state()
+                history_lengths = {
+                    'loss_iterations_dict': {k: len(v) for k, v in self.loss_iterations_dict.items()},
+                    'loss_dict': {k: len(v) for k, v in self.loss_dict.items()},
+                    'uw_loss_dict': {k: len(v) for k, v in self.uw_loss_dict.items()},
+                    'vis_loss_dict': {k: len(v) for k, v in self.vis_loss_dict.items()},
+                    'vis_uw_loss_dict': {k: len(v) for k, v in self.vis_uw_loss_dict.items()},
+                    'total_loss': len(self.total_loss),
+                    'alm_lambdas_history': {k: len(v) for k, v in self.alm_lambdas_history.items()},
+                    'alm_mus_history': {k: len(v) for k, v in self.alm_mus_history.items()},
+                }
             self._current_loss_dict = {}
             self._current_uw_loss_dict = {}
             vis_kwargs.update({'iteration': it})
@@ -411,6 +487,38 @@ class Optimizer():
                     self.schedulers[key].step()
             self.geom_dict = self.geometry.update_points(**self.geom_dict)
 
+            if self.revert_on_nan and self._geom_dict_has_nan():
+                nan_retries += 1
+                # Revert the parameters/optimizer state and drop this iteration's history
+                # entries regardless of whether we retry or give up, so neither the saved
+                # geometry nor the loss histories ever reflect a NaN step.
+                self._restore_checkpoint(pre_step_checkpoint)
+                for key, length in history_lengths['loss_iterations_dict'].items():
+                    del self.loss_iterations_dict[key][length:]
+                for key, length in history_lengths['loss_dict'].items():
+                    del self.loss_dict[key][length:]
+                for key, length in history_lengths['uw_loss_dict'].items():
+                    del self.uw_loss_dict[key][length:]
+                for key, length in history_lengths['vis_loss_dict'].items():
+                    del self.vis_loss_dict[key][length:]
+                for key, length in history_lengths['vis_uw_loss_dict'].items():
+                    del self.vis_uw_loss_dict[key][length:]
+                del self.total_loss[history_lengths['total_loss']:]
+                for key, length in history_lengths['alm_lambdas_history'].items():
+                    del self.alm_lambdas_history[key][length:]
+                for key, length in history_lengths['alm_mus_history'].items():
+                    del self.alm_mus_history[key][length:]
+
+                if nan_retries > self.max_nan_retries:
+                    print(f"Iter {it+1}: geometry became NaN and max_nan_retries ({self.max_nan_retries}) "
+                          "exceeded; stopping optimization early and keeping the last non-NaN geometry.")
+                    self._stopped_early_on_nan = True
+                    break
+                else:
+                    print(f"Iter {it+1}: geometry became NaN, reverting to previous step and retrying "
+                          f"(attempt {nan_retries}/{self.max_nan_retries}).")
+                    continue
+
             if self.clear_cuda_cache and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -439,7 +547,21 @@ class Optimizer():
                 if (it % gif_freq == 0 or it == n_iter - 1):
                     vis_kwargs.update({"make_gif": True})
                     self.visualizer.visualize_progress(**vis_kwargs)
-        
+            break
+
+        if self._stopped_early_on_nan:
+            # The iteration that triggered the stop never ran the usual save block
+            # (its history was rolled back), so make sure the last non-NaN geometry
+            # still gets persisted via the normal save options before returning.
+            if self.save_best_geom_file is not None:
+                with open(self.save_best_geom_file, 'wb') as f:
+                    pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
+            if self._geom_save_enabled:
+                self._geom_save_idx += 1
+                geom_path = os.path.join(self.save_geom_folder, f"geom_{self._geom_save_idx}.pkl")
+                with open(geom_path, 'wb') as f:
+                    pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
+
         return self.geom_dict
     
 class CustomWeight(WeightModel):
