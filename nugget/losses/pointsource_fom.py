@@ -1,8 +1,9 @@
 import torch
 
 from nugget.losses.base_loss import LossFunction
-from nugget.losses.effective_area import EffectiveAreaLoss
+from nugget.losses.effective_area import EffectiveAreaLoss, get_weighted_bounding_cylinder
 from nugget.losses.fisher_info import ResolutionLoss, WeightedResolutionLoss
+from nugget.samplers.cyl_sampler import CylinderSampler
 
 
 class FoMLoss(LossFunction):
@@ -77,15 +78,82 @@ class FoMLoss(LossFunction):
 
         return event_params
 
+    def _get_geometry_bounding_cylinder(self, geom_dict, temperature):
+        """Compute the same weighted bounding cylinder EffectiveAreaLoss derives from geometry."""
+        points_3d = geom_dict.get("points_3d")
+        string_xy = geom_dict.get("string_xy", None)
+        string_weights = geom_dict.get("string_weights", None)
+
+        if string_weights is not None:
+            if string_xy is None:
+                seen = set()
+                unique_indices = []
+                for i, xy in enumerate(points_3d[:, :2]):
+                    xy_tuple = tuple(xy.tolist())
+                    if xy_tuple not in seen:
+                        seen.add(xy_tuple)
+                        unique_indices.append(i)
+                string_xy = points_3d[unique_indices, :2]
+            point_weights = self.effective_area_loss.map_string_weights_to_points(points_3d, string_xy, string_weights)
+        else:
+            point_weights = torch.ones(len(points_3d), device=self.device)
+
+        return get_weighted_bounding_cylinder(points_3d, point_weights=point_weights, temperature=temperature)
+
+    # Constructor args of CylinderSampler that are captured explicitly (not in
+    # self.kwargs), so a from-scratch cylinder can be safely merged into a
+    # clone's **kwargs without colliding with these.
+    _CYLINDER_SAMPLER_RESERVED_KEYS = ("device", "dim", "domain_size", "cylinder_center", "cylinder_height", "cylinder_radius")
+
+    def _get_geometry_adjusted_sampler(self, geom_dict, kwargs):
+        """Clone the configured signal_sampler onto the cylinder derived from the current geometry."""
+        signal_sampler = kwargs.get("signal_sampler", None)
+        if signal_sampler is None:
+            raise ValueError("signal_sampler must be provided when adjust_cylinder_to_geometry=True")
+        if not isinstance(signal_sampler, CylinderSampler):
+            raise TypeError(
+                "adjust_cylinder_to_geometry=True requires signal_sampler to be a CylinderSampler, "
+                f"got {type(signal_sampler)}"
+            )
+
+        temperature = kwargs.get("bounding_cylinder_temperature", 0.1)
+        center, radius, height = self._get_geometry_bounding_cylinder(geom_dict, temperature)
+
+        sampler_kwargs = {
+            k: v for k, v in signal_sampler.kwargs.items()
+            if k not in self._CYLINDER_SAMPLER_RESERVED_KEYS
+        }
+
+        return CylinderSampler(
+            device=signal_sampler.device,
+            dim=signal_sampler.dim,
+            domain_size=signal_sampler.domain_size,
+            cylinder_center=center.detach(),
+            cylinder_height=height.detach(),
+            cylinder_radius=radius.detach(),
+            **sampler_kwargs,
+        )
+
     def __call__(self, geom_dict, **kwargs):
         # use_irregular_cylinder = kwargs.get("use_irregular_cylinder", False)
         # use_batched_effective_area = kwargs.get("use_batched_effective_area", False)
+
+        adjust_cylinder_to_geometry = kwargs.get("fom_adjust_cylinder_to_geometry", False)
 
         # Let resolution choose/load/subsample events first (e.g. weighted Fisher path).
         resolution_kwargs = dict(kwargs)
         normalize_fom_by_energy = kwargs.get("normalize_fom_by_energy", True)
         # resolution_kwargs.pop("use_irregular_cylinder", None)
         # resolution_kwargs.pop("use_batched_effective_area", None)
+
+        if adjust_cylinder_to_geometry:
+            # Recompute the sampling cylinder from the current geometry's bounding
+            # cylinder (same as EffectiveAreaLoss would derive it) and resample fresh
+            # events from it, rather than reusing whatever events/cylinder the caller
+            # passed in.
+            geometry_adjusted_sampler = self._get_geometry_adjusted_sampler(geom_dict, kwargs)
+            resolution_kwargs["signal_sampler"] = geometry_adjusted_sampler
+            resolution_kwargs["signal_event_params"] = None
 
         # Angular resolution (weighted or non-weighted)
         resolution_out = self.resolution_loss(geom_dict, **resolution_kwargs)
@@ -97,9 +165,9 @@ class FoMLoss(LossFunction):
         # Use the exact event list that resolution used after any internal subsampling.
         shared_events = resolution_out.get("resolution_params", None)
         if shared_events is None:
-            shared_events = self._get_events(kwargs)
+            shared_events = self._get_events(resolution_kwargs)
 
-        effective_area_kwargs = dict(kwargs)
+        effective_area_kwargs = dict(resolution_kwargs)
         effective_area_kwargs["signal_event_params"] = shared_events
         effective_area_kwargs["per_event_effective_area_loss"] = True
         # effective_area_kwargs["use_irregular_cylinder"] = use_irregular_cylinder
