@@ -863,10 +863,10 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 # Use traditional zenith/azimuth resolution - need covariance matrix
                 # Vectorized batch inverse
                 n_events = len(signal_event_params)
-                regularized_fisher = total_fisher_info + 1e-5 * torch.eye(
-                    total_fisher_info.shape[1], device=self.device
-                ).unsqueeze(0).expand(n_events, -1, -1)  # Increased regularization for stability
-                
+                # regularized_fisher = total_fisher_info + 1e-20 * torch.eye(
+                #     total_fisher_info.shape[1], device=self.device
+                # ).unsqueeze(0).expand(n_events, -1, -1)  # Increased regularization for stability
+                regularized_fisher = total_fisher_info 
                 try:
                     cov_matrix = torch.inverse(regularized_fisher)
                 except:
@@ -890,7 +890,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     angular_resolution_rad = torch.sqrt(var_zenith + torch.sin(zenith)*var_azimuth + 2*torch.sin(zenith)*torch.cos(zenith)*covar_zenith_azimuth)
                     resolution_per_event.append(angular_resolution_rad)
                 resolution_per_event = torch.stack(resolution_per_event)
-            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
+            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-15)
             if finite_mask.any():
                 # Replace bad entries with a large sentinel WITHIN the graph (not via
                 # boolean indexing) so their 1/r^2 contribution is ~0 AND no NaN/inf
@@ -901,7 +901,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 res_clean = torch.nan_to_num(resolution_per_event, nan=1e6, posinf=1e6, neginf=1e6)
                 safe_res = torch.where(
                     finite_mask,
-                    torch.clamp_min(res_clean, 1e-12),
+                    torch.clamp_min(res_clean, 1e-15),
                     torch.full_like(resolution_per_event, 1e6),
                 )
                 if fisher_use_fom:
@@ -916,7 +916,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
             # Compute covariance matrix for energy resolution
             # Vectorized batch inverse
             n_events = len(signal_event_params)
-            regularized_fisher = total_fisher_info + 1e-6 * torch.eye(
+            regularized_fisher = total_fisher_info + 1e-20 * torch.eye(
                 total_fisher_info.shape[1], device=self.device
             ).unsqueeze(0).expand(n_events, -1, -1)
             

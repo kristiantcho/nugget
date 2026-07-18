@@ -1785,7 +1785,7 @@ def directional_resolution(F3, n):
     if not is_batched:
         # Single input case - normalize and compute. Epsilon-guard the norm so a
         # degenerate (zero) direction does not give 0/0 = NaN.
-        n = n / torch.norm(n).clamp_min(1e-12)
+        n = n / torch.norm(n)
 
         # --- Build tangent basis B (3x2) ---
         ref = torch.tensor([0.0, 0.0, 1.0], dtype=n.dtype, device=n.device)
@@ -1793,9 +1793,9 @@ def directional_resolution(F3, n):
             ref = torch.tensor([1.0, 0.0, 0.0], dtype=n.dtype, device=n.device)
 
         b1 = torch.cross(n, ref)
-        b1 = b1 / torch.norm(b1).clamp_min(1e-12)
+        b1 = b1 / torch.norm(b1)
         b2 = torch.cross(n, b1)
-        b2 = b2 / torch.norm(b2).clamp_min(1e-12)
+        b2 = b2 / torch.norm(b2)
         B = torch.stack([b1, b2], dim=1)  # 3x2
 
         # --- Project Fisher ---
@@ -1804,7 +1804,7 @@ def directional_resolution(F3, n):
         # finite when F2 is near-singular (zero-Fisher strings); the gradient of
         # inverse scales like O(1/eps^2), so 1e-10 -> ~1e20. 1e-6 keeps it bounded
         # while remaining small relative to physically-informative Fisher values.
-        F2 = F2 + 1e-6 * torch.eye(2, device=F2.device, dtype=F2.dtype)
+        # F2 = F2 + 1e-12 * torch.eye(2, device=F2.device, dtype=F2.dtype)
 
         # --- Invert to get covariance ---
         try:
@@ -1822,10 +1822,10 @@ def directional_resolution(F3, n):
         c11 = Cov2[1, 1]
         c01 = Cov2[0, 1]
         half_tr = 0.5 * (c00 + c11)
-        half_gap = torch.sqrt((0.5 * (c00 - c11)) ** 2 + c01 ** 2 + 1e-12)
+        half_gap = torch.sqrt((0.5 * (c00 - c11)) ** 2 + c01 ** 2)
         eigvals = torch.stack([half_tr - half_gap, half_tr + half_gap])
-        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
-        sigma_eff = torch.sqrt(torch.mean(eigvals) + 1e-10)  # Add epsilon for numerical stability
+        # eigvals = torch.nn.functional.softplus(eigvals, beta=10) - (math.log(2.0) / 10)
+        sigma_eff = torch.sqrt(torch.mean(eigvals))  # Add epsilon for numerical stability
         r68 = 1.515 * sigma_eff
 
         return r68
@@ -1835,19 +1835,9 @@ def directional_resolution(F3, n):
         batch_size = F3.shape[0]
         device = F3.device
         dtype = F3.dtype
-        
-        # Normalize direction vectors (N, 3). Guard the norm with an epsilon so a
-        # degenerate (zero) direction does not produce 0/0 = NaN that then
-        # poisons the entire tangent basis and resolution.
-        n = n / torch.norm(n, dim=1, keepdim=True).clamp_min(1e-12)
+  
+        n = n / torch.norm(n, dim=1, keepdim=True)
 
-        # --- Build tangent basis B for all directions (N, 3, 2) ---
-        # Reference vector, per-row so we can safely swap it for directions that
-        # are nearly parallel to the default ref. NOTE: a plain
-        # torch.tensor(...).expand(batch_size, 3) is a stride-0 broadcast VIEW;
-        # writing into it in-place (ref[mask] = ...) is undefined behaviour and
-        # was corrupting the ref for parallel directions, leaving cross(n, ref)=0
-        # -> b1 = 0/0 = NaN. Build a real (N, 3) tensor instead.
         ref = torch.zeros(batch_size, 3, dtype=dtype, device=device)
         ref[:, 2] = 1.0  # default reference [0, 0, 1] for every row
 
@@ -1861,11 +1851,11 @@ def directional_resolution(F3, n):
         # ref swap above, ||b1|| is bounded away from 0 for valid unit
         # directions, but the clamp keeps it finite even for degenerate inputs.
         b1 = torch.cross(n, ref, dim=1)  # (N, 3)
-        b1 = b1 / torch.norm(b1, dim=1, keepdim=True).clamp_min(1e-12)
+        b1 = b1 / torch.norm(b1, dim=1, keepdim=True)
 
         # Second tangent vector
         b2 = torch.cross(n, b1, dim=1)  # (N, 3)
-        b2 = b2 / torch.norm(b2, dim=1, keepdim=True).clamp_min(1e-12)
+        b2 = b2 / torch.norm(b2, dim=1, keepdim=True)
 
         # Stack to form basis: (N, 3, 2)
         B = torch.stack([b1, b2], dim=2)
@@ -1878,7 +1868,7 @@ def directional_resolution(F3, n):
         # stays finite when F2 is near-singular (zero-Fisher strings); the gradient
         # of inverse scales like O(1/eps^2), so 1e-8 -> ~1e16. 1e-6 keeps it bounded
         # while remaining small relative to physically-informative Fisher values.
-        F2 = F2 + 1e-6 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)
+        # F2 = F2 + 1e-15 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)
         
         # --- Invert to get covariance (N, 2, 2) ---
         try:
@@ -1909,10 +1899,10 @@ def directional_resolution(F3, n):
         c11 = Cov2[:, 1, 1]
         c01 = Cov2[:, 0, 1]
         half_tr = 0.5 * (c00 + c11)
-        half_gap = torch.sqrt((0.5 * (c00 - c11)) ** 2 + c01 ** 2 + 1e-12)
+        half_gap = torch.sqrt((0.5 * (c00 - c11)) ** 2 + c01 ** 2 )
         eigvals = torch.stack([half_tr - half_gap, half_tr + half_gap], dim=1)  # (N, 2)
-        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
-        sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) + 1e-10)  # (N,)
+        # eigvals = torch.nn.functional.softplus(eigvals, beta=10) - (math.log(2.0) / 10)
+        sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) )  # (N,)
         r68 = 1.515 * sigma_eff  # (N,)
 
         return r68

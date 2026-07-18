@@ -9,23 +9,23 @@ radius = 600
 height = 1000
 lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = 'track')
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate_batched
-signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
-                                                    device=None, 
-                                                    event_type='signal', 
-                                                    domain_size=1600, 
-                                                    E_min=1e2, 
-                                                    E_max=1e8, 
-                                                    find_exact_intersection=True,
-                                                    random_position_along_ray=False,  
-                                                    energy_dist='log_uniform',
-                                                    cylinder_center=center,
-                                                    cylinder_radius=radius,
-                                                    cylinder_height=height,
-                                                    uniform_zenith_sampling=True,
-                                                    cos_range=torch.tensor([0,1]),
-                                                    # point_towards_center=True,
-                                                    # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
-                                                    )
+# signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+#                                                     device=device, 
+#                                                     event_type='signal', 
+#                                                     domain_size=1600, 
+#                                                     E_min=1e2, 
+#                                                     E_max=1e8, 
+#                                                     find_exact_intersection=True,
+#                                                     random_position_along_ray=False,  
+#                                                     energy_dist='log_uniform',
+#                                                     cylinder_center=center,
+#                                                     cylinder_radius=radius,
+#                                                     cylinder_height=height,
+#                                                     uniform_zenith_sampling=True,
+#                                                     cos_range=torch.tensor([0,1]),
+#                                                     # point_towards_center=True,
+#                                                     # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
+#                                                     )
 angular_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
         device=device,
         resolution_type='angular',
@@ -40,18 +40,19 @@ energy_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
 num_events = 100000
 angular_loss_dicts = {}
 energy_loss_dicts = {}
-spacing_min = 20
-spacing_max = 220
-spacing_count = 30
+spacing_min = 10
+spacing_max = 200
+spacing_count = 100
 
-for energy in [2,3,4,5,6]:
-    print(f"Running fisher info calculations for energy range: 10^{energy} GeV to 10^{energy+1 if energy < 6 else energy+2} GeV")
+for energy in [2,3,4,5,6,7]:
+    # print(f"Running fisher info calculations for energy range: 10^{energy} GeV to 10^{energy+1 if energy < 6 else energy+2} GeV")
+    print(f"Running fisher info calculations for energy range: 10^{energy} GeV to 10^{energy+1} GeV")
     signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                         device=None, 
                                                         event_type='signal', 
                                                         domain_size=1600, 
                                                         E_min=10**energy, 
-                                                        E_max=10**(energy+1) if energy < 6 else 10**(energy+2), 
+                                                        E_max=10**(energy+1), #if energy < 6 else 10**(energy+2), 
                                                         find_exact_intersection=True,
                                                         random_position_along_ray=False,  
                                                         energy_dist='log_uniform',
@@ -64,13 +65,14 @@ for energy in [2,3,4,5,6]:
                                                         # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                         )
     signal_events = signal_sampler.sample_events(num_events=num_events)
-    nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1 if energy < 6 else energy+2}.parquet')
-    if energy < 6:
-        angular_loss_dicts[f'{energy}-{energy+1}'] = []
-        energy_loss_dicts[f'{energy}-{energy+1}'] = []
-    else:
-        angular_loss_dicts[f'{energy}-{energy+2}'] = []
-        energy_loss_dicts[f'{energy}-{energy+2}'] = []
+    # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1 if energy < 6 else energy+2}.parquet')
+    nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1}.parquet')
+    # if energy < 6:
+    angular_loss_dicts[f'{energy}-{energy+1}'] = []
+    energy_loss_dicts[f'{energy}-{energy+1}'] = []
+    # else:
+    #     angular_loss_dicts[f'{energy}-{energy+2}'] = []
+    #     energy_loss_dicts[f'{energy}-{energy+2}'] = []
     for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), spacing_count):
         print(f"Running fisher info calculations for string spacing: {string_spacing}m")
         geometry = nugget.geometries.SpaceString.SpaceString(
@@ -127,22 +129,24 @@ for energy in [2,3,4,5,6]:
         for key in energy_loss_dict:
             if isinstance(energy_loss_dict[key], torch.Tensor):
                 energy_loss_dict[key] = energy_loss_dict[key].detach().cpu()
-        if energy < 6:
-            angular_loss_dicts[f'{energy}-{energy+1}'].append(ang_loss_dict)
-            energy_loss_dicts[f'{energy}-{energy+1}'].append(energy_loss_dict)
-        else:
-            angular_loss_dicts[f'{energy}-{energy+2}'].append(ang_loss_dict)
-            energy_loss_dicts[f'{energy}-{energy+2}'].append(energy_loss_dict)
+        # if energy < 6:
+        angular_loss_dicts[f'{energy}-{energy+1}'].append(ang_loss_dict)
+        energy_loss_dicts[f'{energy}-{energy+1}'].append(energy_loss_dict)
+        # else:
+            # angular_loss_dicts[f'{energy}-{energy+2}'].append(ang_loss_dict)
+            # energy_loss_dicts[f'{energy}-{energy+2}'].append(energy_loss_dict)
 
 
 
 
 copy_angular_loss_dicts = angular_loss_dicts.copy()
 copy_energy_loss_dicts = energy_loss_dicts.copy()
-for energy in range(2,7):
-    for angular_loss_dict in copy_angular_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
+for energy in range(2,8):
+    # for angular_loss_dict in copy_angular_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
+    for angular_loss_dict in copy_angular_loss_dicts[f'{energy}-{energy+1}']:
         del angular_loss_dict['resolution_params']
-    for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
+    # for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
+    for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}']:    
         del energy_loss_dict['resolution_params']
 with open('pois_tests/pois_127_angular_loss_dicts_energies.pkl', 'wb') as f:
     pickle.dump(copy_angular_loss_dicts, f)
