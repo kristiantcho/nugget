@@ -230,50 +230,92 @@ class Optimizer():
     def _checkpoint_state(self):
         """Save a restorable checkpoint of the geometry and optimizer state.
 
-        Unlike `_snapshot_geom_dict`, this keeps tensors on-device and also
-        captures each torch optimizer's internal state (e.g. Adam's running
-        moment estimates), since reverting only the parameter values while
-        leaving poisoned optimizer state in place can immediately reproduce
-        the same NaN on the very next step.
+        Only the tensors actually being optimized (the keys in `self.optimizers`,
+        i.e. the leaves each Adam instance was constructed around) are kept as
+        live, grad-eligible parameters. Every other entry in `geom_dict` (e.g.
+        `points_3d`, fixed buffers like `string_indices`) is *derived* from the
+        leaves by `update_points`, so it is recomputed on restore rather than
+        cloned independently.
+
+        Some geometries alias a non-optimizer key to the same tensor object as
+        an optimized leaf (e.g. `old_string_weights` pointing at the exact
+        tensor managed under `string_weights`) so that gradients computed via
+        either key reach the one Adam-tracked parameter. `alias_of` records
+        which "other" keys are such aliases (by identity) so restore can
+        repoint them at the restored leaf instead of an independently cloned,
+        non-grad copy - cloning them independently would silently detach that
+        key from the optimized leaf's graph.
+
+        This also captures each optimizer's internal state (e.g. Adam's
+        running moment estimates), since reverting only the parameter values
+        while leaving poisoned optimizer state in place can immediately
+        reproduce the same NaN on the very next step.
         """
-        geom_checkpoint = {}
+        leaf_checkpoint = {
+            name: self.geom_dict[name].detach().clone()
+            for name in self.optimizers
+            if torch.is_tensor(self.geom_dict.get(name))
+        }
+        other_checkpoint = {}
+        alias_of = {}
         for key, value in self.geom_dict.items():
+            if key in self.optimizers:
+                continue
             if torch.is_tensor(value):
-                geom_checkpoint[key] = value.detach().clone()
+                aliased_leaf = next(
+                    (name for name in self.optimizers if self.geom_dict.get(name) is value),
+                    None,
+                )
+                if aliased_leaf is not None:
+                    alias_of[key] = aliased_leaf
+                else:
+                    other_checkpoint[key] = value.detach().clone()
             else:
-                geom_checkpoint[key] = value
+                other_checkpoint[key] = value
         optimizer_checkpoint = {
             name: pickle.loads(pickle.dumps(optimizer.state_dict()))
             for name, optimizer in self.optimizers.items()
         }
-        return {'geom_dict': geom_checkpoint, 'optimizer_states': optimizer_checkpoint}
+        return {
+            'leaves': leaf_checkpoint,
+            'other': other_checkpoint,
+            'alias_of': alias_of,
+            'optimizer_states': optimizer_checkpoint,
+        }
 
     def _restore_checkpoint(self, checkpoint):
         """Restore geometry parameters and optimizer state from a checkpoint.
 
-        Restored parameter tensors are re-created as fresh leaf tensors (with
-        `requires_grad` matching the live tensor they replace) so the
-        optimizers keep referencing valid, grad-eligible parameters.
+        Restored leaf tensors are re-created as fresh `requires_grad=True`
+        tensors so the rebuilt optimizers reference valid, grad-eligible
+        parameters. Keys that aliased a leaf at checkpoint time are repointed
+        at the corresponding restored leaf (preserving that aliasing) before
+        the full geom_dict (including derived entries) is recomputed from
+        those leaves via `update_points`, exactly like the normal
+        per-iteration update - this keeps grad connectivity consistent with
+        the non-reverted code path.
         """
-        restored_geom_dict = {}
-        for key, value in checkpoint['geom_dict'].items():
-            if torch.is_tensor(value):
-                new_tensor = value.clone().to(self.device)
-                if key in self.optimizers:
-                    new_tensor.requires_grad = True
-                restored_geom_dict[key] = new_tensor
-            else:
-                restored_geom_dict[key] = value
-        self.geom_dict = restored_geom_dict
+        restored_leaves = {}
+        for name, value in checkpoint['leaves'].items():
+            new_tensor = value.clone().to(self.device)
+            new_tensor.requires_grad = True
+            restored_leaves[name] = new_tensor
 
         for name, optimizer in self.optimizers.items():
-            if name not in restored_geom_dict:
+            if name not in restored_leaves:
                 continue
-            new_optimizer = torch.optim.Adam([restored_geom_dict[name]], lr=optimizer.param_groups[0]['lr'])
+            new_optimizer = torch.optim.Adam([restored_leaves[name]], lr=optimizer.param_groups[0]['lr'])
             if name in checkpoint['optimizer_states']:
                 new_optimizer.load_state_dict(checkpoint['optimizer_states'][name])
             self.optimizers[name] = new_optimizer
 
+        restored_aliases = {
+            key: restored_leaves[leaf_name]
+            for key, leaf_name in checkpoint['alias_of'].items()
+            if leaf_name in restored_leaves
+        }
+
+        self.geom_dict = {**checkpoint['other'], **restored_aliases, **restored_leaves}
         self.geom_dict = self.geometry.update_points(**self.geom_dict)
 
     def optimize(self, loss_func_dict, loss_dict=None, uw_loss_dict=None, loss_weights_dict=None, loss_params_dict=None, n_iter=100, print_freq=10, vis_freq=None, vis_kwargs=None, gif_freq=None, **kwargs):
