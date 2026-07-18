@@ -11,8 +11,8 @@ import torch
 from nugget.samplers.cyl_sampler import CylinderSampler
 
 # Default packaged data directory (nugget/assets/data)
-# data_dir = Path(__file__).resolve().parents[1] / "assets" / "data"
-data_dir=''
+data_dir = Path(__file__).resolve().parents[1] / "assets" / "data"
+# data_dir=''
 
 
 def _to_numpy_no_grad(x):
@@ -1127,10 +1127,10 @@ def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.
     center_xy = torch.sum(w.unsqueeze(1) * xy_positions, dim=0) / torch.sum(w)
 
     # Smooth radius via weighted log-sum-exp over radial distances.
-    # distances_xy = torch.sqrt(torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1) + eps)
-    # d_ref = torch.max(distances_xy).detach()
-    # radius = d_ref + tau * torch.logsumexp((distances_xy*log_w - d_ref) / tau, dim=0)
-    radius = torch.sqrt(torch.sum(w * torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1)) / torch.sum(w))
+    distances_xy = torch.sqrt(torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1))
+    d_ref = torch.max(distances_xy).detach()
+    radius = d_ref + temperature * torch.logsumexp((distances_xy*torch.log(w) - d_ref) / temperature, dim=0)
+    # radius = torch.sqrt(torch.sum(w * torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1)) / torch.sum(w))
 
     # Smooth z-bounds via weighted log-sum-exp (stable references).
     z_max = torch.max(z_positions)
