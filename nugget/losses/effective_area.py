@@ -1124,17 +1124,22 @@ def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.
     w = point_weights
 
     # Weighted xy center.
-    # center_xy = torch.sum(w.unsqueeze(1) * xy_positions, dim=0) / torch.sum(w)
+    center_xy = torch.sum(w.unsqueeze(1) * xy_positions, dim=0) / torch.sum(w)
     # distances_xy = torch.sqrt(torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1))
-    center_xy = torch.tensor([0.0, 0.0], device=device, dtype=dtype)
+    # center_xy = torch.tensor([0.0, 0.0], device=device, dtype=dtype)
     distances_xy = torch.sqrt(torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1))
-    log_w = torch.log(w)
+    # log_w = torch.log(w)
 
-    weighted_terms = (distances_xy + log_w) / temperature
-    d_ref = torch.max(weighted_terms).detach()
-    radius = temperature * (d_ref + torch.logsumexp(weighted_terms - d_ref, dim=0))
+    # weighted_terms = (distances_xy + log_w) / temperature
+    # d_ref = torch.max(weighted_terms).detach()
+    # radius = temperature * (d_ref + torch.logsumexp(weighted_terms - d_ref, dim=0))
     # radius = torch.sqrt(torch.sum(w * torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1)) / torch.sum(w))
 
+    # radius = torch.sum(distances_xy * w * torch.exp(temperature * distances_xy) /
+    #                    torch.sum(w * torch.exp(temperature * distances_xy)))
+
+    weighted_terms = temperature * distances_xy * w
+    radius = torch.logsumexp(weighted_terms, dim=0) / temperature
     # Smooth z-bounds via weighted log-sum-exp (stable references).
     z_max = torch.max(z_positions)
     # z_max = z_ref_max + tau * torch.logsumexp((z_positions*log_w - z_ref_max) / tau, dim=0)
