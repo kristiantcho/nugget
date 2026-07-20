@@ -1,7 +1,7 @@
 import torch
 
 from nugget.losses.base_loss import LossFunction
-from nugget.losses.effective_area import EffectiveAreaLoss, get_weighted_bounding_cylinder
+from nugget.losses.effective_area import EffectiveAreaLoss, get_weighted_min_enclosing_circle
 from nugget.losses.fisher_info import ResolutionLoss, WeightedResolutionLoss
 from nugget.samplers.cyl_sampler import CylinderSampler
 
@@ -78,27 +78,36 @@ class FoMLoss(LossFunction):
 
         return event_params
 
-    def _get_geometry_bounding_cylinder(self, geom_dict, temperature):
-        """Compute the same weighted bounding cylinder EffectiveAreaLoss derives from geometry."""
-        points_3d = geom_dict.get("points_3d")
+    def _get_geometry_bounding_cylinder(self, geom_dict, temperature, include_height=True):
+        """Fit a cylinder to the current geometry: XY center/radius come from the
+        smooth weighted minimum enclosing circle of the string positions
+        (weighted continuously in [0, 1] by string_weights); height (if
+        requested) is the unweighted z-extent of the detector's points_3d.
+        """
         string_xy = geom_dict.get("string_xy", None)
+        if string_xy is None:
+            raise ValueError("geom_dict must provide 'string_xy' to adjust the cylinder to geometry")
         string_weights = geom_dict.get("string_weights", None)
-
         if string_weights is not None:
-            if string_xy is None:
-                seen = set()
-                unique_indices = []
-                for i, xy in enumerate(points_3d[:, :2]):
-                    xy_tuple = tuple(xy.tolist())
-                    if xy_tuple not in seen:
-                        seen.add(xy_tuple)
-                        unique_indices.append(i)
-                string_xy = points_3d[unique_indices, :2]
-            point_weights = self.effective_area_loss.map_string_weights_to_points(points_3d, string_xy, string_weights)
-        else:
-            point_weights = torch.ones(len(points_3d), device=self.device)
+            string_weights = torch.sigmoid(string_weights)
 
-        return get_weighted_bounding_cylinder(points_3d, point_weights=point_weights, temperature=temperature)
+        center_xy, radius = get_weighted_min_enclosing_circle(
+            string_xy, string_weights=string_weights, temperature=temperature
+        )
+
+        if not include_height:
+            center_z = torch.zeros((), device=self.device, dtype=center_xy.dtype)
+            height = torch.zeros((), device=self.device, dtype=center_xy.dtype)
+        else:
+            points_3d = geom_dict.get("points_3d")
+            z_positions = points_3d[:, 2]
+            z_max = torch.max(z_positions)
+            z_min = torch.min(z_positions)
+            center_z = 0.5 * (z_min + z_max)
+            height = z_max - z_min
+
+        center = torch.stack([center_xy[0], center_xy[1], center_z])
+        return center, radius, height
 
     # Constructor args of CylinderSampler that are captured explicitly (not in
     # self.kwargs), so a from-scratch cylinder can be safely merged into a
@@ -117,7 +126,8 @@ class FoMLoss(LossFunction):
             )
 
         temperature = kwargs.get("bounding_cylinder_temperature", 0.1)
-        center, radius, height = self._get_geometry_bounding_cylinder(geom_dict, temperature)
+        include_height = kwargs.get("fom_adjust_cylinder_height", True)
+        center, radius, height = self._get_geometry_bounding_cylinder(geom_dict, temperature, include_height=include_height)
 
         sampler_kwargs = {
             k: v for k, v in signal_sampler.kwargs.items()

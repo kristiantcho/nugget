@@ -1153,6 +1153,81 @@ def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.
     center = torch.stack([center_xy[0], center_xy[1], center_z])
     return center, radius, height
 
+
+def get_weighted_min_enclosing_circle(
+    string_xy,
+    string_weights=None,
+    temperature=0.05,
+    weight_scale=None,
+    n_iters=50,
+    lr=0.5,
+):
+    """Differentiably approximate the minimum enclosing circle of weighted string positions.
+
+
+    Parameters
+    ----------
+    string_xy : torch.Tensor
+        XY positions of strings, shape (n_strings, 2).
+    string_weights : torch.Tensor, optional
+        Continuous importance in [0, 1] per string, shape (n_strings,). If
+        None, all strings are treated as fully active (weight 1).
+    temperature : float
+        Softmax temperature for the radius. Lower values sharpen the soft-max
+        toward the true (hard) max distance among effectively-active strings.
+    weight_scale : float, optional
+        Length-scale (same units as string_xy) controlling how many units of
+        distance a weight deficit can "cost". Defaults to the (detached) max
+        distance from the plain weighted centroid, so it's automatically on
+        the right scale for the given geometry.
+    n_iters : int
+        Number of gradient-descent steps used to refine the center.
+    lr : float
+        Step size for the center gradient-descent updates.
+
+    Returns
+    -------
+    tuple
+        (center_xy, radius) where center_xy has shape (2,) and radius is a
+        0-d tensor, both differentiable w.r.t. string_xy and string_weights.
+    """
+    device = string_xy.device
+    dtype = string_xy.dtype
+
+    if string_weights is None:
+        w = torch.ones(string_xy.shape[0], device=device, dtype=dtype)
+    else:
+        w = string_weights.to(device=device, dtype=dtype)
+
+    log_w = torch.log(w)
+
+    centroid_xy = torch.sum(w.unsqueeze(1) * string_xy, dim=0) / torch.sum(w)
+    if weight_scale is None:
+        weight_scale = torch.max(
+            torch.sqrt(torch.sum((string_xy - centroid_xy.unsqueeze(0)) ** 2, dim=1))
+        ).detach()
+
+    def _radius(center_xy):
+        diff = string_xy - center_xy.unsqueeze(0)
+        distances_xy = torch.sqrt(torch.sum(diff ** 2, dim=1) + 1e-12)
+        weighted_terms = (distances_xy + weight_scale * log_w) / temperature
+        d_ref = torch.max(weighted_terms).detach()
+        radius = temperature * (d_ref + torch.logsumexp(weighted_terms - d_ref, dim=0))
+        return radius
+
+    # Ensure center_xy requires grad regardless of whether string_xy/string_weights
+    # do, so torch.autograd.grad below always has a valid graph to differentiate.
+    center_xy = centroid_xy + torch.zeros_like(centroid_xy).requires_grad_(True)
+    for _ in range(n_iters):
+        radius = _radius(center_xy)
+       
+        grad_xy, = torch.autograd.grad(radius, center_xy, create_graph=True)
+        center_xy = center_xy - lr * grad_xy
+
+    radius = _radius(center_xy)
+    return center_xy, radius
+
+
 class EffectiveAreaLoss(LossFunction):
     """Loss class to maximize neutrino effective area."""
     
@@ -1277,28 +1352,37 @@ class EffectiveAreaLoss(LossFunction):
 
 
         # signal_sampler = CylinderSampler(event_type='signal', domain_size=2500, E_min=energy_range, E_max=1e8, energy_dist='log_uniform')
-    
+
         point_weights = None
+        if string_xy is None:
+            # Get unique xy coordinates in order of first appearance
+            seen = set()
+            unique_indices = []
+            for i, xy in enumerate(points_3d[:, :2]):
+                xy_tuple = tuple(xy.tolist())
+                if xy_tuple not in seen:
+                    seen.add(xy_tuple)
+                    unique_indices.append(i)
+
+            string_xy = points_3d[unique_indices, :2]
+
         if string_weights is not None:
             # string_assignment_temperature = kwargs.get('string_assignment_temperature', 1.0)
-            if string_xy is None:
-                # Get unique xy coordinates in order of first appearance
-                seen = set()
-                unique_indices = []
-                for i, xy in enumerate(points_3d[:, :2]):
-                    xy_tuple = tuple(xy.tolist())
-                    if xy_tuple not in seen:
-                        seen.add(xy_tuple)
-                        unique_indices.append(i)
-                
-                string_xy = points_3d[unique_indices, :2]
-            
             point_weights = self.map_string_weights_to_points(points_3d, string_xy, string_weights)
+            string_probs = torch.sigmoid(string_weights)
         else:
             point_weights = torch.ones(len(points_3d), device=self.device)
-        
+            string_probs = None
+
         if not use_irregular_cylinder:
-            center, cyl_radius, cyl_height = get_weighted_bounding_cylinder(points_3d, point_weights=point_weights, temperature=temperature)
+            center_xy, cyl_radius = get_weighted_min_enclosing_circle(
+                string_xy, string_weights=string_probs, temperature=temperature
+            )
+            z_positions = points_3d[:, 2]
+            z_max = torch.max(z_positions)
+            z_min = torch.min(z_positions)
+            cyl_height = z_max - z_min
+            center = torch.stack([center_xy[0], center_xy[1], 0.5 * (z_min + z_max)])
         else:
             center = None
             cyl_radius = None
