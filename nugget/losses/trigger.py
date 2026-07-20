@@ -236,7 +236,10 @@ class TriggerLoss(LossFunction):
 
         # For each bar position, accumulate t1 from points that fall inside the bar.
         point_s = projections.unsqueeze(0)
-        in_bar_mask = (point_s >= bar_starts.unsqueeze(1)) & (point_s <= bar_ends.unsqueeze(1))
+        if self.use_hard_cuts:
+            in_bar_mask = (point_s >= bar_starts.unsqueeze(1)) & (point_s <= bar_ends.unsqueeze(1))
+        else:
+            in_bar_mask = torch.sigmoid(10 * (point_s - bar_starts.unsqueeze(1))) * torch.sigmoid(10 * (bar_ends.unsqueeze(1) - point_s))
         bar_activity = torch.sum(in_bar_mask.float() * t1_values.unsqueeze(0), dim=1)
 
         # Threshold each bar and aggregate.
