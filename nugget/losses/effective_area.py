@@ -1377,6 +1377,16 @@ class EffectiveAreaLoss(LossFunction):
             center = None
             cyl_radius = None
             cyl_height = None
+
+        # geom_dict for the trigger MUST carry string_xy/string_weights so the trigger
+        # weights its points by the current (continuous) string activation. Passing only
+        # points_3d would silently give every point weight 1, making detector efficiency
+        # independent of string_weights.
+        trigger_geom_dict = {'points_3d': points_3d}
+        if string_xy is not None:
+            trigger_geom_dict['string_xy'] = string_xy
+        if string_weights is not None:
+            trigger_geom_dict['string_weights'] = string_weights
         def _extract_energy_and_cos_zenith(event_params):
             if 'energy' not in event_params:
                 raise ValueError("Each event must provide 'energy' for per-event effective area mode")
@@ -1402,7 +1412,7 @@ class EffectiveAreaLoss(LossFunction):
                     precomputed_light_yield_per_point_per_event = precomputed_light_yield_per_point_per_event[selected_indices]
 
             trigger_out = self.trigger(
-                {'points_3d': points_3d},
+                trigger_geom_dict,
                 **{
                     **kwargs,
                     'signal_surrogate_func': surrogate_func,
@@ -1515,7 +1525,7 @@ class EffectiveAreaLoss(LossFunction):
             counts = torch.zeros((num_zenith_bins, num_energy_bins), device=self.device)
 
             trigger_out = self.trigger(
-                {'points_3d': points_3d},
+                trigger_geom_dict,
                 **{
                     **kwargs,
                     'signal_surrogate_func': surrogate_func,
@@ -1575,7 +1585,7 @@ class EffectiveAreaLoss(LossFunction):
                                                      event_type='signal', energy_dist='log_uniform', uniform_zenith_sampling=True, **cylinder_kwargs).sample_events(num_events_per_bin)
 
                     trigger_out = self.trigger(
-                        {'points_3d': points_3d},
+                        trigger_geom_dict,
                         **{
                             **kwargs,
                             'signal_surrogate_func': surrogate_func,
