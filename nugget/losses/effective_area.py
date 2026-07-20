@@ -1158,12 +1158,10 @@ def get_weighted_min_enclosing_circle(
     string_xy,
     string_weights=None,
     temperature=0.05,
-    weight_scale=None,
-    n_iters=50,
-    lr=0.5,
+    n_directions=360,
+    angular_kappa=5.0,
 ):
-    """Differentiably approximate the minimum enclosing circle of weighted string positions.
-
+    """Differentiably estimate a weighted enclosing-circle radius around a fixed origin.
 
     Parameters
     ----------
@@ -1173,62 +1171,50 @@ def get_weighted_min_enclosing_circle(
         Continuous importance in [0, 1] per string, shape (n_strings,). If
         None, all strings are treated as fully active (weight 1).
     temperature : float
-        Softmax temperature for the radius. Lower values sharpen the soft-max
-        toward the true (hard) max distance among effectively-active strings.
-    weight_scale : float, optional
-        Length-scale (same units as string_xy) controlling how many units of
-        distance a weight deficit can "cost". Defaults to the (detached) max
-        distance from the plain weighted centroid, so it's automatically on
-        the right scale for the given geometry.
-    n_iters : int
-        Number of gradient-descent steps used to refine the center.
-    lr : float
-        Step size for the center gradient-descent updates.
+        Softmax temperature for the per-direction outer-distance soft-max.
+        Lower values sharpen it toward the true (hard) max distance among
+        effectively-active, direction-aligned strings.
+    n_directions : int
+        Number of directions sampled evenly around the origin.
+    angular_kappa : float
+        Sharpness of the angular gate. Higher values restrict each direction's
+        soft-max to strings more tightly aligned with that direction.
 
     Returns
     -------
     tuple
-        (center_xy, radius) where center_xy has shape (2,) and radius is a
-        0-d tensor, both differentiable w.r.t. string_xy and string_weights.
+        (center_xy, radius) where center_xy is a fixed zero vector, shape (2,),
+        and radius is a 0-d tensor, differentiable w.r.t. string_xy and
+        string_weights.
     """
     device = string_xy.device
     dtype = string_xy.dtype
+    n_strings = string_xy.shape[0]
 
     if string_weights is None:
-        w = torch.ones(string_xy.shape[0], device=device, dtype=dtype)
+        w = torch.ones(n_strings, device=device, dtype=dtype)
     else:
         w = string_weights.to(device=device, dtype=dtype)
 
-    # log_w = torch.log(w)
+    center_xy = torch.zeros(2, device=device, dtype=dtype)
 
-    # centroid_xy = torch.sum(w.unsqueeze(1) * string_xy, dim=0) / torch.sum(w)
-    # if weight_scale is None:
-    #     weight_scale = torch.max(
-    #         torch.sqrt(torch.sum((string_xy - centroid_xy.unsqueeze(0)) ** 2, dim=1))
-    #     ).detach()
+    distances = torch.sqrt(torch.sum(string_xy ** 2, dim=1) + 1e-12)  # (n_strings,)
 
-    # def _radius(center_xy):
-    #     diff = string_xy - center_xy.unsqueeze(0)
-    #     distances_xy = torch.sqrt(torch.sum(diff ** 2, dim=1) + 1e-12)
-    #     weighted_terms = (distances_xy + weight_scale * log_w) / temperature
-    #     d_ref = torch.max(weighted_terms).detach()
-    #     radius = temperature * (d_ref + torch.logsumexp(weighted_terms - d_ref, dim=0))
-    #     return radius
+    # Unit direction of each string from the origin.
+    string_dir = string_xy / distances.unsqueeze(1)  # (n_strings, 2)
 
-    # # Ensure center_xy requires grad regardless of whether string_xy/string_weights
-    # # do, so torch.autograd.grad below always has a valid graph to differentiate.
-    # center_xy = centroid_xy + torch.zeros_like(centroid_xy).requires_grad_(True)
-    # for _ in range(n_iters):
-    #     radius = _radius(center_xy)
-       
-    #     grad_xy, = torch.autograd.grad(radius, center_xy, create_graph=True)
-    #     center_xy = center_xy - lr * grad_xy
+    angles = torch.linspace(0.0, 2 * torch.pi, n_directions + 1, device=device, dtype=dtype)[:-1]
+    u = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)  # (n_directions, 2)
 
-    # radius = _radius(center_xy)
-    center_xy = torch.tensor([0.0, 0.0], device=device, dtype=dtype)
-    distances_xy = torch.sqrt(torch.sum((string_xy - center_xy.unsqueeze(0)) ** 2, dim=1))
-    weighted_terms = (distances_xy * w) * temperature
-    radius = (torch.logsumexp(weighted_terms, dim=0))/temperature
+    # Cosine alignment of every string with every sampled direction, in [-1, 1].
+    align = string_dir @ u.T  # (n_strings, n_directions) 
+    align = torch.nn.functional.softplus(align, beta=angular_kappa)  # (n_strings, n_directions)
+    # Per-(string, direction) score used for the outer-distance soft-max: raw
+    # distance, discounted by string weight and angular misalignment together.
+    combined = distances.unsqueeze(1) * w.unsqueeze(1) * align / temperature
+    per_direction_radius = temperature * torch.logsumexp(combined, dim=0)
+
+    radius = torch.mean(per_direction_radius)
     return center_xy, radius
 
 
