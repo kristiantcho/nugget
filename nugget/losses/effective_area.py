@@ -1157,7 +1157,7 @@ def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.
 def get_weighted_min_enclosing_circle(
     string_xy,
     string_weights=None,
-    temperature=0.05,
+    temperature=1,
     n_directions=360,
     angular_kappa=5.0,
 ):

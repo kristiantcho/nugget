@@ -218,13 +218,14 @@ class FoMLoss(LossFunction):
         if normalize_fom_by_energy:
             energies = [event['energy'] for event in shared_events]
             energies = torch.as_tensor(energies, device=self.device)
-            effective_area_per_event = effective_area_per_event/energies
+            norm_effective_area_per_event = effective_area_per_event/energies
+        else:
+            norm_effective_area_per_event = effective_area_per_event
         if finite_mask.any():
             # safe_res = torch.clamp_min(resolution_per_event[finite_mask], 1e-12)
             # safe_aeff = torch.clamp_min(effective_area_per_event[finite_mask], 0.0)
             safe_res = resolution_per_event[finite_mask]
-            safe_aeff = effective_area_per_event[finite_mask]
-            
+            safe_aeff = norm_effective_area_per_event[finite_mask]
             sum_term = torch.sum(safe_aeff / (4.0 * torch.pi * (safe_res ** 2)))
             combined_loss = 1.0 / torch.sqrt(torch.clamp_min(sum_term, 1e-20))
         else:
@@ -243,5 +244,6 @@ class FoMLoss(LossFunction):
             "resolution_details": resolution_out,
             "effective_area_details": effective_area_out,
             "signal_event_params": shared_events,
+            "detector_efficiencies": effective_area_out.get("detector_efficiencies", None),
             "use_weighted_resolution": self.use_weighted_resolution,
         }

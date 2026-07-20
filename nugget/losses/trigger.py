@@ -24,7 +24,6 @@ class TriggerLoss(LossFunction):
                  t3_temperature=1.0,
                  t_temperature=1.0,
                  use_hard_cuts=False,
-                 weight_sigmoid_sharpness=1.0,
                  print_loss=False):
         """
         Initialize the trigger loss function.
@@ -66,7 +65,6 @@ class TriggerLoss(LossFunction):
         self.t3_temperature = t3_temperature
         self.t_temperature = t_temperature
         self.use_hard_cuts = use_hard_cuts
-        self.weight_sigmoid_sharpness = weight_sigmoid_sharpness
         self.print_loss = print_loss
     
     def map_string_weights_to_points(self, points_3d, string_xy, string_weights):
@@ -111,7 +109,7 @@ class TriggerLoss(LossFunction):
             point_weights[i] = string_weights[closest_string_idx]
         
         # Apply sigmoid to weights (not controlled by temperature)
-        point_weights_sigmoid = torch.sigmoid(self.weight_sigmoid_sharpness * point_weights)
+        point_weights_sigmoid = torch.sigmoid(point_weights)
         
         return point_weights_sigmoid
     
