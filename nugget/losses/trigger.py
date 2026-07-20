@@ -245,9 +245,12 @@ class TriggerLoss(LossFunction):
             t_values = torch.max(t3)
         else:
             t3 = torch.sigmoid(self.t3_temperature * (bar_activity - self.min_points_threshold))
-            t_values = torch.sum(t3 * torch.softmax(t3 * self.t_temperature, dim=0))
-            # t_values = torch.logsumexp(self.t_temperature * t3, dim=0) / self.t_temperature
-            # t_values = torch.mean(t3**self.t_temperature) ** (1.0 / self.t_temperature)
+            # Soft-max over bars: an event triggers if ANY bar has enough activity.
+            # Weight by bar_activity (which meaningfully ranks bars) rather than by
+            # t3 itself; t3 saturates at 1, which makes softmax(t3) near-uniform and
+            # dilutes a single strongly-triggering bar by 1/n_bars (capping t_values
+            # well below 1 regardless of geometry).
+            t_values = torch.sum(t3 * torch.softmax(bar_activity * self.t_temperature, dim=0))
 
         return {
             't3_values': t3,
@@ -399,9 +402,9 @@ class TriggerLoss(LossFunction):
                 t_values = torch.max(t3, dim=1).values
             else:
                 t3 = torch.sigmoid(self.t3_temperature * (bar_activity - self.min_points_threshold))
-                t_values = torch.sum(t3 * torch.softmax(t3 * self.t_temperature, dim=1), dim=1)
-                # t_values = torch.logsumexp(self.t_temperature * t3, dim=1) / self.t_temperature
-                # t_values = torch.max(t3, dim=1).values
+                # Soft-max over bars weighted by bar_activity (not t3): see the
+                # single-event path for why weighting by t3 caps t_values ~1/n_bars.
+                t_values = torch.sum(t3 * torch.softmax(bar_activity * self.t_temperature, dim=1), dim=1)
 
             return {
                 't3_values': t3,
@@ -446,9 +449,15 @@ class TriggerLoss(LossFunction):
             t3 = torch.sigmoid(self.t3_temperature * (bar_activity - self.min_points_threshold))
             t3 = torch.where(valid_bar_bool, t3, torch.zeros_like(t3))
 
-            # One-line masked aggregation; easy to swap to logsumexp if desired.
-            t_values = torch.sum(t3 * torch.softmax(torch.where(valid_bar_bool, t3 * self.t_temperature, torch.full_like(t3, torch.finfo(t3.dtype).min)), dim=1), dim=1)
-            # t_values = torch.logsumexp(torch.where(valid_bar_bool, self.t_temperature * t3, torch.full_like(t3, torch.finfo(t3.dtype).min)), dim=1) / self.t_temperature
+            # Soft-max over bars weighted by bar_activity (not t3): see the
+            # single-event path for why weighting by t3 caps t_values ~1/n_bars.
+            # Invalid (padding) bars get -inf logits so they take zero softmax weight.
+            softmax_logits = torch.where(
+                valid_bar_bool,
+                bar_activity * self.t_temperature,
+                torch.full_like(bar_activity, torch.finfo(bar_activity.dtype).min),
+            )
+            t_values = torch.sum(t3 * torch.softmax(softmax_logits, dim=1), dim=1)
 
         return {
             't3_values': t3,
