@@ -331,7 +331,8 @@ class TriggerLoss(LossFunction):
             string_weights = torch.ones(n_points, device=points_3d.device, dtype=light_yields.dtype)
         else:
             string_weights = string_weights.to(device=points_3d.device, dtype=light_yields.dtype)
-
+            if self.use_hard_cuts:
+                string_weights = (string_weights >= 0.5).to(string_weights.dtype)
         # t1(e, i): soft (sigmoid) or hard (binary threshold)
         if self.use_hard_cuts:
             t1_values = (light_yields >= self.light_yield_threshold).to(light_yields.dtype) * string_weights.unsqueeze(0)
