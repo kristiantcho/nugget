@@ -137,6 +137,8 @@ class Visualizer:
     PLOT_STRING_XY_LOCAL_STRING_REPULSION = "string_xy_local_string_repulsion_penalty"
     PLOT_ALM_MU = "alm_mu"
     PLOT_ALM_LAMBDA = "alm_lambda"
+    PLOT_DETECTOR_EFFICIENCY_HISTORY = "detector_efficiency_history"
+    PLOT_EFFECTIVE_AREA_HISTORY = "effective_area_history"
 
     
     def __init__(self, device=None, dim=3, domain_size=2.0, gif_temp_dir=None):
@@ -159,6 +161,15 @@ class Visualizer:
         self.gif_frames = [] # Added to store frames for the GIF
         self.gif_temp_dir = gif_temp_dir# Temporary directory for storing individual images
         self.gif_image_paths = [] # List to track saved image paths
+
+        # Running histories of scalar summaries derived from per-iteration tensors
+        # (e.g. mean detector efficiency, mean effective area) that aren't already
+        # accumulated in the optimizer's loss_dict/uw_loss_dict. Keyed by iteration
+        # so repeated visualize_progress calls at the same iteration don't duplicate entries.
+        self._mean_detector_efficiency_history = []
+        self._mean_effective_area_history = []
+        self._last_recorded_iteration_efficiency = None
+        self._last_recorded_iteration_effective_area = None
 
     @staticmethod
     def _z_value_for_confidence(confidence_level: float = 0.95) -> float:
@@ -790,6 +801,11 @@ class Visualizer:
             - 'uw_loss_components': Individual unweighted loss components and total unweighted loss
             - 'alm_mu': ALM penalty parameters (mu) history for each constraint
             - 'alm_lambda': ALM Lagrange multipliers (lambda) history for each constraint
+            - 'detector_efficiency_history': Mean detector efficiency over optimization iterations
+              (from 'detector_efficiencies' in kwargs, as returned by EffectiveAreaLoss/FoMLoss)
+            - 'effective_area_history': Mean effective area over optimization iterations
+              (from 'effective_area_per_event' or 'effective_area_matrix' in kwargs, as returned
+              by EffectiveAreaLoss/FoMLoss)
         make_gif : bool
             Whether to generate and save a GIF of the progress.
         gif_plot_selection : list of str or None
@@ -5100,7 +5116,61 @@ class Visualizer:
                 #               xytext=(10, 10), textcoords='offset points',
                 #               fontsize=10, ha='left')
             else:
-                ax.text(0.5, 0.5, "Energy resolution history not available\n(Pass 'energy_resolution_history' in kwargs)", 
+                ax.text(0.5, 0.5, "Energy resolution history not available\n(Pass 'energy_resolution_history' in kwargs)",
+                      ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_DETECTOR_EFFICIENCY_HISTORY:
+            # Mean detector efficiency (per-event trigger probability, or binned
+            # efficiency matrix, from EffectiveAreaLoss/FoMLoss) over optimization iterations.
+            detector_efficiencies = kwargs.get('detector_efficiencies', None)
+
+            if detector_efficiencies is not None:
+                if isinstance(detector_efficiencies, torch.Tensor):
+                    eff_values = detector_efficiencies.clone().detach().cpu().numpy().flatten()
+                else:
+                    eff_values = np.array(detector_efficiencies).flatten()
+
+                finite_eff = eff_values[np.isfinite(eff_values)]
+                if finite_eff.size > 0 and iteration is not None and iteration != self._last_recorded_iteration_efficiency:
+                    self._mean_detector_efficiency_history.append(float(np.mean(finite_eff)))
+                    self._last_recorded_iteration_efficiency = iteration
+
+            if len(self._mean_detector_efficiency_history) > 0:
+                ax.plot(self._mean_detector_efficiency_history, color='green', linewidth=2, markersize=4)
+                ax.set_title('Mean Detector Efficiency History')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Mean Detector Efficiency')
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, "Detector efficiency history not available\n(Pass 'detector_efficiencies' in kwargs)",
+                      ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_EFFECTIVE_AREA_HISTORY:
+            # Mean effective area (per-event or binned effective area matrix from
+            # EffectiveAreaLoss/FoMLoss) over optimization iterations.
+            effective_area_values = kwargs.get('effective_area_per_event', None)
+            if effective_area_values is None:
+                effective_area_values = kwargs.get('effective_area_matrix', None)
+
+            if effective_area_values is not None:
+                if isinstance(effective_area_values, torch.Tensor):
+                    aeff_values = effective_area_values.clone().detach().cpu().numpy().flatten()
+                else:
+                    aeff_values = np.array(effective_area_values).flatten()
+
+                finite_aeff = aeff_values[np.isfinite(aeff_values)]
+                if finite_aeff.size > 0 and iteration is not None and iteration != self._last_recorded_iteration_effective_area:
+                    self._mean_effective_area_history.append(float(np.mean(finite_aeff)))
+                    self._last_recorded_iteration_effective_area = iteration
+
+            if len(self._mean_effective_area_history) > 0:
+                ax.plot(self._mean_effective_area_history, color='orange', linewidth=2, markersize=4)
+                ax.set_title('Mean Effective Area History')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Mean Effective Area (m$^2$)')
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, "Effective area history not available\n(Pass 'effective_area_per_event' or 'effective_area_matrix' in kwargs)",
                       ha='center', va='center', transform=ax.transAxes)
 
         elif plot_type == self.PLOT_POINTSOURCE_FOM:
