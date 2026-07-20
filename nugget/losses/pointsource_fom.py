@@ -88,11 +88,12 @@ class FoMLoss(LossFunction):
         if string_xy is None:
             raise ValueError("geom_dict must provide 'string_xy' to adjust the cylinder to geometry")
         string_weights = geom_dict.get("string_weights", None)
+        string_probs = None
         if string_weights is not None:
-            string_weights = torch.sigmoid(string_weights)
+            string_probs = torch.sigmoid(string_weights)
 
         center_xy, radius = get_weighted_min_enclosing_circle(
-            string_xy, string_weights=string_weights, temperature=temperature
+            string_xy, string_weights=string_probs, temperature=temperature
         )
 
         if not include_height:

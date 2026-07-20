@@ -1199,32 +1199,36 @@ def get_weighted_min_enclosing_circle(
     else:
         w = string_weights.to(device=device, dtype=dtype)
 
-    log_w = torch.log(w)
+    # log_w = torch.log(w)
 
-    centroid_xy = torch.sum(w.unsqueeze(1) * string_xy, dim=0) / torch.sum(w)
-    if weight_scale is None:
-        weight_scale = torch.max(
-            torch.sqrt(torch.sum((string_xy - centroid_xy.unsqueeze(0)) ** 2, dim=1))
-        ).detach()
+    # centroid_xy = torch.sum(w.unsqueeze(1) * string_xy, dim=0) / torch.sum(w)
+    # if weight_scale is None:
+    #     weight_scale = torch.max(
+    #         torch.sqrt(torch.sum((string_xy - centroid_xy.unsqueeze(0)) ** 2, dim=1))
+    #     ).detach()
 
-    def _radius(center_xy):
-        diff = string_xy - center_xy.unsqueeze(0)
-        distances_xy = torch.sqrt(torch.sum(diff ** 2, dim=1) + 1e-12)
-        weighted_terms = (distances_xy + weight_scale * log_w) / temperature
-        d_ref = torch.max(weighted_terms).detach()
-        radius = temperature * (d_ref + torch.logsumexp(weighted_terms - d_ref, dim=0))
-        return radius
+    # def _radius(center_xy):
+    #     diff = string_xy - center_xy.unsqueeze(0)
+    #     distances_xy = torch.sqrt(torch.sum(diff ** 2, dim=1) + 1e-12)
+    #     weighted_terms = (distances_xy + weight_scale * log_w) / temperature
+    #     d_ref = torch.max(weighted_terms).detach()
+    #     radius = temperature * (d_ref + torch.logsumexp(weighted_terms - d_ref, dim=0))
+    #     return radius
 
-    # Ensure center_xy requires grad regardless of whether string_xy/string_weights
-    # do, so torch.autograd.grad below always has a valid graph to differentiate.
-    center_xy = centroid_xy + torch.zeros_like(centroid_xy).requires_grad_(True)
-    for _ in range(n_iters):
-        radius = _radius(center_xy)
+    # # Ensure center_xy requires grad regardless of whether string_xy/string_weights
+    # # do, so torch.autograd.grad below always has a valid graph to differentiate.
+    # center_xy = centroid_xy + torch.zeros_like(centroid_xy).requires_grad_(True)
+    # for _ in range(n_iters):
+    #     radius = _radius(center_xy)
        
-        grad_xy, = torch.autograd.grad(radius, center_xy, create_graph=True)
-        center_xy = center_xy - lr * grad_xy
+    #     grad_xy, = torch.autograd.grad(radius, center_xy, create_graph=True)
+    #     center_xy = center_xy - lr * grad_xy
 
-    radius = _radius(center_xy)
+    # radius = _radius(center_xy)
+    center_xy = torch.tensor([0.0, 0.0], device=device, dtype=dtype)
+    distances_xy = torch.sqrt(torch.sum((string_xy - center_xy.unsqueeze(0)) ** 2, dim=1))
+    weighted_terms = (distances_xy * w) * temperature
+    radius = (torch.logsumexp(weighted_terms, dim=0))/temperature
     return center_xy, radius
 
 
