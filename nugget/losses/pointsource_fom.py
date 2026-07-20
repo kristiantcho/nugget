@@ -125,7 +125,7 @@ class FoMLoss(LossFunction):
                 f"got {type(signal_sampler)}"
             )
 
-        temperature = kwargs.get("bounding_cylinder_temperature", 0.1)
+        temperature = kwargs.get("bounding_cylinder_temperature", 1)
         include_height = kwargs.get("fom_adjust_cylinder_height", True)
         center, radius, height = self._get_geometry_bounding_cylinder(geom_dict, temperature, include_height=include_height)
 
