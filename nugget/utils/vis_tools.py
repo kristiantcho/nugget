@@ -135,6 +135,7 @@ class Visualizer:
     PLOT_LLR_HISTOGRAM_POINTS = "llr_histogram_points"
     PLOT_STRING_XY_ROV_PENALTY = "string_xy_rov_penalty"
     PLOT_STRING_XY_LOCAL_STRING_REPULSION = "string_xy_local_string_repulsion_penalty"
+    PLOT_STRING_HISTORY = "string_history"
     PLOT_ALM_MU = "alm_mu"
     PLOT_ALM_LAMBDA = "alm_lambda"
     PLOT_DETECTOR_EFFICIENCY_HISTORY = "detector_efficiency_history"
@@ -170,6 +171,16 @@ class Visualizer:
         self._mean_effective_area_history = []
         self._last_recorded_iteration_efficiency = None
         self._last_recorded_iteration_effective_area = None
+
+        # Cache of string XY positions (and weights) snapshotted once per unique
+        # iteration whenever a 'string_history' plot is requested, so the full
+        # trajectory each string traced over optimization can be drawn without the
+        # caller needing to pass the starting positions or intermediate snapshots
+        # themselves. The first snapshot recorded is treated as the starting geometry.
+        self._string_xy_history = []
+        self._string_weights_history = []
+        self._string_history_iterations = []
+        self._last_recorded_iteration_string_history = None
 
     @staticmethod
     def _z_value_for_confidence(confidence_level: float = 0.95) -> float:
@@ -788,6 +799,22 @@ class Visualizer:
             - 'llr_histogram_points': LLR density histogram comparing signal and background distributions per point
             - 'snr_contour': SNR contour plot based on per-string values
             - 'string_xy_local_string_repulsion_penalty': String XY scatter colored by per-string local string repulsion penalty
+            - 'string_history': Traced path of each string's XY position across every recorded
+              iteration, from its start-of-optimization position (red) to its current/final
+              position (green), with a legend distinguishing the two. Positions are cached
+              automatically on this Visualizer instance from the `string_xy`/`string_weights`
+              passed in kwargs each time this plot type is requested (e.g. via `vis_freq` during
+              `optimizer.optimize()`) - no need to pass a starting geometry or history yourself;
+              the first snapshot recorded becomes the trajectory's start. Call
+              `clear_string_history()` before a fresh optimization run to reset the cache.
+              Requires at least 2 recorded snapshots (i.e. this plot type must have already been
+              requested at least twice) before it renders anything. Optional kwargs:
+              'weight_threshold' (default 0.7, applied to the final snapshot's `string_weights`
+              to drop inactive strings); 'string_history_apply_sigmoid' (default True);
+              'string_history_match_strings' (bool or None, auto-detects string count mismatches
+              between consecutive snapshots and uses Hungarian matching); 'string_history_min_segment_length';
+              'string_history_color_start'/'string_history_color_end'; 'string_history_line_kwargs';
+              'string_history_title'.
             - 'signal_light_yield_contour': Signal light yield contour plot based on per-string values
             - 'signal_light_yield_contour_points': Signal light yield contour plot based on per-point values
             - 'fisher_info_logdet': Log determinant of Fisher Information matrix contour plot
@@ -3090,9 +3117,47 @@ class Visualizer:
                     ax.text(0.5, 0.5, "Local string repulsion per string data not available", 
                           ha='center', va='center', transform=ax.transAxes)
             else:
-                ax.text(0.5, 0.5, "String XY data not available", 
+                ax.text(0.5, 0.5, "String XY data not available",
                       ha='center', va='center', transform=ax.transAxes)
-                
+
+        elif plot_type == self.PLOT_STRING_HISTORY:
+            # Traced path of each string's XY position across every recorded iteration,
+            # from its starting position (red) to its current/final position (green).
+            # Snapshots are cached on self so the caller never has to pass the starting
+            # geometry or intermediate positions themselves - just keep requesting this
+            # plot type (e.g. via vis_freq during optimizer.optimize()) and each unique
+            # iteration's string_xy/string_weights are appended automatically.
+            string_weights = kwargs.get('string_weights', None)
+            if string_xy is not None and (iteration is None or iteration != self._last_recorded_iteration_string_history):
+                xy_snapshot = string_xy.clone().detach().cpu().numpy() if torch.is_tensor(string_xy) else np.array(string_xy)
+                self._string_xy_history.append(xy_snapshot)
+                if string_weights is not None:
+                    w_snapshot = string_weights.clone().detach().cpu().numpy() if torch.is_tensor(string_weights) else np.array(string_weights)
+                else:
+                    w_snapshot = None
+                self._string_weights_history.append(w_snapshot)
+                self._string_history_iterations.append(iteration)
+                self._last_recorded_iteration_string_history = iteration
+
+            if len(self._string_xy_history) >= 2:
+                self._draw_string_history(
+                    ax,
+                    string_xy_history=self._string_xy_history,
+                    string_weights_history=self._string_weights_history,
+                    weight_threshold=kwargs.get('weight_threshold', 0.7),
+                    apply_sigmoid=kwargs.get('string_history_apply_sigmoid', True),
+                    match_strings=kwargs.get('string_history_match_strings', None),
+                    min_segment_length=kwargs.get('string_history_min_segment_length', 1e-3),
+                    zoom_range=zoom_range,
+                    color_start=kwargs.get('string_history_color_start', 'red'),
+                    color_end=kwargs.get('string_history_color_end', 'green'),
+                    line_kwargs=kwargs.get('string_history_line_kwargs', None),
+                    title=kwargs.get('string_history_title', 'String Position History: Start to End of Optimization'),
+                )
+            else:
+                ax.text(0.5, 0.5, "String history not available yet\n(Need at least 2 recorded iterations;\nrequires 'string_xy' in kwargs)",
+                      ha='center', va='center', transform=ax.transAxes)
+
         elif plot_type == self.PLOT_Z_DIST:
             # Z value distribution histogram
             z_values = points_xyz[:, 2]
@@ -6511,6 +6576,267 @@ class Visualizer:
             **kwargs
         )
     
+    def _draw_string_history(self, ax, string_xy_history, string_weights_history=None,
+                           weight_threshold=0.7, apply_sigmoid=True,
+                           match_strings=None, min_segment_length=1e-3,
+                           zoom_range=None,
+                           color_start='red', color_end='green',
+                           line_kwargs=None, title='String Position History: Start to End of Optimization'):
+        """
+        Draw the full path traced by each detector string across every recorded
+        iteration, from its position at the start of optimization (red) to its
+        position at the end (green), onto an existing axis. Each string's path is
+        drawn as a poly-line color-graded from red to green along its length, with
+        an arrowhead on the final segment showing the direction of travel.
+
+        Parameters:
+        -----------
+        ax : matplotlib.axes.Axes
+            Axis to draw on.
+        string_xy_history : list of (torch.Tensor or np.ndarray)
+            Sequence of (N, 2) XY string positions, one snapshot per recorded
+            iteration, in chronological order. The first entry is treated as the
+            starting geometry and the last as the current/final geometry.
+        string_weights_history : list of (torch.Tensor, np.ndarray, or None) or None
+            Optional per-snapshot per-string weights (raw, pre-sigmoid unless
+            apply_sigmoid=False), used to determine which strings are active in the
+            final snapshot (weight < weight_threshold strings are dropped entirely).
+            If None, all strings are treated as active.
+        weight_threshold : float
+            Minimum (post-sigmoid, if apply_sigmoid) weight for a string to be
+            considered active in the final snapshot and included in the plot.
+        apply_sigmoid : bool
+            Whether to apply a sigmoid to the raw weights before thresholding.
+        match_strings : bool or None
+            Whether to match strings between consecutive snapshots via
+            nearest-neighbor (Hungarian) assignment rather than by index. If None,
+            matching is automatic: index-aligned when consecutive snapshots have the
+            same number of active strings, and Hungarian-matched otherwise (e.g. if
+            strings were added/removed during optimization).
+        min_segment_length : float
+            Segments shorter than this are skipped (avoids zero-length artifacts).
+        zoom_range : float or None
+            If provided, sets axis limits to [-zoom_range, zoom_range]. Defaults to
+            the visualizer's domain.
+        color_start, color_end : str
+            Colors for the start (first snapshot) and end (last snapshot) of each
+            string's path; intermediate segments are linearly interpolated between
+            them.
+        line_kwargs : dict or None
+            Extra keyword arguments forwarded to each path's `LineCollection`.
+        title : str
+            Plot title.
+
+        Returns:
+        --------
+        dict with keys 'xy_snapshots' (list of active-string-filtered snapshots,
+        index-aligned across snapshots) and 'n_strings'.
+        """
+        from matplotlib.collections import LineCollection
+        from matplotlib.patches import FancyArrowPatch
+        from matplotlib.lines import Line2D
+        from matplotlib.colors import to_rgb
+
+        if string_xy_history is None or len(string_xy_history) < 2:
+            ax.text(0.5, 0.5, "Need at least 2 string_xy snapshots to trace a history",
+                  ha='center', va='center', transform=ax.transAxes)
+            return {'xy_snapshots': [], 'n_strings': 0}
+
+        n_snapshots = len(string_xy_history)
+        if string_weights_history is None:
+            string_weights_history = [None] * n_snapshots
+
+        snapshots = [np.asarray(self._safe_tensor_convert(xy), dtype=float) for xy in string_xy_history]
+        weights = [
+            np.asarray(self._safe_tensor_convert(w), dtype=float).reshape(-1) if w is not None else None
+            for w in string_weights_history
+        ]
+
+        # Determine the active-string mask from the final snapshot's weights (if any),
+        # applied uniformly across all snapshots so each string's path is complete.
+        final_weights = weights[-1]
+        n_final = len(snapshots[-1])
+        if final_weights is not None and len(final_weights) == n_final:
+            w = final_weights
+            if apply_sigmoid:
+                w = 1.0 / (1.0 + np.exp(-w))
+            w = np.nan_to_num(w, nan=0.0)
+            final_mask = w >= weight_threshold
+        else:
+            final_mask = np.ones(n_final, dtype=bool)
+
+        # Walk snapshots backwards from the final one, matching each snapshot to the
+        # previous one so string identity is tracked consistently even if string
+        # count/order changes between snapshots (e.g. strings added/removed). The
+        # result is one aligned path per final active string, in chronological order.
+        # `latest_xy[k]` is path k's most-recently-matched point (initially its final
+        # position); each step matches it against the previous snapshot's active
+        # strings and prepends the match (or stops extending that path if unmatched).
+        latest_xy = snapshots[-1][final_mask]
+        n_strings = len(latest_xy)
+        paths = [[pt] for pt in latest_xy]
+
+        for snap_idx in range(n_snapshots - 2, -1, -1):
+            xy_prev_full = snapshots[snap_idx]
+            w_prev = weights[snap_idx]
+            if w_prev is not None and len(w_prev) == len(xy_prev_full):
+                wp = w_prev
+                if apply_sigmoid:
+                    wp = 1.0 / (1.0 + np.exp(-wp))
+                wp = np.nan_to_num(wp, nan=0.0)
+                mask_prev = wp >= weight_threshold
+            else:
+                mask_prev = np.ones(len(xy_prev_full), dtype=bool)
+            xy_prev_active = xy_prev_full[mask_prev]
+
+            if len(xy_prev_active) == 0:
+                # Nothing to match against this snapshot; paths stop extending here.
+                continue
+
+            do_match = match_strings
+            if do_match is None:
+                do_match = len(xy_prev_active) != len(latest_xy)
+
+            if do_match:
+                from scipy.optimize import linear_sum_assignment
+                dist_matrix = np.linalg.norm(
+                    latest_xy[:, None, :] - xy_prev_active[None, :, :], axis=-1
+                )
+                row_idx, col_idx = linear_sum_assignment(dist_matrix)
+                match_of = {r: c for r, c in zip(row_idx.tolist(), col_idx.tolist())}
+            else:
+                n_common = min(len(latest_xy), len(xy_prev_active))
+                match_of = {i: i for i in range(n_common)}
+
+            new_latest_xy = list(latest_xy)
+            for k in range(n_strings):
+                if k in match_of:
+                    matched_pt = xy_prev_active[match_of[k]]
+                    paths[k].append(matched_pt)
+                    new_latest_xy[k] = matched_pt
+            latest_xy = np.array(new_latest_xy)
+
+        for path in paths:
+            path.reverse()  # chronological order: start -> end
+
+        if zoom_range is not None:
+            ax.set_xlim(-zoom_range, zoom_range)
+            ax.set_ylim(-zoom_range, zoom_range)
+        else:
+            ax.set_xlim(-self.half_domain, self.half_domain)
+            ax.set_ylim(-self.half_domain, self.half_domain)
+
+        rgb_start = np.array(to_rgb(color_start))
+        rgb_end = np.array(to_rgb(color_end))
+
+        default_line_kwargs = dict(linewidth=1.2, alpha=0.7, zorder=2)
+        if line_kwargs:
+            default_line_kwargs.update(line_kwargs)
+
+        start_points = []
+        end_points = []
+        for path in paths:
+            path_arr = np.array(path)
+            # Drop consecutive duplicate points (string didn't move that step).
+            deltas = np.linalg.norm(np.diff(path_arr, axis=0), axis=-1)
+            keep = np.concatenate([[True], deltas >= min_segment_length])
+            path_arr = path_arr[keep]
+            if len(path_arr) < 2:
+                if len(path_arr) == 1:
+                    start_points.append(path_arr[0])
+                    end_points.append(path_arr[0])
+                continue
+
+            segments = np.stack([path_arr[:-1], path_arr[1:]], axis=1)
+            n_segs = len(segments)
+            t = np.linspace(0.0, 1.0, n_segs) if n_segs > 1 else np.array([0.0])
+            seg_colors = rgb_start[None, :] * (1 - t[:, None]) + rgb_end[None, :] * t[:, None]
+
+            lc = LineCollection(segments, colors=seg_colors, **default_line_kwargs)
+            ax.add_collection(lc)
+
+            # Arrowhead on the final segment to show direction of travel.
+            arrow = FancyArrowPatch(
+                posA=tuple(path_arr[-2]), posB=tuple(path_arr[-1]),
+                arrowstyle='-|>', mutation_scale=8, linewidth=0,
+                color=color_end, alpha=0.9, zorder=3,
+            )
+            ax.add_patch(arrow)
+
+            start_points.append(path_arr[0])
+            end_points.append(path_arr[-1])
+
+        start_points = np.array(start_points) if start_points else np.empty((0, 2))
+        end_points = np.array(end_points) if end_points else np.empty((0, 2))
+
+        if len(start_points) > 0:
+            ax.scatter(start_points[:, 0], start_points[:, 1], c=color_start, alpha=0.8, s=25, zorder=4)
+        if len(end_points) > 0:
+            ax.scatter(end_points[:, 0], end_points[:, 1], c=color_end, alpha=0.8, s=25, zorder=4)
+
+        legend_elements = [
+            Line2D([0], [0], marker='o', color='none', markerfacecolor=color_start,
+                   markersize=8, label='Original string positions'),
+            Line2D([0], [0], marker='o', color='none', markerfacecolor=color_end,
+                   markersize=8, label='New string positions'),
+            Line2D([0], [0], color=color_end, lw=1.5, marker='>', markersize=6,
+                   label='Path traced during optimization'),
+        ]
+        ax.legend(handles=legend_elements, loc='best', fontsize='small')
+
+        ax.set_aspect('equal')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_title(title)
+
+        return {'xy_snapshots': paths, 'n_strings': n_strings}
+
+    def plot_string_history(self, string_xy_history=None, string_weights_history=None,
+                          weight_threshold=0.7, apply_sigmoid=True,
+                          match_strings=None, min_segment_length=1e-3,
+                          zoom_range=None, figsize=(7, 7), ax=None,
+                          color_start='red', color_end='green',
+                          line_kwargs=None, title='String Position History: Start to End of Optimization',
+                          use_cached_history=True):
+        """
+        Standalone convenience wrapper around `_draw_string_history` that creates its own
+        figure/axis (unless one is passed in).
+
+        By default (`use_cached_history=True`, `string_xy_history=None`) this plots
+        whatever trajectory has already been cached on this Visualizer instance from
+        prior `visualize_progress(plot_types=['string_history'], ...)` calls (e.g.
+        made automatically during `optimizer.optimize(vis_kwargs=..., vis_freq=...)`)
+        - so no positions need to be passed in explicitly. Pass an explicit
+        `string_xy_history` list to bypass the cache, or call `clear_string_history()`
+        first to start a fresh trajectory.
+
+        See `_draw_string_history` for full parameter details.
+
+        Returns:
+        --------
+        dict with keys 'fig', 'ax', 'xy_snapshots', 'n_strings'.
+        """
+        if string_xy_history is None and use_cached_history:
+            string_xy_history = self._string_xy_history
+            string_weights_history = self._string_weights_history
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.get_figure()
+
+        result = self._draw_string_history(
+            ax, string_xy_history, string_weights_history=string_weights_history,
+            weight_threshold=weight_threshold, apply_sigmoid=apply_sigmoid,
+            match_strings=match_strings, min_segment_length=min_segment_length,
+            zoom_range=zoom_range,
+            color_start=color_start, color_end=color_end,
+            line_kwargs=line_kwargs, title=title,
+        )
+        result['fig'] = fig
+        result['ax'] = ax
+        return result
+
     def create_interactive_3d_plot(self, points_3d, weight_threshold=None,
                                  points_per_string_list=None, string_xy=None, string_weights=None):
         """
@@ -6813,6 +7139,18 @@ class Visualizer:
             except Exception as e:
                 print(f"Error cleaning up temporary directory: {e}")
         print("GIF temporary files cleanup completed.")
+
+    def clear_string_history(self) -> None:
+        """
+        Clear the cached string XY position/weight history used by the
+        'string_history' plot type. Call this before starting a fresh
+        optimization run if you want the traced path to restart from that
+        run's initial geometry rather than continuing from a previous run.
+        """
+        self._string_xy_history = []
+        self._string_weights_history = []
+        self._string_history_iterations = []
+        self._last_recorded_iteration_string_history = None
 
 def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        param_names=None, param_ranges=None, n_points=50,
