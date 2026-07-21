@@ -1932,14 +1932,25 @@ def _resolve_lightsabre_instance(surrogate_func):
 _POISSON_BATCHED_COMPILE_CACHE = {}
 
 
-def _make_compiled_lambda_and_jac_fn(
-    surrogate, fisher_info_params, torch_compile_kwargs=None, points_require_grad=False,
-):
-    """Build (and cache) a torch.compile'd function computing (J, lambda) for a
-    chunk of points, vmapped over the event axis.
+def _make_compiled_call_batched(surrogate, torch_compile_kwargs=None, points_require_grad=False):
+    """Build (and cache) a torch.compile'd wrapper around ``surrogate.call_batched``.
 
-    Returns a callable ``compiled_fn(theta0, poss, dirs, energies, pts_chunk) ->
-    (J, ly)`` with ``J: (E, n_pts_chunk, D)`` and ``ly: (E, n_pts_chunk)``.
+    IMPORTANT: only the surrogate's forward call is compiled here -- NOT the
+    surrounding ``vmap``/``jacfwd`` composition. Letting Dynamo trace *through*
+    ``torch.func`` transforms (``vmap(jacfwd(...))``) is unreliable: Dynamo has
+    to inline the functorch higher-order-op machinery itself, which in
+    practice hits repeated graph-break/inlining failures and can raise
+    ``TorchRuntimeError`` (observed in this codebase's actual training loop --
+    see the WeightedResolutionLoss traceback this helper was written to fix).
+    The supported, working composition order is the other way around:
+    ``torch.func`` transforms wrapping a compiled leaf function. So `jacfwd`
+    and `vmap` stay in eager `torch.func` (exactly like the non-compiled path)
+    and only `call_batched` -- the actual hot/expensive surrogate forward --
+    is handed to `torch.compile`.
+
+    Returns a callable ``compiled_call_batched(track_pos, track_dir,
+    track_energy, om_positions) -> light_yield``, drop-in for
+    ``surrogate.call_batched``.
 
     ``points_require_grad`` is folded into the cache key (not just left to
     Dynamo's ``requires_grad`` guard) so a call made while differentiating
@@ -1951,11 +1962,28 @@ def _make_compiled_lambda_and_jac_fn(
     across steps with new leaf tensors (a new ``string_xy`` after each
     optimizer step) can silently return stale gradients instead of erroring.
     """
-    cache_key = (id(surrogate), tuple(fisher_info_params), bool(points_require_grad))
+    cache_key = (id(surrogate), bool(points_require_grad))
     cached = _POISSON_BATCHED_COMPILE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
+    kwargs = dict(torch_compile_kwargs) if torch_compile_kwargs else {}
+    kwargs.setdefault('dynamic', True)
+    if points_require_grad:
+        # Never let a caller opt into CUDA-graph capture (mode='reduce-overhead'
+        # / 'max-autotune') on the differentiable path -- see docstring.
+        kwargs['mode'] = 'default'
+    compiled_call_batched = torch.compile(surrogate.call_batched, **kwargs)
+
+    _POISSON_BATCHED_COMPILE_CACHE[cache_key] = compiled_call_batched
+    return compiled_call_batched
+
+
+def _make_lambda_and_jac_fn(call_batched_fn, fisher_info_params):
+    """Build the (jacfwd, plain-eval) closures over a given ``call_batched``-like
+    callable (eager or torch.compile'd), sharing logic between the eager and
+    compiled-surrogate code paths in ``compute_fisher_info_poisson_batched_events``.
+    """
     def _lambda_e(theta_flat_e, pos_e, dir_e, energy_e, pts_chunk):
         idx = 0
         e_val = energy_e
@@ -1971,32 +1999,16 @@ def _make_compiled_lambda_and_jac_fn(
             else:  # position
                 p_val = theta_flat_e[idx:idx + 3].reshape(3)
                 idx += 3
-        ly = surrogate.call_batched(
+        ly = call_batched_fn(
             p_val.reshape(1, 3), d_val.reshape(1, 3),
             e_val.reshape(1), pts_chunk,
         )
         return ly.reshape(-1)  # (n_pts_chunk,)
 
-    def _J_and_lambda_e(theta_flat_e, pos_e, dir_e, energy_e, pts_chunk):
-        J_e = jacfwd(lambda t: _lambda_e(t, pos_e, dir_e, energy_e, pts_chunk))(theta_flat_e)
-        ly_e = _lambda_e(theta_flat_e, pos_e, dir_e, energy_e, pts_chunk)
-        return J_e, ly_e
+    def _J_e(theta_flat_e, pos_e, dir_e, energy_e, pts_chunk):
+        return jacfwd(lambda t: _lambda_e(t, pos_e, dir_e, energy_e, pts_chunk))(theta_flat_e)
 
-    def _batched_fn(theta0, poss, dirs, energies, pts_chunk):
-        return vmap(_J_and_lambda_e, in_dims=(0, 0, 0, 0, None))(
-            theta0, poss, dirs, energies, pts_chunk,
-        )
-
-    kwargs = dict(torch_compile_kwargs) if torch_compile_kwargs else {}
-    kwargs.setdefault('dynamic', True)
-    if points_require_grad:
-        # Never let a caller opt into CUDA-graph capture (mode='reduce-overhead'
-        # / 'max-autotune') on the differentiable path -- see docstring.
-        kwargs['mode'] = 'default'
-    compiled_fn = torch.compile(_batched_fn, **kwargs)
-
-    _POISSON_BATCHED_COMPILE_CACHE[cache_key] = compiled_fn
-    return compiled_fn
+    return _lambda_e, _J_e
 
 
 def compute_fisher_info_poisson_batched_events(
@@ -2167,69 +2179,38 @@ def compute_fisher_info_poisson_batched_events(
     else:
         fisher_chunks = []
 
-    # Per-event λ(θ_e) over a chunk of points, built from θ_flat + fixed values.
-    def _make_lambda_fn(pts_chunk):
-        def _lambda_e(theta_flat_e, pos_e, dir_e, energy_e):
-            # Rebuild the three call_batched inputs, substituting the
-            # differentiated pieces from theta_flat_e.
-            idx = 0
-            e_val = energy_e
-            d_val = dir_e
-            p_val = pos_e
-            for p in fisher_info_params:
-                if p == 'energy':
-                    e_val = theta_flat_e[idx:idx + 1].reshape(())
-                    idx += 1
-                elif p == 'direction':
-                    d_val = theta_flat_e[idx:idx + 3].reshape(3)
-                    idx += 3
-                else:  # position
-                    p_val = theta_flat_e[idx:idx + 3].reshape(3)
-                    idx += 3
-            # call_batched expects a leading event dim; use size-1 batch.
-            ly = surrogate.call_batched(
-                p_val.reshape(1, 3), d_val.reshape(1, 3),
-                e_val.reshape(1), pts_chunk,
-            )
-            return ly.reshape(-1)  # (n_pts_chunk,)
-        return _lambda_e
-
+    # Choose the call_batched implementation: the raw surrogate method, or a
+    # torch.compile'd wrapper around it. Either way, vmap/jacfwd stay eager --
+    # see _make_compiled_call_batched's docstring for why compiling *through*
+    # vmap(jacfwd(...)) is not attempted.
     if use_torch_compile:
         # Any leaf that gradients must survive back to (detector positions via
         # `points`, or event params via `theta0`) forces the safe (non-CUDA-graph)
-        # compile mode -- see _make_compiled_lambda_and_jac_fn's docstring. Only
+        # compile mode -- see _make_compiled_call_batched's docstring. Only
         # relevant when the caller isn't detaching (detach_fisher_tensors=False).
         points_require_grad = (not detach_fisher_tensors) and (
-            points.requires_grad 
+            points.requires_grad or theta0.requires_grad
         )
-        compiled_fn = _make_compiled_lambda_and_jac_fn(
-            surrogate, fisher_info_params, torch_compile_kwargs=torch_compile_kwargs,
+        call_batched_fn = _make_compiled_call_batched(
+            surrogate, torch_compile_kwargs=torch_compile_kwargs,
             points_require_grad=points_require_grad,
         )
+    else:
+        call_batched_fn = surrogate.call_batched
+
+    _lambda_e, _J_e = _make_lambda_and_jac_fn(call_batched_fn, fisher_info_params)
 
     for p_start in range(0, n_points, pt_chunk):
         p_end = min(p_start + pt_chunk, n_points)
         pts_chunk = points[p_start:p_end]
 
-        if use_torch_compile:
-            # Compiled closure captures fisher_info_params/surrogate only;
-            # points, theta0, poss, dirs, energies are passed as tensor args so
-            # recompilation is triggered only on genuine shape changes.
-            J, ly = compiled_fn(theta0, poss, dirs, energies, pts_chunk)  # (E, n_pts, D), (E, n_pts)
-        else:
-            lambda_fn = _make_lambda_fn(pts_chunk)
-
-            # Forward-mode Jacobian per event: jacfwd gives J (n_pts_chunk, D) and we
-            # evaluate λ separately. Both are vmapped over the event axis, so all
-            # events in the batch run in a single set of GPU kernels.
-            def _J_e(theta_flat_e, pos_e, dir_e, energy_e):
-                return jacfwd(lambda t: lambda_fn(t, pos_e, dir_e, energy_e))(theta_flat_e)
-
-            def _lambda_only_e(theta_flat_e, pos_e, dir_e, energy_e):
-                return lambda_fn(theta_flat_e, pos_e, dir_e, energy_e)
-
-            J = vmap(_J_e)(theta0, poss, dirs, energies)          # (E, n_pts, D)
-            ly = vmap(_lambda_only_e)(theta0, poss, dirs, energies)  # (E, n_pts)
+        # Forward-mode Jacobian per event: jacfwd gives J (n_pts_chunk, D) and we
+        # evaluate λ separately. Both are vmapped over the event axis, so all
+        # events in the batch run in a single set of GPU kernels. Identical
+        # eager torch.func composition regardless of use_torch_compile -- only
+        # the underlying call_batched differs.
+        J = vmap(lambda t, p, d, e: _J_e(t, p, d, e, pts_chunk))(theta0, poss, dirs, energies)  # (E, n_pts, D)
+        ly = vmap(lambda t, p, d, e: _lambda_e(t, p, d, e, pts_chunk))(theta0, poss, dirs, energies)  # (E, n_pts)
 
         # Per-point Fisher (Poisson mean): outer(J) / λ. Mirrors the per-event
         # surrogate-only branch of compute_fisher_info_single_averaged exactly
