@@ -359,10 +359,10 @@ class Visualizer:
             ax.tick_params(axis='x', rotation=0, pad=3)
             ax.tick_params(axis='y', rotation=0, pad=3)
     
-    def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=1, zoom_range=None):
+    def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=1, zoom_range=None, half_domain=None):
         """
         Draw ROV safe space shape on the given axes.
-        
+
         Parameters:
         -----------
         ax : matplotlib.axes.Axes
@@ -373,10 +373,14 @@ class Visualizer:
             Where to place the ROV shape ('bottom_left', 'bottom_right', etc.)
         scale_factor : float
             Scale factor for the ROV shape relative to plot domain
+        half_domain : float or None
+            Half-width of the domain actually plotted on `ax` (e.g. an auto-expanded
+            domain when strings lie outside the nominal one). Falls back to
+            `self.half_domain` if not provided. Ignored if `zoom_range` is given.
         """
         if rov_penalty is None:
             return
-            
+
         # Get ROV dimensions
         # rov_rec_width = rov_penalty.rov_rec_width
         rov_rec_width = rov_penalty.rov_rec_width
@@ -385,7 +389,7 @@ class Visualizer:
         if zoom_range is not None:
             ax_lims = zoom_range*2
         else:
-            ax_lims = self.domain_size
+            ax_lims = (half_domain * 2) if half_domain is not None else self.domain_size
         
         # Scale dimensions to fit in corner of plot
         scale = scale_factor #* self.domain_size
@@ -3069,7 +3073,7 @@ class Visualizer:
                     
                     rov_penalty = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
                     if rov_penalty is not None:
-                        self._draw_rov_safe_space(ax, rov_penalty, zoom_range=zoom_range)
+                        self._draw_rov_safe_space(ax, rov_penalty, zoom_range=zoom_range, half_domain=effective_half_domain)
                     
                     set_axis_limits(ax)
                     ax.set_title('ROV Penalty per String')
