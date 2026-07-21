@@ -1935,32 +1935,6 @@ _POISSON_BATCHED_COMPILE_CACHE = {}
 def _make_compiled_call_batched(surrogate, torch_compile_kwargs=None, points_require_grad=False):
     """Build (and cache) a torch.compile'd wrapper around ``surrogate.call_batched``.
 
-    IMPORTANT: only the surrogate's forward call is compiled here -- NOT the
-    surrounding ``vmap``/``jacfwd`` composition. Letting Dynamo trace *through*
-    ``torch.func`` transforms (``vmap(jacfwd(...))``) is unreliable: Dynamo has
-    to inline the functorch higher-order-op machinery itself, which in
-    practice hits repeated graph-break/inlining failures and can raise
-    ``TorchRuntimeError`` (observed in this codebase's actual training loop --
-    see the WeightedResolutionLoss traceback this helper was written to fix).
-    The supported, working composition order is the other way around:
-    ``torch.func`` transforms wrapping a compiled leaf function. So `jacfwd`
-    and `vmap` stay in eager `torch.func` (exactly like the non-compiled path)
-    and only `call_batched` -- the actual hot/expensive surrogate forward --
-    is handed to `torch.compile`.
-
-    Returns a callable ``compiled_call_batched(track_pos, track_dir,
-    track_energy, om_positions) -> light_yield``, drop-in for
-    ``surrogate.call_batched``.
-
-    ``points_require_grad`` is folded into the cache key (not just left to
-    Dynamo's ``requires_grad`` guard) so a call made while differentiating
-    w.r.t. detector positions (``detach_fisher_tensors=False``) never reuses a
-    graph compiled for a detached/no-grad call, or vice versa. It also forces
-    ``mode='default'`` (never CUDA-graph-capturing modes such as
-    ``reduce-overhead``) whenever gradients are required: CUDA graphs replay
-    from fixed input/output memory addresses, and reusing that captured graph
-    across steps with new leaf tensors (a new ``string_xy`` after each
-    optimizer step) can silently return stale gradients instead of erroring.
     """
     cache_key = (id(surrogate), bool(points_require_grad))
     cached = _POISSON_BATCHED_COMPILE_CACHE.get(cache_key)
