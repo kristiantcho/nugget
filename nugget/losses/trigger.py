@@ -11,11 +11,25 @@ _TRIGGER_SURROGATE_COMPILE_CACHE = {}
 
 
 def _compiled_surrogate(fn, torch_compile_kwargs=None):
-    """Return a torch.compile'd wrapper around `fn`, cached by `fn`'s identity."""
+    """Return a torch.compile'd wrapper around `fn`, cached by `fn`'s identity.
+
+    Disables AOTAutograd's "donated buffer" optimization before compiling.
+    Donated buffers assume a compiled function's backward runs at most once per
+    forward (so its saved-for-backward tensors can be freed immediately after
+    use). This codebase's training loop backprops several losses that share
+    upstream forward computation via ``loss.backward(retain_graph=True)`` (see
+    Optimizer.loss_update_step) -- when the trigger/effective-area loss isn't
+    the last one processed, its compiled surrogate's graph is still needed
+    after its own backward call, and a donated-buffer graph raises
+    ``RuntimeError: This backward function was compiled with non-empty donated
+    buffers...`` in that case. Disabling it costs a little memory reuse but is
+    required here for correctness.
+    """
     cache_key = id(fn)
     cached = _TRIGGER_SURROGATE_COMPILE_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    torch._functorch.config.donated_buffer = False
     kwargs = dict(torch_compile_kwargs) if torch_compile_kwargs else {}
     kwargs.setdefault('dynamic', True)
     compiled = torch.compile(fn, **kwargs)
