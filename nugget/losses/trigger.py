@@ -2,6 +2,27 @@ import torch
 from nugget.losses.base_loss import LossFunction
 from nugget.losses.fisher_info import WeightedResolutionLoss
 
+# Cache of torch.compile'd surrogate wrappers, keyed by the identity of the raw
+# callable. TriggerLoss's own math (sigmoid gating, sliding-bar logic, softmax
+# aggregation) has no torch.func (vmap/jacfwd/jacrev) transforms in it, so --
+# unlike the Fisher-info Poisson path -- compiling the surrogate call directly
+# is safe here; there's no functorch-transform composition to worry about.
+_TRIGGER_SURROGATE_COMPILE_CACHE = {}
+
+
+def _compiled_surrogate(fn, torch_compile_kwargs=None):
+    """Return a torch.compile'd wrapper around `fn`, cached by `fn`'s identity."""
+    cache_key = id(fn)
+    cached = _TRIGGER_SURROGATE_COMPILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    kwargs = dict(torch_compile_kwargs) if torch_compile_kwargs else {}
+    kwargs.setdefault('dynamic', True)
+    compiled = torch.compile(fn, **kwargs)
+    _TRIGGER_SURROGATE_COMPILE_CACHE[cache_key] = compiled
+    return compiled
+
+
 class TriggerLoss(LossFunction):
     """
     Trigger loss based on a sliding bar along the event track.
@@ -560,6 +581,20 @@ class TriggerLoss(LossFunction):
         batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
         chunk_size = kwargs.get('binned_trigger_batch_size', None)
         detach_light_yields = kwargs.get('detach_light_yields', False)
+
+        # Optional torch.compile of the surrogate call(s). TriggerLoss's own math
+        # has no torch.func transforms, so compiling the surrogate callable
+        # directly (rather than anything it's wrapped in) is safe -- see the
+        # module-level _compiled_surrogate helper. Cached per callable identity,
+        # so repeated calls (e.g. across training steps / energy-zenith bins)
+        # reuse the same compiled graph instead of re-tracing.
+        use_torch_compile = kwargs.get('trigger_use_torch_compile', False)
+        torch_compile_kwargs = kwargs.get('trigger_torch_compile_kwargs', None)
+        if use_torch_compile:
+            if surrogate_func is not None:
+                surrogate_func = _compiled_surrogate(surrogate_func, torch_compile_kwargs)
+            if batched_surrogate_func is not None:
+                batched_surrogate_func = _compiled_surrogate(batched_surrogate_func, torch_compile_kwargs)
 
         # Optional override: choose computation mode
         # - None: auto (batched if precomputed yields provided, else single loop)
