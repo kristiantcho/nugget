@@ -6811,7 +6811,7 @@ class Visualizer:
                    markersize=8, label='Original string positions'),
             Line2D([0], [0], marker='o', color='none', markerfacecolor=color_end,
                    markersize=8, label='New string positions'),
-            Line2D([0], [0], color=color_end, lw=1.5, marker='>', markersize=6),
+            # Line2D([0], [0], color=color_end, lw=1.5, marker='>', markersize=6),
         ]
         ax.legend(handles=legend_elements, loc='best', fontsize='small')
 
