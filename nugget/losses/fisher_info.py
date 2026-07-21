@@ -204,6 +204,7 @@ class WeightedFisherInfoLoss(LossFunction):
         adaptive_grid_retry=True, adaptive_t_max_floor_ns=10.0, uninformative_fisher_value=1e-6,
         precomputed_fisher_per_string_per_event=None, recompute_bad_points=True,
         empty_cache_after_event=False, events_per_batch=1,
+        use_torch_compile=False, torch_compile_kwargs=None,
     ):
         n_strings = len(string_xy)
         # use_rich_features is now stored on the model — read from it if available.
@@ -325,6 +326,8 @@ class WeightedFisherInfoLoss(LossFunction):
                     zero_response_threshold=zero_response_threshold,
                     uninformative_fisher_value=uninformative_fisher_value,
                     detach_fisher_tensors=detach_fisher_tensors,
+                    use_torch_compile=use_torch_compile,
+                    torch_compile_kwargs=torch_compile_kwargs,
                 )  # (b, n_strings, D, D)
                 fisher_per_string_per_event[b_start:b_end] += fisher_batch.to(self.device)
                 del fisher_batch
@@ -770,6 +773,8 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         recompute_bad_points = kwargs.get('recompute_bad_points', False)
         empty_cache_after_event = kwargs.get('empty_cache_after_event', False)
         events_per_batch = kwargs.get('events_per_batch', None)
+        use_torch_compile = kwargs.get('fisher_info_use_torch_compile', False)
+        torch_compile_kwargs = kwargs.get('fisher_info_torch_compile_kwargs', None)
         # New parameters for batched loading from files
         event_paths = kwargs.get('event_paths', None)
         fisher_info_paths = kwargs.get('fisher_info_paths', None)
@@ -823,7 +828,9 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 precomputed_fisher_per_string_per_event=precomputed_fisher_info_per_string_per_event,
                 recompute_bad_points=recompute_bad_points,
                 empty_cache_after_event=empty_cache_after_event,
-                events_per_batch=events_per_batch
+                events_per_batch=events_per_batch,
+                use_torch_compile=use_torch_compile,
+                torch_compile_kwargs=torch_compile_kwargs,
             )
         else:
             fisher_info_per_string_per_event = precomputed_fisher_info_per_string_per_event.to(self.device)

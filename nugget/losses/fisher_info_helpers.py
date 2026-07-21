@@ -1924,11 +1924,87 @@ def _resolve_lightsabre_instance(surrogate_func):
     return None
 
 
+# Cache of torch.compile'd (J, lambda) closures, keyed by the identity of the
+# surrogate instance plus the tuple of differentiated params. Compilation is
+# fairly expensive (graph capture + Inductor codegen), so we compile once per
+# (surrogate, fisher_info_params) combination and reuse across calls/chunks
+# instead of re-tracing on every invocation.
+_POISSON_BATCHED_COMPILE_CACHE = {}
+
+
+def _make_compiled_lambda_and_jac_fn(
+    surrogate, fisher_info_params, torch_compile_kwargs=None, points_require_grad=False,
+):
+    """Build (and cache) a torch.compile'd function computing (J, lambda) for a
+    chunk of points, vmapped over the event axis.
+
+    Returns a callable ``compiled_fn(theta0, poss, dirs, energies, pts_chunk) ->
+    (J, ly)`` with ``J: (E, n_pts_chunk, D)`` and ``ly: (E, n_pts_chunk)``.
+
+    ``points_require_grad`` is folded into the cache key (not just left to
+    Dynamo's ``requires_grad`` guard) so a call made while differentiating
+    w.r.t. detector positions (``detach_fisher_tensors=False``) never reuses a
+    graph compiled for a detached/no-grad call, or vice versa. It also forces
+    ``mode='default'`` (never CUDA-graph-capturing modes such as
+    ``reduce-overhead``) whenever gradients are required: CUDA graphs replay
+    from fixed input/output memory addresses, and reusing that captured graph
+    across steps with new leaf tensors (a new ``string_xy`` after each
+    optimizer step) can silently return stale gradients instead of erroring.
+    """
+    cache_key = (id(surrogate), tuple(fisher_info_params), bool(points_require_grad))
+    cached = _POISSON_BATCHED_COMPILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    def _lambda_e(theta_flat_e, pos_e, dir_e, energy_e, pts_chunk):
+        idx = 0
+        e_val = energy_e
+        d_val = dir_e
+        p_val = pos_e
+        for p in fisher_info_params:
+            if p == 'energy':
+                e_val = theta_flat_e[idx:idx + 1].reshape(())
+                idx += 1
+            elif p == 'direction':
+                d_val = theta_flat_e[idx:idx + 3].reshape(3)
+                idx += 3
+            else:  # position
+                p_val = theta_flat_e[idx:idx + 3].reshape(3)
+                idx += 3
+        ly = surrogate.call_batched(
+            p_val.reshape(1, 3), d_val.reshape(1, 3),
+            e_val.reshape(1), pts_chunk,
+        )
+        return ly.reshape(-1)  # (n_pts_chunk,)
+
+    def _J_and_lambda_e(theta_flat_e, pos_e, dir_e, energy_e, pts_chunk):
+        J_e = jacfwd(lambda t: _lambda_e(t, pos_e, dir_e, energy_e, pts_chunk))(theta_flat_e)
+        ly_e = _lambda_e(theta_flat_e, pos_e, dir_e, energy_e, pts_chunk)
+        return J_e, ly_e
+
+    def _batched_fn(theta0, poss, dirs, energies, pts_chunk):
+        return vmap(_J_and_lambda_e, in_dims=(0, 0, 0, 0, None))(
+            theta0, poss, dirs, energies, pts_chunk,
+        )
+
+    kwargs = dict(torch_compile_kwargs) if torch_compile_kwargs else {}
+    kwargs.setdefault('dynamic', True)
+    if points_require_grad:
+        # Never let a caller opt into CUDA-graph capture (mode='reduce-overhead'
+        # / 'max-autotune') on the differentiable path -- see docstring.
+        kwargs['mode'] = 'default'
+    compiled_fn = torch.compile(_batched_fn, **kwargs)
+
+    _POISSON_BATCHED_COMPILE_CACHE[cache_key] = compiled_fn
+    return compiled_fn
+
+
 def compute_fisher_info_poisson_batched_events(
     fisher_info_params, points, event_params_list, surrogate_func,
     string_xy=None, device=None, point_chunk_size=None, grad_chunk_size=None,
     skip_zero_response=True, zero_response_threshold=0.5,
     uninformative_fisher_value=1e-6, detach_fisher_tensors=True,
+    use_torch_compile=False, torch_compile_kwargs=None,
 ):
     """Event-batched Poisson-mean Fisher information via forward-mode JVP.
 
@@ -1963,6 +2039,32 @@ def compute_fisher_info_poisson_batched_events(
         Accepted for API symmetry with the per-event path but unused here: the
         forward-mode Jacobian over the (small) parameter dimension D is computed
         in one jacfwd call.
+    use_torch_compile : bool
+        If True, evaluate the per-chunk (Jacobian, lambda) computation through a
+        ``torch.compile``'d closure instead of eager ``vmap(jacfwd(...))``. The
+        compiled closure is cached per (surrogate instance, fisher_info_params,
+        whether gradients must survive to `points`/`theta0`) so the
+        (potentially expensive) graph capture happens once per configuration;
+        subsequent calls and point-chunks reuse it. Numerically equivalent to
+        the default eager path -- only worth enabling when this function is
+        called repeatedly (e.g. across many training steps) so the compilation
+        cost is amortised.
+
+        When ``detach_fisher_tensors=False`` and ``points`` (or the per-event
+        parameter tensors) require grad -- i.e. the Fisher matrix itself must
+        stay differentiable w.r.t. detector positions, such as during geometry
+        optimisation -- the compiled closure is automatically re-specialised
+        for that case and forced to ``mode='default'`` regardless of
+        ``torch_compile_kwargs``, so a CUDA-graph-capturing mode never risks
+        replaying a stale graph against new leaf tensors (e.g. `string_xy`
+        after an optimizer step). This mirrors the eager path exactly:
+        gradients flow from the returned Fisher matrix through `J`/`ly` back to
+        `points` via `surrogate.call_batched`.
+    torch_compile_kwargs : dict or None
+        Extra keyword arguments forwarded to ``torch.compile`` (e.g. ``mode``,
+        ``fullgraph``). Ignored unless ``use_torch_compile=True``. ``mode`` is
+        overridden to ``'default'`` whenever gradients must reach `points`/
+        `theta0` (see ``use_torch_compile`` above).
 
     Returns
     -------
@@ -2092,22 +2194,42 @@ def compute_fisher_info_poisson_batched_events(
             return ly.reshape(-1)  # (n_pts_chunk,)
         return _lambda_e
 
+    if use_torch_compile:
+        # Any leaf that gradients must survive back to (detector positions via
+        # `points`, or event params via `theta0`) forces the safe (non-CUDA-graph)
+        # compile mode -- see _make_compiled_lambda_and_jac_fn's docstring. Only
+        # relevant when the caller isn't detaching (detach_fisher_tensors=False).
+        points_require_grad = (not detach_fisher_tensors) and (
+            points.requires_grad 
+        )
+        compiled_fn = _make_compiled_lambda_and_jac_fn(
+            surrogate, fisher_info_params, torch_compile_kwargs=torch_compile_kwargs,
+            points_require_grad=points_require_grad,
+        )
+
     for p_start in range(0, n_points, pt_chunk):
         p_end = min(p_start + pt_chunk, n_points)
         pts_chunk = points[p_start:p_end]
-        lambda_fn = _make_lambda_fn(pts_chunk)
 
-        # Forward-mode Jacobian per event: jacfwd gives J (n_pts_chunk, D) and we
-        # evaluate λ separately. Both are vmapped over the event axis, so all
-        # events in the batch run in a single set of GPU kernels.
-        def _J_e(theta_flat_e, pos_e, dir_e, energy_e):
-            return jacfwd(lambda t: lambda_fn(t, pos_e, dir_e, energy_e))(theta_flat_e)
+        if use_torch_compile:
+            # Compiled closure captures fisher_info_params/surrogate only;
+            # points, theta0, poss, dirs, energies are passed as tensor args so
+            # recompilation is triggered only on genuine shape changes.
+            J, ly = compiled_fn(theta0, poss, dirs, energies, pts_chunk)  # (E, n_pts, D), (E, n_pts)
+        else:
+            lambda_fn = _make_lambda_fn(pts_chunk)
 
-        def _lambda_only_e(theta_flat_e, pos_e, dir_e, energy_e):
-            return lambda_fn(theta_flat_e, pos_e, dir_e, energy_e)
+            # Forward-mode Jacobian per event: jacfwd gives J (n_pts_chunk, D) and we
+            # evaluate λ separately. Both are vmapped over the event axis, so all
+            # events in the batch run in a single set of GPU kernels.
+            def _J_e(theta_flat_e, pos_e, dir_e, energy_e):
+                return jacfwd(lambda t: lambda_fn(t, pos_e, dir_e, energy_e))(theta_flat_e)
 
-        J = vmap(_J_e)(theta0, poss, dirs, energies)          # (E, n_pts, D)
-        ly = vmap(_lambda_only_e)(theta0, poss, dirs, energies)  # (E, n_pts)
+            def _lambda_only_e(theta_flat_e, pos_e, dir_e, energy_e):
+                return lambda_fn(theta_flat_e, pos_e, dir_e, energy_e)
+
+            J = vmap(_J_e)(theta0, poss, dirs, energies)          # (E, n_pts, D)
+            ly = vmap(_lambda_only_e)(theta0, poss, dirs, energies)  # (E, n_pts)
 
         # Per-point Fisher (Poisson mean): outer(J) / λ. Mirrors the per-event
         # surrogate-only branch of compute_fisher_info_single_averaged exactly
