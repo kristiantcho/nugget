@@ -2639,15 +2639,31 @@ class Visualizer:
         
         # Extract zoom_range parameter for contour plots
         zoom_range = kwargs.get('zoom_range', None)
-        
-        # Helper function to set axis limits based on zoom_range or default domain
+
+        # If any string lies outside the nominal domain, expand the plotted half-domain
+        # just enough to include it (with a small margin) rather than silently clipping
+        # strings out of view. Only kicks in when no explicit zoom_range was requested -
+        # an explicit zoom_range is a deliberate user choice and is left untouched.
+        # String point sizes are shrunk proportionally (via string_size_scale) so plots
+        # stay visually consistent with the un-expanded domain when nothing is out of bounds.
+        string_size_scale = 1.0
+        effective_half_domain = self.half_domain
+        if zoom_range is None and string_xy is not None:
+            string_xy_np = string_xy.detach().cpu().numpy() if torch.is_tensor(string_xy) else np.asarray(string_xy)
+            if string_xy_np.size > 0:
+                max_abs_coord = float(np.max(np.abs(string_xy_np)))
+                if np.isfinite(max_abs_coord) and max_abs_coord > self.half_domain:
+                    effective_half_domain = max_abs_coord * 1.05  # small margin so edge strings aren't flush with the border
+                    string_size_scale = self.half_domain / effective_half_domain
+
+        # Helper function to set axis limits based on zoom_range or default (possibly expanded) domain
         def set_axis_limits(ax_obj):
             if zoom_range is not None:
                 ax_obj.set_xlim(-zoom_range, zoom_range)
                 ax_obj.set_ylim(-zoom_range, zoom_range)
             else:
-                ax_obj.set_xlim(-self.half_domain, self.half_domain)
-                ax_obj.set_ylim(-self.half_domain, self.half_domain)
+                ax_obj.set_xlim(-effective_half_domain, effective_half_domain)
+                ax_obj.set_ylim(-effective_half_domain, effective_half_domain)
         
         # Create the requested plot type
         if plot_type == self.PLOT_LOSS:
@@ -2863,7 +2879,7 @@ class Visualizer:
                         sc = ax.scatter(
                             xy_weighted[:, 0],
                             xy_weighted[:, 1],
-                            s=min([40, 30 * 200 / max(1, len(xy_weighted))]),
+                            s=min([40, 30 * 200 / max(1, len(xy_weighted))]) * string_size_scale,
                             c=points_weighted,
                             cmap=cmap,
                             alpha=alpha_vals[weight_mask],
@@ -2887,7 +2903,7 @@ class Visualizer:
                         weight_mask = np.array([True]*len(xy_np))
 
                     if np.any(weight_mask):    
-                        ax.scatter(xy_np[:, 0][weight_mask], xy_np[:, 1][weight_mask], s=min([40,30*200/len(xy_np[weight_mask])]), alpha=alpha_vals[weight_mask])
+                        ax.scatter(xy_np[:, 0][weight_mask], xy_np[:, 1][weight_mask], s=min([40,30*200/len(xy_np[weight_mask])]) * string_size_scale, alpha=alpha_vals[weight_mask])
 
                 set_axis_limits(ax)
                 ax.set_title('String Positions in XY Plane')
@@ -3038,7 +3054,7 @@ class Visualizer:
                     sc = ax.scatter(
                         xy_np[:, 0],
                         xy_np[:, 1],
-                        s=min([30, 50 * 200 / len(xy_np)]),
+                        s=min([30, 50 * 200 / len(xy_np)]) * string_size_scale,
                         c=rov_penalty_np,
                         cmap=cmap,
                         norm=norm,
@@ -3097,7 +3113,7 @@ class Visualizer:
                         sc = ax.scatter(
                             xy_np[:, 0],
                             xy_np[:, 1],
-                            s=min([30, 50 * 200 / len(xy_np)]),
+                            s=min([30, 50 * 200 / len(xy_np)]) * string_size_scale,
                             c=local_repulsion_np,
                             cmap=cmap,
                             norm=norm,
@@ -3145,7 +3161,10 @@ class Visualizer:
                     string_xy_history=self._string_xy_history,
                     string_weights_history=self._string_weights_history,
                     weight_threshold=kwargs.get('weight_threshold', 0.7),
-                    apply_sigmoid=kwargs.get('string_history_apply_sigmoid', True),
+                    # `kwargs['string_weights']` was already sigmoid-applied above (see the
+                    # top of _create_plot), and each snapshot cached here came from that same
+                    # already-sigmoided kwarg, so do not sigmoid it again by default.
+                    apply_sigmoid=kwargs.get('string_history_apply_sigmoid', False),
                     match_strings=kwargs.get('string_history_match_strings', None),
                     min_segment_length=kwargs.get('string_history_min_segment_length', 1e-3),
                     zoom_range=zoom_range,
@@ -3315,7 +3334,7 @@ class Visualizer:
                 # print("Alpha values:", alpha_values)
                 # alpha_values = [alpha_values[i] if alpha_values[i] > 0.7 else 0.1 for i in range(len(alpha_values))]
                 
-                ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='white')
+                ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='white')
                 
                 # Set appropriate title based on input type
                 if signal_surrogate_func is not None:
@@ -3433,7 +3452,7 @@ class Visualizer:
             
             # alpha_values = [alpha_values[i] if alpha_values[i] > 0.7 else 0.1 for i in range(len(alpha_values))]
                 
-            ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+            ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
             
             ax.set_title(plot_title)
             ax.set_xlabel("X")
@@ -3691,7 +3710,7 @@ class Visualizer:
                     alpha_values = np.clip(alpha_values, 0.05, 1.0)
                 else:
                     alpha_values = 0.8
-                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
             else:
                 title_str += " (Z=0)"
                 # For single-slice, show points near the z=0 slice
@@ -3707,7 +3726,7 @@ class Visualizer:
                         alpha_values = np.clip(alpha_values, 0.05, 1.0)
                     else:
                         alpha_values = 0.8
-                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
                 else: # If no points are near z=0, show all points projected
                     if string_weights is not None and string_indices is not None:
                         alpha_values = np.array([string_weights[idx] for idx in string_indices])
@@ -3717,7 +3736,7 @@ class Visualizer:
                         alpha_values = np.clip(alpha_values, 0.05, 1.0)
                     else:
                         alpha_values = 0.8
-                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
 
             # Add detail to title based on what was visualized
             if vis_all_surrogates and len(surrogate_funcs_list) > 1:
@@ -3932,7 +3951,7 @@ class Visualizer:
                 alpha_values = 0.8
 
             if multi_slice:
-                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
             else: # Single slice (Z=0.0)
                 xy_points_z0 = points_np[np.abs(points_np[:, 2] - 0.0) < 0.2] # Points near Z=0
                 if len(xy_points_z0) > 0:
@@ -3942,9 +3961,9 @@ class Visualizer:
                         z0_alpha_values = alpha_values[z0_indices]
                     else:
                         z0_alpha_values = alpha_values
-                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=z0_alpha_values, edgecolor='black')
+                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=z0_alpha_values, edgecolor='black')
                 else: # If no points near Z=0, show all points projected
-                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
             
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
@@ -3974,7 +3993,7 @@ class Visualizer:
                         cmap='Greens',
                         alpha=alphas,
                         edgecolors=None,
-                        s=min([40,30*200/len(weights_np)]),
+                        s=min([40,30*200/len(weights_np)]) * string_size_scale,
                         norm=norm
                         )
                     
@@ -4055,7 +4074,7 @@ class Visualizer:
                 
                 # Show string positions colored by their LLR values
                 scatter = ax.scatter(string_x, string_y, c=llr_values_np, 
-                                   cmap='RdYlBu_r', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='RdYlBu_r', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -4122,7 +4141,7 @@ class Visualizer:
                 
                 # Show string positions colored by their signal LLR values
                 scatter = ax.scatter(string_x, string_y, c=signal_llr_values_np, 
-                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -4189,7 +4208,7 @@ class Visualizer:
                 
                 # Show string positions colored by their signal LLR values
                 scatter = ax.scatter(string_x, string_y, c=signal_llr_values_np, 
-                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -4314,7 +4333,7 @@ class Visualizer:
                 
                 # Show string positions colored by their background LLR values
                 scatter = ax.scatter(string_x, string_y, c=background_llr_values_np, 
-                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -4381,7 +4400,7 @@ class Visualizer:
                 
                 # Show string positions colored by their background LLR values
                 scatter = ax.scatter(string_x, string_y, c=background_llr_values_np, 
-                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -4870,12 +4889,12 @@ class Visualizer:
                         signal_light_yield_values_np = np.array(signal_light_yield_per_string)
                         
                     scatter = ax.scatter(string_x, string_y, c=signal_light_yield_values_np, 
-                                       cmap='Oranges', s=min([60, 40*200*size_factor/len(string_indices)]), 
+                                       cmap='Oranges', s=min([60, 40*200*size_factor/len(string_indices)]) * string_size_scale, 
                                        alpha=alpha_values, edgecolor='black', linewidth=1,
                                        label='String Positions')
                 else:
                     # Just show string positions without color coding
-                    point_size = min([60, 40*200*size_factor/len(string_indices)]) if (string_indices is not None and len(string_indices) > 0) else 60
+                    point_size = (min([60, 40*200*size_factor/len(string_indices)]) if (string_indices is not None and len(string_indices) > 0) else 60) * string_size_scale
                     scatter = ax.scatter(string_x, string_y, c='red', 
                                        s=point_size, 
                                        alpha=alpha_values, edgecolor='black', linewidth=1,
@@ -4998,7 +5017,7 @@ class Visualizer:
                 
                 # Show string positions colored by their SNR values
                 scatter = ax.scatter(string_x, string_y, c=snr_values_np, 
-                                   cmap='viridis', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='viridis', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -5101,7 +5120,7 @@ class Visualizer:
                         alpha_values = 0.8
                     
                     scatter = ax.scatter(string_x, string_y, c=fisher_logdet_values, 
-                                       cmap='plasma', s=min([60, 40*200/len(string_x)]), 
+                                       cmap='plasma', s=min([60, 40*200/len(string_x)]) * string_size_scale, 
                                        alpha=alpha_values, edgecolor='black', linewidth=1)
                     
                     ax.set_title(f"Fisher Info Inv. Trace per String")
@@ -5112,7 +5131,7 @@ class Visualizer:
                     if num_finite > 0:
                         ax.scatter(string_x[finite_mask], string_y[finite_mask], 
                                  c=fisher_logdet_values[finite_mask], cmap='plasma', 
-                                 s=min([60, 40*200/len(string_x)]), alpha=0.8, 
+                                 s=min([60, 40*200/len(string_x)]) * string_size_scale, alpha=0.8, 
                                  edgecolor='black', linewidth=1)
                         ax.set_title(f"Fisher Info Inv. Trace per String")
                         ax.text(0.5, 0.02, f"Interpolation failed: {error_msg}", 
@@ -6719,12 +6738,25 @@ class Visualizer:
         for path in paths:
             path.reverse()  # chronological order: start -> end
 
+        # Expand the plotted half-domain to cover any string whose path strays outside
+        # the nominal domain, rather than clipping it out of view; shrink point/marker
+        # sizes proportionally so the plot stays visually consistent when nothing is out
+        # of bounds. An explicit zoom_range is a deliberate user choice and wins outright.
+        string_size_scale = 1.0
+        effective_half_domain = self.half_domain
+        if zoom_range is None and n_strings > 0:
+            all_coords = np.concatenate([np.array(path) for path in paths], axis=0)
+            max_abs_coord = float(np.max(np.abs(all_coords))) if all_coords.size > 0 else 0.0
+            if np.isfinite(max_abs_coord) and max_abs_coord > self.half_domain:
+                effective_half_domain = max_abs_coord * 1.05
+                string_size_scale = self.half_domain / effective_half_domain
+
         if zoom_range is not None:
             ax.set_xlim(-zoom_range, zoom_range)
             ax.set_ylim(-zoom_range, zoom_range)
         else:
-            ax.set_xlim(-self.half_domain, self.half_domain)
-            ax.set_ylim(-self.half_domain, self.half_domain)
+            ax.set_xlim(-effective_half_domain, effective_half_domain)
+            ax.set_ylim(-effective_half_domain, effective_half_domain)
 
         rgb_start = np.array(to_rgb(color_start))
         rgb_end = np.array(to_rgb(color_end))
@@ -6770,9 +6802,9 @@ class Visualizer:
         end_points = np.array(end_points) if end_points else np.empty((0, 2))
 
         if len(start_points) > 0:
-            ax.scatter(start_points[:, 0], start_points[:, 1], c=color_start, alpha=0.8, s=25, zorder=4)
+            ax.scatter(start_points[:, 0], start_points[:, 1], c=color_start, alpha=0.8, s=25 * string_size_scale, zorder=4)
         if len(end_points) > 0:
-            ax.scatter(end_points[:, 0], end_points[:, 1], c=color_end, alpha=0.8, s=25, zorder=4)
+            ax.scatter(end_points[:, 0], end_points[:, 1], c=color_end, alpha=0.8, s=25 * string_size_scale, zorder=4)
 
         legend_elements = [
             Line2D([0], [0], marker='o', color='none', markerfacecolor=color_start,
