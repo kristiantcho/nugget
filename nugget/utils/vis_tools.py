@@ -3152,7 +3152,7 @@ class Visualizer:
                     color_start=kwargs.get('string_history_color_start', 'red'),
                     color_end=kwargs.get('string_history_color_end', 'green'),
                     line_kwargs=kwargs.get('string_history_line_kwargs', None),
-                    title=kwargs.get('string_history_title', 'String Position History: Start to End of Optimization'),
+                    title=kwargs.get('string_history_title', 'String Position History'),
                 )
             else:
                 ax.text(0.5, 0.5, "String history not available yet\n(Need at least 2 recorded iterations;\nrequires 'string_xy' in kwargs)",
@@ -6779,8 +6779,7 @@ class Visualizer:
                    markersize=8, label='Original string positions'),
             Line2D([0], [0], marker='o', color='none', markerfacecolor=color_end,
                    markersize=8, label='New string positions'),
-            Line2D([0], [0], color=color_end, lw=1.5, marker='>', markersize=6,
-                   label='Path traced during optimization'),
+            Line2D([0], [0], color=color_end, lw=1.5, marker='>', markersize=6),
         ]
         ax.legend(handles=legend_elements, loc='best', fontsize='small')
 
