@@ -1020,7 +1020,15 @@ class ROVPenalty(LossFunction):
             away_vec,
             away_vec + torch.tensor([1.0, 0.0], device=all_relative.device, dtype=away_vec.dtype),
         )
-        theta_away = torch.atan2(safe_away_vec[:, 1], safe_away_vec[:, 0])  # (N,)
+        # NOTE: `angles` (and blockage_per_angle's heading grid) use ROVPenalty's own
+        # corridor-rotation convention, under which a heading `theta` maps to the WORLD
+        # direction (cos(theta), -sin(theta)) -- i.e. angles increase clockwise, not the
+        # standard (counter-clockwise) atan2 convention. `away_vec` is an ordinary
+        # world-space Cartesian vector, so we must negate its y-component before
+        # atan2 to express it in that same clockwise convention; otherwise theta_away
+        # would be the mirror image (about the x-axis) of the true away direction,
+        # visibly pointing the wrong way once compared against `angles`.
+        theta_away = torch.atan2(-safe_away_vec[:, 1], safe_away_vec[:, 0])  # (N,)
         return theta_away, away_valid
 
     def _select_away_best_angle(
