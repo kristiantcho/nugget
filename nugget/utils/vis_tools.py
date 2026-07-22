@@ -566,6 +566,17 @@ class Visualizer:
             zorder=zorder,
         )
 
+    @staticmethod
+    def _rov_space_color_for_index(idx):
+        """Deterministic rainbow color for a given (global) string index.
+
+        Picks a pseudo-random point on the `rainbow` colormap seeded by the string
+        index, so the same string always gets the same color across iterations while
+        different strings get well-scattered colors.
+        """
+        rng = np.random.default_rng(int(idx))
+        return plt.cm.rainbow(float(rng.random()))
+
     def _draw_rov_safe_space_union(
         self,
         ax,
@@ -579,6 +590,8 @@ class Visualizer:
         zorder=2,
         color='purple',
         label='Unioned ROV Safe Space',
+        per_space_colors=False,
+        string_indices=None,
     ):
         """Draw the unioned shape of multiple strings' ROV safe-space corridors.
 
@@ -591,10 +604,48 @@ class Visualizer:
             least-blocked angle for that string.
         rov_penalty : ROVPenalty object or None
             Used to get corridor dimensions.
+        per_space_colors : bool
+            If True, fill each string's individual corridor in its own color
+            (semi-transparent, so overlaps blend) instead of drawing a single
+            merged union shape. No union outline is drawn in this mode. Colors are
+            keyed on `string_indices` so they stay consistent across iterations.
+        string_indices : array-like of shape (N,) or None
+            Global string index for each corridor, used to pick a stable per-space
+            color when `per_space_colors` is True. Falls back to positional index.
 
         Requires the optional `shapely` package. No-ops (with a message drawn
         on the axes) if it is not installed.
         """
+        if rov_penalty is None or origins_xy is None or angles_rad is None:
+            return
+
+        # Per-space colored fills: draw each corridor individually, no union geometry.
+        if per_space_colors:
+            for pos, (origin_xy, angle_rad) in enumerate(zip(origins_xy, angles_rad)):
+                verts = self._rov_safe_space_vertices_at_string(origin_xy, angle_rad, rov_penalty)
+                if verts is None:
+                    continue
+                key = int(string_indices[pos]) if string_indices is not None else pos
+                space_color = self._rov_space_color_for_index(key)
+                verts_closed = np.vstack([verts, verts[0]])
+                ax.fill(
+                    verts_closed[:, 0],
+                    verts_closed[:, 1],
+                    color=space_color,
+                    alpha=float(np.clip(alpha, 0.0, 1.0)),
+                    zorder=zorder,
+                )
+                if line_alpha > 0:
+                    ax.plot(
+                        verts_closed[:, 0],
+                        verts_closed[:, 1],
+                        color=space_color,
+                        linewidth=linewidth,
+                        alpha=float(np.clip(line_alpha, 0.0, 1.0)),
+                        zorder=zorder,
+                    )
+            return
+
         if not SHAPELY_AVAILABLE:
             ax.text(
                 0.5, 0.02,
@@ -602,9 +653,6 @@ class Visualizer:
                 ha='center', va='bottom', transform=ax.transAxes,
                 fontsize=8, color='red',
             )
-            return
-
-        if rov_penalty is None or origins_xy is None or angles_rad is None:
             return
 
         polygons = []
@@ -887,6 +935,10 @@ class Visualizer:
                             the unioned shape of the best (least-blocked-angle) ROV safe spaces across all active strings
                             (string_weights >= weight_threshold, or all strings if string_weights is not provided).
                             Requires the optional `shapely` package.
+                        - rov_union_per_space_colors: bool, optional. If True, draws each string's individual ROV safe
+                            space in its own (semi-transparent, overlap-blending) color instead of one merged union shape.
+                            Colors are keyed on the global string index so they stay consistent across iterations. In this
+                            mode no union outline is drawn and shapely is not required.
             - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range] 
               instead of the default domain boundaries [-half_domain, half_domain]
             - plot_with_surrogate: bool, optional. If True and 'light_surrogate_func' and 'surrogate_event_params' 
@@ -2975,6 +3027,7 @@ class Visualizer:
                 draw_rov_safe_space_on_violations = bool(kwargs.get('rov_draw_safe_space_on_violations', False))
                 draw_rov_safe_space_active_only = bool(kwargs.get('rov_draw_safe_space_active_only', False))
                 draw_rov_safe_space_union = bool(kwargs.get('rov_draw_safe_space_union', False))
+                rov_union_per_space_colors = bool(kwargs.get('rov_union_per_space_colors', False))
                 weight_threshold = kwargs.get('weight_threshold', 0.7)
                 if rov_penalty_per_string is not None:
                     # Convert ROV penalty per string to numpy
@@ -3036,6 +3089,8 @@ class Visualizer:
                                     angles_rad=rov_angles_np[union_idx],
                                     rov_penalty=rov_penalty_func,
                                     zorder=1,
+                                    per_space_colors=rov_union_per_space_colors,
+                                    string_indices=union_idx,
                                 )
 
                     # Use string weights for alpha transparency (no threshold filtering)
