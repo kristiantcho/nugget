@@ -140,8 +140,9 @@ class Visualizer:
     PLOT_ALM_LAMBDA = "alm_lambda"
     PLOT_DETECTOR_EFFICIENCY_HISTORY = "detector_efficiency_history"
     PLOT_EFFECTIVE_AREA_HISTORY = "effective_area_history"
+    PLOT_NN_DISTANCE_HISTORY = "nn_distance_history"
 
-    
+
     def __init__(self, device=None, dim=3, domain_size=2.0, gif_temp_dir=None):
         """
         Initialize the visualizer.
@@ -171,6 +172,10 @@ class Visualizer:
         self._mean_effective_area_history = []
         self._last_recorded_iteration_efficiency = None
         self._last_recorded_iteration_effective_area = None
+        # History of the (weighted) average per-string mean distance to its 5 nearest
+        # neighbours, accumulated across iterations for the 'nn_distance_history' plot.
+        self._nn_distance_history = []
+        self._last_recorded_iteration_nn_distance = None
 
         # Cache of string XY positions (and weights) snapshotted once per unique
         # iteration whenever a 'string_history' plot is requested, so the full
@@ -577,6 +582,75 @@ class Visualizer:
         rng = np.random.default_rng(int(idx))
         return plt.cm.rainbow(float(rng.random()))
 
+    @staticmethod
+    def _weighted_mean_nn_distance(string_xy, string_weights=None, num_neighbours=5, nn_tau=None):
+        """Weighted average of each string's mean distance to its 5 nearest neighbours.
+
+        All strings are included; the contribution of each string (and each of its
+        neighbours) is weighted by sigmoid(string_weights), matching the soft
+        neighbour-weighting used by ROVPenalty. The "5 nearest" is a soft selection
+        via softmax over -distance (like ROVPenalty._compute_away_theta), so the
+        metric varies smoothly:
+
+            w_ij   = sigmoid(w_j) * softmax_j(-dist_ij / tau)     (over j != i)
+            d_i    = sum_j w_ij * dist_ij / sum_j w_ij
+            metric = sum_i sigmoid(w_i) * d_i / sum_i sigmoid(w_i)
+
+        tau defaults to 0.5 * (median k-th nearest distance) so it is robust to the
+        absolute coordinate units.
+
+        Returns
+        -------
+        float, or None if there are fewer than 2 strings.
+        """
+        xy = np.asarray(string_xy, dtype=float)
+        if xy.ndim != 2 or xy.shape[0] < 2:
+            return None
+        n = xy.shape[0]
+        k = int(max(1, min(int(num_neighbours), n - 1)))
+
+        # Pairwise distances, excluding self (diagonal -> +inf so it is never a NN).
+        diff = xy[:, None, :] - xy[None, :, :]  # (n, n, 2)
+        dist = np.sqrt((diff ** 2).sum(axis=-1) + 1e-12)  # (n, n)
+        np.fill_diagonal(dist, np.inf)
+
+        # Off-diagonal distances per row -> (n, n-1).
+        off = ~np.eye(n, dtype=bool)
+        dist_off = dist[off].reshape(n, n - 1)
+
+        # Scale-aware softmax temperature from the median k-th nearest distance.
+        kth = np.sort(dist_off, axis=1)[:, k - 1]  # (n,)
+        dist_scale = max(float(np.median(kth)), 1e-12)
+        tau_mult = 0.5 if nn_tau is None else float(nn_tau)
+        tau = max(tau_mult * dist_scale, 1e-12)
+
+        # Softmax over -distance -> soft top-k emphasis on the nearest strings.
+        z = -dist_off / tau
+        z -= z.max(axis=1, keepdims=True)  # numerical stability
+        soft = np.exp(z)  # (n, n-1)
+
+        # Neighbour sigmoid weights (per column j, excluding self).
+        if string_weights is not None:
+            sw = np.asarray(string_weights, dtype=float).reshape(-1)
+            probs = 1.0 / (1.0 + np.exp(-sw))  # sigmoid
+            probs_off = np.broadcast_to(probs[None, :], (n, n))[off].reshape(n, n - 1)
+            own_probs = probs
+        else:
+            probs_off = np.ones((n, n - 1), dtype=float)
+            own_probs = np.ones(n, dtype=float)
+
+        w = soft * probs_off  # (n, n-1)
+        w_sum = w.sum(axis=1)
+        valid = w_sum > 1e-12
+        d_per_string = np.zeros(n, dtype=float)
+        d_per_string[valid] = (w[valid] * dist_off[valid]).sum(axis=1) / w_sum[valid]
+
+        own_sum = own_probs[valid].sum()
+        if own_sum <= 1e-12:
+            return None
+        metric = float((own_probs[valid] * d_per_string[valid]).sum() / own_sum)
+        return metric
+
     def _draw_rov_safe_space_union(
         self,
         ax,
@@ -885,6 +959,11 @@ class Visualizer:
             - 'effective_area_history': Mean effective area over optimization iterations
               (from 'effective_area_per_event' or 'effective_area_matrix' in kwargs, as returned
               by EffectiveAreaLoss/FoMLoss)
+            - 'nn_distance_history': History of the (sigmoid-weight-weighted) average per-string
+              mean distance to its nearest neighbours, computed from the current 'string_xy' each
+              iteration. Optional kwargs: 'nn_distance_num_neighbours' (default 5),
+              'nn_distance_nn_tau' (soft-selection temperature as a multiple of the geometry's
+              median k-th nearest distance; default None -> 0.5), 'string_weights'.
         make_gif : bool
             Whether to generate and save a GIF of the progress.
         gif_plot_selection : list of str or None
@@ -5316,6 +5395,38 @@ class Visualizer:
                 ax.text(0.5, 0.5, "Effective area history not available\n(Pass 'effective_area_per_event' or 'effective_area_matrix' in kwargs)",
                       ha='center', va='center', transform=ax.transAxes)
 
+        elif plot_type == self.PLOT_NN_DISTANCE_HISTORY:
+            # History of the (weighted) average per-string mean distance to its 5
+            # nearest neighbours, accumulated across optimization iterations. The
+            # metric is computed from the current string_xy (weighted by
+            # sigmoid(string_weights), matching the ROV penalty's soft weighting).
+            if string_xy is not None:
+                num_neighbours = int(kwargs.get('nn_distance_num_neighbours', 5))
+                nn_tau = kwargs.get('nn_distance_nn_tau', None)
+                string_weights = kwargs.get('string_weights', None)
+
+                xy_np = string_xy.clone().detach().cpu().numpy() if torch.is_tensor(string_xy) else np.asarray(string_xy)
+                metric = self._weighted_mean_nn_distance(
+                    xy_np,
+                    string_weights=string_weights,
+                    num_neighbours=num_neighbours,
+                    nn_tau=nn_tau,
+                )
+                if metric is not None and np.isfinite(metric) and iteration is not None \
+                        and iteration != self._last_recorded_iteration_nn_distance:
+                    self._nn_distance_history.append(metric)
+                    self._last_recorded_iteration_nn_distance = iteration
+
+            if len(self._nn_distance_history) > 0:
+                ax.plot(self._nn_distance_history, color='teal', linewidth=2, markersize=4)
+                ax.set_title(f'Mean Distance to {int(kwargs.get("nn_distance_num_neighbours", 5))} Nearest Neighbours')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Weighted Avg. Mean NN Distance')
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, "Nearest-neighbour distance history not available\n(Pass 'string_xy')",
+                      ha='center', va='center', transform=ax.transAxes)
+
         elif plot_type == self.PLOT_POINTSOURCE_FOM:
             # Pointsource FoM history from unweighted loss dictionary.
             loss_dict = kwargs.get('uw_loss_dict', None)
@@ -7233,14 +7344,17 @@ class Visualizer:
     def clear_string_history(self) -> None:
         """
         Clear the cached string XY position/weight history used by the
-        'string_history' plot type. Call this before starting a fresh
-        optimization run if you want the traced path to restart from that
-        run's initial geometry rather than continuing from a previous run.
+        'string_history' plot type (and the 'nn_distance_history' plot). Call
+        this before starting a fresh optimization run if you want the traced
+        path / metric history to restart from that run's initial geometry
+        rather than continuing from a previous run.
         """
         self._string_xy_history = []
         self._string_weights_history = []
         self._string_history_iterations = []
         self._last_recorded_iteration_string_history = None
+        self._nn_distance_history = []
+        self._last_recorded_iteration_nn_distance = None
 
 def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        param_names=None, param_ranges=None, n_points=50,
