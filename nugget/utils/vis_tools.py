@@ -176,6 +176,10 @@ class Visualizer:
         # neighbours, accumulated across iterations for the 'nn_distance_history' plot.
         self._nn_distance_history = []
         self._last_recorded_iteration_nn_distance = None
+        # History of the global (weighted-softmin, if string_weights given) minimum
+        # pairwise string-string distance, also shown on the 'nn_distance_history' plot.
+        self._min_pairwise_distance_history = []
+        self._last_recorded_iteration_min_pairwise_distance = None
 
         # Cache of string XY positions (and weights) snapshotted once per unique
         # iteration whenever a 'string_history' plot is requested, so the full
@@ -651,6 +655,69 @@ class Visualizer:
         metric = float((own_probs[valid] * d_per_string[valid]).sum() / own_sum)
         return metric
 
+    @staticmethod
+    def _mean_min_nn_distance(string_xy, string_weights=None, min_tau=None):
+        """Weighted average, across strings, of each string's own (soft) nearest-
+        neighbour distance.
+
+        For each string i, its nearest-neighbour distance is computed as a softmin
+        over distances to all other strings j (a smooth version of the per-string
+        1-NN distance, avoiding a hard-argmin discontinuity):
+
+            min_i  = -tau * log( sum_j exp(-dist_ij / tau) )     (j != i)
+            metric = sum_i sigmoid(w_i) * min_i / sum_i sigmoid(w_i)
+
+        (plain mean over i if `string_weights` is None). `tau` defaults to
+        0.05 * (median 1-NN distance). Unlike the "soft top-5" averaging in
+        `_weighted_mean_nn_distance` (which intentionally blends several neighbours
+        together), this softmin is meant to track a single true minimum, so it needs
+        a much smaller temperature: with several comparably-close neighbours (e.g. a
+        hex-packed string with ~6 near-equidistant neighbours, which is the common
+        case, not an edge case), a softmin biases below the true minimum by an amount
+        that grows with the temperature and the number of near-tied neighbours -- at
+        0.5x (the other helper's default) the bias can exceed 40%.
+
+        Returns
+        -------
+        float, or None if there are fewer than 2 strings.
+        """
+        xy = np.asarray(string_xy, dtype=float)
+        if xy.ndim != 2 or xy.shape[0] < 2:
+            return None
+        n = xy.shape[0]
+
+        diff = xy[:, None, :] - xy[None, :, :]  # (n, n, 2)
+        dist = np.sqrt((diff ** 2).sum(axis=-1) + 1e-12)  # (n, n)
+        np.fill_diagonal(dist, np.inf)
+
+        off = ~np.eye(n, dtype=bool)
+        dist_off = dist[off].reshape(n, n - 1)  # (n, n-1)
+
+        # Scale-aware temperature: 0.05 * median 1-NN (hard) distance -- deliberately
+        # much sharper than _weighted_mean_nn_distance's 0.5x default (see docstring).
+        nn_1 = dist_off.min(axis=1)  # (n,)
+        dist_scale = max(float(np.median(nn_1)), 1e-12)
+        tau_mult = 0.05 if min_tau is None else float(min_tau)
+        tau = max(tau_mult * dist_scale, 1e-12)
+
+        # Per-string softmin over its distances to all other strings.
+        z = -dist_off / tau
+        z_max = z.max(axis=1, keepdims=True)
+        logsumexp = z_max.squeeze(1) + np.log(np.exp(z - z_max).sum(axis=1))
+        min_per_string = -tau * logsumexp  # (n,)
+
+        if string_weights is not None:
+            sw = np.asarray(string_weights, dtype=float).reshape(-1)
+            probs = 1.0 / (1.0 + np.exp(-sw))  # sigmoid
+        else:
+            probs = np.ones(n, dtype=float)
+
+        probs_sum = probs.sum()
+        if probs_sum <= 1e-12:
+            return None
+        metric = float((probs * min_per_string).sum() / probs_sum)
+        return metric
+
     def _draw_rov_safe_space_union(
         self,
         ax,
@@ -959,11 +1026,18 @@ class Visualizer:
             - 'effective_area_history': Mean effective area over optimization iterations
               (from 'effective_area_per_event' or 'effective_area_matrix' in kwargs, as returned
               by EffectiveAreaLoss/FoMLoss)
-            - 'nn_distance_history': History of the (sigmoid-weight-weighted) average per-string
-              mean distance to its nearest neighbours, computed from the current 'string_xy' each
-              iteration. Optional kwargs: 'nn_distance_num_neighbours' (default 5),
-              'nn_distance_nn_tau' (soft-selection temperature as a multiple of the geometry's
-              median k-th nearest distance; default None -> 0.5), 'string_weights'.
+            - 'nn_distance_history': History of two distance series, computed from the current
+              'string_xy' each iteration and plotted together: (1) the (sigmoid-weight-weighted)
+              average per-string mean distance to its 5 nearest neighbours, and (2) the
+              (sigmoid-weight-weighted) average, across strings, of each string's own (soft)
+              nearest-neighbour distance -- i.e. a softmin per string over its distances to all
+              others, then a weighted average of those per-string minimums. Both fall back to a
+              plain (unweighted) average if 'string_weights' is not provided. Optional kwargs:
+              'nn_distance_num_neighbours' (default 5), 'nn_distance_nn_tau' (soft-selection
+              temperature as a multiple of the geometry's median k-th nearest distance; default
+              None -> 0.5), 'nn_distance_min_tau' (per-string softmin temperature for the second
+              series, same scale-aware convention but deliberately sharper since it targets a
+              single minimum rather than a top-5 blend; default None -> 0.05), 'string_weights'.
         make_gif : bool
             Whether to generate and save a GIF of the progress.
         gif_plot_selection : list of str or None
@@ -5397,31 +5471,54 @@ class Visualizer:
 
         elif plot_type == self.PLOT_NN_DISTANCE_HISTORY:
             # History of the (weighted) average per-string mean distance to its 5
-            # nearest neighbours, accumulated across optimization iterations. The
-            # metric is computed from the current string_xy (weighted by
-            # sigmoid(string_weights), matching the ROV penalty's soft weighting).
+            # nearest neighbours, accumulated across optimization iterations, alongside
+            # the global minimum pairwise string-string distance. Both are computed
+            # from the current string_xy (weighted by sigmoid(string_weights), matching
+            # the ROV penalty's soft weighting, when string_weights is provided).
             if string_xy is not None:
                 num_neighbours = int(kwargs.get('nn_distance_num_neighbours', 5))
                 nn_tau = kwargs.get('nn_distance_nn_tau', None)
+                min_tau = kwargs.get('nn_distance_min_tau', None)
                 string_weights = kwargs.get('string_weights', None)
 
                 xy_np = string_xy.clone().detach().cpu().numpy() if torch.is_tensor(string_xy) else np.asarray(string_xy)
-                metric = self._weighted_mean_nn_distance(
+
+                mean_metric = self._weighted_mean_nn_distance(
                     xy_np,
                     string_weights=string_weights,
                     num_neighbours=num_neighbours,
                     nn_tau=nn_tau,
                 )
-                if metric is not None and np.isfinite(metric) and iteration is not None \
+                if mean_metric is not None and np.isfinite(mean_metric) and iteration is not None \
                         and iteration != self._last_recorded_iteration_nn_distance:
-                    self._nn_distance_history.append(metric)
+                    self._nn_distance_history.append(mean_metric)
                     self._last_recorded_iteration_nn_distance = iteration
 
-            if len(self._nn_distance_history) > 0:
-                ax.plot(self._nn_distance_history, color='teal', linewidth=2, markersize=4)
-                ax.set_title(f'String Spacing ({int(kwargs.get("nn_distance_num_neighbours", 5))} N.N.) History') 
+                min_metric = self._mean_min_nn_distance(
+                    xy_np,
+                    string_weights=string_weights,
+                    min_tau=min_tau,
+                )
+                if min_metric is not None and np.isfinite(min_metric) and iteration is not None \
+                        and iteration != self._last_recorded_iteration_min_pairwise_distance:
+                    self._min_pairwise_distance_history.append(min_metric)
+                    self._last_recorded_iteration_min_pairwise_distance = iteration
+
+            if len(self._nn_distance_history) > 0 or len(self._min_pairwise_distance_history) > 0:
+                if len(self._nn_distance_history) > 0:
+                    ax.plot(
+                        self._nn_distance_history, color='teal', linewidth=2, markersize=4,
+                        label=f'Mean dist. to {int(kwargs.get("nn_distance_num_neighbours", 5))} N.N. (weighted avg.)',
+                    )
+                if len(self._min_pairwise_distance_history) > 0:
+                    ax.plot(
+                        self._min_pairwise_distance_history, color='crimson', linewidth=2, markersize=4,
+                        label='Mean nearest-neighbour distance (weighted avg. of per-string min)',
+                    )
+                ax.set_title(f'String Spacing ({int(kwargs.get("nn_distance_num_neighbours", 5))} N.N.) History')
                 ax.set_xlabel('Iteration')
-                ax.set_ylabel('Weighted Avg. Mean NN Distance')
+                ax.set_ylabel('Distance')
+                ax.legend()
                 ax.grid(True, alpha=0.3)
             else:
                 ax.text(0.5, 0.5, "Nearest-neighbour distance history not available\n(Pass 'string_xy')",
@@ -7355,6 +7452,8 @@ class Visualizer:
         self._last_recorded_iteration_string_history = None
         self._nn_distance_history = []
         self._last_recorded_iteration_nn_distance = None
+        self._min_pairwise_distance_history = []
+        self._last_recorded_iteration_min_pairwise_distance = None
 
 def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        param_names=None, param_ranges=None, n_points=50,
