@@ -5419,7 +5419,7 @@ class Visualizer:
 
             if len(self._nn_distance_history) > 0:
                 ax.plot(self._nn_distance_history, color='teal', linewidth=2, markersize=4)
-                ax.set_title(f'Mean Distance to {int(kwargs.get("nn_distance_num_neighbours", 5))} Nearest Neighbours')
+                ax.set_title(f'String Spacing ({int(kwargs.get("nn_distance_num_neighbours", 5))} N.N.) History') 
                 ax.set_xlabel('Iteration')
                 ax.set_ylabel('Weighted Avg. Mean NN Distance')
                 ax.grid(True, alpha=0.3)
