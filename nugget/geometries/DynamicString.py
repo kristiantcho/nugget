@@ -435,6 +435,47 @@ class DynamicString(Geometry):
         }
     
      
+    def _point_to_string_index(self, points_per_string_list):
+        """Per-point -> string index map (n_points,), cached across steps.
+
+        The counts in points_per_string_list are structural metadata that do not
+        change during optimization (only string_xy / z_values *values* change),
+        so the expansion index is computed once and reused. Crucially this avoids
+        a per-string ``int(points_per_string_list[s])`` in the hot update_points
+        loop: when points_per_string_list is a CUDA tensor (as produced by
+        initialize_points), each such int() forces a device->host sync, i.e.
+        n_strings synchronizations *per optimization step* -- the main reason
+        DynamicString ran slower than EvanescentString (whose counts are a plain
+        Python list) on GPU.
+        """
+        # Fast path: reuse the cached index without ANY device->host transfer.
+        # The counts are structural (fixed across optimization steps), so we key
+        # the cache on the object's identity + version, avoiding a .tolist()
+        # (itself a sync on CUDA) on every step. Only a genuine change in the
+        # counts object triggers a recompute.
+        if isinstance(points_per_string_list, torch.Tensor):
+            key = (id(points_per_string_list), points_per_string_list._version)
+        else:
+            key = tuple(int(c) for c in points_per_string_list)  # small, CPU-only
+
+        cache = getattr(self, '_p2s_cache', None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+
+        # Cache miss: read the counts to the CPU once (single .tolist(), not one
+        # int() per element) and build the per-point string index.
+        if isinstance(points_per_string_list, torch.Tensor):
+            counts = [int(c) for c in points_per_string_list.detach().cpu().tolist()]
+        else:
+            counts = [int(c) for c in points_per_string_list]
+
+        idx = torch.repeat_interleave(
+            torch.arange(len(counts), device=self.device),
+            torch.tensor(counts, device=self.device, dtype=torch.long),
+        )  # (n_points,) — string index for each point, in point order
+        self._p2s_cache = (key, idx)
+        return idx
+
     def update_points(self, z_values, string_xy, points_per_string_list, string_indices, **kwargs):
         """Update the points based on current optimization state.
         Parameters:
@@ -447,37 +488,27 @@ class DynamicString(Geometry):
             Number of points per string (n_strings,) - Not used in the 'redis_phase' logic below.
         string_indices : list
             List of string indices for each point - Not used in the 'redis_phase' logic below.
-        
+
         returns:
         --------
         dict
-            Dictionary with updated tensors 
+            Dictionary with updated tensors
             """
-        
-        # Original hard allocation logic (if the above condition is not met)
-        # Create new points_3d with updated distribution while preserving gradients
-        points_list = []
-        current_idx = 0
-        for s in range(self.n_strings):
-            n_pts = int(points_per_string_list[s])
-            if n_pts > 0:  # Skip empty strings
-                # Create points for this string, preserving gradients
-                x_coords = string_xy[s, 0].repeat(n_pts)  # Repeat x coordinate
-                y_coords = string_xy[s, 1].repeat(n_pts)  # Repeat y coordinate
-                z_coords = z_values[current_idx:current_idx+n_pts]  # Use corresponding z values
-                
-                # Stack coordinates to create 3D points
-                string_points = torch.stack([x_coords, y_coords, z_coords], dim=1)
-                points_list.append(string_points)
-                current_idx += n_pts
-        
-        # Concatenate all points while preserving gradients
-        if points_list:
-            points_3d = torch.cat(points_list, dim=0)
+
+        # Build points_3d from the (optimizable) string_xy and z_values in a
+        # single vectorized, gradient-preserving, sync-free op. Each point's XY
+        # is gathered from its string via a precomputed per-point string index;
+        # z comes straight from z_values. This replaces the old per-string Python
+        # loop (which called int(points_per_string_list[s]) every string, forcing
+        # a device sync per string per step on GPU) -- see _point_to_string_index.
+        if z_values.shape[0] > 0:
+            p2s = self._point_to_string_index(points_per_string_list)  # (n_points,)
+            xy = string_xy[p2s]                                        # (n_points, 2), differentiable gather
+            points_3d = torch.cat([xy, z_values.reshape(-1, 1)], dim=1)  # (n_points, 3)
         else:
             # Fallback if no points are assigned
             points_3d = torch.zeros(0, 3, device=self.device)
-        
+
         return {
             "points_3d": points_3d, 
             "z_values": z_values, 
