@@ -8,10 +8,10 @@ import pickle
 
 
 chargenet = nugget.surrogates.ChargeNet.ChargeNet(
-    domain_size=3000,  # Size of the detector domain
+    domain_size=6000,  # Size of the detector domain
     dim=3,  # 3D spatial coordinates
     hidden_dims=[128, 128, 128, 128, 128, 128],  # Neural network architecture
-    use_fourier_features=False,  # Use Fourier features for better spatial encoding
+    use_fourier_features=True,  # Use Fourier features for better spatial encoding
     num_parallel_branches=1,  # Multiple branches for ensemble learning
     frequency_scales=[0.1, 0.4],  # Different frequency scales for fourier features
     num_frequencies_per_branch=[64,64],  # Number of Fourier features per branch
@@ -52,7 +52,7 @@ train_dataloader = chargenet.create_light_yield_parquet_dataloader(
                 parquet_path = 'new_accepted_photons_ly_all.parquet',
                 geometry_csv_path= '../other/800_40_40_geom.csv',
                 num_samples_per_epoch=2048, 
-                batch_size=32,
+                batch_size=16,
                 shuffle=True, 
                 num_workers=4, 
                 seed=None,
@@ -64,20 +64,20 @@ train_dataloader = chargenet.create_light_yield_parquet_dataloader(
                 n_energy_bins=20, 
                 n_coszen_bins=20,
                 filter_vertex_in_domain=True,
-                test_save_path='./llrnet_models/mc_muon_lynet_v2_test_samples.parquet', 
+                test_save_path='./llrnet_models/mc_muon_lynet_v3_test_samples.parquet', 
                 test_frac=0.1,
                 )
 
 history = chargenet.train_with_dataloader(
     train_dataloader=train_dataloader,
-    epochs=2000,
+    epochs=4000,
     input_dim=12,
     save_every_n_epochs=20,
-    early_stopping_patience=2000,
-    checkpoint_path='llrnet_models/best_mc_muon_lynet_model_v2.pt',
+    early_stopping_patience=1000,
+    checkpoint_path='llrnet_models/best_mc_muon_lynet_model_v3.pt',
 )
 
 
 
 # #save history as pickle
-pickle.dump(history, open('mc_muon_lynet_v2_training_history.pkl', 'wb'))
+pickle.dump(history, open('mc_muon_lynet_v3_training_history.pkl', 'wb'))

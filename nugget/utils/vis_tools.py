@@ -5508,14 +5508,14 @@ class Visualizer:
                 if len(self._nn_distance_history) > 0:
                     ax.plot(
                         self._nn_distance_history, color='teal', linewidth=2, markersize=4,
-                        label=f'Mean dist. to {int(kwargs.get("nn_distance_num_neighbours", 5))} N.N. (weighted avg.)',
+                        label=f'Mean {int(kwargs.get("nn_distance_num_neighbours", 5))} N.N.',
                     )
                 if len(self._min_pairwise_distance_history) > 0:
                     ax.plot(
                         self._min_pairwise_distance_history, color='crimson', linewidth=2, markersize=4,
-                        label='Mean nearest-neighbour distance (weighted avg. of per-string min)',
+                        label='Min.',
                     )
-                ax.set_title(f'String Spacing ({int(kwargs.get("nn_distance_num_neighbours", 5))} N.N.) History')
+                ax.set_title(f'String Spacing History')
                 ax.set_xlabel('Iteration')
                 ax.set_ylabel('Distance')
                 ax.legend()
