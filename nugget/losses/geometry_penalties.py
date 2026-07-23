@@ -1040,53 +1040,50 @@ class ROVPenalty(LossFunction):
         *,
         away_weight=0.0,
         soft=True,
-        select_tau=0.1,
+        angle_softmin_tau=0.0,
     ):
-        """Choose the "best" ROV heading by trading off blockage against outwardness.
+        """Choose the "best" (least-blocked) ROV heading, then add an away-pointing
+        penalty term evaluated AT that heading.
 
-        Selection uses a combined per-angle score
+        The heading is selected STRICTLY by blockage -- exactly like the plain
+        (non-away) path: a hard argmin over bins (or a softmin aggregate value, with
+        the reported heading still the hard argmin bin), never by a combined
+        score. This guarantees the reported angle is always a real, actually-clear
+        location -- selecting by a blockage+misalignment combined score (or worse,
+        averaging angles under such a score) can otherwise land on a heading that is
+        NOT actually clear (e.g. the circular mean of two separate clear lobes can
+        fall in a fully-blocked gap between them).
 
-            score[a] = blockage[a] + away_weight * misalign[a]
+        The returned penalty is
 
-        where misalign[a] = (1 - cos(angle_a - theta_away)) / 2 in [0, 1] measures how
-        much heading `a` points *toward* the nearest neighbours (0 = straight away,
-        1 = straight toward). Blockage is the primary term: because misalign is bounded
-        by away_weight, a uniquely-clear ("no alternative") corridor keeps the lowest
-        score and is still chosen, so it is not punished. The away term only tips the
-        choice among headings with comparable blockage.
+            penalty = blockage_at_best_angle + away_weight * misalign_at_best_angle
 
-        The returned penalty is the *blockage* at the chosen heading (NOT the combined
-        score), so preferring a more-outward-but-equally-clear angle costs nothing extra.
-
-        Soft mode selects via softmin weights (differentiable) over the combined score;
-        hard mode uses a hard argmin. For strings with an undefined outward direction
-        (`away_valid` False), the away term is disabled (falls back to pure blockage).
+        where misalign in [0, 1] measures how much the chosen (least-blocked) heading
+        points *toward* the nearest neighbours (0 = points straight away). For strings
+        with an undefined outward direction (`away_valid` False), the away term is
+        zeroed (penalty reduces to plain blockage).
 
         Returns
         -------
-        penalty_per_string : (N,) selected blockage.
-        best_angle : (N,) chosen heading in radians.
+        penalty_per_string : (N,) blockage-at-best-angle plus the away penalty term.
+        best_angle : (N,) chosen (least-blocked) heading in radians.
         """
-        misalign = (1.0 - torch.cos(angles.unsqueeze(0) - theta_away.unsqueeze(1))) / 2.0  # (N, A)
-        if away_valid is not None:
-            # Zero the away influence where the outward direction is undefined.
-            misalign = misalign * away_valid.unsqueeze(1).to(misalign.dtype)
-
-        score = blockage_per_angle + away_weight * misalign  # (N, A)
-
-        if soft:
-            # Softmin selection weights over the combined score (differentiable).
-            w = torch.softmax(-score / max(float(select_tau), 1e-12), dim=1)  # (N, A)
-            # Penalty = expected blockage under the selection distribution.
-            penalty_per_string = (w * blockage_per_angle).sum(dim=1)  # (N,)
-            # Chosen heading = circular mean of angles under the selection weights.
-            cos_b = (w * torch.cos(angles).unsqueeze(0)).sum(dim=1)  # (N,)
-            sin_b = (w * torch.sin(angles).unsqueeze(0)).sum(dim=1)  # (N,)
-            best_angle = torch.atan2(sin_b, cos_b)  # (N,)
+        if soft and angle_softmin_tau > 0.0:
+            blockage_at_best = -angle_softmin_tau * torch.logsumexp(
+                -blockage_per_angle / angle_softmin_tau, dim=1
+            )
+            blockage_at_best = blockage_at_best.clamp(min=0.0)
         else:
-            best_idx = score.argmin(dim=1)  # (N,)
-            penalty_per_string = blockage_per_angle.gather(1, best_idx.unsqueeze(1)).squeeze(1)  # (N,)
-            best_angle = angles[best_idx]  # (N,)
+            blockage_at_best = blockage_per_angle.min(dim=1)[0]  # (N,)
+
+        best_idx = blockage_per_angle.argmin(dim=1)  # (N,)
+        best_angle = angles[best_idx]  # (N,)
+
+        misalign_at_best = (1.0 - torch.cos(best_angle - theta_away)) / 2.0  # (N,)
+        if away_valid is not None:
+            misalign_at_best = misalign_at_best * away_valid.to(misalign_at_best.dtype)
+
+        penalty_per_string = blockage_at_best + away_weight * misalign_at_best
 
         return penalty_per_string, best_angle
 
@@ -1097,24 +1094,23 @@ class ROVPenalty(LossFunction):
                  'rov_least_blocked_angle_per_string' (N,).
 
         "Point away from the nearest neighbours" options (opt-in; defaults off):
-        - rov_away_weight: float, default 0.0. If > 0, the chosen ROV heading trades off
-            blockage (primary) against pointing away from the string's nearest
-            neighbours (secondary): score[a] = blockage[a] + rov_away_weight*misalign[a],
-            with misalign in [0, 1] (0 = points straight away). The reported
-            least-blocked angle becomes this chosen heading, and the penalty is the
-            blockage at it. Blockage dominates, so a single narrow clear corridor is
-            still chosen and not punished; the away term only tips ties among comparably
-            clear headings.
+        - rov_away_weight: float, default 0.0. If > 0, the reported/selected heading is
+            still chosen STRICTLY by blockage (least-blocked; the away term never
+            changes which angle is picked, so a uniquely-clear corridor is always
+            selected and never gets a worse angle substituted in). The away term is
+            added on top, evaluated at that same heading:
+                penalty = blockage_at_best_angle + rov_away_weight * misalign_at_best_angle
+            with misalign in [0, 1] (0 = the chosen heading points straight away from
+            the nearest neighbours, 1 = straight toward them).
         - rov_away_soft: bool, default = rov_soft_inside. Soft variant (soft top-k
-            neighbours via softmax over -distance + softmin heading selection, fully
-            differentiable) vs hard variant (hard top-k + argmin selection).
+            neighbours via softmax over -distance for theta_away, and blockage
+            aggregated via rov_angle_softmin_tau if set) vs hard variant (hard top-k
+            neighbours, hard argmin blockage).
         - rov_away_num_neighbours: int, default 5. Number of nearest neighbours defining
             the outward direction.
         - rov_away_nn_tau: float or None, default None. Softmax temperature for the soft
             neighbour selection, as a multiple of the geometry's own distance scale
             (median k-th nearest distance), so it is unit-robust. None -> 0.5.
-        - rov_away_select_tau: float, default 0.1. Softmin temperature (blockage units)
-            for the soft heading selection.
         """
         points = geom_dict.get('string_xy', None)
         num_angles = kwargs.get('num_angles', 6)
@@ -1150,8 +1146,6 @@ class ROVPenalty(LossFunction):
         # None -> scale-aware default (0.5 * median k-th nearest distance).
         _nn_tau = kwargs.get('rov_away_nn_tau', None)
         rov_away_nn_tau = None if _nn_tau is None else float(_nn_tau)
-        # Softmin temperature (blockage units) for the soft heading selection.
-        rov_away_select_tau = float(kwargs.get('rov_away_select_tau', 0.1))
 
         N = points.shape[0]
         
@@ -1240,9 +1234,9 @@ class ROVPenalty(LossFunction):
 
         # --- Per-string penalty and reported least-blocked heading ---
         if rov_away_enabled and theta_away is not None:
-            # Choose the heading by trading off blockage (primary) against pointing
-            # away from the nearest neighbours (secondary). The penalty is the blockage
-            # at the chosen heading, and the reported angle IS that heading.
+            # Heading is selected STRICTLY by blockage (least-blocked), exactly like the
+            # plain path below. The away term is added to the penalty afterward,
+            # evaluated at that same (strictly least-blocked) heading.
             penalty_per_string, least_blocked_angle_per_string = self._select_away_best_angle(
                 blockage_per_angle,
                 angles,
@@ -1250,7 +1244,7 @@ class ROVPenalty(LossFunction):
                 away_valid,
                 away_weight=rov_away_weight,
                 soft=rov_away_soft,
-                select_tau=rov_away_select_tau,
+                angle_softmin_tau=angle_softmin_tau,
             )
         else:
             # Default behavior: least-blocked path only.
