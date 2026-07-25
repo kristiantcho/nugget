@@ -11,37 +11,6 @@ except ImportError:
 
 from nugget.losses.base_loss import LossFunction
 
-# Cache of torch.compile'd geometry-penalty cores, keyed by (function identity,
-# extra config). These cores are pure-tensor functions (no torch.func vmap/jac
-# transforms, no dict/kwarg parsing), so compiling them directly is safe.
-#
-# Like the trigger/effective-area losses, this codebase backprops several losses
-# that share upstream forward computation via ``loss.backward(retain_graph=True)``
-# (see Optimizer.loss_update_step). AOTAutograd's "donated buffer" optimization
-# assumes a compiled function's backward runs at most once per forward and frees
-# saved-for-backward tensors immediately, which raises
-# ``RuntimeError: This backward function was compiled with non-empty donated
-# buffers...`` when a compiled loss isn't the last one backpropped. We disable it
-# for correctness (costs a little memory reuse).
-_GEOM_PENALTY_COMPILE_CACHE = {}
-
-
-def _compiled_core(fn, cache_key, torch_compile_kwargs=None):
-    """Return a torch.compile'd wrapper around ``fn``, cached by ``cache_key``.
-
-    ``cache_key`` should uniquely identify the callable (e.g. its ``id``); use a
-    tuple to fold in any config that changes the traced graph.
-    """
-    cached = _GEOM_PENALTY_COMPILE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    torch._functorch.config.donated_buffer = False
-    kwargs = dict(torch_compile_kwargs) if torch_compile_kwargs else {}
-    kwargs.setdefault('dynamic', True)
-    compiled = torch.compile(fn, **kwargs)
-    _GEOM_PENALTY_COMPILE_CACHE[cache_key] = compiled
-    return compiled
-
 
 class BoundaryPenalty(LossFunction):
     """Loss function for boundary penalties."""
@@ -330,8 +299,7 @@ class LocalStringRepulsionPenalty(LossFunction):
 
     @staticmethod
     def _repulsion_core(string_xy, string_weights, max_radius, beta, ignore_border, domain_size):
-        """Pure-tensor repulsion core (no dict/kwarg parsing) so it can be wrapped
-        with torch.compile. Returns (repulsion, repulsion_per_string).
+        """Pure-tensor repulsion core. Returns (repulsion, repulsion_per_string).
 
         Soft quadratic hinge: penalty per pair grows as strings get closer than
         max_radius and is ~0 once they are beyond it. Unlike the previous
@@ -390,8 +358,6 @@ class LocalStringRepulsionPenalty(LossFunction):
             Geometry dictionary containing 'string_xy' and optional 'string_weights' keys.
         **kwargs
             Additional keyword arguments including 'max_radius' and 'min_dist'.
-            Optional 'local_repulsion_use_torch_compile' (bool) compiles the pure-tensor
-            core, plus 'local_repulsion_torch_compile_kwargs'.
 
         Returns:
         --------
@@ -408,8 +374,6 @@ class LocalStringRepulsionPenalty(LossFunction):
         sharpness = kwargs.get('local_sharpness', 10.0)
         ignore_border = kwargs.get('ignore_border', False)
         domain_size = kwargs.get('boundary_range', 2.0)
-        use_torch_compile = bool(kwargs.get('local_repulsion_use_torch_compile', False))
-        torch_compile_kwargs = kwargs.get('local_repulsion_torch_compile_kwargs', None)
 
         if string_xy is None:
             return {'local_string_repulsion_penalty': torch.tensor(0.0)}
@@ -419,17 +383,7 @@ class LocalStringRepulsionPenalty(LossFunction):
 
         beta = max(float(sharpness), 1e-6)
 
-        core = LocalStringRepulsionPenalty._repulsion_core
-        if use_torch_compile:
-            # ignore_border selects a structurally different graph, so fold it into
-            # the cache key.
-            core = _compiled_core(
-                core,
-                ('local_repulsion_core', bool(ignore_border)),
-                torch_compile_kwargs,
-            )
-
-        repulsion, repulsion_per_string = core(
+        repulsion, repulsion_per_string = self._repulsion_core(
             string_xy, string_weights, max_radius, beta, ignore_border, domain_size,
         )
         return {
@@ -932,20 +886,13 @@ class ROVPenalty(LossFunction):
     ):
         """Vectorized triangle+rectangle blockage via per-angle rotation.
 
-        Pure-tensor core (no kwargs/dict access) so it is wrapped with torch.compile
-        (via _compiled_core) when `rov_use_torch_compile=True`, independently of
-        __call__'s dynamic argument parsing. Note it takes `self` only as a namespace
-        holder and does not read any attribute off it, which keeps it compile-safe.
-        Mirrors _compute_blockage_per_angle_alt's role for the non-alt path (the alt
-        path is left eager: its data-dependent boolean indexing and index_add_ cause
-        torch.compile graph breaks / recompiles).
+        Mirrors _compute_blockage_per_angle_alt's role for the non-alt path.
 
         For the soft_inside path, each per-constraint half-plane membership gate is by
         default sigmoid(k*margin) (bounded in [0,1]). If `use_softplus=True`, the gate
-        is instead the unbounded one-sided hinge softplus(k*margin)/k (~0 outside the
-        constraint, ~margin deep inside); the product (soft-AND) and 1-(1-a)(1-b)
-        (soft-OR) combination structure is unchanged, so blockage becomes a
-        depth-weighted count that can exceed the number of blocking strings.
+        is instead the bounded softplus-shaped gate sp/(1+sp) with sp=softplus(k*margin)
+        (~0 outside the constraint, ->1 deep inside); still in [0,1) so the product
+        (soft-AND) and 1-(1-a)(1-b) (soft-OR) combination stays valid.
         """
         L_tri = tri_length
         L_rect = rec_width
@@ -958,12 +905,11 @@ class ROVPenalty(LossFunction):
 
         num_angles = angles.shape[0]
 
-        # Per-constraint half-plane membership gate for a margin m (>0 inside).
-        # Default: bounded sigmoid(k*m). Optional: unbounded one-sided hinge
-        # softplus(k*m)/k (~0 outside, ~m deep inside).
+       
         def _gate(m, k):
             if use_softplus:
-                return F.softplus(k * m) / k
+                sp = F.softplus(k * m)
+                return sp / (1.0 + sp)
             return torch.sigmoid(k * m)
 
         if use_chunked:
@@ -1204,11 +1150,6 @@ class ROVPenalty(LossFunction):
         # soft_inside gate: default bounded sigmoid; if True, use the unbounded
         # softplus(k*m)/k one-sided hinge instead (only affects the soft_inside path).
         inside_use_softplus = bool(kwargs.get('rov_inside_use_softplus', False))
-        # Optional torch.compile of the (compile-friendly) rotation-math blockage core
-        # used by the non-alt path. The alt path uses data-dependent boolean indexing
-        # and index_add_, which torch.compile handles poorly, so it stays eager.
-        use_torch_compile = bool(kwargs.get('rov_use_torch_compile', False))
-        torch_compile_kwargs = kwargs.get('rov_torch_compile_kwargs', None)
 
         # "Point away from the nearest neighbours" options (opt-in; default off).
         # When rov_away_weight > 0, the "best" ROV heading is chosen by trading off
@@ -1300,20 +1241,7 @@ class ROVPenalty(LossFunction):
             use_chunked = soft_inside and points.is_cuda
             chunk_size = kwargs.get('rov_angle_chunk_size', 16)
 
-            # Compile the pure rotation-math core when requested. The core doesn't use
-            # `self`, so we compile the unbound function and pass `self` explicitly.
-            # The cache key folds in the static branch flags (soft_inside/use_chunked/
-            # use_softplus) since they select structurally different graphs.
-            core = ROVPenalty._compute_blockage_per_angle_default
-            if use_torch_compile:
-                core = _compiled_core(
-                    core,
-                    ('rov_blockage_default', bool(soft_inside), bool(use_chunked), bool(inside_use_softplus)),
-                    torch_compile_kwargs,
-                )
-
-            blockage_per_angle = core(
-                self,
+            blockage_per_angle = self._compute_blockage_per_angle_default(
                 all_relative=all_relative,
                 angles=angles,
                 half_height=half_height,
