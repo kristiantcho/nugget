@@ -316,10 +316,13 @@ class LocalStringRepulsionPenalty(LossFunction):
         string_weights = geom_dict.get('string_weights', None)
         max_radius = kwargs.get('max_radius', 0.1)
         min_dist = kwargs.get('min_dist', 1e-3)
-        sharpness = kwargs.get('local_sharpness', 10.0)  # Controls steepness of sigmoid transition
+        # Softness of the hinge corner at max_radius (dimensionless, on the normalized
+        # overshoot h = 1 - dist/max_radius). Larger -> sharper cutoff, i.e. the penalty
+        # decays to ~0 faster once dist exceeds max_radius.
+        sharpness = kwargs.get('local_sharpness', 10.0)
         ignore_border = kwargs.get('ignore_border', False)
         domain_size = kwargs.get('boundary_range', 2.0)
-        
+
         if string_xy is None:
             return {'local_string_repulsion_penalty': torch.tensor(0.0)}
         n = string_xy.shape[0]
@@ -329,13 +332,26 @@ class LocalStringRepulsionPenalty(LossFunction):
         diff = string_xy.unsqueeze(1) - string_xy.unsqueeze(0)  # (n, n, 2)
         dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
         dist = torch.sqrt(dist_sq + 1e-10)  # Add small epsilon for numerical stability
-        
-        # Soft mask using sigmoid - smoother transition at radius boundary
+
+        # Soft quadratic hinge: penalty per pair grows as strings get closer than
+        # max_radius and is ~0 once they are beyond it. Unlike the previous
+        # sigmoid((max_radius - dist) * sharpness) indicator -- which saturated to a
+        # constant 1 for close pairs and therefore had a VANISHING gradient exactly
+        # where repulsion is most needed -- this hinge keeps a live, growing repulsive
+        # force all the way down to contact (dist -> 0).
+        #
+        #   h(dist)  = 1 - dist / max_radius            (>0 inside radius, <0 outside)
+        #   hinge    = softplus(sharpness * h) / sharpness   (smooth relu; ->0 as dist>>R)
+        #   pair_pen = hinge ** 2                        (quadratic; C1, force grows to R)
+        #
+        # softplus (rather than a hard relu) rounds the corner at dist == max_radius so
+        # the term stays differentiable there; `sharpness` controls how sharp that
+        # corner is and how quickly the penalty decays to ~0 beyond max_radius.
         self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
-        radius_weight = torch.sigmoid((max_radius - dist) * sharpness)  # Sharp transition around max_radius
-        # radius_weight = torch.ones_like(dist)
-        # radius_mask = dist < max_radius
-        # radius_weight = radius_weight * radius_mask.float()
+        h = 1.0 - dist / max_radius
+        beta = max(float(sharpness), 1e-6)
+        hinge = torch.nn.functional.softplus(beta * h) / beta
+        radius_weight = hinge ** 2
         radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
         
         if ignore_border:
