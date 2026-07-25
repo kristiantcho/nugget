@@ -11,6 +11,38 @@ except ImportError:
 
 from nugget.losses.base_loss import LossFunction
 
+# Cache of torch.compile'd geometry-penalty cores, keyed by (function identity,
+# extra config). These cores are pure-tensor functions (no torch.func vmap/jac
+# transforms, no dict/kwarg parsing), so compiling them directly is safe.
+#
+# Like the trigger/effective-area losses, this codebase backprops several losses
+# that share upstream forward computation via ``loss.backward(retain_graph=True)``
+# (see Optimizer.loss_update_step). AOTAutograd's "donated buffer" optimization
+# assumes a compiled function's backward runs at most once per forward and frees
+# saved-for-backward tensors immediately, which raises
+# ``RuntimeError: This backward function was compiled with non-empty donated
+# buffers...`` when a compiled loss isn't the last one backpropped. We disable it
+# for correctness (costs a little memory reuse).
+_GEOM_PENALTY_COMPILE_CACHE = {}
+
+
+def _compiled_core(fn, cache_key, torch_compile_kwargs=None):
+    """Return a torch.compile'd wrapper around ``fn``, cached by ``cache_key``.
+
+    ``cache_key`` should uniquely identify the callable (e.g. its ``id``); use a
+    tuple to fold in any config that changes the traced graph.
+    """
+    cached = _GEOM_PENALTY_COMPILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    torch._functorch.config.donated_buffer = False
+    kwargs = dict(torch_compile_kwargs) if torch_compile_kwargs else {}
+    kwargs.setdefault('dynamic', True)
+    compiled = torch.compile(fn, **kwargs)
+    _GEOM_PENALTY_COMPILE_CACHE[cache_key] = compiled
+    return compiled
+
+
 class BoundaryPenalty(LossFunction):
     """Loss function for boundary penalties."""
     def __init__(self, device=None):
@@ -296,17 +328,71 @@ class LocalStringRepulsionPenalty(LossFunction):
         """
         super().__init__(device)
 
+    @staticmethod
+    def _repulsion_core(string_xy, string_weights, max_radius, beta, ignore_border, domain_size):
+        """Pure-tensor repulsion core (no dict/kwarg parsing) so it can be wrapped
+        with torch.compile. Returns (repulsion, repulsion_per_string).
+
+        Soft quadratic hinge: penalty per pair grows as strings get closer than
+        max_radius and is ~0 once they are beyond it. Unlike the previous
+        sigmoid((max_radius - dist) * sharpness) indicator -- which saturated to a
+        constant 1 for close pairs and therefore had a VANISHING gradient exactly
+        where repulsion is most needed -- this hinge keeps a live, growing repulsive
+        force all the way down to contact (dist -> 0).
+
+          h(dist)  = 1 - dist / max_radius            (>0 inside radius, <0 outside)
+          hinge    = softplus(beta * h) / beta        (smooth relu; ->0 as dist>>R)
+          pair_pen = hinge ** 2                        (quadratic; C1, force grows to R)
+
+        softplus (rather than a hard relu) rounds the corner at dist == max_radius so
+        the term stays differentiable there; `beta` controls how sharp that corner is
+        and how quickly the penalty decays to ~0 beyond max_radius.
+        """
+        n = string_xy.shape[0]
+        # Compute pairwise squared distances
+        diff = string_xy.unsqueeze(1) - string_xy.unsqueeze(0)  # (n, n, 2)
+        dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
+        dist = torch.sqrt(dist_sq + 1e-10)  # Add small epsilon for numerical stability
+
+        self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
+        h = 1.0 - dist / max_radius
+        hinge = F.softplus(beta * h) / beta
+        radius_weight = hinge ** 2
+        radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
+
+        if ignore_border:
+            clamped_string_xy = torch.clamp(torch.abs(string_xy) - domain_size / 2, min=0.0) ** 2
+            clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy, dim=1))
+            border_mask = (clamped_string_xy < 1e-3).unsqueeze(1) | (clamped_string_xy < 1e-3).unsqueeze(0)
+            radius_weight = radius_weight * (~border_mask).float()
+
+        if string_weights is not None:
+            string_probs = torch.sigmoid(string_weights)
+            # Outer product for all pairs
+            weight_matrix = string_probs.unsqueeze(1) * string_probs.unsqueeze(0)  # (n, n)
+            repulsion_matrix = weight_matrix * radius_weight
+            repulsion_per_string = repulsion_matrix.sum(dim=1)  # Total repulsion for each string
+            repulsion = repulsion_per_string.mean()
+        else:
+            # Mirror weighted behavior with implicit unit weights.
+            repulsion_per_string = radius_weight.sum(dim=1)
+            repulsion = repulsion_per_string.mean()
+
+        return repulsion, repulsion_per_string
+
     def __call__(self, geom_dict, **kwargs):
         """
         Compute repulsion penalty between strings, but only for pairs within a given radius.
-        
+
         Parameters:
         -----------
         geom_dict : dict
             Geometry dictionary containing 'string_xy' and optional 'string_weights' keys.
         **kwargs
             Additional keyword arguments including 'max_radius' and 'min_dist'.
-            
+            Optional 'local_repulsion_use_torch_compile' (bool) compiles the pure-tensor
+            core, plus 'local_repulsion_torch_compile_kwargs'.
+
         Returns:
         --------
         torch.Tensor
@@ -322,76 +408,30 @@ class LocalStringRepulsionPenalty(LossFunction):
         sharpness = kwargs.get('local_sharpness', 10.0)
         ignore_border = kwargs.get('ignore_border', False)
         domain_size = kwargs.get('boundary_range', 2.0)
+        use_torch_compile = bool(kwargs.get('local_repulsion_use_torch_compile', False))
+        torch_compile_kwargs = kwargs.get('local_repulsion_torch_compile_kwargs', None)
 
         if string_xy is None:
             return {'local_string_repulsion_penalty': torch.tensor(0.0)}
         n = string_xy.shape[0]
         if n == 0:
             return {'local_string_repulsion_penalty': torch.tensor(0.0)}
-        # Compute pairwise squared distances
-        diff = string_xy.unsqueeze(1) - string_xy.unsqueeze(0)  # (n, n, 2)
-        dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
-        dist = torch.sqrt(dist_sq + 1e-10)  # Add small epsilon for numerical stability
 
-        # Soft quadratic hinge: penalty per pair grows as strings get closer than
-        # max_radius and is ~0 once they are beyond it. Unlike the previous
-        # sigmoid((max_radius - dist) * sharpness) indicator -- which saturated to a
-        # constant 1 for close pairs and therefore had a VANISHING gradient exactly
-        # where repulsion is most needed -- this hinge keeps a live, growing repulsive
-        # force all the way down to contact (dist -> 0).
-        #
-        #   h(dist)  = 1 - dist / max_radius            (>0 inside radius, <0 outside)
-        #   hinge    = softplus(sharpness * h) / sharpness   (smooth relu; ->0 as dist>>R)
-        #   pair_pen = hinge ** 2                        (quadratic; C1, force grows to R)
-        #
-        # softplus (rather than a hard relu) rounds the corner at dist == max_radius so
-        # the term stays differentiable there; `sharpness` controls how sharp that
-        # corner is and how quickly the penalty decays to ~0 beyond max_radius.
-        self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
-        h = 1.0 - dist / max_radius
         beta = max(float(sharpness), 1e-6)
-        hinge = torch.nn.functional.softplus(beta * h) / beta
-        radius_weight = hinge ** 2
-        radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
-        
-        if ignore_border:
-            clamped_string_xy = torch.clamp(torch.abs(string_xy) - domain_size/2, min=0.0)** 2
-            clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy, dim=1))
-            border_mask = (clamped_string_xy < 1e-3).unsqueeze(1) | (clamped_string_xy < 1e-3).unsqueeze(0)
-            radius_weight = radius_weight * (~border_mask).float()
-        repulsion = 0.0
-        repulsion_per_string = torch.zeros(n, device=string_xy.device)
-        if string_weights is not None:
-            string_probs = torch.sigmoid(string_weights)
-            # Outer product for all pairs
-            weight_matrix = string_probs.unsqueeze(1) * string_probs.unsqueeze(0)  # (n, n)
-            # repulsion_matrix = weight_matrix * radius_weight / (dist_sq + min_dist)
-            repulsion_matrix = weight_matrix * radius_weight #* torch.exp(-dist_sq / (max_radius**2 + 1e-10))
-            # repulsion = torch.sum(repulsion_matrix) / n
-            # num_neighbors_per_string = radius_weight.sum(dim=1)  # Count neighbors for each string
-            repulsion_per_string = repulsion_matrix.sum(dim=1)  # Total repulsion for each string
-            
-            # Avoid division by zero and normalize
-            # normalized_repulsion = torch.where(
-            #     num_neighbors_per_string > 0,
-            #     repulsion_per_string / (num_neighbors_per_string + 1e-10),
-            #     torch.zeros_like(repulsion_per_string)
-            # )
-            # repulsion_per_string = normalized_repulsion
-            repulsion = repulsion_per_string.mean() #* string_probs.sum()
-        else:
-            # Mirror weighted behavior with implicit unit weights.
-            # This keeps the same smooth, differentiable dependence on string_xy.
-            repulsion_matrix = radius_weight
-            # num_neighbors_per_string = radius_weight.sum(dim=1)
-            repulsion_per_string = repulsion_matrix.sum(dim=1)
-            # normalized_repulsion = torch.where(
-            #     num_neighbors_per_string > 0,
-            #     repulsion_per_string / (num_neighbors_per_string + 1e-10),
-            #     torch.zeros_like(repulsion_per_string)
-            # )
-            # repulsion_per_string = normalized_repulsion
-            repulsion = repulsion_per_string.mean()
+
+        core = LocalStringRepulsionPenalty._repulsion_core
+        if use_torch_compile:
+            # ignore_border selects a structurally different graph, so fold it into
+            # the cache key.
+            core = _compiled_core(
+                core,
+                ('local_repulsion_core', bool(ignore_border)),
+                torch_compile_kwargs,
+            )
+
+        repulsion, repulsion_per_string = core(
+            string_xy, string_weights, max_radius, beta, ignore_border, domain_size,
+        )
         return {
             'local_string_repulsion_penalty': repulsion,
             'local_string_repulsion_penalty_per_string': repulsion_per_string,
@@ -892,9 +932,13 @@ class ROVPenalty(LossFunction):
     ):
         """Vectorized triangle+rectangle blockage via per-angle rotation.
 
-        Pure-tensor core (no kwargs/dict access) so it can be wrapped with
-        torch.compile independently of __call__'s dynamic argument parsing.
-        Mirrors _compute_blockage_per_angle_alt's role for the non-alt path.
+        Pure-tensor core (no kwargs/dict access) so it is wrapped with torch.compile
+        (via _compiled_core) when `rov_use_torch_compile=True`, independently of
+        __call__'s dynamic argument parsing. Note it takes `self` only as a namespace
+        holder and does not read any attribute off it, which keeps it compile-safe.
+        Mirrors _compute_blockage_per_angle_alt's role for the non-alt path (the alt
+        path is left eager: its data-dependent boolean indexing and index_add_ cause
+        torch.compile graph breaks / recompiles).
         """
         L_tri = tri_length
         L_rect = rec_width
@@ -1142,6 +1186,11 @@ class ROVPenalty(LossFunction):
         angle_softmin_tau = float(kwargs.get('rov_angle_softmin_tau', 0.0))
         detach_other_probs = kwargs.get('detach_other_probs', True)
         alt_mode = bool(kwargs.get('rov_alt_mode', False))
+        # Optional torch.compile of the (compile-friendly) rotation-math blockage core
+        # used by the non-alt path. The alt path uses data-dependent boolean indexing
+        # and index_add_, which torch.compile handles poorly, so it stays eager.
+        use_torch_compile = bool(kwargs.get('rov_use_torch_compile', False))
+        torch_compile_kwargs = kwargs.get('rov_torch_compile_kwargs', None)
 
         # "Point away from the nearest neighbours" options (opt-in; default off).
         # When rov_away_weight > 0, the "best" ROV heading is chosen by trading off
@@ -1233,7 +1282,20 @@ class ROVPenalty(LossFunction):
             use_chunked = soft_inside and points.is_cuda
             chunk_size = kwargs.get('rov_angle_chunk_size', 16)
 
-            blockage_per_angle = self._compute_blockage_per_angle_default(
+            # Compile the pure rotation-math core when requested. The core doesn't use
+            # `self`, so we compile the unbound function and pass `self` explicitly.
+            # The cache key folds in the static branch flags (soft_inside/use_chunked)
+            # since they select structurally different graphs.
+            core = ROVPenalty._compute_blockage_per_angle_default
+            if use_torch_compile:
+                core = _compiled_core(
+                    core,
+                    ('rov_blockage_default', bool(soft_inside), bool(use_chunked)),
+                    torch_compile_kwargs,
+                )
+
+            blockage_per_angle = core(
+                self,
                 all_relative=all_relative,
                 angles=angles,
                 half_height=half_height,
