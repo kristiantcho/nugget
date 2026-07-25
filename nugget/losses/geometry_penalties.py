@@ -928,7 +928,7 @@ class ROVPenalty(LossFunction):
     def _compute_blockage_per_angle_default(
         self, all_relative, angles, half_height, tri_length, rec_width,
         soft_inside=False, inside_sharpness=5.0, other_probs=None,
-        use_chunked=False, chunk_size=16,
+        use_chunked=False, chunk_size=16, use_softplus=False,
     ):
         """Vectorized triangle+rectangle blockage via per-angle rotation.
 
@@ -939,6 +939,13 @@ class ROVPenalty(LossFunction):
         Mirrors _compute_blockage_per_angle_alt's role for the non-alt path (the alt
         path is left eager: its data-dependent boolean indexing and index_add_ cause
         torch.compile graph breaks / recompiles).
+
+        For the soft_inside path, each per-constraint half-plane membership gate is by
+        default sigmoid(k*margin) (bounded in [0,1]). If `use_softplus=True`, the gate
+        is instead the unbounded one-sided hinge softplus(k*margin)/k (~0 outside the
+        constraint, ~margin deep inside); the product (soft-AND) and 1-(1-a)(1-b)
+        (soft-OR) combination structure is unchanged, so blockage becomes a
+        depth-weighted count that can exceed the number of blocking strings.
         """
         L_tri = tri_length
         L_rect = rec_width
@@ -951,11 +958,19 @@ class ROVPenalty(LossFunction):
 
         num_angles = angles.shape[0]
 
+        # Per-constraint half-plane membership gate for a margin m (>0 inside).
+        # Default: bounded sigmoid(k*m). Optional: unbounded one-sided hinge
+        # softplus(k*m)/k (~0 outside, ~m deep inside).
+        def _gate(m, k):
+            if use_softplus:
+                return F.softplus(k * m) / k
+            return torch.sigmoid(k * m)
+
         if use_chunked:
             k = inside_sharpness
 
             def _soft_between(x, lo, hi):
-                return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
+                return _gate(x - lo, k) * _gate(hi - x, k)
 
             blockage_per_angle = torch.zeros(
                 all_relative.shape[0], num_angles, device=all_relative.device, dtype=all_relative.dtype)
@@ -968,11 +983,11 @@ class ROVPenalty(LossFunction):
                 y_rot_abs = (rel_expanded[..., 0] * s_ch + rel_expanded[..., 1] * c_ch).abs()
 
                 tri_x      = _soft_between(x_rot, 0.0, L_tri)
-                tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
+                tri_y      = _gate(slope * x_rot - y_rot_abs, k)
                 inside_tri = tri_x * tri_y
 
                 rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
-                rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
+                rect_y      = _gate(half_height - y_rot_abs, k)
                 inside_rect = rect_x * rect_y
 
                 inside_ch = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)   # (N, N-1, chunk)
@@ -996,14 +1011,14 @@ class ROVPenalty(LossFunction):
             k = inside_sharpness
 
             def _soft_between(x, lo, hi):
-                return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
+                return _gate(x - lo, k) * _gate(hi - x, k)
 
             tri_x      = _soft_between(x_rot, 0.0, L_tri)
-            tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
+            tri_y      = _gate(slope * x_rot - y_rot_abs, k)
             inside_tri = tri_x * tri_y
 
             rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
-            rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
+            rect_y      = _gate(half_height - y_rot_abs, k)
             inside_rect = rect_x * rect_y
 
             inside = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)
@@ -1186,6 +1201,9 @@ class ROVPenalty(LossFunction):
         angle_softmin_tau = float(kwargs.get('rov_angle_softmin_tau', 0.0))
         detach_other_probs = kwargs.get('detach_other_probs', True)
         alt_mode = bool(kwargs.get('rov_alt_mode', False))
+        # soft_inside gate: default bounded sigmoid; if True, use the unbounded
+        # softplus(k*m)/k one-sided hinge instead (only affects the soft_inside path).
+        inside_use_softplus = bool(kwargs.get('rov_inside_use_softplus', False))
         # Optional torch.compile of the (compile-friendly) rotation-math blockage core
         # used by the non-alt path. The alt path uses data-dependent boolean indexing
         # and index_add_, which torch.compile handles poorly, so it stays eager.
@@ -1284,13 +1302,13 @@ class ROVPenalty(LossFunction):
 
             # Compile the pure rotation-math core when requested. The core doesn't use
             # `self`, so we compile the unbound function and pass `self` explicitly.
-            # The cache key folds in the static branch flags (soft_inside/use_chunked)
-            # since they select structurally different graphs.
+            # The cache key folds in the static branch flags (soft_inside/use_chunked/
+            # use_softplus) since they select structurally different graphs.
             core = ROVPenalty._compute_blockage_per_angle_default
             if use_torch_compile:
                 core = _compiled_core(
                     core,
-                    ('rov_blockage_default', bool(soft_inside), bool(use_chunked)),
+                    ('rov_blockage_default', bool(soft_inside), bool(use_chunked), bool(inside_use_softplus)),
                     torch_compile_kwargs,
                 )
 
@@ -1306,6 +1324,7 @@ class ROVPenalty(LossFunction):
                 other_probs=other_probs,
                 use_chunked=use_chunked,
                 chunk_size=chunk_size,
+                use_softplus=inside_use_softplus,
             )
 
         angle_scores_per_angle = blockage_per_angle
