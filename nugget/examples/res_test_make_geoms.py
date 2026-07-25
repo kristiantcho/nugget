@@ -4,7 +4,7 @@ import nugget
 import pickle
 import os
 
-device="cuda:2"
+device="cuda:1"
 string_number_penalty = nugget.losses.geometry_penalties.StringNumberPenalty(device=device)
 string_boundary_penalty = nugget.losses.geometry_penalties.StringBoundaryPenaltyCircle(device=device)
 weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizationPenalty(device=device)
@@ -27,14 +27,15 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
 )
 fisher_res_metric = 'mean'  # 'fom' 'median' 'mean'
 version = '_poisson'
-use_rov = 'no_rov'
+use_rov = 'rov'
 num_events = 'inf'
 event_type = 'track'
 res_param = 'angle'
+limit_zenith = None
 center = [0,0,0]
 radius = 600
 height = 1000
-bin_energies = False
+bin_energies = True
 folder_name = f'res_test/opt_geoms/opt_geoms_dyn_127_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
@@ -49,7 +50,7 @@ if not os.path.exists(folder_name):
 loss_params = {
     # 'signal_event_params': pickle.load(open(f'res_test/signal_events_{num_events}_r600_50{version}.pkl', 'rb'))[:],
     # 'signal_event_params': nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_r600_50{version}.pt')[:],
-    'num_events': 2000,  # Number of events to sample per optimization step
+    'num_events': 1000,  # Number of events to sample per optimization step
     'boundary_range': 1200,  # Size of boundary region
     'use_relative_energy': True,
     # 'precomputed_signal_yield_per_string': torch.load(f'res_test/light_yield_per_string_{num_events}_800main_full_hex_r600_50{version}.pt')[:],
@@ -61,13 +62,13 @@ loss_params.update({
     'max_radius': 80,  # Maximum radius for string placement
     'num_angles': 360,  # Number of angles (divided into 360 degrees) to test for rov
     'rov_alt_mode': True,  # Whether to use alternative mode for rov penalty (see rov_penalty.py for details)
-    'local_sharpness': 5,  # Sharpness parameter for local string repulsion
+    'local_sharpness': 3,  # Sharpness parameter for local string repulsion
     'boundary_sharpness': 10,  # Sharpness parameter for boundary penalty
     'string_number_beta':5,
     'detach_other_probs':True,
     'rov_soft_inside':True,
-    'rov_inside_sharpness': 15,
-    'rov_angle_softmin_tau': 0.01,
+    'rov_inside_sharpness': 5,
+    'rov_angle_softmin_tau': 0.1,
     'rov_angle_chunk_size': 360,
     'skip_zero_response': False,
      # 'fisher_info_llr_net': llr_net,
@@ -107,9 +108,9 @@ loss_params.update({
                 ],  # Constraints to enforce
     })
 loss_weights_dict = {
-    'angular_resolution_loss': 1,
+    'angular_resolution_loss': 1e2,
     'pointsource_fom_loss': 1e2,
-    'energy_resolution_loss': 1,
+    'energy_resolution_loss': 1e2,
     # 'fisher_loss': 0.005, 
     'signal_yield_loss': 0.01,        # High weight: maximize light collection
     # 'signal_llr_loss': 2.5,          # Moderate weight: good signal discrimination
@@ -178,12 +179,13 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
     E_min=10**2, 
     E_max=10**8, 
     energy_dist='log_uniform', 
-    find_exact_intersection=True,
-    random_position_along_ray=False,
+    find_exact_intersection=True if event_type == 'track' else False,
+    random_position_along_ray=False if event_type == 'track' else True,
     uniform_zenith_sampling=True,
     cylinder_center=center,
     cylinder_radius=radius,
     cylinder_height=height,
+    cos_range = torch.tensor([-1,0]) if limit_zenith is None else limit_zenith
     # cos_range=torch.tensor((np.cos(np.pi/2),np.cos(np.pi/2)))
     )
 
@@ -196,7 +198,10 @@ num_trials = 15
 if bin_energies:
     num_trials = 6
 for i in range(num_trials):
-    print(f"Running optimization iteration {i+1}/{num_trials}")
+    if not bin_energies:
+        print(f"Running optimization iteration {i+1}/{num_trials}")
+    else:
+        print(f"Running optimization iteration in energy range e{i+2}-e{i+3}")
 # for i in range(6):
 #     print(f"Running optimization iteration in energy range e{i+2}-e{i+3}")
     # if the geometry in the folder already exists, skip this iteration
@@ -242,16 +247,16 @@ for i in range(num_trials):
         loss_params.update({
             'signal_sampler': signal_sampler,
             })
-    geometry = nugget.geometries.EvanescentString.EvanescentString(
+    geometry = nugget.geometries.DynamicString.DynamicString(
             device=device,
             hex_type='hexagonal',
-            domain_size=3000,  # Size of detector domain
+            domain_size=400,  # Size of detector domain
             dim=3,  # 3D geometry
             n_strings=127,  # Initial number of detector strings
             points_per_string=20,  # Number of PMTs/sensors per string
             custom_z_spacing=50,
             # random_weights=True
-            starting_weight = 100,
+            # starting_weight = 100,
         )
     
     optimizer = nugget.utils.basic_optimizer.Optimizer(
