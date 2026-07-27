@@ -4,7 +4,7 @@ import nugget
 import pickle
 import os
 
-device="cuda:1"
+device="cuda:3"
 string_number_penalty = nugget.losses.geometry_penalties.StringNumberPenalty(device=device)
 string_boundary_penalty = nugget.losses.geometry_penalties.StringBoundaryPenaltyCircle(device=device)
 weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizationPenalty(device=device)
@@ -29,14 +29,15 @@ fisher_res_metric = 'mean'  # 'fom' 'median' 'mean'
 version = '_poisson'
 use_rov = 'rov'
 num_events = 'inf'
-event_type = 'track'
-res_param = 'angle'
+event_type = 'cascade'
+res_param = 'energy'
+num_strings = 61
 limit_zenith = None
 center = [0,0,0]
 radius = 600
 height = 1000
 bin_energies = True
-folder_name = f'res_test/opt_geoms/opt_geoms_dyn_127_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}'
+folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -48,38 +49,66 @@ if not os.path.exists(folder_name):
 #     count += 1
 
 loss_params = {
-    # 'signal_event_params': pickle.load(open(f'res_test/signal_events_{num_events}_r600_50{version}.pkl', 'rb'))[:],
-    # 'signal_event_params': nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{num_events}_r600_50{version}.pt')[:],
+    # 'llr_net': llr_net,
+    # 'signal_event_params': nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events/signal_events_{total_events}_{events_version}.pt'),  # Pre-sampled signal events for loss computation
+    # 'signal_event_params': nugget.utils.data_tools.select_events(nugget.utils.data_tools.load_signal_events_parquet(f'res_test/signal_events_{total_events}_{events_version}.pt'),limits=selection_limits),  # Pre-sampled signal events for loss computation
+    # 'background_event_params': new_background_events,
+    # 'signal_surrogate_func': light_yield_surrogate,  # Function to compute light yield
+    # 'background_surrogate_func': light_yield_surrogate,
+    # 'signal_sampler': signal_sampler,
+    # 'background_sampler': background_sampler,
     'num_events': 1000,  # Number of events to sample per optimization step
+    'signal_noise_scale': 0,  # Noise level for signal events
+    # 'background_noise_scale': 0.2,  # Noise level for background events
     'boundary_range': 1200,  # Size of boundary region
+    'skip_zero_response': False,
+    # 'fisher_info_llr_net': llr_net,
     'use_relative_energy': True,
-    # 'precomputed_signal_yield_per_string': torch.load(f'res_test/light_yield_per_string_{num_events}_800main_full_hex_r600_50{version}.pt')[:],
-    # 'precomputed_fisher_info_per_string_per_event': torch.load(f'res_test/fisher_info_per_string_per_event_{num_events}_800main_full_hex_r600_50{version}.pt')[:]
-    }
-loss_params.update({
-    'eva_min_num_strings': 127,  # Minimum number of active strings
+    # 'event_paths': ['/u/kristiantcho/ptmp/nugget/nugget/examples/res_test_signal_events_100_1.pkl'],
+    # 'fisher_info_paths': ['/u/kristiantcho/ptmp/nugget/nugget/examples/res_test_fisher_info_per_string_per_event_100_1.pt'],
+    # 'sample_every': 50,
+    # 'precomputed_signal_yield_per_string': torch.load('res_test/light_yield_per_string_50000_800main_full_hex_r600_50_u_1.pt')[selection_inds],
+    # 'llr_event_labels': ['position','energy', 'direction'],
+    # 'precomputed_fisher_info_per_string_per_event': fisher_info_precomp#[selection_inds]
+
+    'eva_min_num_strings': 70,  # Minimum number of active strings
     'string_number_use_binarization_weight': False,
     'max_radius': 80,  # Maximum radius for string placement
     'num_angles': 360,  # Number of angles (divided into 360 degrees) to test for rov
     'rov_alt_mode': True,  # Whether to use alternative mode for rov penalty (see rov_penalty.py for details)
-    'local_sharpness': 3,  # Sharpness parameter for local string repulsion
+    'local_sharpness': 10,  # Sharpness parameter for local string repulsion
     'boundary_sharpness': 10,  # Sharpness parameter for boundary penalty
     'string_number_beta':5,
-    'detach_other_probs':True,
+    'detach_other_probs':False,
     'rov_soft_inside':True,
-    'rov_inside_sharpness': 5,
-    'rov_angle_softmin_tau': 0.1,
+    'rov_inside_sharpness': 10,
+    'rov_angle_softmin_tau': 0.05,
     'rov_angle_chunk_size': 360,
-    'skip_zero_response': False,
-     # 'fisher_info_llr_net': llr_net,
+    'rov_away_weight': 0.00,
+    'rov_away_num_neighbours':5,
+    'rov_use_torch_compile': False,
+    'local_repulsion_use_torch_compile': False,
+    'rov_inside_use_softplus': True,
+
+
+    # 'other_geoms':[pickle.load(open('./800main_full_hex_r600_50_pl_1_ang_res_rov/geom_17.pkl', 'rb'))],
+    'diversity_use_hungarian': True,
+    'diversity_use_sinkhorn':False,
+    'diversity_min':1,
+    'sinkhorn_niter':10,
+    'sinkhorn_epsilon':0.5,
+    'diversity_use_mmd':False,
+    
+    # 'fisher_info_llr_net': llr_net,
     # 'fisher_info_llr_iterations':50,
     # 'llr_event_labels': ['position','energy', 'direction'],
     'fisher_info_grad_chunk_size': 14,
     'fisher_info_jacrev_chunk_size': 50000,
-    'fisher_info_point_chunk_size': 41000,
+    'fisher_info_point_chunk_size': 40100,
     'fisher_info_llr_autodiff_mode': 'jvp',
     'fisher_info_detach_tensors': False,
     'fisher_info_use_patd': False,
+    'fisher_res_metric': 'mean',  # 'fom' 'median' 'mean'
     'fisher_info_use_torch_compile': True,
     # 'eval_patd_log_probs':patd_surrogate.eval_patd_log_probs,
     'use_rich_features': True,
@@ -94,7 +123,24 @@ loss_params.update({
     'uninformative_fisher_value':1e-6,
     'empty_cache_after_event': False,
     'events_per_batch': 10000,
-    'fisher_res_metric': fisher_res_metric,  # 'fom' 'median' 'mean'
+
+    'trigger_use_torch_compile': False,
+    'use_batched_trigger': True,
+    'use_batched_binned_trigger': True,
+    'use_batched_effective_area': True,
+    'use_irregular_cylinder': False,
+    'bounding_cylinder_temperature': 1,
+    # 'num_events_per_bin': 100,
+    # 'num_energy_bins': 30,
+    # 'num_zenith_bins': 30,
+    'per_event_effective_area_loss': True,
+    'fom_adjust_cylinder_to_geometry':False,
+    'normalize_fom_by_energy':True,
+    # 'perfect_efficiency': False,
+    # 'cos_zenith_range': (-1, 0),
+    # 'binned_trigger_batch_size': 500,
+    # 'batched_surrogate_func': batched_track_surrogate,
+    # 'detach_trigger': False,
     'constraints_list': [
                 # 'energy_resolution_loss',
                 # 'angular_resolution_loss',
@@ -104,13 +150,14 @@ loss_params.update({
                 'local_string_repulsion_penalty', 
                 'string_number_penalty', 
                 # 'string_weights_penalty',
-                # 'weighted_binarization_penalty'
+                # 'weight_binarization_penalty',
+                # 'diversity_penalty',
                 ],  # Constraints to enforce
-    })
+}
 loss_weights_dict = {
-    'angular_resolution_loss': 1e2,
+    'angular_resolution_loss': 1,
     'pointsource_fom_loss': 1e2,
-    'energy_resolution_loss': 1e2,
+    'energy_resolution_loss': 1,
     # 'fisher_loss': 0.005, 
     'signal_yield_loss': 0.01,        # High weight: maximize light collection
     # 'signal_llr_loss': 2.5,          # Moderate weight: good signal discrimination
@@ -252,7 +299,7 @@ for i in range(num_trials):
             hex_type='hexagonal',
             domain_size=400,  # Size of detector domain
             dim=3,  # 3D geometry
-            n_strings=127,  # Initial number of detector strings
+            n_strings=num_strings,  # Initial number of detector strings
             points_per_string=20,  # Number of PMTs/sensors per string
             custom_z_spacing=50,
             # random_weights=True
