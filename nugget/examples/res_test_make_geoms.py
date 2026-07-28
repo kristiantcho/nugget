@@ -4,7 +4,7 @@ import nugget
 import pickle
 import os
 
-device="cuda:3"
+device="cuda:2"
 string_number_penalty = nugget.losses.geometry_penalties.StringNumberPenalty(device=device)
 string_boundary_penalty = nugget.losses.geometry_penalties.StringBoundaryPenaltyCircle(device=device)
 weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizationPenalty(device=device)
@@ -27,17 +27,17 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
 )
 fisher_res_metric = 'mean'  # 'fom' 'median' 'mean'
 version = '_poisson'
-use_rov = 'rov'
+use_rov = 'no_rov'
 num_events = 'inf'
-event_type = 'cascade'
-res_param = 'energy'
+event_type = 'track'
+res_param = 'angle'
 num_strings = 61
-limit_zenith = None
+limit_zenith = 'horizontal'
 center = [0,0,0]
 radius = 600
 height = 1000
 bin_energies = True
-folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}'
+folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}_{limit_zenith if limit_zenith is not None else ""}'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -330,7 +330,7 @@ for i in range(num_trials):
         loss_func_dict=loss_func_dict,          # Dictionary of loss functions to use
         loss_weights_dict=loss_weights_dict,    # Weights for combining multiple losses
         loss_params_dict=loss_params,           # Parameters for loss function computation
-        n_iter=1000,                           # Maximum number of optimization iterations
+        n_iter=1500,                           # Maximum number of optimization iterations
         print_freq=100,                          # Print progress every N iterations
         sigmoid_loss_list=loss_sigmoid_list,         # Which losses to apply sigmoid to (for better optimization dynamics)
         # save_best_geom_file = f'{folder_name}geom_e{(2*i)+2}_e{2*(i+1) + 2}.pkl',  # File to save best geometry found

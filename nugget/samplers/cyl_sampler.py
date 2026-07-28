@@ -393,8 +393,10 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
 
     if uniform_zenith_sampling:
         if cos_range_mode == "horizontal": # selecting horizontal zenith angles (cosθ ∈ [-0.2, 0.2])
-            theta_min = torch.acos(torch.as_tensor(0.2, device=device, dtype=dtype))
-            theta_max = torch.acos(torch.as_tensor(-0.2, device=device, dtype=dtype))
+            # theta_min = torch.acos(torch.as_tensor(0.2, device=device, dtype=dtype))
+            # theta_max = torch.acos(torch.as_tensor(-0.2, device=device, dtype=dtype))
+            theta_min = 70*math.pi/180.0
+            theta_max = 110*math.pi/180.0
             if fixed_costheta:
                 theta = torch.full((n_samples,), theta_min, dtype=dtype, device=device)
             else:
@@ -428,7 +430,7 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
                 u = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
                 cand = -1.0 + 2.0 * u
                 if cos_range_mode == "horizontal":
-                    range_mask = torch.abs(cand) < 0.2
+                    range_mask = torch.abs(cand) < torch.cos(torch.tensor(70*math.pi/180.0, device=device, dtype=dtype))  # cos(70°) ≈ 0.342
                 else:
                     range_mask = torch.abs(cand) > 0.8
                 q = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)

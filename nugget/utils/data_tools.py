@@ -186,7 +186,7 @@ def _matches_zenith_limit(event_value: Any, limit_value: Any) -> bool | None:
 
 	normalized_limit = limit_value.strip().lower()
 	if "horizontal" in normalized_limit:
-		threshold = 0.2
+		threshold = torch.cos(torch.tensor(70*torch.pi/180.0))  # cos(70°) ≈ 0.342
 		comparison = torch.lt
 	elif "vertical" in normalized_limit:
 		threshold = 0.8

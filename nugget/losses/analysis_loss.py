@@ -188,6 +188,7 @@ class AnalysisLoss(LossFunction):
     
         if signal_event_params is None:
             signal_event_params = signal_sampler.sample_events(num_events)
+            weight_factor = live_time
         else:
             # randomly sample a subset of the provided signal events and corresponding precomputed values if more than num_events are given
             if len(signal_event_params) > num_events:

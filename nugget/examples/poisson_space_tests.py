@@ -3,12 +3,13 @@ import torch
 import numpy as np
 import pickle
 
-device='cuda:2'
+device='cuda:1'
 center = [0,0,0]
 radius = 600
 height = 1000
 num_strings = 61
-event_type = 'cascade'  # 'track' or 'cascade'
+event_type = 'track'  # 'track' or 'cascade'
+limit_zenith = 'vertical'  # 'horizontal' or 'vertical'
 lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = event_type)
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate_batched
 # signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
@@ -62,13 +63,13 @@ for energy in [2,3,4,5,6,7]:
                                                         cylinder_radius=radius,
                                                         cylinder_height=height,
                                                         uniform_zenith_sampling=True,
-                                                        cos_range=torch.tensor([-1,1]),
+                                                        cos_range=torch.tensor([-1,1]) if limit_zenith is None else limit_zenith,
                                                         # point_towards_center=True,
                                                         # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                         )
     signal_events = signal_sampler.sample_events(num_events=num_events)
     # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1 if energy < 6 else energy+2}.parquet')
-    nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_{num_strings}_{event_type}_signal_events_e{energy}-e{energy+1}.parquet')
+    nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_{num_strings}_{event_type}_{limit_zenith+ "_" if limit_zenith is not None else ""}signal_events_e{energy}-e{energy+1}.parquet')
     # if energy < 6:
     angular_loss_dicts[f'{energy}-{energy+1}'] = []
     energy_loss_dicts[f'{energy}-{energy+1}'] = []
@@ -154,8 +155,8 @@ for energy in range(2,8):
     # for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
     for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}']:    
         del energy_loss_dict['resolution_params']
-with open(f'pois_tests/pois_{num_strings}_{event_type}_angular_loss_dicts_energies.pkl', 'wb') as f:
+with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}angular_loss_dicts_energies.pkl', 'wb') as f:
     pickle.dump(copy_angular_loss_dicts, f)
 
-with open(f'pois_tests/pois_{num_strings}_{event_type}_energy_loss_dicts_energies.pkl', 'wb') as f:
+with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}energy_loss_dicts_energies.pkl', 'wb') as f:
     pickle.dump(copy_energy_loss_dicts, f)
