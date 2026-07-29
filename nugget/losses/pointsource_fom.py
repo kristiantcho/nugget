@@ -78,11 +78,14 @@ class FoMLoss(LossFunction):
 
         return event_params
 
-    def _get_geometry_bounding_cylinder(self, geom_dict, temperature, include_height=True):
+    def _get_geometry_bounding_cylinder(self, geom_dict, temperature, include_height=True, **circle_kwargs):
         """Fit a cylinder to the current geometry: XY center/radius come from the
         smooth weighted minimum enclosing circle of the string positions
         (weighted continuously in [0, 1] by string_weights); height (if
         requested) is the unweighted z-extent of the detector's points_3d.
+
+        Extra keyword arguments are forwarded to get_weighted_min_enclosing_circle
+        (e.g. downweight_untriggerable and its trigger_* parameters).
         """
         string_xy = geom_dict.get("string_xy", None)
         if string_xy is None:
@@ -93,7 +96,7 @@ class FoMLoss(LossFunction):
             string_probs = torch.sigmoid(string_weights)
 
         center_xy, radius = get_weighted_min_enclosing_circle(
-            string_xy, string_weights=string_probs, temperature=temperature
+            string_xy, string_weights=string_probs, temperature=temperature, **circle_kwargs
         )
 
         if not include_height:
@@ -128,7 +131,18 @@ class FoMLoss(LossFunction):
 
         temperature = kwargs.get("bounding_cylinder_temperature", 1)
         include_height = kwargs.get("fom_adjust_cylinder_height", True)
-        center, radius, height = self._get_geometry_bounding_cylinder(geom_dict, temperature, include_height=include_height)
+        # Forward the triggerability-gating options so the FoM sampling cylinder
+        # matches the radius EffectiveAreaLoss derives (keeps the two consistent).
+        circle_kwargs = {
+            "downweight_untriggerable": kwargs.get("downweight_untriggerable", False),
+            "trigger_neighbor_distance": kwargs.get("trigger_neighbor_distance", 550.0),
+            "trigger_min_neighbors": kwargs.get("trigger_min_neighbors", 30.0),
+            "trigger_distance_sharpness": kwargs.get("trigger_distance_sharpness", 0.05),
+            "trigger_count_sharpness": kwargs.get("trigger_count_sharpness", 1.0),
+        }
+        center, radius, height = self._get_geometry_bounding_cylinder(
+            geom_dict, temperature, include_height=include_height, **circle_kwargs
+        )
 
         sampler_kwargs = {
             k: v for k, v in signal_sampler.kwargs.items()

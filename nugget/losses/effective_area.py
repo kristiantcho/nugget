@@ -1160,6 +1160,11 @@ def get_weighted_min_enclosing_circle(
     temperature=1,
     n_directions=360,
     angular_kappa=5.0,
+    downweight_untriggerable=False,
+    trigger_neighbor_distance=550.0,
+    trigger_min_neighbors=30.0,
+    trigger_distance_sharpness=0.05,
+    trigger_count_sharpness=1.0,
 ):
     """Differentiably estimate a weighted enclosing-circle radius around a fixed origin.
 
@@ -1179,6 +1184,26 @@ def get_weighted_min_enclosing_circle(
     angular_kappa : float
         Sharpness of the angular gate. Higher values restrict each direction's
         soft-max to strings more tightly aligned with that direction.
+    downweight_untriggerable : bool
+        If True, heavily downweight strings that cannot be part of a trigger,
+        i.e. strings that do not have at least ``trigger_min_neighbors`` other
+        (weighted) strings within ``trigger_neighbor_distance`` in the XY plane.
+        This prevents a lone, far-flung string from inflating the radius: an
+        isolated string is not "triggerable", so it should not enlarge the
+        sampling cylinder. Fully differentiable (soft neighbor count + soft gate).
+    trigger_neighbor_distance : float
+        XY neighborhood radius (same units as string_xy) used to count
+        neighbors for the triggerability gate. Mirrors the trigger's sliding-bar
+        length. Default 550.0.
+    trigger_min_neighbors : float
+        Minimum (weighted) neighbor count for a string to count as triggerable.
+        Mirrors the trigger's ``min_points_threshold``. Default 30.0.
+    trigger_distance_sharpness : float
+        Sharpness of the soft "is neighbor within trigger_neighbor_distance"
+        sigmoid (higher = sharper cutoff at the neighbor distance).
+    trigger_count_sharpness : float
+        Sharpness of the soft "neighbor count >= trigger_min_neighbors" gate
+        (higher = sharper transition around the threshold).
 
     Returns
     -------
@@ -1195,6 +1220,18 @@ def get_weighted_min_enclosing_circle(
         w = torch.ones(n_strings, device=device, dtype=dtype)
     else:
         w = string_weights.to(device=device, dtype=dtype)
+
+    if downweight_untriggerable:
+        # Soft count of weighted neighbors within trigger_neighbor_distance (excluding self),
+        # then a soft gate at trigger_min_neighbors. A string that fails the gate is
+        # multiplied down toward ~0 so it no longer contributes to (inflates) the radius.
+        pairwise = torch.cdist(string_xy, string_xy)  # (n_strings, n_strings)
+        within = torch.sigmoid(trigger_distance_sharpness * (trigger_neighbor_distance - pairwise))
+        # Exclude self from the neighbor count.
+        within = within - torch.diag(torch.diagonal(within))
+        neighbor_count = within @ w  # (n_strings,) weighted neighbor count per string
+        triggerable = torch.sigmoid(trigger_count_sharpness * (neighbor_count - trigger_min_neighbors))
+        w = w * triggerable
 
     center_xy = torch.zeros(2, device=device, dtype=dtype)
 
@@ -1311,6 +1348,11 @@ class EffectiveAreaLoss(LossFunction):
         energy_range = kwargs.get('energy_range', (1e2, 1e8))
         zenith_range = kwargs.get('cos_zenith_range', (-1, 1))
         temperature = kwargs.get('bounding_cylinder_temperature', 0.1)
+        downweight_untriggerable = kwargs.get('downweight_untriggerable', False)
+        trigger_neighbor_distance = kwargs.get('trigger_neighbor_distance', 550.0)
+        trigger_min_neighbors = kwargs.get('trigger_min_neighbors', 30.0)
+        trigger_distance_sharpness = kwargs.get('trigger_distance_sharpness', 0.05)
+        trigger_count_sharpness = kwargs.get('trigger_count_sharpness', 1.0)
         use_irregular_cylinder = kwargs.get('use_irregular_cylinder', False)
         use_batched_effective_area = kwargs.get('use_batched_effective_area', False)
         cylinder_kwargs = kwargs.get('cylinder_sampler_kwargs', {})
@@ -1366,7 +1408,12 @@ class EffectiveAreaLoss(LossFunction):
 
         if not use_irregular_cylinder:
             center_xy, cyl_radius = get_weighted_min_enclosing_circle(
-                string_xy, string_weights=string_probs, temperature=temperature
+                string_xy, string_weights=string_probs, temperature=temperature,
+                downweight_untriggerable=downweight_untriggerable,
+                trigger_neighbor_distance=trigger_neighbor_distance,
+                trigger_min_neighbors=trigger_min_neighbors,
+                trigger_distance_sharpness=trigger_distance_sharpness,
+                trigger_count_sharpness=trigger_count_sharpness,
             )
             z_positions = points_3d[:, 2]
             z_max = torch.max(z_positions)

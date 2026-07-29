@@ -26,6 +26,30 @@ def cart_to_sph(vec):
     return theta, phi
 
 
+def _reseed_dataset_rng_in_worker(worker_id):
+    """Give each DataLoader worker its own independent numpy RNG stream.
+
+    Datasets here draw their samples from ``self._rng``, which is created in the parent
+    process. Workers are forked, so without this every worker starts from an identical
+    RNG state and they all produce the SAME rows -- silently duplicating much of each
+    epoch. ``worker_info.seed`` is unique per worker and changes each epoch, and derives
+    from torch's base seed, so setting ``torch.manual_seed`` still makes runs
+    reproducible. The dataset's own ``seed`` (when given) is mixed in so it continues to
+    affect the stream.
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return
+    dataset = info.dataset
+    if not hasattr(dataset, '_rng'):
+        return
+    seed_parts = [int(info.seed)]
+    base_seed = getattr(dataset, '_seed', None)
+    if base_seed is not None:
+        seed_parts.append(int(base_seed))
+    dataset._rng = np.random.default_rng(seed_parts)
+
+
 class FourierFeatures(torch.nn.Module):
     """
     Multiscale Fourier feature mapping for neural networks.
@@ -139,19 +163,34 @@ class LLRnet(Surrogate):
     Log-Likelihood Ratio network for training an MLP classifier to estimate LLR.
     
     This network is trained as a binary classifier but uses the sigmoid trick to compute
-    Log-Likelihood Ratios. The network outputs probabilities through a sigmoid activation,
-    and the LLR is computed as log(p/(1-p)) where p is the output probability.
-    
+    Log-Likelihood Ratios. The network outputs a raw LOGIT, which IS the LLR for a
+    balanced (50/50 matched/mismatched) training set; probabilities are obtained by
+    applying a sigmoid. Training uses BCEWithLogitsLoss.
+
+    Emitting logits rather than a sigmoid'd probability matters here: in float32,
+    torch.sigmoid saturates to exactly 1.0 for inputs above ~17, so recovering the LLR
+    as logit(p) would return +/-inf for confidently classified samples and lose all
+    resolution above |LLR| ~ 16. Reading the logit directly keeps the full range.
+
     The network supports parallel Fourier mapping layers with corresponding MLPs that
     process different frequency scales simultaneously. This allows the network to capture
     patterns at multiple scales and combine them for improved performance.
-    
+
     Architecture:
     - Multiple parallel branches, each with:
       * Optional Fourier feature mapping at different frequency scales
       * Either separate MLPs per branch OR a single shared MLP (when shared_mlp=True)
-    - Final MLP that concatenates all branch outputs and applies sigmoid
-    
+    - Final MLP that concatenates all branch outputs and emits one logit
+
+    Training note: because the mismatched sample reuses the SAME (event params, detector
+    position) row and only swaps the light yield for one drawn from the marginal, every
+    individual feature has an identical marginal distribution in both classes. All the
+    signal therefore lives in interactions between the light yield and the geometry, and
+    the loss sits at ln(2) until the network starts fitting those interactions. Small
+    batches with a low learning rate can stay on that plateau for tens of thousands of
+    steps; prefer a large batch (>= 2048) with a warmup (lr_schedule='onecycle') and
+    standardize_inputs=True.
+
     When shared_mlp=True, each Fourier branch output is separately fed to the same
     shared MLP and the outputs are concatenated before the final layer. If branches
     have different Fourier output dimensions, smaller inputs are zero-padded to match
@@ -190,7 +229,9 @@ class LLRnet(Surrogate):
                  num_parallel_branches=1, frequency_scales=None, num_frequencies_per_branch=None, log_scale_ly=False, norm_pos=False, log_charge_scale=4,
                  shared_mlp=False, use_residual_connections=False, signal_noise_scale=0.0, background_noise_scale=0.0, add_relative_pos=True, jitter_time=0.0,
                  add_distance_from_beam=False, log_scale_energy=False, reduce_lr_on_plateau=False, lr_scheduler_patience=10, input_delta_time=False, add_vertex_distance=True, ly_eps = 1e-10,
-                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, rich_rel_pos_mode=False, add_pmt_direction=False, **kwargs):
+                 lr_scheduler_factor=0.5, lr_scheduler_min_lr=1e-6, use_patd=False, min_photons=1, num_photons_per_sample=None, rel_time=False, input_charge=False, use_rich_features=False, flag_negative_times=False, time_scale_divisor=4.0, rich_rel_pos_mode=False, add_pmt_direction=False,
+                 add_dist_long=False, track_dir_is_arrival=False, standardize_inputs=False,
+                 lr_schedule=None, warmup_frac=0.15, **kwargs):
         """
         Initialize the LLRnet surrogate model.
         
@@ -236,6 +277,37 @@ class LLRnet(Surrogate):
         add_distance_from_beam : bool
             If True, adds perpendicular distance from detector point to beam/track as a feature.
             Requires 'position', 'zenith', and 'azimuth' in event data.
+            NOTE: this distance is measured to the INFINITE line through the vertex, so it
+            is blind to whether the detector point sits up- or downstream of the vertex.
+            A point 500 m upstream (where no muon exists yet, hence no light) gets the same
+            value as one 500 m downstream. Pair it with add_dist_long to break that
+            degeneracy.
+        add_dist_long : bool
+            If True, adds the SIGNED longitudinal distance from the vertex to the detector
+            point, projected on the muon travel direction and normalised by domain_size/2.
+            Positive means downstream of the vertex (light expected), negative means
+            upstream (no light expected). This is the half of the track geometry that
+            add_distance_from_beam discards, and it is the single most useful addition to
+            the charge feature set.
+        track_dir_is_arrival : bool
+            Sign convention for event_data['direction']. If True, 'direction' is treated as
+            the direction the particle ARRIVED FROM (the usual zenith/azimuth convention in
+            neutrino MC), so the muon travel direction is -direction. This only affects the
+            longitudinal projection: dist_perp is sign-invariant. Set True for light-yield
+            parquet data built from (zenith, azimuth) columns -- with that data ~95% of hit
+            PMTs are downstream of the vertex under -direction and only ~5% under
+            +direction. Default False preserves the previous behaviour.
+        standardize_inputs : bool
+            If True, features are standardized (zero mean, unit variance) before entering
+            the network. Statistics are estimated from the first few training batches, are
+            then frozen, and are persisted with the model so inference matches training.
+        lr_schedule : str or None
+            'onecycle' to use a OneCycleLR schedule over the whole run (warmup to
+            learning_rate then anneal), which is what reliably escapes the ln(2) plateau.
+            'plateau' (or None with reduce_lr_on_plateau=True) keeps ReduceLROnPlateau.
+            None with reduce_lr_on_plateau=False means a constant learning rate.
+        warmup_frac : float
+            Fraction of total steps spent warming up when lr_schedule='onecycle'.
         add_vertex_distance : bool
             If True, adds distance from detector point to event vertex as a feature.
         log_scale_ly : bool
@@ -306,6 +378,15 @@ class LLRnet(Surrogate):
         # vector, relative to the optical module) as 3 extra features. The
         # direction is read from event_data['pmt_direction'].
         self.add_pmt_direction = add_pmt_direction
+        self.add_dist_long = add_dist_long
+        self.track_dir_is_arrival = track_dir_is_arrival
+        # Input standardisation. Estimated from the first training batches, frozen
+        # thereafter, and saved/loaded with the model so inference matches training.
+        self.standardize_inputs = standardize_inputs
+        self.input_mean = None
+        self.input_std = None
+        self.lr_schedule = lr_schedule
+        self.warmup_frac = warmup_frac
         # All unique PMT directions seen when add_pmt_direction is used, as a
         # (n_unique, 3) tensor. Populated by the light-yield parquet dataset from
         # the geometry CSV, and persisted via save_model / load_model. None until
@@ -342,12 +423,17 @@ class LLRnet(Surrogate):
         self.final_mlp = None
         self.optimizer = None
         self.lr_scheduler = None  # Learning rate scheduler
-        self.loss_fn = torch.nn.BCELoss()  # Changed from BCEWithLogitsLoss
+        # The network emits logits, so the loss must be the logit-space BCE. This is
+        # numerically stable where Sigmoid + BCELoss is not: it never saturates, so
+        # gradients survive for confidently classified samples.
+        self.loss_fn = torch.nn.BCEWithLogitsLoss()
         
         # Training history
         self.train_losses = []
         self.val_losses = []
         self.is_trained = False
+        # Deep copy of the weights at the best validation loss (None until validation runs)
+        self.best_state_dict = None
 
         # Accumulated [x, y, z, light_yield, label] rows recorded during
         # training when record_marginal_lys=True (see train_with_dataloader)
@@ -378,7 +464,24 @@ class LLRnet(Surrogate):
             )
 
         return domain_size / 2.0
-        
+
+    def _scalar_pos_norm(self):
+        """Return a single float divisor for normalizing scalar distances.
+
+        Unlike _pos_norm_divisor this always yields a scalar, so it can be applied to
+        lengths (which have no per-axis meaning). For a (width, height) domain_size the
+        transverse half-width is used.
+        """
+        domain_size = self.domain_size
+        if isinstance(domain_size, torch.Tensor):
+            domain_size = domain_size.tolist() if domain_size.dim() > 0 else domain_size.item()
+        if isinstance(domain_size, (tuple, list)) and len(domain_size) == 2:
+            width = domain_size[0]
+            if isinstance(width, torch.Tensor):
+                width = width.item()
+            return float(width) / 2.0
+        return float(domain_size) / 2.0
+
     def _build_network(self, input_dim):
         """Build the parallel MLP network architecture with multiple Fourier feature mappings."""
         
@@ -512,10 +615,14 @@ class LLRnet(Surrogate):
         final_layers.append(torch.nn.SiLU())
         final_layers.append(torch.nn.Dropout(self.dropout_rate))
         
-        # # Final output layer with sigmoid
+        # Final output layer emits a raw logit (no Sigmoid): the logit IS the LLR, and
+        # keeping it unsquashed avoids the float32 sigmoid saturating to exactly 1.0
+        # (which would make logit(p) return inf). Checkpoints written by the older
+        # Sigmoid-terminated version still load: Sigmoid holds no parameters and was the
+        # last entry, so the state_dict keys are unchanged and the stored weights
+        # produce exactly the same logits.
         final_layers.append(torch.nn.Linear(final_hidden_dim, 1))
-        final_layers.append(torch.nn.Sigmoid())
-        
+
         self.final_mlp = torch.nn.Sequential(*final_layers).to(self.device)
         
         print(f"  Final MLP: {total_branch_output_dim} -> {final_hidden_dim} -> 1")
@@ -859,20 +966,28 @@ class LLRnet(Surrogate):
 
         This is the charge analogue of prepare_features_patd
 
-        Feature layout (10 features total):
+        Feature layout:
           [det_x, det_y, det_z,       normalised detector position     (3)
            v_x,   v_y,   v_z,         normalised vertex position       (3)
+             -- or, when rich_rel_pos_mode, just rel = det - vert      (3)
            d_x,   d_y,   d_z,         unit direction vector            (3)
            log10(E)/8,                log-scaled energy                (1)
            vert_dist,                 L2(detector - vertex) normalised (1, optional)
            cos_angle,                 cos(direction ∠ vertex→detector) (1)
            dist_perp,                 perp. distance to beam normalised(1, optional)
+           dist_long,                 SIGNED along-track distance      (1, optional)
            pmt_dir_x, pmt_dir_y, pmt_dir_z,  hit-PMT direction        (3, optional)
            log_ly]                    log-scaled light yield           (1)
-                                                                       total = 12 .. 17
+                                                                       total = 12 .. 18
 
         The pmt_dir block is included only when self.add_pmt_direction is True,
         in which case event_data must provide 'pmt_direction' (a 3-vector).
+
+        dist_long (self.add_dist_long) is the projection of (detector - vertex) onto the
+        muon TRAVEL direction, normalised by domain_size/2. It is signed: positive
+        downstream of the vertex, negative upstream. Which way the muon travels is set by
+        self.track_dir_is_arrival -- when True, event_data['direction'] is the arrival
+        direction and the travel direction is its negative.
 
         Normalisation uses self.domain_size via _pos_norm_divisor().
 
@@ -952,11 +1067,18 @@ class LLRnet(Surrogate):
         if self.add_vertex_distance:
             feature_values.append(vert_dist)
         feature_values.append(cos_angle)
-        if self.add_distance_from_beam:
+        if self.add_distance_from_beam or self.add_dist_long:
             track_pos = vert * norm  # back to original scale for distance calculation
-            track_dir = direction    # already a unit vector
-            _, dist_perp = self.compute_distance_from_beam(point, track_pos, track_dir)
-            feature_values.append(dist_perp.reshape(()) / (self.domain_size / 2))
+            # Travel direction. 'direction' is a unit vector; when it encodes where the
+            # particle came from, the muon propagates along its negative. dist_perp is
+            # unaffected by this sign, dist_long flips with it.
+            track_dir = -direction if self.track_dir_is_arrival else direction
+            dist_long, dist_perp = self.compute_distance_from_beam(point, track_pos, track_dir)
+            pos_div = self._scalar_pos_norm()
+            if self.add_distance_from_beam:
+                feature_values.append(dist_perp.reshape(()) / pos_div)
+            if self.add_dist_long:
+                feature_values.append(dist_long.reshape(()) / pos_div)
         # --- hit-PMT direction (unit vector relative to the optical module) ---
         if self.add_pmt_direction:
             pmt_dir = event_data['pmt_direction']
@@ -1037,13 +1159,17 @@ class LLRnet(Surrogate):
         if self.add_vertex_distance:
             cols.append(vert_dist.unsqueeze(1))     # (n, 1)
         cols.append(cos_angle.unsqueeze(1))         # (n, 1)
-        if self.add_distance_from_beam:
+        if self.add_distance_from_beam or self.add_dist_long:
             track_pos = vert * norm                 # (3,) original scale
-            _, dist_perp = self.compute_distance_from_beam(
-                det * norm, track_pos.unsqueeze(0), direction.unsqueeze(0)
-            )  # dist_perp: (n, 1)
-            half = self.domain_size / 2
-            cols.append(dist_perp.reshape(n, 1) / half)
+            track_dir = -direction if self.track_dir_is_arrival else direction
+            dist_long, dist_perp = self.compute_distance_from_beam(
+                det * norm, track_pos.unsqueeze(0), track_dir.unsqueeze(0)
+            )  # each (n, 1)
+            half = self._scalar_pos_norm()
+            if self.add_distance_from_beam:
+                cols.append(dist_perp.reshape(n, 1) / half)
+            if self.add_dist_long:
+                cols.append(dist_long.reshape(n, 1) / half)
         if self.add_pmt_direction:
             if pmt_directions is None:
                 raise ValueError("pmt_directions is required when add_pmt_direction=True")
@@ -1687,11 +1813,38 @@ class LLRnet(Surrogate):
                 self._build_network(feature_dim)
             else:
                 self._build_network(input_dim)
-        
+
+        # Estimate input standardisation statistics once, from a few training batches,
+        # then freeze them. Frozen (rather than running) stats keep the mapping from
+        # features to LLR fixed, which matters because the LLR is used downstream.
+        if self.standardize_inputs and self.input_mean is None:
+            self._fit_input_scaler(train_dataloader)
+
+        # A OneCycle schedule needs the total number of optimizer steps up front.
+        if self.lr_schedule == 'onecycle':
+            try:
+                steps_per_epoch = len(train_dataloader)
+            except TypeError:
+                steps_per_epoch = None
+            if steps_per_epoch:
+                self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    self.optimizer,
+                    max_lr=self.learning_rate,
+                    total_steps=steps_per_epoch * epochs,
+                    pct_start=self.warmup_frac,
+                )
+                print(f"  LR schedule: OneCycle, max_lr={self.learning_rate:g}, "
+                      f"{steps_per_epoch * epochs} total steps, "
+                      f"warmup {self.warmup_frac:.0%}")
+            else:
+                print("  lr_schedule='onecycle' requires a sized dataloader; "
+                      "falling back to a constant learning rate.")
+                self.lr_scheduler = None
+
         # Training loop
         best_val_loss = float('inf') if val_dataloader is not None else None
         patience_counter = 0
-        
+
         for epoch in range(epochs):
             # Training phase
             if self.shared_mlp:
@@ -1754,7 +1907,13 @@ class LLRnet(Surrogate):
                     ) + list(self.final_mlp.parameters())
                     torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
                 self.optimizer.step()
-                
+                # OneCycle advances per optimizer step, not per epoch. It raises once it
+                # has been stepped total_steps times, so guard against any drift between
+                # the planned and actual batch count (e.g. a resumed or extended run).
+                if self.lr_schedule == 'onecycle' and self.lr_scheduler is not None:
+                    if self.lr_scheduler.last_epoch + 1 < self.lr_scheduler.total_steps:
+                        self.lr_scheduler.step()
+
                 train_loss += loss.item()
                 if n_batches == 0 and epoch == 0:
                     print(f"Batch trained in {time.time() - time_start:.4f} seconds", flush=True)
@@ -1799,26 +1958,25 @@ class LLRnet(Surrogate):
             if val_loss is not None:
                 self.val_losses.append(val_loss)
             
-            # Update learning rate scheduler if enabled
-            if self.reduce_lr_on_plateau and self.lr_scheduler is not None:
+            # Update learning rate scheduler if enabled (OneCycle already stepped
+            # per batch above, so only the plateau scheduler is advanced here).
+            if (self.lr_schedule != 'onecycle' and self.reduce_lr_on_plateau
+                    and self.lr_scheduler is not None):
                 if val_loss is not None:
                     # Use validation loss for scheduler
                     self.lr_scheduler.step(val_loss)
                 else:
-                    # Use training loss if no validation data
+                    # Use training loss if no validation data. Note this is averaged over
+                    # only num_samples_per_epoch*2 samples, so with a small epoch it is
+                    # noisy relative to the total available signal -- prefer passing a
+                    # val_dataloader.
                     self.lr_scheduler.step(train_loss)
             
             # Early stopping check (only if validation data provided)
             if val_dataloader is not None and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
-                # Save best model state
-                self.best_state_dict = {
-                    'mlp_branches': [branch.state_dict().copy() for branch in self.mlp_branches] if not self.shared_mlp else None,
-                    'shared_branch_mlp': self.shared_branch_mlp.state_dict().copy() if self.shared_mlp else None,
-                    'final_mlp': self.final_mlp.state_dict().copy(),
-                    'fourier_features_list': [fourier_layer.state_dict().copy() for fourier_layer in self.fourier_features_list] if self.fourier_features_list is not None else None
-                }
+                self.best_state_dict = self._snapshot_state()
             elif val_dataloader is not None:
                 patience_counter += 1
             
@@ -1831,17 +1989,9 @@ class LLRnet(Surrogate):
             # Early stopping (only if validation data provided)
             if val_dataloader is not None and patience_counter >= early_stopping_patience:
                 if verbose:
-                    print(f"Early stopping at epoch {epoch+1}")
-                # Load best model
-                if self.shared_mlp:
-                    self.shared_branch_mlp.load_state_dict(self.best_state_dict['shared_branch_mlp'])
-                else:
-                    for i, branch in enumerate(self.mlp_branches):
-                        branch.load_state_dict(self.best_state_dict['mlp_branches'][i])
-                self.final_mlp.load_state_dict(self.best_state_dict['final_mlp'])
-                if self.fourier_features_list is not None and self.best_state_dict['fourier_features_list'] is not None:
-                    for i, fourier_layer in enumerate(self.fourier_features_list):
-                        fourier_layer.load_state_dict(self.best_state_dict['fourier_features_list'][i])
+                    print(f"Early stopping at epoch {epoch+1} "
+                          f"(best val loss {best_val_loss:.5f})")
+                self._restore_state(self.best_state_dict)
                 break
 
             if record_marginal_lys and recorded_ly_batches:
@@ -1852,7 +2002,10 @@ class LLRnet(Surrogate):
                 checkpoint_dirname = os.path.dirname(checkpoint_path)
                 if checkpoint_dirname:
                     os.makedirs(checkpoint_dirname, exist_ok=True)
-                self._save_model_state(checkpoint_path)
+                # With validation available, persist the best-so-far weights rather than
+                # whatever the latest epoch happens to hold -- this task overfits well
+                # before the run ends, so the last epoch is often not the one you want.
+                self._save_model_state(checkpoint_path, state=self.best_state_dict)
 
                 if dataset_checkpoint_path is not None:
                     dataset_checkpoint_dirname = os.path.dirname(dataset_checkpoint_path)
@@ -1860,13 +2013,85 @@ class LLRnet(Surrogate):
                         os.makedirs(dataset_checkpoint_dirname, exist_ok=True)
                     torch.save(self.recorded_lys, dataset_checkpoint_path)
 
+        # Finished all epochs without early stopping: still adopt the best weights.
+        if val_dataloader is not None and self.best_state_dict is not None:
+            self._restore_state(self.best_state_dict)
+            if verbose:
+                print(f"Restored best weights (val loss {best_val_loss:.5f})")
+
         self.is_trained = True
-        
+
         return {
             'train_loss': self.train_losses,
             'val_loss': self.val_losses if val_dataloader is not None else []
         }
         
+    def _snapshot_state(self):
+        """Return a detached deep copy of every trainable module's state.
+
+        The tensors are cloned. ``state_dict()`` hands back references to the live
+        parameters, so a shallow ``.copy()`` of the dict would keep tracking subsequent
+        training updates and the "best" weights would silently become the latest ones.
+        """
+        def clone(state):
+            return {k: v.detach().clone() for k, v in state.items()}
+
+        return {
+            'mlp_branches': [clone(b.state_dict()) for b in self.mlp_branches] if not self.shared_mlp else None,
+            'shared_branch_mlp': clone(self.shared_branch_mlp.state_dict()) if self.shared_mlp else None,
+            'final_mlp': clone(self.final_mlp.state_dict()),
+            'fourier_features_list': [clone(f.state_dict()) for f in self.fourier_features_list] if self.fourier_features_list is not None else None,
+        }
+
+    def _restore_state(self, snapshot):
+        """Load a snapshot produced by _snapshot_state back into the live modules."""
+        if snapshot is None:
+            return
+        if self.shared_mlp:
+            if snapshot.get('shared_branch_mlp') is not None:
+                self.shared_branch_mlp.load_state_dict(snapshot['shared_branch_mlp'])
+        elif snapshot.get('mlp_branches') is not None:
+            for i, branch in enumerate(self.mlp_branches):
+                branch.load_state_dict(snapshot['mlp_branches'][i])
+        self.final_mlp.load_state_dict(snapshot['final_mlp'])
+        if self.fourier_features_list is not None and snapshot.get('fourier_features_list') is not None:
+            for i, fourier_layer in enumerate(self.fourier_features_list):
+                fourier_layer.load_state_dict(snapshot['fourier_features_list'][i])
+
+    def _fit_input_scaler(self, dataloader, max_batches=20):
+        """Estimate and freeze per-feature mean/std from the first few batches.
+
+        Stored on the model (and persisted by save/load) so that inference applies
+        exactly the same transform as training.
+        """
+        total = None
+        total_sq = None
+        count = 0
+        for i, batch in enumerate(dataloader):
+            if i >= max_batches:
+                break
+            feats = batch[0].float().to(self.device)
+            if total is None:
+                total = torch.zeros(feats.shape[1], device=self.device)
+                total_sq = torch.zeros(feats.shape[1], device=self.device)
+            total += feats.sum(dim=0)
+            total_sq += (feats ** 2).sum(dim=0)
+            count += feats.shape[0]
+
+        if count == 0:
+            print("  standardize_inputs: no batches available, skipping.")
+            return
+
+        mean = total / count
+        var = (total_sq / count) - mean ** 2
+        std = torch.sqrt(torch.clamp(var, min=0.0))
+        # Constant features would divide by ~0; leave them unscaled.
+        std = torch.where(std < 1e-6, torch.ones_like(std), std)
+        self.input_mean = mean
+        self.input_std = std
+        print(f"  standardize_inputs: fitted on {count} samples from "
+              f"{min(max_batches, i + 1)} batches")
+
     def _forward_pass(self, points):
         """
         Internal method for forward pass through the parallel network.
@@ -1879,13 +2104,16 @@ class LLRnet(Surrogate):
         Returns:
         --------
         torch.Tensor
-            Network output (probabilities)
+            Network output (raw logits, i.e. the LLR). Apply a sigmoid for probabilities.
         """
         if not isinstance(points, torch.Tensor):
             points = torch.tensor(points, device=self.device, dtype=torch.float32)
         else:
             points = points.float().to(self.device)  # Ensure float32 and correct device
-        
+
+        if self.standardize_inputs and self.input_mean is not None:
+            points = (points - self.input_mean) / self.input_std
+
         # Process through each parallel branch
         branch_outputs = []
         
@@ -1923,8 +2151,8 @@ class LLRnet(Surrogate):
         
         # Concatenate all branch outputs
         concatenated_features = torch.cat(branch_outputs, dim=-1)
-        
-        # Final MLP with sigmoid activation
+
+        # Final MLP -> raw logit
         final_output = self.final_mlp(concatenated_features)
         
         # Ensure output maintains batch dimension - squeeze only last dim if it's 1
@@ -1964,16 +2192,13 @@ class LLRnet(Surrogate):
                 fourier_layer.eval()
             
       
-        probabilities = self._forward_pass(points)
-        
+        # The network emits the logit directly, which already IS the LLR.
+        logits = self._forward_pass(points)
+
         if return_probabilities:
-            return probabilities
+            return torch.sigmoid(logits)
         else:
-            # Convert probabilities to LLR = logit(p) = log(p/(1-p)).
-            # Do NOT clamp before logit: clamp has zero gradient in the clamped
-            # region, which kills Fisher info for saturated outputs. nn.Sigmoid
-            # never produces exactly 0 or 1 in float32, so logit stays finite.
-            return torch.logit(probabilities)
+            return logits
 
     def evaluate_patd_likelihood(self, point, event_data, signal_surrogate_func,
                                  event_labels=['position', 'energy', 'zenith', 'azimuth'],
@@ -2239,16 +2464,16 @@ class LLRnet(Surrogate):
     def predict_log_likelihood_ratio(self, features, epsilon=1e-7):
         """
         Compute the Log-Likelihood Ratio using the sigmoid trick.
-        
-        This method computes log(p/(1-p)) where p is the output probability from the network.
 
-    
+        Returns the network's raw logit, which equals log(p/(1-p)) for the balanced
+        training setup and so is the LLR directly.
+
         Parameters:
         -----------
         features : torch.Tensor
             Input features to evaluate
         epsilon : float
-            Small value to prevent log(0)
+            Unused; kept for backward compatibility with existing call sites.
         Returns:
         --------
         torch.Tensor
@@ -2268,15 +2493,12 @@ class LLRnet(Surrogate):
                 fourier_layer.eval()
             
         
-        # Get probabilities from the network (already has sigmoid)
-        probabilities = self._forward_pass(features)
-
-        # Compute LLR = logit(p) = log(p/(1-p)).
-        # Do NOT clamp before logit: clamp has zero gradient in the clamped region,
-        # which kills Fisher info for saturated (out-of-distribution) outputs.
-        # nn.Sigmoid never produces exactly 0 or 1 in float32, so logit stays finite.
-        llr = torch.logit(probabilities)
-        return llr
+        # The network's output IS the logit, so it is already the LLR. Reading it
+        # directly (rather than as logit(sigmoid(z))) preserves the full dynamic range
+        # and keeps gradients alive for Fisher-information use: in float32 the round
+        # trip through a sigmoid returns inf above |z| ~ 17 and loses resolution well
+        # before that.
+        return self._forward_pass(features)
     
     def predict_likelihood_ratio(self, features):
         """
@@ -2450,11 +2672,28 @@ class LLRnet(Surrogate):
         )
         return self.pmt_directions
 
-    def _save_model_state(self, filepath):
+    def _save_model_state(self, filepath, state=None):
+        """Write the model to ``filepath``.
+
+        ``state`` optionally supplies weights from _snapshot_state (e.g. the best
+        validation epoch) to write instead of the live module weights.
+        """
+        if state is not None:
+            branch_states = state.get('mlp_branches') if not self.shared_mlp else None
+            shared_state = state.get('shared_branch_mlp') if self.shared_mlp else None
+            final_state = state['final_mlp']
+            fourier_states = state.get('fourier_features_list')
+        else:
+            branch_states = [branch.state_dict() for branch in self.mlp_branches] if not self.shared_mlp else None
+            shared_state = self.shared_branch_mlp.state_dict() if self.shared_mlp else None
+            final_state = self.final_mlp.state_dict()
+            fourier_states = ([fourier.state_dict() for fourier in self.fourier_features_list]
+                              if self.fourier_features_list is not None else None)
+
         save_dict = {
-            'mlp_branches_state_dict': [branch.state_dict() for branch in self.mlp_branches] if not self.shared_mlp else None,
-            'shared_branch_mlp_state_dict': self.shared_branch_mlp.state_dict() if self.shared_mlp else None,
-            'final_mlp_state_dict': self.final_mlp.state_dict(),
+            'mlp_branches_state_dict': branch_states,
+            'shared_branch_mlp_state_dict': shared_state,
+            'final_mlp_state_dict': final_state,
             'hidden_dims': self.hidden_dims,
             'dropout_rate': self.dropout_rate,
             'learning_rate': self.learning_rate,
@@ -2471,6 +2710,10 @@ class LLRnet(Surrogate):
             'frequency_scales': self.frequency_scales,
             'num_frequencies_per_branch': self.num_frequencies_per_branch,
             'shared_mlp': self.shared_mlp,
+            # Required to rebuild the same architecture: with residual connections the
+            # branch layers are ResidualBlocks ('N.linear.weight') rather than plain
+            # Linears ('N.weight'), so a mismatch makes load_state_dict fail outright.
+            'use_residual_connections': self.use_residual_connections,
             'signal_noise_scale': self.signal_noise_scale,
             'background_noise_scale': self.background_noise_scale,
             'add_relative_pos': self.add_relative_pos,
@@ -2490,6 +2733,11 @@ class LLRnet(Surrogate):
             'min_photons': self.min_photons,
             'num_photons_per_sample': self.num_photons_per_sample,
             'add_distance_from_beam': self.add_distance_from_beam,
+            'add_dist_long': self.add_dist_long,
+            'track_dir_is_arrival': self.track_dir_is_arrival,
+            'standardize_inputs': self.standardize_inputs,
+            'input_mean': self.input_mean.detach().cpu() if self.input_mean is not None else None,
+            'input_std': self.input_std.detach().cpu() if self.input_std is not None else None,
             'add_vertex_distance': self.add_vertex_distance,
             'add_pmt_direction': self.add_pmt_direction,
             'pmt_directions': self.pmt_directions.detach().cpu() if self.pmt_directions is not None else None,
@@ -2501,10 +2749,7 @@ class LLRnet(Surrogate):
             'lr_scheduler_state_dict': self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None
         }
         
-        if self.fourier_features_list is not None:
-            save_dict['fourier_features_list_state_dict'] = [fourier.state_dict() for fourier in self.fourier_features_list]
-        else:
-            save_dict['fourier_features_list_state_dict'] = None
+        save_dict['fourier_features_list_state_dict'] = fourier_states
 
         torch.save(save_dict, filepath)
 
@@ -2536,6 +2781,10 @@ class LLRnet(Surrogate):
         self.frequency_scales = checkpoint.get('frequency_scales', [self.frequency_scale])
         self.num_frequencies_per_branch = checkpoint.get('num_frequencies_per_branch', [self.num_frequencies])
         self.shared_mlp = checkpoint.get('shared_mlp', False)
+        # Must be restored before _build_network is called below, or the rebuilt branches
+        # will not match the saved weights.
+        self.use_residual_connections = checkpoint.get(
+            'use_residual_connections', self.use_residual_connections)
         
         # Load learning rate scheduler parameters
         self.reduce_lr_on_plateau = checkpoint.get('reduce_lr_on_plateau', False)
@@ -2563,6 +2812,13 @@ class LLRnet(Surrogate):
         self.flag_negative_times = checkpoint.get('flag_negative_times', False)
         self.time_scale_divisor = checkpoint.get('time_scale_divisor', 4.0)
         self.add_distance_from_beam = checkpoint.get('add_distance_from_beam', self.add_distance_from_beam)
+        self.add_dist_long = checkpoint.get('add_dist_long', False)
+        self.track_dir_is_arrival = checkpoint.get('track_dir_is_arrival', False)
+        self.standardize_inputs = checkpoint.get('standardize_inputs', False)
+        input_mean = checkpoint.get('input_mean', None)
+        input_std = checkpoint.get('input_std', None)
+        self.input_mean = input_mean.to(self.device) if input_mean is not None else None
+        self.input_std = input_std.to(self.device) if input_std is not None else None
         self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
         self.add_pmt_direction = checkpoint.get('add_pmt_direction', False)
         pmt_directions = checkpoint.get('pmt_directions', None)
@@ -4247,8 +4503,11 @@ class LLRnet(Surrogate):
             self.num_samples_per_epoch = (
                 num_samples_per_epoch if num_samples_per_epoch is not None else n
             )
-            # Dedicated RNG so mismatch pairing is reproducible and independent
-            # of global torch/numpy state (also safe across DataLoader workers).
+            # Dedicated RNG so mismatch pairing is reproducible and independent of global
+            # torch/numpy state. With num_workers > 0 this state is replaced per worker by
+            # _reseed_dataset_rng_in_worker -- forked workers would otherwise share it and
+            # draw identical rows.
+            self._seed = seed
             self._rng = np.random.default_rng(seed)
 
             # Importance sampling to flatten (energy, cos zenith): group rows into
@@ -4602,8 +4861,40 @@ class LLRnet(Surrogate):
         )
         if pin_memory and pin_memory_device:
             dl_kwargs['pin_memory_device'] = pin_memory_device
+        if num_workers > 0:
+            # Without this every worker inherits an identical copy of the dataset's RNG
+            # and they all draw the SAME rows, duplicating a large fraction of each
+            # epoch (measured: ~1500 distinct contexts out of 4096 samples with 4
+            # workers, versus ~3870 with num_workers=0).
+            dl_kwargs['worker_init_fn'] = _reseed_dataset_rng_in_worker
 
         return DataLoader(**dl_kwargs)
+
+    def create_light_yield_parquet_val_dataloader(self, parquet_path, geometry_csv_path,
+                                                 num_samples_per_epoch=None, batch_size=4096,
+                                                 num_workers=0, seed=0, **kwargs):
+        """Build a validation DataLoader from a held-out light-yield parquet.
+
+        Intended for the ``test_save_path`` file written by
+        create_light_yield_parquet_dataloader, so training gets an honest
+        event-disjoint validation loss. Pass the result as ``val_dataloader`` to
+        train_with_dataloader to enable early stopping and best-checkpoint tracking.
+
+        ``seed`` is fixed and shuffle is off so the validation pairs are drawn the same
+        way every epoch and the loss is comparable across epochs.
+        """
+        kwargs.setdefault('zero_ly_prob', 0.0)
+        return self.create_light_yield_parquet_dataloader(
+            parquet_path=parquet_path,
+            geometry_csv_path=geometry_csv_path,
+            num_samples_per_epoch=num_samples_per_epoch,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            seed=seed,
+            test_save_path=None,
+            **kwargs,
+        )
 
     def compute_light_yield_pdf(self, parquet_path, geometry_csv_path,
                                 num_points=512):
