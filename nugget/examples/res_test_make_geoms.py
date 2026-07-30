@@ -37,7 +37,7 @@ center = [0,0,0]
 radius = 600
 height = 1000
 bin_energies = True
-folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}_{limit_zenith if limit_zenith is not None else ""}'
+folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}{"_"+limit_zenith if limit_zenith is not None else ""}'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 

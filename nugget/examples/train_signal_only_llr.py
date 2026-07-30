@@ -64,6 +64,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     add_pmt_direction=True
     )
 
+llr_net.load_model('llrnet_models/best_mc_ly_muon_llr_model_v3.pt')
 # train_dataloader = llr_net.create_signal_only_dataloader(
 #     signal_sampler=signal_sampler, 
 #     signal_surrogate_func=light_yield_surrogate,
@@ -84,9 +85,9 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
 #     )
 
 GEOM = '../other/800_40_40_geom.csv'
-TEST_PARQUET = './llrnet_models/mc_ly_muon_llr_v2_test_samples.parquet'
+TEST_PARQUET = './llrnet_models/mc_ly_muon_llr_v3_test_samples.parquet'
 
-EPOCHS = 200
+EPOCHS = 10000
 
 train_dataloader = llr_net.create_light_yield_parquet_dataloader(
     parquet_path='new_accepted_photons_ly_all.parquet',
@@ -94,8 +95,8 @@ train_dataloader = llr_net.create_light_yield_parquet_dataloader(
     # Each epoch is num_samples_per_epoch matched/mismatched pairs = 2x that many
     # samples. Batches of 4096 need a much bigger epoch than 2048 samples to be
     # meaningful, and it also makes the reported per-epoch loss far less noisy.
-    num_samples_per_epoch=131072,
-    batch_size=4096,     # large batch: the interaction gradient is tiny at init
+    num_samples_per_epoch=10000,
+    batch_size=250,     # large batch: the interaction gradient is tiny at init
     # num_workers=0 is ~12x FASTER here (measured 12,100 vs 980 samples/s at batch 4096).
     # Building one item costs only 0.09 ms, so the per-item worker IPC dominates; the
     # workers also each fork a copy of the multi-GB dataset.
@@ -115,8 +116,8 @@ train_dataloader = llr_net.create_light_yield_parquet_dataloader(
 val_dataloader = llr_net.create_light_yield_parquet_val_dataloader(
     parquet_path=TEST_PARQUET,
     geometry_csv_path=GEOM,
-    num_samples_per_epoch=16384,
-    batch_size=4096,
+    num_samples_per_epoch=2000,
+    batch_size=200,
     num_workers=0,
     seed=0,
     uniform_energy_zenith=True,
@@ -131,13 +132,13 @@ history = llr_net.train_with_dataloader(
     epochs=EPOCHS,
     input_dim=INPUT_DIM,
     grad_clip=None,
-    early_stopping_patience=25,
+    early_stopping_patience=300,
     save_every_n_epochs=20,
-    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v2.pt',
+    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v3.pt',
 )
 
 # Save the best model for later use
 # llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v2_training_history.pkl', 'wb'))
+pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v3_training_history.pkl', 'wb'))

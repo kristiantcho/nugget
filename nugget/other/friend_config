@@ -1,0 +1,76 @@
+# friEnd example config
+# Usage: python scripts/run_analysis.py --df events.parquet --config configs/example.yaml
+
+# Map standard internal key names to actual df column names.
+# The df is never modified — this is only used at access time.
+keys:
+  true_energy:     "energy"
+  true_zen:        "zenith"
+  true_az:         "azimuth"
+  baseline_weight: "fluxless_weight"
+  particle_type:   "pid"
+  # ra:              "ra"
+  # dec:             "dec"
+
+# Steps are executed in the order listed here.
+# Make sure any column a step needs is either in the original df
+# or produced by an earlier step (e.g. galactic_coords before kra_weight).
+steps:
+
+  # --- Coordinates ---
+  # Converts local (zenith, azimuth) to equatorial (ra, dec) and galactic (l, b).
+  # - name: galactic_coords
+  #   params:
+  #     lat_deg:    -0.0
+  #     lon_deg:    0.0
+  #     height_m:   -2500.0
+  #     az_offset:  0.0
+  #     az_sign:    1.0
+  #     #fixed_time: "2020-06-01T00:00:00"
+  #     #time_scale: "utc"
+  #     ra_scramble: true
+  #     output_keys:
+  #       true_ra:    "MCRA"
+  #       true_dec:   "MCDec"
+  #       true_gal_l: "MCGalL"
+  #       true_gal_b: "MCGalB"
+
+  # --- Powerlaw weight ---
+  - name: powerlaw_weight
+    params:
+      norm:  1.0e-18
+      gamma: 2.0
+      e0:    100000.0
+      output_keys:
+        weight: "weight_powerlaw"
+
+  # --- Atmospheric weights (MCEq spline) ---
+  # One step per spline file. Produces conv and pr columns for each.
+  - name: mceq_spline_weight
+    params:
+      spline_path: /home/wecapstor3/capn/capn105h/working/software/pyFF_helpers/atmospherics/mceq/outputs/POne/splines/LAT47-LON-127_coszsteps256-azimuthsteps256_SIBYLL-2.3c-GSF.pickle
+      flux_types:  [conv, pr]
+      output_keys:
+        conv: "mceq_conv_SIBYLL23c_GSF"
+        pr:   "mceq_pr_SIBYLL23c_GSF"
+
+  - name: mceq_spline_weight
+    params:
+      spline_path: /home/wecapstor3/capn/capn105h/working/software/pyFF_helpers/atmospherics/mceq/outputs/POne/splines/LAT47-LON-127_coszsteps256-azimuthsteps256_SIBYLL-2.3c-H4a.pickle
+      flux_types:  [conv, pr]
+      output_keys:
+        conv: "mceq_conv_SIBYLL23c_H4a"
+        pr:   "mceq_pr_SIBYLL23c_H4a"
+
+  # # --- Galactic weights ---
+  # - name: cringe_weight
+  #   params:
+  #     fits_path: /home/wecapstor3/capn/capn105h/data/cringe_fits/Neutrino_AAfrag_Galprop_Ferr_Fiducial_256.fits
+  #     output_keys:
+  #       flux: "cringe_diffuse"
+
+  # - name: cringe_weight
+  #   params:
+  #     fits_path: /home/wecapstor3/capn/capn105h/data/cringe_fits/Neutrino_Unresolved_Fiducial_256.fits
+  #     output_keys:
+  #       flux: "cringe_unresolved"

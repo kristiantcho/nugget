@@ -3,13 +3,14 @@ import torch
 import numpy as np
 import pickle
 
-device='cuda:1'
+device='cuda:2'
 center = [0,0,0]
 radius = 600
 height = 1000
 num_strings = 61
 event_type = 'track'  # 'track' or 'cascade'
 limit_zenith = 'vertical'  # 'horizontal' or 'vertical'
+free_sim_volume = True  # If True, the simulation volume is not constrained to a cylinder. If False, the simulation volume is constrained to a cylinder with the specified center, radius, and height.
 lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = event_type)
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate_batched
 # signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
@@ -43,9 +44,9 @@ energy_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
 num_events = 50000
 angular_loss_dicts = {}
 energy_loss_dicts = {}
-spacing_min = 10
-spacing_max = 250
-spacing_count = 50
+spacing_min = 50
+spacing_max = 400
+spacing_count = 100
 
 for energy in [2,3,4,5,6,7]:
     # print(f"Running fisher info calculations for energy range: 10^{energy} GeV to 10^{energy+1 if energy < 6 else energy+2} GeV")
@@ -63,13 +64,14 @@ for energy in [2,3,4,5,6,7]:
                                                         cylinder_radius=radius,
                                                         cylinder_height=height,
                                                         uniform_zenith_sampling=True,
-                                                        cos_range=torch.tensor([-1,1]) if limit_zenith is None else limit_zenith,
+                                                        cos_range=torch.tensor([-1,0]) if limit_zenith is None else limit_zenith,
                                                         # point_towards_center=True,
                                                         # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                         )
-    signal_events = signal_sampler.sample_events(num_events=num_events)
-    # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1 if energy < 6 else energy+2}.parquet')
-    nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_{num_strings}_{event_type}_{limit_zenith+ "_" if limit_zenith is not None else ""}signal_events_e{energy}-e{energy+1}.parquet')
+    if not free_sim_volume:
+        signal_events = signal_sampler.sample_events(num_events=num_events)
+        # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1 if energy < 6 else energy+2}.parquet')
+        nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_{num_strings}_{event_type}_{limit_zenith+ "_" if limit_zenith is not None else ""}signal_events_e{energy}-e{energy+1}.parquet')
     # if energy < 6:
     angular_loss_dicts[f'{energy}-{energy+1}'] = []
     energy_loss_dicts[f'{energy}-{energy+1}'] = []
@@ -89,7 +91,11 @@ for energy in [2,3,4,5,6,7]:
                 starting_z_spacing=50
             )
         geom_dict = geometry.initialize_points()
-        
+        if free_sim_volume:
+            # change cylinder parameters to match the geometry for bigger volume:
+            radius = torch.max(torch.linalg.vector_norm(geom_dict['string_xy'], axis=1))
+            signal_sampler.cylinder_radius = radius
+            signal_events = signal_sampler.sample_events(num_events=num_events)
         
         loss_params = {
                     'signal_event_params': signal_events,

@@ -403,8 +403,8 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
                 u = torch.rand(n_samples, generator=rng, device=device, dtype=dtype)
                 theta = theta_min + u * (theta_max - theta_min)
         elif cos_range_mode == "vertical": # selecting vertical zenith angles (cosθ < -0.8 or cosθ > 0.8)
-            theta_min = torch.acos(torch.as_tensor(0.8, device=device, dtype=dtype))
-            theta_mid = torch.acos(torch.as_tensor(-0.8, device=device, dtype=dtype))
+            theta_min = torch.acos(torch.as_tensor(0.9, device=device, dtype=dtype))
+            theta_mid = torch.acos(torch.as_tensor(-0.9, device=device, dtype=dtype))
             theta_max = torch.pi
             side_selector = torch.rand(n_samples, generator=rng, device=device, dtype=dtype) < 0.5
             u = torch.rand(n_samples, generator=rng, device=device, dtype=dtype)
@@ -431,8 +431,10 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
                 cand = -1.0 + 2.0 * u
                 if cos_range_mode == "horizontal":
                     range_mask = torch.abs(cand) < torch.cos(torch.tensor(70*math.pi/180.0, device=device, dtype=dtype))  # cos(70°) ≈ 0.342
+                elif cos_range_mode == "vertical":
+                    range_mask = torch.abs(cand) > 0.9
                 else:
-                    range_mask = torch.abs(cand) > 0.8
+                    raise ValueError(f"Unexpected cos_range_mode: {cos_range_mode}")
                 q = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
                 proj_areas = torch.tensor([projected_area(cyl, c) for c in cand], 
                                           dtype=dtype, device=device)
