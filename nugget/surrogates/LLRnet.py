@@ -441,14 +441,18 @@ class LLRnet(Surrogate):
         # training when record_marginal_lys=True (see train_with_dataloader)
         self.recorded_lys = torch.empty((0, 5), dtype=torch.float32)
 
-    def _pos_norm_divisor(self):
+    def _pos_norm_divisor(self, device=None):
         """Return a divisor for normalizing (x,y,z) positions.
 
         - If domain_size is scalar: divisor is (domain_size/2) (original behavior).
         - If domain_size is (width, height): divisor is (width/2, width/2, height/2).
 
-        Returns a float or a (3,) torch.Tensor on self.device.
+        Returns a float or a (3,) torch.Tensor on ``device`` (default: self.device).
+        Pass the tensor's own device explicitly from code that must not touch
+        self.device -- e.g. dataset __getitem__ methods that run in a forked
+        DataLoader worker, where addressing a CUDA device is unsafe.
         """
+        dev = self.device if device is None else device
         domain_size = self.domain_size
         if isinstance(domain_size, torch.Tensor):
             domain_size = domain_size.item()
@@ -461,7 +465,7 @@ class LLRnet(Surrogate):
                 height = height.item()
             return torch.tensor(
                 [width / 2.0, width / 2.0, height / 2.0],
-                device=self.device,
+                device=dev,
                 dtype=torch.float32,
             )
 
@@ -961,7 +965,7 @@ class LLRnet(Surrogate):
 
         return features.clone().detach(), num_photons
 
-    def prepare_features_charge(self, point, event_data, light_yield):
+    def prepare_features_charge(self, point, event_data, light_yield, device=None):
         """
         Build a feature vector for the charge (non-PATD) LLR network from a
         pre-computed light yield value.
@@ -1001,43 +1005,52 @@ class LLRnet(Surrogate):
             Event parameters. Must contain 'position', 'energy', 'direction'.
         light_yield : torch.Tensor or float
             Pre-computed light yield scalar (the observation).
+        device : torch.device, str, or None
+            Device to build the feature tensor on. Defaults to self.device (the
+            model's device). Dataset code that runs inside DataLoader worker
+            processes should pass device='cpu' explicitly instead: moving CUDA
+            tensors (or touching a CUDA context) inside a forked worker is unsafe,
+            and the sample is moved to the model's device anyway once collated in
+            the main process (see train_with_dataloader).
 
         Returns
         -------
         features : torch.Tensor, shape (13,) or (12,)
         """
+        dev = self.device if device is None else device
+
         if isinstance(point, np.ndarray):
-            point = torch.tensor(point, device=self.device, dtype=torch.float32)
+            point = torch.tensor(point, device=dev, dtype=torch.float32)
         else:
-            point = point.float().to(self.device)
+            point = point.float().to(dev)
         point = point.squeeze()  # (3,)
 
-        norm = self._pos_norm_divisor()  # scalar or (3,) tensor
+        norm = self._pos_norm_divisor(device=dev)  # scalar or (3,) tensor
 
         # --- detector and vertex positions, normalised ---
         det = point / norm  # (3,)
 
         vert = event_data['position']
         if isinstance(vert, np.ndarray):
-            vert = torch.tensor(vert, device=self.device, dtype=torch.float32)
+            vert = torch.tensor(vert, device=dev, dtype=torch.float32)
         else:
-            vert = vert.float().to(self.device)
+            vert = vert.float().to(dev)
         vert = vert.squeeze() / norm  # (3,)
 
         # --- direction (already a unit vector) ---
         direction = event_data['direction']
         if isinstance(direction, np.ndarray):
-            direction = torch.tensor(direction, device=self.device, dtype=torch.float32)
+            direction = torch.tensor(direction, device=dev, dtype=torch.float32)
         else:
-            direction = direction.float().to(self.device)
+            direction = direction.float().to(dev)
         direction = direction.squeeze()  # (3,)
 
         # --- log-scaled energy ---
         energy = event_data['energy']
         if isinstance(energy, np.ndarray):
-            energy = torch.tensor(energy, device=self.device, dtype=torch.float32)
+            energy = torch.tensor(energy, device=dev, dtype=torch.float32)
         else:
-            energy = energy.float().to(self.device)
+            energy = energy.float().to(dev)
         log_energy = torch.log10(energy.squeeze() + self.ly_eps) / 8.0  # scalar
 
         # --- derived geometric scalars ---
@@ -1047,9 +1060,9 @@ class LLRnet(Surrogate):
 
         # --- log-scaled light yield ---
         if not isinstance(light_yield, torch.Tensor):
-            light_yield = torch.tensor(light_yield, device=self.device, dtype=torch.float32)
+            light_yield = torch.tensor(light_yield, device=dev, dtype=torch.float32)
         else:
-            light_yield = light_yield.float().to(self.device)
+            light_yield = light_yield.float().to(dev)
         log_ly = torch.log10(torch.abs(light_yield.squeeze()) + self.ly_eps) / self.log_charge_scale  # scalar
 
         if self.rich_rel_pos_mode:
@@ -1088,9 +1101,9 @@ class LLRnet(Surrogate):
         if self.add_pmt_direction:
             pmt_dir = event_data['pmt_direction']
             if isinstance(pmt_dir, np.ndarray):
-                pmt_dir = torch.tensor(pmt_dir, device=self.device, dtype=torch.float32)
+                pmt_dir = torch.tensor(pmt_dir, device=dev, dtype=torch.float32)
             else:
-                pmt_dir = pmt_dir.float().to(self.device)
+                pmt_dir = pmt_dir.float().to(dev)
             pmt_dir = pmt_dir.squeeze()  # (3,)
             feature_values.extend([pmt_dir[0], pmt_dir[1], pmt_dir[2]])
             if self.add_pmt_cosangle:
@@ -4402,7 +4415,12 @@ class LLRnet(Surrogate):
             import pandas as pd
 
             self.llrnet = llrnet_instance
-            self.device = llrnet_instance.device
+            # Samples are always built on CPU, regardless of the model's device. With
+            # num_workers > 0, __getitem__ runs in a forked worker process; addressing
+            # a CUDA device there is unsafe (each process needs its own CUDA context)
+            # and unnecessary, since train_with_dataloader moves each collated batch to
+            # self.llrnet.device right before the forward pass anyway.
+            self.device = torch.device('cpu')
             self.zero_ly_prob = float(zero_ly_prob)
             self.zero_ly_value = float(zero_ly_value)
 
@@ -4625,8 +4643,11 @@ class LLRnet(Surrogate):
             pt = self._point[i] if point is None else point
             point_t = torch.tensor(pt, device=self.device, dtype=torch.float32)
             ly = torch.tensor(light_yield, device=self.device, dtype=torch.float32)
+            # device='cpu' overrides prepare_features_charge's default of
+            # self.llrnet.device -- see the note on self.device above.
             return self.llrnet.prepare_features_charge(
-                point_t, self._event_data(i, pmt_direction=pmt_direction), ly
+                point_t, self._event_data(i, pmt_direction=pmt_direction), ly,
+                device=self.device,
             )
 
         def _sample_unhit_key(self, row):
