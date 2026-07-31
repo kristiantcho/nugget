@@ -3,14 +3,14 @@ import torch
 import numpy as np
 import pickle
 
-device='cuda:2'
+device='cuda:3'
 center = [0,0,0]
 radius = 600
 height = 1000
 num_strings = 61
 event_type = 'track'  # 'track' or 'cascade'
 limit_zenith = 'vertical'  # 'horizontal' or 'vertical'
-free_sim_volume = True  # If True, the simulation volume is not constrained to a cylinder. If False, the simulation volume is constrained to a cylinder with the specified center, radius, and height.
+free_sim_volume = False  # If True, the simulation volume is not constrained to a cylinder. If False, the simulation volume is constrained to a cylinder with the specified center, radius, and height.
 lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = event_type)
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate_batched
 # signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
@@ -126,7 +126,8 @@ for energy in [2,3,4,5,6,7]:
                     'fisher_info_detach_tensors': True,
                     'fisher_info_use_patd': False,
                     'fisher_res_metric': 'fom',  # 'fom' 'median' 'mean'
-                    'fisher_info_use_torch_compile': False,
+                    'fisher_info_use_torch_compile': True,
+                    'use_relative_energy': True,
                     }
         ang_loss_dict = angular_resolution_loss(
                     geom_dict=geom_dict,
@@ -161,8 +162,8 @@ for energy in range(2,8):
     # for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
     for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}']:    
         del energy_loss_dict['resolution_params']
-with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}angular_loss_dicts_energies.pkl', 'wb') as f:
+with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}angular_loss_dicts_energies.pkl', 'wb') as f:
     pickle.dump(copy_angular_loss_dicts, f)
 
-with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}energy_loss_dicts_energies.pkl', 'wb') as f:
+with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}energy_loss_dicts_energies.pkl', 'wb') as f:
     pickle.dump(copy_energy_loss_dicts, f)

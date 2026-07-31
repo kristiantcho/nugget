@@ -378,6 +378,7 @@ class LLRnet(Surrogate):
         # vector, relative to the optical module) as 3 extra features. The
         # direction is read from event_data['pmt_direction'].
         self.add_pmt_direction = add_pmt_direction
+        self.add_pmt_cosangle = kwargs.get('add_pmt_cosangle', False)
         self.add_dist_long = add_dist_long
         self.track_dir_is_arrival = track_dir_is_arrival
         # Input standardisation. Estimated from the first training batches, frozen
@@ -1054,6 +1055,7 @@ class LLRnet(Surrogate):
             # Use only relative position (detector - vertex) instead of both absolute positions
             feature_values = [
                 rel[0], rel[1], rel[2],
+                vert[0], vert[1], vert[2],
                 direction[0], direction[1], direction[2],
                 log_energy,
             ]
@@ -1088,6 +1090,9 @@ class LLRnet(Surrogate):
                 pmt_dir = pmt_dir.float().to(self.device)
             pmt_dir = pmt_dir.squeeze()  # (3,)
             feature_values.extend([pmt_dir[0], pmt_dir[1], pmt_dir[2]])
+            if self.add_pmt_cosangle:
+                cos_angle_pmt = torch.dot(direction, pmt_dir) / (torch.norm(direction) * torch.norm(pmt_dir) + 1e-8)
+                feature_values.append(cos_angle_pmt)
         feature_values.append(log_ly)
 
         features = torch.stack(feature_values)
@@ -2740,6 +2745,7 @@ class LLRnet(Surrogate):
             'input_std': self.input_std.detach().cpu() if self.input_std is not None else None,
             'add_vertex_distance': self.add_vertex_distance,
             'add_pmt_direction': self.add_pmt_direction,
+            'add_pmt_cosangle': self.add_pmt_cosangle,
             'pmt_directions': self.pmt_directions.detach().cpu() if self.pmt_directions is not None else None,
             'rich_rel_pos_mode': self.rich_rel_pos_mode,
             'reduce_lr_on_plateau': self.reduce_lr_on_plateau,
@@ -2821,6 +2827,7 @@ class LLRnet(Surrogate):
         self.input_std = input_std.to(self.device) if input_std is not None else None
         self.add_vertex_distance = checkpoint.get('add_vertex_distance', True)
         self.add_pmt_direction = checkpoint.get('add_pmt_direction', False)
+        self.add_pmt_cosangle = checkpoint.get('add_pmt_cosangle', False)
         pmt_directions = checkpoint.get('pmt_directions', None)
         self.pmt_directions = pmt_directions.to(self.device) if pmt_directions is not None else None
         self.rich_rel_pos_mode = checkpoint.get('rich_rel_pos_mode', False)
