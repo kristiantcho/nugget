@@ -21,6 +21,7 @@ import pickle
 INPUT_DIM = 16
 
 llr_net = nugget.surrogates.LLRnet.LLRnet(
+    device='cuda:2',
     domain_size=5000,  # Size of the detector domain
     dim=3,  # 3D spatial coordinates
     hidden_dims=[250 for _ in range(14)],  # Neural network architecture
@@ -59,6 +60,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     use_rich_features=True,  # Whether to use rich features from the surrogate model
     add_vertex_distance=False,
     rich_rel_pos_mode=True,
+    include_vertex_position=True,
     log_charge_scale=4,
     ly_eps=1e-6,
     add_pmt_direction=True,

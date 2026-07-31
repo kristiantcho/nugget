@@ -374,6 +374,7 @@ class LLRnet(Surrogate):
         # negligible relative to the geometric features); smaller values let timing dominate.
         self.time_scale_divisor = time_scale_divisor
         self.rich_rel_pos_mode = rich_rel_pos_mode
+        self.include_vertex_position = kwargs.get('include_vertex_position', False)
         # If True, prepare_features_charge appends the hit-PMT direction (a unit
         # vector, relative to the optical module) as 3 extra features. The
         # direction is read from event_data['pmt_direction'].
@@ -1055,10 +1056,12 @@ class LLRnet(Surrogate):
             # Use only relative position (detector - vertex) instead of both absolute positions
             feature_values = [
                 rel[0], rel[1], rel[2],
-                vert[0], vert[1], vert[2],
+                
                 direction[0], direction[1], direction[2],
                 log_energy,
             ]
+            if self.include_vertex_position:
+                feature_values.extend([vert[0], vert[1], vert[2]])
         else:
             feature_values = [
                 det[0], det[1], det[2],
@@ -2748,6 +2751,7 @@ class LLRnet(Surrogate):
             'add_pmt_cosangle': self.add_pmt_cosangle,
             'pmt_directions': self.pmt_directions.detach().cpu() if self.pmt_directions is not None else None,
             'rich_rel_pos_mode': self.rich_rel_pos_mode,
+            'include_vertex_position': self.include_vertex_position,
             'reduce_lr_on_plateau': self.reduce_lr_on_plateau,
             'lr_scheduler_patience': self.lr_scheduler_patience,
             'lr_scheduler_factor': self.lr_scheduler_factor,
@@ -2831,6 +2835,7 @@ class LLRnet(Surrogate):
         pmt_directions = checkpoint.get('pmt_directions', None)
         self.pmt_directions = pmt_directions.to(self.device) if pmt_directions is not None else None
         self.rich_rel_pos_mode = checkpoint.get('rich_rel_pos_mode', False)
+        self.include_vertex_position = checkpoint.get('include_vertex_position', False)
         # Determine if this is old format (single MLP) or new format (parallel branches)
         is_old_format = 'model_state_dict' in checkpoint
         
