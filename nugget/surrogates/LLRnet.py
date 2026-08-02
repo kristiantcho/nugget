@@ -4339,15 +4339,20 @@ class LLRnet(Surrogate):
         Balanced training, mirroring SignalOnlyDataset. A "params" row is drawn
         at random (with replacement) on every __getitem__ call, so the epoch
         length (num_samples_per_epoch) is decoupled from the number of rows.
-        With uniform_energy_zenith=True the draw is stratified so the network
-        sees (neutrino energy, cos zenith) approximately uniformly (pick a
+        With uniform_energy_zenith=True the PARAMS draw is stratified so the
+        network sees (neutrino energy, cos zenith) approximately uniformly (pick a
         non-empty log10-energy x cos-zenith bin uniformly, then a row within it):
             * matched   (label 1): the drawn row's event params with its own count.
             * mismatched(label 0): the drawn row's event params, but the
-                                   light-yield count taken from a DIFFERENT event
-                                   (a fresh stratified/uniform draw, rejecting any
-                                   row from the same event so the params are never
-                                   accidentally self-consistent).
+                                   light-yield count taken from a DIFFERENT event.
+                                   That count is drawn UNIFORMLY over ALL rows --
+                                   never stratified, even when
+                                   uniform_energy_zenith=True -- so the mismatched
+                                   class sees the true marginal p(count) rather
+                                   than one distorted towards whatever's common in
+                                   a bin. Any draw from the same event is rejected
+                                   so the params are never accidentally
+                                   self-consistent.
 
         Optional zero light-yield augmentation (zero_ly_prob > 0): with low
         probability any item (matched OR mismatched slot) is replaced by a
@@ -4705,20 +4710,22 @@ class LLRnet(Surrogate):
                 label = torch.tensor(1.0, device=self.device)
             else:
                 # Mismatched: this row's event params observed with a light yield
-                # from a DIFFERENT event. The "other" row is drawn with a fresh
-                # bin draw (same stratified scheme as the params row) so a
-                # completely different (energy, zenith) region can supply the
-                # mismatched count -- and we reject any draw from the SAME event
-                # so the params are never accidentally self-consistent.
+                # from a DIFFERENT event. The "other" row (which only supplies its
+                # count) is drawn UNIFORMLY over all rows -- deliberately ignoring
+                # uniform_energy_zenith stratification, which is a sampling scheme
+                # for the params row only. Stratifying the mismatch draw as well
+                # would bias the marginal p(count) the network sees for the
+                # mismatched class towards whatever's common in a bin, rather than
+                # the true marginal p(count) over the whole dataset.
                 row_event = self._row_event[row]
-                other = self._sample_params_row()
+                other = int(self._rng.integers(0, self._n_rows))
                 attempts = 0
                 while self._row_event[other] == row_event and attempts < 50:
-                    other = self._sample_params_row()
+                    other = int(self._rng.integers(0, self._n_rows))
                     attempts += 1
                 if self._row_event[other] == row_event:
-                    # Degenerate (e.g. a single event in the file / bin): fall
-                    # back to any row from a different event if one exists.
+                    # Degenerate (e.g. a single event in the file): fall back to
+                    # any row from a different event if one exists.
                     other = self._other_event_row(row_event)
                     if other is None:
                         other = row  # last resort: no other event available
