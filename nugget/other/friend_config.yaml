@@ -48,7 +48,7 @@ steps:
   # One step per spline file. Produces conv and pr columns for each.
   - name: mceq_spline_weight
     params:
-      spline_path: /home/wecapstor3/capn/capn105h/working/software/pyFF_helpers/atmospherics/mceq/outputs/POne/splines/LAT47-LON-127_coszsteps256-azimuthsteps256_SIBYLL-2.3c-GSF.pickle
+      spline_path: /u/kristiantcho/ptmp/nugget/nugget/assets/data/LAT47-LON-127_coszsteps256-azimuthsteps256_SIBYLL-2.3c-GSF.pickle
       flux_types:  [conv, pr]
       output_keys:
         conv: "mceq_conv_SIBYLL23c_GSF"
@@ -56,7 +56,7 @@ steps:
 
   - name: mceq_spline_weight
     params:
-      spline_path: /home/wecapstor3/capn/capn105h/working/software/pyFF_helpers/atmospherics/mceq/outputs/POne/splines/LAT47-LON-127_coszsteps256-azimuthsteps256_SIBYLL-2.3c-H4a.pickle
+      spline_path: /u/kristiantcho/ptmp/nugget/nugget/assets/data/LAT47-LON-127_coszsteps256-azimuthsteps256_SIBYLL-2.3c-H4a.pickle
       flux_types:  [conv, pr]
       output_keys:
         conv: "mceq_conv_SIBYLL23c_H4a"

@@ -395,7 +395,6 @@ def bKDE(
             + torch.Tensor([counts[0]] + [0] * (len(counts) - 3))
             + torch.Tensor([0] * (len(counts) - 3) + [counts[-1]])
         )
-    print(f"counts: {counts}")
     return counts
 
 def bKDEnD(
@@ -459,7 +458,7 @@ def A_optimality(fim, **kwargs):
 
 
 class AnalysisLoss(LossFunction):
-    def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith']):
+    def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith'], effective_area_loss=None, trigger_loss=None):
         """
         Initialize the weighted LLR loss function.
         
@@ -489,7 +488,8 @@ class AnalysisLoss(LossFunction):
         self.print_loss = print_loss
         self.random_seed = random_seed
         self.fisher_info_params = fisher_info_params
-
+        self.effective_area_loss = effective_area_loss
+        self.trigger_loss = trigger_loss
 
 
     def _ensure_weights(
@@ -568,13 +568,13 @@ class AnalysisLoss(LossFunction):
         signal_sampler         = kwargs.get('signal_sampler') # :Callable
         # weights             = kwargs.get('flux_weights') # :Tensor
         # grad_weights        = kwargs.get('grad_flux_weights') # :List[Tensor]
-        trigger_loss        = kwargs.get('trigger_loss', None) # :Tensor
+        trigger_loss        = self.trigger_loss
         optimality          = kwargs.get('analysis_optimality','a') # :str
         live_time           = kwargs.get('live_time', 1.0) # :float
         # Effective-area acceptance: replaces trigger_loss as the acceptance term.
         # Pass an EffectiveAreaLoss instance; it already owns the cross-section
         # and transmission tables and runs the trigger internally.
-        effective_area_loss = kwargs.get('effective_area_loss', None) # :EffectiveAreaLoss
+        effective_area_loss =  self.effective_area_loss
         eff_area_cyl_radius = kwargs.get('eff_area_cyl_radius', None) # :float
         eff_area_cyl_height = kwargs.get('eff_area_cyl_height', None) # :float
         # Flux weighting (friEnd + pyForwardFolding), used when the sampled events
@@ -631,13 +631,13 @@ class AnalysisLoss(LossFunction):
                 weighted_resolution_loss=WeightedResolutionLoss(
                         device=self.device,
                         resolution_type='energy',
-                        fisher_info_params=self.fisher_info_params
+                        fisher_info_params=['energy']
                 )
             elif input_name == 'zenith':
                 weighted_resolution_loss=WeightedResolutionLoss(
                         device=self.device,
                         resolution_type='angular',
-                        fisher_info_params=self.fisher_info_params
+                        fisher_info_params=['direction']
                 )
             loss_stuff = weighted_resolution_loss(geom_dict, **kwargs)
             uncerainty = loss_stuff['resolution_per_event']
@@ -677,13 +677,13 @@ class AnalysisLoss(LossFunction):
                     eff_area_cyl_radius = _as_float(signal_sampler.cylinder.radius)
                     eff_area_cyl_height = _as_float(signal_sampler.cylinder.height)
 
-            eff_kwargs = {
-                **kwargs,
+            eff_kwargs = kwargs
+            eff_kwargs.update({
                 'signal_event_params': signal_event_params,
                 'per_event_effective_area_loss': True,
                 'include_projected_area': False,
-                'use_batched_effective_area': True,
-            }
+                'use_batched_effective_area': True,})
+        
             if eff_area_cyl_radius is not None and eff_area_cyl_height is not None:
                 eff_kwargs['use_sampler_cyl_for_volume'] = True
             eff_out = effective_area_loss(geom_dict, **eff_kwargs)
