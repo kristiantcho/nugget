@@ -378,7 +378,17 @@ def bKDE(
         1D array of bKDE counts.
     """
 
-    bins = torch.Tensor([-torch.inf, *bins, torch.inf]) if reflect_infinities else bins
+    # Follow the data: binning_var carries the device/dtype of the event tensors,
+    # so coerce the bin edges to match instead of assuming the caller built them
+    # on the right device (torch.linspace defaults to CPU).
+    binning_var = torch.as_tensor(binning_var)
+    bins = torch.as_tensor(bins, device=binning_var.device, dtype=binning_var.dtype)
+    if torch.is_tensor(bandwidth):
+        bandwidth = bandwidth.to(device=binning_var.device, dtype=binning_var.dtype)
+
+    if reflect_infinities:
+        inf_edge = torch.tensor([torch.inf], device=bins.device, dtype=bins.dtype)
+        bins = torch.cat([-inf_edge, bins.reshape(-1), inf_edge])
 
     # get cumulative counts (area under kde) for each set of bin edges
     z = ((bins.reshape(-1, 1) - binning_var) / bandwidth)
@@ -390,20 +400,23 @@ def bKDE(
     counts = (event_cdf[1:, :] - event_cdf[:-1, :])
 
     if reflect_infinities:
-        counts = (
-            counts[1:-1]
-            + torch.Tensor([counts[0]] + [0] * (len(counts) - 3))
-            + torch.Tensor([0] * (len(counts) - 3) + [counts[-1]])
-        )
+        # Fold the two overflow bins back into the first/last real bins so no
+        # kernel mass is lost outside the binning range.
+        counts = counts[1:-1].clone()
+        counts[0] = counts[0] + event_cdf[1] - event_cdf[0]
+        counts[-1] = counts[-1] + event_cdf[-1] - event_cdf[-2]
     return counts
 
 def bKDEnD(
-        binning_vars: list, 
+        binning_vars: list,
         bins: list,
         uncerts: list,
         ):
     count_list = []
     for binning_var, uncert, bin1d in zip(binning_vars,uncerts,bins):
+        # bKDE aligns bins/bandwidth to binning_var's device, so a caller that
+        # built the bin edges on CPU (torch.linspace default) still works when
+        # the event tensors live on a GPU.
         counts = bKDE(binning_var,bin1d,uncert)
         count_list.append(counts)
 
@@ -537,12 +550,16 @@ class AnalysisLoss(LossFunction):
         )
 
         # add_weights_to_signal_events round-trips through pandas, which turns
-        # every field into a plain tensor. Restore anything the round trip does
-        # not carry (e.g. grad-tracking tensors) from the originals.
+        # every field into a plain CPU tensor. Restore the pre-existing fields
+        # from the originals (keeping device and any grad tracking), and move the
+        # newly added weight columns onto self.device so they can be combined
+        # with the acceptance / bKDE tensors later.
         for original, new in zip(signal_event_params, weighted):
-            for key, value in original.items():
-                if key in new and torch.is_tensor(value):
-                    new[key] = value
+            for key, value in list(new.items()):
+                if key in original and torch.is_tensor(original[key]):
+                    new[key] = original[key]
+                elif torch.is_tensor(value):
+                    new[key] = value.to(self.device)
 
         return weighted
 
@@ -696,8 +713,8 @@ class AnalysisLoss(LossFunction):
         weights = []
         grad_weights = []
         test_event = signal_event_params[0]
-        energy_bins = torch.linspace(2,8, num_bins)
-        zenith_bins = torch.linspace(-1,1, num_bins)
+        energy_bins = torch.linspace(2,8, num_bins, device=self.device)
+        zenith_bins = torch.linspace(-1,1, num_bins, device=self.device)
         signal_idx = []
         var_count = 0
         input_vars = []

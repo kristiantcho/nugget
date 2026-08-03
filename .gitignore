@@ -44,6 +44,7 @@ gif_temp/
 *.pt
 *.pkl
 *.sh
+*.pickle
 # nugget/examples/modular_surrogate_notebook.ipynb
 
 nugget/examples/best_geom_uniform.pkl
