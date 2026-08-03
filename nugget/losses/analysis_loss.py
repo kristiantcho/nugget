@@ -751,8 +751,19 @@ class AnalysisLoss(LossFunction):
             raise NotImplementedError(f"No {optimality} optimality")
         
         fisher_loss = opti(fim)
-        
+
+        # Marginalized covariance of the signal flux parameters. Its diagonal is
+        # the per-parameter variance; ordering matches signal_flux_var_names,
+        # since calc_fisher_matrix moves signal_idx to the front.
+        cov = calc_cov(fim)
+        param_variances = torch.diag(cov)
+
         if self.print_loss:
             print(f"Fisher Analysis Info Loss: {fisher_loss.item()}")
-        
-        return {'fisher_analysis_loss': fisher_loss, 'flux_param_names': signal_flux_var_names}
+
+        return {
+            'fisher_analysis_loss': fisher_loss,
+            'flux_param_names': signal_flux_var_names,
+            'flux_param_covariance': cov,
+            'flux_param_variances': param_variances,
+        }

@@ -140,6 +140,7 @@ class Visualizer:
     PLOT_ALM_LAMBDA = "alm_lambda"
     PLOT_DETECTOR_EFFICIENCY_HISTORY = "detector_efficiency_history"
     PLOT_EFFECTIVE_AREA_HISTORY = "effective_area_history"
+    PLOT_FLUX_VARIANCE_HISTORY = "flux_variance_history"
     PLOT_NN_DISTANCE_HISTORY = "nn_distance_history"
 
 
@@ -1014,6 +1015,13 @@ class Visualizer:
             - 'angular_resolution': Angular resolution from Fisher Information using Cramér-Rao bound
             - 'energy_resolution': Energy resolution from Fisher Information using Cramér-Rao bound
             - 'pointsource_fom': Pointsource FoM history from unweighted loss dictionary
+            - 'flux_variance_history': Combined variance/error of the signal flux parameters
+              from `AnalysisLoss` over iterations, read from `uw_loss_dict['fisher_analysis_loss']`
+              (the A-optimality value, i.e. sum of marginal 1-sigma errors). Optional kwargs:
+              'flux_param_variance_history' ({param: [variance, ...]}) to overlay per-parameter
+              curves from the loss's 'flux_param_variances'; 'flux_param_names' to label the
+              combined curve; 'flux_variance_as_sigma' (default True) to plot sum-of-sigmas
+              rather than its square.
             - 'angular_resolution_vs_zenith': Binned angular resolution vs zenith
             - 'angular_resolution_vs_energy': Binned angular resolution vs energy
             - 'energy_resolution_vs_energy': Binned energy resolution vs energy
@@ -1432,6 +1440,7 @@ class Visualizer:
             self.PLOT_ANGULAR_RESOLUTION,
             self.PLOT_ENERGY_RESOLUTION,
             self.PLOT_POINTSOURCE_FOM,
+            self.PLOT_FLUX_VARIANCE_HISTORY,
             self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH,
             self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
             self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
@@ -1581,13 +1590,17 @@ class Visualizer:
                                 any_series = True
                         continue
 
-                    if plot_type in (self.PLOT_ANGULAR_RESOLUTION, self.PLOT_ENERGY_RESOLUTION, self.PLOT_POINTSOURCE_FOM):
+                    if plot_type in (self.PLOT_ANGULAR_RESOLUTION, self.PLOT_ENERGY_RESOLUTION, self.PLOT_POINTSOURCE_FOM, self.PLOT_FLUX_VARIANCE_HISTORY):
                         uw_loss_dict = payload.get('uw_loss_dict', None)
                         if isinstance(uw_loss_dict, dict):
                             if plot_type == self.PLOT_ANGULAR_RESOLUTION:
                                 series = uw_loss_dict.get('angular_resolution_loss', None)
                             elif plot_type == self.PLOT_ENERGY_RESOLUTION:
                                 series = uw_loss_dict.get('energy_resolution_loss', None)
+                            elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
+                                series = uw_loss_dict.get('fisher_analysis_loss', None)
+                                if series is None:
+                                    series = uw_loss_dict.get('analysis_loss', None)
                             else:
                                 series = uw_loss_dict.get('pointsource_fom_loss', None)
                                 if series is None:
@@ -1598,6 +1611,8 @@ class Visualizer:
                                 series = np.array(series)
                                 if plot_type == self.PLOT_ANGULAR_RESOLUTION:
                                     series = series * 180.0
+                                elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY and not bool(payload.get('flux_variance_as_sigma', True)):
+                                    series = series ** 2
                                 ax.plot(series, linewidth=2, label=geom_name_str, color=geom_color.get(geom_name_str, None))
                                 any_series = True
                         continue
@@ -2550,6 +2565,11 @@ class Visualizer:
                     ax.set_title('Pointsource FoM History')
                     ax.set_xlabel('Iteration')
                     ax.set_ylabel('Pointsource FoM')
+                    ax.grid(True, alpha=0.3)
+                elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
+                    ax.set_title('Flux Parameter Variance History')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel(r'Combined flux error  $\sum_p \sigma_p$')
                     ax.grid(True, alpha=0.3)
                 elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
                     ax.set_title('Angular FOM vs Zenith' if any_fom_series else 'Angular Resolution vs Zenith')
@@ -5523,6 +5543,80 @@ class Visualizer:
             else:
                 ax.text(0.5, 0.5, "Nearest-neighbour distance history not available\n(Pass 'string_xy')",
                       ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
+            # Combined variance of the signal flux parameters from AnalysisLoss,
+            # over optimization iterations.
+            #
+            # AnalysisLoss returns A-optimality: sum_p sqrt(Cov_pp), i.e. the sum
+            # of marginal 1-sigma errors on the flux parameters listed in
+            # 'analysis_signal_flux_var_names'. The optimizer records that scalar
+            # under 'fisher_analysis_loss' in uw_loss_dict, so the combined
+            # history is read straight from there - no extra state needed.
+            loss_dict = kwargs.get('uw_loss_dict', None)
+
+            flux_variance_history = None
+            if loss_dict is not None:
+                flux_variance_history = loss_dict.get('fisher_analysis_loss', None)
+                if flux_variance_history is None:
+                    flux_variance_history = loss_dict.get('analysis_loss', None)
+
+            # Optional per-parameter breakdown: pass 'flux_param_variance_history'
+            # as {param_name: [variance_per_iteration, ...]} to overlay the
+            # individual contributions (from the loss's 'flux_param_variances'),
+            # and 'flux_param_names' to label the combined curve.
+            per_param_history = kwargs.get('flux_param_variance_history', None)
+            flux_param_names = kwargs.get('flux_param_names', None)
+            plot_as_sigma = kwargs.get('flux_variance_as_sigma', True)
+
+            if flux_variance_history is not None and len(flux_variance_history) > 0:
+                combined = np.asarray(flux_variance_history, dtype=float)
+
+                # A_optimality already returns a sum of sigmas; square it only if
+                # the caller explicitly asks for a variance-like quantity.
+                if plot_as_sigma:
+                    combined_plot = combined
+                    ylabel = r'Combined flux error  $\sum_p \sigma_p$'
+                else:
+                    combined_plot = combined ** 2
+                    ylabel = r'Combined flux variance  $(\sum_p \sigma_p)^2$'
+
+                ax.plot(combined_plot, color='crimson', linewidth=2, markersize=4,
+                        label='combined', zorder=3)
+
+                if per_param_history:
+                    names = list(per_param_history.keys())
+                    cmap = plt.get_cmap('viridis')
+                    for idx, name in enumerate(names):
+                        series = np.asarray(per_param_history[name], dtype=float)
+                        if series.size == 0:
+                            continue
+                        # Stored as variances; show sigma to match the combined curve.
+                        series_plot = np.sqrt(np.clip(series, 0.0, None)) if plot_as_sigma else series
+                        denom = max(1, len(names) - 1)
+                        ax.plot(series_plot, linewidth=1.4, alpha=0.85, linestyle='--',
+                                color=cmap(0.15 + 0.7 * idx / denom), label=str(name))
+
+                title = 'Flux Parameter Variance History'
+                if flux_param_names:
+                    title += f"  ({', '.join(str(n) for n in flux_param_names)})"
+                ax.set_title(title)
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel(ylabel)
+                ax.grid(True, alpha=0.3)
+                if np.all(np.isfinite(combined_plot)) and np.all(combined_plot > 0):
+                    ax.set_yscale('log')
+                if per_param_history or flux_param_names:
+                    ax.legend(fontsize=8, loc='best')
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "Flux variance history not available\n(Pass 'uw_loss_dict' with 'fisher_analysis_loss' history)",
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes,
+                )
 
         elif plot_type == self.PLOT_POINTSOURCE_FOM:
             # Pointsource FoM history from unweighted loss dictionary.
