@@ -167,7 +167,7 @@ class FoMLoss(LossFunction):
 
         # Let resolution choose/load/subsample events first (e.g. weighted Fisher path).
         resolution_kwargs = dict(kwargs)
-        normalize_fom_by_energy = kwargs.get("normalize_fom_by_energy", True)
+        include_e_term = kwargs.get("include_uniform_log_e_term", True)
         # resolution_kwargs.pop("use_irregular_cylinder", None)
         # resolution_kwargs.pop("use_batched_effective_area", None)
 
@@ -195,6 +195,7 @@ class FoMLoss(LossFunction):
         effective_area_kwargs = dict(resolution_kwargs)
         effective_area_kwargs["signal_event_params"] = shared_events
         effective_area_kwargs["per_event_effective_area_loss"] = True
+        effective_area_kwargs["signal_sampler"] = geometry_adjusted_sampler if adjust_cylinder_to_geometry else effective_area_kwargs.get("signal_sampler", None) 
         # effective_area_kwargs["use_irregular_cylinder"] = use_irregular_cylinder
         # effective_area_kwargs["use_batched_effective_area"] = use_batched_effective_area
 
@@ -229,10 +230,10 @@ class FoMLoss(LossFunction):
             & (resolution_per_event > 1e-12)
             & (effective_area_per_event >= 0.0)
         )
-        if normalize_fom_by_energy:
+        if include_e_term:
             energies = [event['energy'] for event in shared_events]
             energies = torch.as_tensor(energies, device=self.device)
-            norm_effective_area_per_event = effective_area_per_event/energies
+            norm_effective_area_per_event = effective_area_per_event*energies
         else:
             norm_effective_area_per_event = effective_area_per_event
         if finite_mask.any():
