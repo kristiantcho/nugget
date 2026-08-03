@@ -760,7 +760,7 @@ class EffectiveAreaLoss(LossFunction):
         # geometry-derived bounding cylinder. This makes A_eff use a fixed
         # generation volume (chord length, interaction prob, and projected area
         # all), decoupling it from the string spread.
-        use_sampler_cylinder = kwargs.get('use_sampler_cylinder_for_volume', False)
+        use_sampler_cylinder = kwargs.get('use_sampler_cyl_for_volume', False)
         use_batched_effective_area = kwargs.get('use_batched_effective_area', False)
         cylinder_kwargs = kwargs.get('cylinder_sampler_kwargs', {})
         pc_ly_per_event_per_point_per_e_per_ct = kwargs.get('pc_ly_per_point_per_event_per_e_per_ct', None)
@@ -806,19 +806,7 @@ class EffectiveAreaLoss(LossFunction):
 
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
 
-        center_xy, cyl_radius = get_weighted_min_enclosing_circle(
-            string_xy, string_weights=string_probs, temperature=temperature,
-            downweight_untriggerable=downweight_untriggerable,
-            trigger_neighbor_distance=trigger_neighbor_distance,
-            trigger_min_neighbors=trigger_min_neighbors,
-            trigger_distance_sharpness=trigger_distance_sharpness,
-            trigger_count_sharpness=trigger_count_sharpness,
-        )
-        z_positions = points_3d[:, 2]
-        z_max = torch.max(z_positions)
-        z_min = torch.min(z_positions)
-        cyl_height = z_max - z_min
-        center = torch.stack([center_xy[0], center_xy[1], 0.5 * (z_min + z_max)])
+        
 
         if use_sampler_cylinder:
             if signal_sampler is None or not hasattr(signal_sampler, 'cylinder'):
@@ -829,7 +817,20 @@ class EffectiveAreaLoss(LossFunction):
             cyl_radius = torch.as_tensor(sampler_cyl.radius, device=self.device, dtype=points_3d.dtype)
             cyl_height = torch.as_tensor(sampler_cyl.height, device=self.device, dtype=points_3d.dtype)
             center = torch.as_tensor(sampler_cyl.center, device=self.device, dtype=points_3d.dtype).reshape(-1)
-
+        else:
+            center_xy, cyl_radius = get_weighted_min_enclosing_circle(
+                        string_xy, string_weights=string_probs, temperature=temperature,
+                        downweight_untriggerable=downweight_untriggerable,
+                        trigger_neighbor_distance=trigger_neighbor_distance,
+                        trigger_min_neighbors=trigger_min_neighbors,
+                        trigger_distance_sharpness=trigger_distance_sharpness,
+                        trigger_count_sharpness=trigger_count_sharpness,
+                    )
+            z_positions = points_3d[:, 2]
+            z_max = torch.max(z_positions)
+            z_min = torch.min(z_positions)
+            cyl_height = z_max - z_min
+            center = torch.stack([center_xy[0], center_xy[1], 0.5 * (z_min + z_max)])
         # geom_dict for the trigger MUST carry string_xy/string_weights so the trigger
         # weights its points by the current (continuous) string activation. Passing only
         # points_3d would silently give every point weight 1, making detector efficiency

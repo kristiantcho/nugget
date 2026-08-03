@@ -35,10 +35,10 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     # geometry (every feature on its own is identically distributed in both classes), so
     # the loss starts on a flat ln(2) plateau. A large batch with a warmup escapes it in
     # ~1k steps; batch 32 at lr 1e-4 was still at ~0.689 after 30k steps.
-    learning_rate=1e-4,  # peak LR for the OneCycle schedule
+    learning_rate=1e-3,  # peak LR for the OneCycle schedule
     # lr_schedule='onecycle',
     # warmup_frac=0.15,
-    standardize_inputs=True,
+    standardize_inputs=False,
     shared_mlp=False,  # Independent MLPs for each branch
     use_residual_connections=True,  # Skip connections for better training
     signal_noise_scale=0,  # Noise level for signal events
@@ -55,8 +55,8 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     # -direction. Verified on the data: 95% of hit PMTs are downstream of the vertex
     # under this convention versus 5% under the other.
     track_dir_is_arrival=False,
-    reduce_lr_on_plateau=False,  # superseded by lr_schedule='onecycle'
-    lr_scheduler_patience=15,  # Patience for LR scheduler
+    reduce_lr_on_plateau=True,  # superseded by lr_schedule='onecycle'
+    lr_scheduler_patience=20,  # Patience for LR scheduler
     use_rich_features=True,  # Whether to use rich features from the surrogate model
     add_vertex_distance=False,
     rich_rel_pos_mode=True,
@@ -88,9 +88,9 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
 #     )
 
 GEOM = '../other/800_40_40_geom.csv'
-TEST_PARQUET = './llrnet_models/mc_ly_muon_llr_v4_test_samples.parquet'
+TEST_PARQUET = './llrnet_models/mc_ly_muon_llr_v5_test_samples.parquet'
 
-EPOCHS = 200
+EPOCHS = 4000
 
 train_dataloader = llr_net.create_light_yield_parquet_dataloader(
     parquet_path='new_accepted_photons_ly_all.parquet',
@@ -137,11 +137,11 @@ history = llr_net.train_with_dataloader(
     grad_clip=None,
     early_stopping_patience=300,
     save_every_n_epochs=10,
-    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v4.pt',
+    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v5.pt',
 )
 
 # Save the best model for later use
 # llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v4_training_history.pkl', 'wb'))
+pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v5_training_history.pkl', 'wb'))

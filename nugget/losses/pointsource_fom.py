@@ -167,7 +167,7 @@ class FoMLoss(LossFunction):
 
         # Let resolution choose/load/subsample events first (e.g. weighted Fisher path).
         resolution_kwargs = dict(kwargs)
-        include_e_term = kwargs.get("include_uniform_log_e_term", True)
+        include_e_term = kwargs.get("fom_include_uniform_log_e_term", True)
         # resolution_kwargs.pop("use_irregular_cylinder", None)
         # resolution_kwargs.pop("use_batched_effective_area", None)
 
