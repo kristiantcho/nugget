@@ -167,12 +167,17 @@ class Visualizer:
 
         # Running histories of scalar summaries derived from per-iteration tensors
         # (e.g. mean detector efficiency, mean effective area) that aren't already
-        # accumulated in the optimizer's loss_dict/uw_loss_dict. Keyed by iteration
-        # so repeated visualize_progress calls at the same iteration don't duplicate entries.
-        self._mean_detector_efficiency_history = []
-        self._mean_effective_area_history = []
-        self._last_recorded_iteration_efficiency = None
-        self._last_recorded_iteration_effective_area = None
+        # accumulated in the optimizer's loss_dict/uw_loss_dict. Each entry is stored
+        # as {iteration: value} so the plotted x-axis reflects the actual optimizer
+        # iteration count (see Optimizer.optimize in basic_optimizer.py) rather than
+        # the number of times visualize_progress happened to be called, and so a
+        # NaN-revert (which replays the same iteration) overwrites instead of duplicating.
+        self._mean_detector_efficiency_history = {}
+        self._mean_effective_area_history = {}
+        # Angular resolution history aggregated from resolution_per_event (via
+        # resolution_stat), rather than the scalar angular_resolution_loss already
+        # tracked in uw_loss_dict. Also keyed by iteration.
+        self._angular_resolution_per_event_history = {}
         # History of the (weighted) average per-string mean distance to its 5 nearest
         # neighbours, accumulated across iterations for the 'nn_distance_history' plot.
         self._nn_distance_history = []
@@ -5381,30 +5386,78 @@ class Visualizer:
                       ha='center', va='center', transform=ax.transAxes)
         
         elif plot_type == self.PLOT_ANGULAR_RESOLUTION:
-            # Angular resolution history from Fisher Information matrix using Cramér-Rao bound
-            loss_dict = kwargs.get('uw_loss_dict', None)
-            
-            if loss_dict is not None:
-                angular_resolution_history = loss_dict.get('angular_resolution_loss', None)
+            # Angular resolution history from Fisher Information matrix using Cramér-Rao bound.
+            #
+            # Preferred source: resolution_per_event (same per-event array used by
+            # PLOT_ANGULAR_RESOLUTION_VS_ZENITH / PLOT_ANGULAR_RESOLUTION_VS_ENERGY),
+            # aggregated per-iteration with the same resolution_stat convention
+            # ('mean', 'median', or 'fom') those plots use. Falls back to the scalar
+            # angular_resolution_loss history in uw_loss_dict when resolution_per_event
+            # isn't provided (e.g. non-weighted resolution loss without per-event output).
+            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_stat = kwargs.get('resolution_stat', None)
+            if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
+                resolution_stat = 'mean'
+            resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+            if resolution_stat not in ('median', 'mean', 'fom'):
+                resolution_stat = 'median'
+            resolution_use_fom = bool(kwargs.get('resolution_use_fom', False)) or resolution_stat == 'fom'
+            resolution_fom_min_resolution = kwargs.get('resolution_fom_min_resolution', 1e-12)
+
+            angular_resolution_history = None
+            using_per_event_history = False
+
+            if resolution_per_event is not None and iteration is not None:
+                if isinstance(resolution_per_event, torch.Tensor):
+                    res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
+                else:
+                    res_values = np.array(resolution_per_event).flatten()
+                res_values = res_values[np.isfinite(res_values)]
+
+                if res_values.size > 0:
+                    if resolution_use_fom:
+                        agg_val, _ = self._compute_fom_from_resolution(
+                            res_values, min_resolution=resolution_fom_min_resolution,
+                        )
+                    elif resolution_stat == 'mean':
+                        agg_val = float(np.nanmean(res_values))
+                    else:
+                        agg_val = float(np.nanmedian(res_values))
+
+                    if np.isfinite(agg_val):
+                        self._angular_resolution_per_event_history[int(iteration)] = float(agg_val)
+
+            if len(self._angular_resolution_per_event_history) > 0:
+                iters_sorted = sorted(self._angular_resolution_per_event_history.keys())
+                angular_resolution_history = np.array(
+                    [self._angular_resolution_per_event_history[i] for i in iters_sorted]
+                )
+                using_per_event_history = True
+            else:
+                loss_dict = kwargs.get('uw_loss_dict', None)
+                if loss_dict is not None:
+                    angular_resolution_history = loss_dict.get('angular_resolution_loss', None)
+                iters_sorted = None
 
             if angular_resolution_history is not None:
-                angular_resolution_history = np.array(angular_resolution_history) * 180.0/np.pi  # Convert to degrees
-                # Plot the history of weighted total angular resolution
-                ax.plot(angular_resolution_history, color='blue', linewidth=2, markersize=4)
-                ax.set_title('Angular Resolution History')
+                angular_resolution_history = np.array(angular_resolution_history)
+                # Plot the history of angular resolution (aggregated per resolution_stat when
+                # using per-event data; otherwise the weighted total angular resolution).
+                x_axis = iters_sorted if using_per_event_history else range(len(angular_resolution_history))
+                is_fom = using_per_event_history and resolution_use_fom
+                if not is_fom:
+                    angular_resolution_history = angular_resolution_history * 180.0/np.pi  # radians -> degrees
+                ax.plot(x_axis, angular_resolution_history, color='blue', linewidth=2, markersize=4)
+                title_stat = (
+                    ('FoM' if resolution_use_fom else resolution_stat.capitalize())
+                    if using_per_event_history else 'Total'
+                )
+                ax.set_title(f'Angular Resolution History ({title_stat})')
                 ax.set_xlabel('Iteration')
-                ax.set_ylabel('Angular Resolution (degrees)')
+                ax.set_ylabel('Angular FoM (rad$^{-1}$)' if is_fom else 'Angular Resolution (degrees)')
                 ax.grid(True, alpha=0.3)
-                
-                # # Add current value annotation
-                # if len(angular_resolution_history) > 0:
-                #     current_val = angular_resolution_history[-1]
-                #     ax.annotate(f'Current: {current_val:.2f}°', 
-                #               xy=(len(angular_resolution_history)-1, current_val),
-                #               xytext=(10, 10), textcoords='offset points',
-                #               fontsize=10, ha='left')
             else:
-                ax.text(0.5, 0.5, "Angular resolution history not available\n(Pass 'angular_resolution_history' in kwargs)", 
+                ax.text(0.5, 0.5, "Angular resolution history not available\n(Pass 'resolution_per_event' or 'angular_resolution_history' in kwargs)",
                       ha='center', va='center', transform=ax.transAxes)
         
         elif plot_type == self.PLOT_ENERGY_RESOLUTION:
@@ -5438,21 +5491,25 @@ class Visualizer:
         elif plot_type == self.PLOT_DETECTOR_EFFICIENCY_HISTORY:
             # Mean detector efficiency (per-event trigger probability, or binned
             # efficiency matrix, from EffectiveAreaLoss/FoMLoss) over optimization iterations.
+            # Recorded against the actual optimizer iteration number (see the `it` loop
+            # variable / vis_kwargs['iteration'] in Optimizer.optimize), not call order,
+            # so gaps from vis_freq skipping and NaN-revert overwrites are both handled correctly.
             detector_efficiencies = kwargs.get('detector_efficiencies', None)
 
-            if detector_efficiencies is not None:
+            if detector_efficiencies is not None and iteration is not None:
                 if isinstance(detector_efficiencies, torch.Tensor):
                     eff_values = detector_efficiencies.clone().detach().cpu().numpy().flatten()
                 else:
                     eff_values = np.array(detector_efficiencies).flatten()
 
                 finite_eff = eff_values[np.isfinite(eff_values)]
-                if finite_eff.size > 0 and iteration is not None and iteration != self._last_recorded_iteration_efficiency:
-                    self._mean_detector_efficiency_history.append(float(np.mean(finite_eff)))
-                    self._last_recorded_iteration_efficiency = iteration
+                if finite_eff.size > 0:
+                    self._mean_detector_efficiency_history[int(iteration)] = float(np.mean(finite_eff))
 
             if len(self._mean_detector_efficiency_history) > 0:
-                ax.plot(self._mean_detector_efficiency_history, color='green', linewidth=2, markersize=4)
+                iters_sorted = sorted(self._mean_detector_efficiency_history.keys())
+                values_sorted = [self._mean_detector_efficiency_history[i] for i in iters_sorted]
+                ax.plot(iters_sorted, values_sorted, color='green', linewidth=2, markersize=4)
                 ax.set_title('Mean Detector Efficiency History')
                 ax.set_xlabel('Iteration')
                 ax.set_ylabel('Mean Detector Efficiency')
@@ -5463,24 +5520,26 @@ class Visualizer:
 
         elif plot_type == self.PLOT_EFFECTIVE_AREA_HISTORY:
             # Mean effective area (per-event or binned effective area matrix from
-            # EffectiveAreaLoss/FoMLoss) over optimization iterations.
+            # EffectiveAreaLoss/FoMLoss) over optimization iterations. Recorded against
+            # the actual optimizer iteration number, same rationale as detector efficiency above.
             effective_area_values = kwargs.get('effective_area_per_event', None)
             if effective_area_values is None:
                 effective_area_values = kwargs.get('effective_area_matrix', None)
 
-            if effective_area_values is not None:
+            if effective_area_values is not None and iteration is not None:
                 if isinstance(effective_area_values, torch.Tensor):
                     aeff_values = effective_area_values.clone().detach().cpu().numpy().flatten()
                 else:
                     aeff_values = np.array(effective_area_values).flatten()
 
                 finite_aeff = aeff_values[np.isfinite(aeff_values)]
-                if finite_aeff.size > 0 and iteration is not None and iteration != self._last_recorded_iteration_effective_area:
-                    self._mean_effective_area_history.append(float(np.mean(finite_aeff)))
-                    self._last_recorded_iteration_effective_area = iteration
+                if finite_aeff.size > 0:
+                    self._mean_effective_area_history[int(iteration)] = float(np.mean(finite_aeff))
 
             if len(self._mean_effective_area_history) > 0:
-                ax.plot(self._mean_effective_area_history, color='orange', linewidth=2, markersize=4)
+                iters_sorted = sorted(self._mean_effective_area_history.keys())
+                values_sorted = [self._mean_effective_area_history[i] for i in iters_sorted]
+                ax.plot(iters_sorted, values_sorted, color='orange', linewidth=2, markersize=4)
                 ax.set_title('Mean Effective Area History')
                 ax.set_xlabel('Iteration')
                 ax.set_ylabel('Mean Effective Area (m$^2$)')
