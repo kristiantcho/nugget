@@ -247,6 +247,28 @@ class Visualizer:
         return fom, fom_err
 
     @staticmethod
+    def _moving_average(values, window):
+        """Trailing (causal) moving average, defined at every index like the input.
+
+        At index i, averages values[max(0, i-window+1):i+1] so the returned array
+        has the same length as the input and the first `window-1` points are
+        averaged over however many samples are actually available (no NaN warm-up).
+        `None` entries (used elsewhere to represent skipped iterations) are treated
+        as missing and excluded from the local average.
+        """
+        window = max(1, int(window))
+        arr = np.array([np.nan if v is None else v for v in values], dtype=np.float64)
+        n = arr.shape[0]
+        result = np.full(n, np.nan, dtype=np.float64)
+        for i in range(n):
+            lo = max(0, i - window + 1)
+            segment = arr[lo:i + 1]
+            finite_segment = segment[np.isfinite(segment)]
+            if finite_segment.size > 0:
+                result[i] = np.mean(finite_segment)
+        return result
+
+    @staticmethod
     def _compute_pointsource_fom_from_resolution_and_aeff(res_values, aeff_values, min_resolution=1e-12):
         """Compute pointsource FoM and propagated uncertainty.
 
@@ -1030,8 +1052,13 @@ class Visualizer:
             - 'angular_resolution_vs_zenith': Binned angular resolution vs zenith
             - 'angular_resolution_vs_energy': Binned angular resolution vs energy
             - 'energy_resolution_vs_energy': Binned energy resolution vs energy
-            - 'loss_components': Individual loss components and total loss from loss dictionary
-            - 'uw_loss_components': Individual unweighted loss components and total unweighted loss
+            - 'loss_components': Individual loss components and total loss from loss dictionary.
+              Pass 'moving_average_losses' (list of loss names) to draw those components'
+              raw series faded with a moving average (window 'moving_average_window',
+              default 10) overlaid at full opacity; 'Total Loss' sums the moving-average
+              values for those losses (and raw values for the rest).
+            - 'uw_loss_components': Individual unweighted loss components and total unweighted loss.
+              Also supports 'moving_average_losses' / 'moving_average_window' as above.
             - 'alm_mu': ALM penalty parameters (mu) history for each constraint
             - 'alm_lambda': ALM Lagrange multipliers (lambda) history for each constraint
             - 'detector_efficiency_history': Mean detector efficiency over optimization iterations
@@ -6713,12 +6740,24 @@ class Visualizer:
                        ha='center', va='center', transform=ax.transAxes, fontsize=12)
         
         elif plot_type == self.PLOT_LOSS_COMPONENTS:
-            # Loss components plot from loss dictionary
+            # Loss components plot from loss dictionary.
+            #
+            # moving_average_losses: optional list of loss names (keys of loss_dict) whose
+            # raw series should be drawn faded, with a moving average (window
+            # moving_average_window, default 10) overlaid at normal opacity. Total Loss
+            # sums the moving-average values for those losses (and the raw values for
+            # everything else), so it reflects the same smoothing shown for each component.
             loss_dict = kwargs.get('loss_dict', None)
             loss_filter_list = kwargs.get('loss_filter', [])
             loss_weights_dict = kwargs.get('loss_weights_dict', None)
             loss_iterations_dict = kwargs.get('loss_iterations_dict', None)
+            moving_average_losses = set(kwargs.get('moving_average_losses', []) or [])
+            moving_average_window = kwargs.get('moving_average_window', 10)
             if loss_dict is not None and isinstance(loss_dict, dict) and loss_dict:
+                # Per-loss series actually used for the Total Loss sum below: the moving
+                # average where requested, otherwise the raw (gap-filled) history.
+                totals_input = {}
+
                 # Plot each loss component
                 for loss_name, loss_history in loss_dict.items():
                     if loss_name in loss_filter_list:
@@ -6727,6 +6766,8 @@ class Visualizer:
                         weight = loss_weights_dict[loss_name]
                         if weight == 0.0:
                             continue
+                    use_moving_average = loss_name in moving_average_losses
+
                     if loss_iterations_dict is not None:
                         iterations = loss_iterations_dict.get(loss_name, None)
                         if iterations is not None and len(iterations) == len(loss_history):
@@ -6734,7 +6775,7 @@ class Visualizer:
                             # Create a full range from 0 to max iteration
                             max_iter = max(iterations)
                             full_range = list(range(max_iter + 1))
-                            
+
                             # Create loss values array with None for missing iterations
                             full_loss_history = []
                             iter_idx = 0
@@ -6744,66 +6785,88 @@ class Visualizer:
                                     iter_idx += 1
                                 else:
                                     full_loss_history.append(None)
-                            
-                            # Plot with gaps handled
-                            ax.plot(full_range, full_loss_history, label=loss_name, alpha=0.8, linewidth=2)
+
+                            if use_moving_average:
+                                smoothed = self._moving_average(full_loss_history, moving_average_window)
+                                line, = ax.plot(full_range, full_loss_history, alpha=0.25, linewidth=2)
+                                ax.plot(full_range, smoothed, label=loss_name, color=line.get_color(),
+                                        alpha=0.9, linewidth=2)
+                                totals_input[loss_name] = list(smoothed)
+                            else:
+                                # Plot with gaps handled
+                                ax.plot(full_range, full_loss_history, label=loss_name, alpha=0.8, linewidth=2)
+                                totals_input[loss_name] = full_loss_history
                             continue
                     if loss_history and len(loss_history) > 0:
-                        ax.plot(loss_history, label=loss_name, alpha=0.8, linewidth=2)
-                
-                # Calculate and plot total loss (sum of all components)
+                        if use_moving_average:
+                            smoothed = self._moving_average(loss_history, moving_average_window)
+                            line, = ax.plot(loss_history, alpha=0.25, linewidth=2)
+                            ax.plot(smoothed, label=loss_name, color=line.get_color(), alpha=0.9, linewidth=2)
+                            totals_input[loss_name] = list(smoothed)
+                        else:
+                            ax.plot(loss_history, label=loss_name, alpha=0.8, linewidth=2)
+                            totals_input[loss_name] = loss_history
+
+                # Calculate and plot total loss (sum of all components, using the
+                # moving-average series in place of the raw one for smoothed losses).
                 # Find the maximum length of all loss histories
-                max_length = max(len(history) for history in loss_dict.values() if history)
-                
+                max_length = max(len(history) for history in totals_input.values() if history)
+
                 # Calculate total loss at each iteration
                 total_loss = []
                 for i in range(max_length):
                     iteration_total = 0.0
-                    for loss_name, loss_history in loss_dict.items():
-                        if loss_name in loss_filter_list:
-                            continue
+                    for loss_name, loss_history in totals_input.items():
                         if loss_weights_dict is not None and loss_name in loss_weights_dict:
                             weight = loss_weights_dict[loss_name]
                             if weight == 0.0:
                                 continue
                         if loss_history and i < len(loss_history):
-                            iteration_total += loss_history[i]
+                            val = loss_history[i]
+                            if val is not None and np.isfinite(val):
+                                iteration_total += val
                     total_loss.append(iteration_total)
-                
+
                 # Plot total loss with a distinct style
-                ax.plot(total_loss, label='Total Loss', color='black', 
+                ax.plot(total_loss, label='Total Loss', color='black',
                        linewidth=3, linestyle='--', alpha=0.9)
-                
+
                 ax.set_title(f"Loss Components")
                 ax.set_xlabel("Iteration")
                 ax.set_ylabel("Loss Value")
                 ax.legend(loc='best', fontsize='small')
                 ax.grid(True, alpha=0.3)
-                
+
                 # Use log scale if all values are positive
-                all_values = [val for history in loss_dict.values() for val in history if val is not None and val != 0]
+                all_values = [val for history in totals_input.values() for val in history if val is not None and np.isfinite(val) and val != 0]
                 all_values.extend(total_loss)
                 if all_values and all(val > 0 for val in all_values):
                     ax.set_yscale('log')
                     # Set y-axis limits
                     min_val = min(all_values) if all_values else 1e-4
                     max_val = max(total_loss) if total_loss else 1.0
-                    
+
                     # Set lower limit to 1e-4 if any loss reaches that value
                     if min_val <= 1e-4:
                         ax.set_ylim(bottom=1e-4)
-                    
+
                     # Adjust upper limit based on total loss with some margin
                     ax.set_ylim(top=max_val * 1.5)
             else:
-                ax.text(0.5, 0.5, "Loss dictionary not available or empty\n(Pass 'loss_dict' in kwargs)", 
+                ax.text(0.5, 0.5, "Loss dictionary not available or empty\n(Pass 'loss_dict' in kwargs)",
                       ha='center', va='center', transform=ax.transAxes)
         
         elif plot_type == self.PLOT_UW_LOSS_COMPONENTS:
-            # Unweighted loss components plot from unweighted loss dictionary
+            # Unweighted loss components plot from unweighted loss dictionary.
+            #
+            # moving_average_losses: optional list of loss names (keys of uw_loss_dict)
+            # whose (normalized) raw series should be drawn faded, with a moving average
+            # (window moving_average_window, default 10) overlaid at normal opacity.
             uw_loss_dict = kwargs.get('uw_loss_dict', None)
             loss_weights_dict = kwargs.get('loss_weights_dict', None)
             loss_iterations_dict = kwargs.get('loss_iterations_dict', None)
+            moving_average_losses = set(kwargs.get('moving_average_losses', []) or [])
+            moving_average_window = kwargs.get('moving_average_window', 10)
             if uw_loss_dict is not None and isinstance(uw_loss_dict, dict) and uw_loss_dict:
                 # Plot each unweighted loss component
                 for loss_name, loss_history in uw_loss_dict.items():
@@ -6818,9 +6881,16 @@ class Visualizer:
                         else:
                             # If all values are the same, set them to middle of range
                             normalized_loss = np.full_like(loss_array, 0.5)
-                        
-                        if loss_iterations_dict is None:    
-                            ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
+
+                        use_moving_average = loss_name in moving_average_losses
+
+                        if loss_iterations_dict is None:
+                            if use_moving_average:
+                                smoothed = self._moving_average(normalized_loss, moving_average_window)
+                                line, = ax.plot(normalized_loss, alpha=0.25, linewidth=2)
+                                ax.plot(smoothed, label=f"{loss_name}", color=line.get_color(), alpha=0.9, linewidth=2)
+                            else:
+                                ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
                         else:
                             iterations = loss_iterations_dict.get(loss_name, None)
                             if iterations is not None:
@@ -6828,7 +6898,7 @@ class Visualizer:
                                 # Create a full range from 0 to max iteration
                                 max_iter = max(iterations)
                                 full_range = list(range(max_iter + 1))
-                                
+
                                 # Create loss values array with None for missing iterations
                                 full_loss_history = []
                                 iter_idx = 0
@@ -6839,9 +6909,20 @@ class Visualizer:
                                     else:
                                         full_loss_history.append(None)
                                 # Plot with gaps handled
-                                ax.plot(full_range, full_loss_history, label=f"{loss_name}", alpha=0.8, linewidth=2)
+                                if use_moving_average:
+                                    smoothed = self._moving_average(full_loss_history, moving_average_window)
+                                    line, = ax.plot(full_range, full_loss_history, alpha=0.25, linewidth=2)
+                                    ax.plot(full_range, smoothed, label=f"{loss_name}", color=line.get_color(),
+                                            alpha=0.9, linewidth=2)
+                                else:
+                                    ax.plot(full_range, full_loss_history, label=f"{loss_name}", alpha=0.8, linewidth=2)
                             else:
-                                ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
+                                if use_moving_average:
+                                    smoothed = self._moving_average(normalized_loss, moving_average_window)
+                                    line, = ax.plot(normalized_loss, alpha=0.25, linewidth=2)
+                                    ax.plot(smoothed, label=f"{loss_name}", color=line.get_color(), alpha=0.9, linewidth=2)
+                                else:
+                                    ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
 
                 # Calculate and plot total unweighted loss (sum of all components)
                 # Find the maximum length of all loss histories
