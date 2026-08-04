@@ -10,6 +10,30 @@ from nugget.losses.fisher_info import WeightedResolutionLoss
 _TRIGGER_SURROGATE_COMPILE_CACHE = {}
 
 
+def _resolve_batched_surrogate(surrogate_func):
+    """Recover a batched light-yield callable from a (bound) per-event surrogate.
+
+    Mirrors the Poisson-Fisher path's auto-discovery (see
+    fisher_info_helpers._resolve_lightsabre_instance): the loss is handed the
+    *bound* per-event method (e.g. ``lightsabre.light_yield_surrogate``); if its
+    owning instance also exposes ``light_yield_surrogate_batched`` (as LightSabre
+    does), return that bound method so the trigger can compute all events for all
+    OMs in a single vectorized GPU call instead of a Python per-event loop.
+
+    Returns the bound batched callable, or None if the surrogate does not support
+    batching (in which case the caller falls back to the per-event path).
+    """
+    if surrogate_func is None:
+        return None
+    owner = getattr(surrogate_func, '__self__', None)
+    if owner is not None and hasattr(owner, 'light_yield_surrogate_batched'):
+        return owner.light_yield_surrogate_batched
+    # Also handle the case where the surrogate object itself was passed.
+    if hasattr(surrogate_func, 'light_yield_surrogate_batched'):
+        return surrogate_func.light_yield_surrogate_batched
+    return None
+
+
 def _compiled_surrogate(fn, torch_compile_kwargs=None):
     """Return a torch.compile'd wrapper around `fn`, cached by `fn`'s identity.
 
@@ -595,6 +619,14 @@ class TriggerLoss(LossFunction):
         batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
         chunk_size = kwargs.get('binned_trigger_batch_size', None)
         detach_light_yields = kwargs.get('detach_light_yields', False)
+
+        # Auto-discover a batched light-yield callable from the surrogate when one
+        # is not explicitly provided, mirroring the Poisson-Fisher path. This lets
+        # the trigger compute all events x all OMs in one vectorized GPU call
+        # (LightSabre.light_yield_surrogate_batched) instead of a Python per-event
+        # loop over surrogate_func. Opt out with use_batched_surrogate=False.
+        if batched_surrogate_func is None and kwargs.get('use_batched_surrogate', True):
+            batched_surrogate_func = _resolve_batched_surrogate(surrogate_func)
 
         # Optional torch.compile of the surrogate call(s). TriggerLoss's own math
         # has no torch.func transforms, so compiling the surrogate callable
