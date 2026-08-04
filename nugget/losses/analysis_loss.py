@@ -393,7 +393,7 @@ def bKDE(
         bins = torch.cat([-inf_edge, bins.reshape(-1), inf_edge])
 
     # get cumulative counts (area under kde) for each set of bin edges
-    z = ((bins.reshape(-1, 1) - binning_var) / bandwidth)
+    z = ((bins.reshape(-1, 1) - binning_var) / (bandwidth + 1e-6))
 
     cdf = ndtr(z)
     event_cdf = cdf
