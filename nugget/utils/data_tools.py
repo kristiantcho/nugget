@@ -33,6 +33,23 @@ def _validate_signal_events(signal_events: Sequence[Dict]) -> List[str]:
 			)
 	return keys
 
+def add_events_to_device(
+		signal_events: Sequence[Dict],
+		device: torch.device,
+		) -> List[Dict]:
+	"""Move all tensor fields in signal events to the specified device."""
+	new_events = []
+	for event in signal_events:
+		new_event = {}
+		for key, value in event.items():
+			if torch.is_tensor(value):
+				new_event[key] = value.to(device=device)
+			else:
+				new_event[key] = value
+		new_events.append(new_event)
+	return new_events	
+
+
 
 def save_signal_events_parquet(
 	signal_events: Sequence[Dict],

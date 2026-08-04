@@ -263,9 +263,11 @@ def compute_fluxless_weights(df, gen):
     cos_theta = np.cos(df['zenith'].to_numpy(dtype=float))
 
     inv_pE = _inv_p_energy(energy, gen)
-    geom, geom_kind = _geometric_weight(cos_theta, gen)
+    # geom, geom_kind = _geometric_weight(cos_theta, gen)
 
-    weights = inv_pE * np.asarray(geom) / N_gen
+    # weights = inv_pE * np.asarray(geom) / N_gen
+    weights = inv_pE * 1e6 * 4*np.pi/ N_gen
+    geom_kind = 'None'
     #weights *= _M2_TO_CM2  # m^2 -> cm^2
     return weights, geom_kind
 
@@ -451,12 +453,19 @@ def calc_fisher_matrix(mu,grad_hist,ssq,signal_idx):
     A = fim[:k,:k]
     B = fim[:k,k:]
     C = fim[k:,k:]
-    marginalized_fim = A - B @ torch.linalg.inv(C) @ B.T
+    try:
+        marginalized_fim = A - B @ torch.linalg.inv(C) @ B.T
+    except RuntimeError as e:
+        marginalized_fim = A - B @ torch.linalg.pinv(C) @ B.T
 
     return marginalized_fim
 
 def calc_cov(fim):
-    return torch.linalg.inv(fim)
+    try:
+        cov = torch.linalg.inv(fim)
+    except RuntimeError as e:
+        cov = torch.linalg.pinv(fim)
+    return cov
 
 def calc_weighted_hists(counts,weights):
     return (counts * weights).sum(dim=-1)

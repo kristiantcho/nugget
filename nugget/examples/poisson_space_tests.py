@@ -73,8 +73,8 @@ for energy in [2,3,4,5,6,7]:
         # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1 if energy < 6 else energy+2}.parquet')
         nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_{num_strings}_{event_type}_{limit_zenith+ "_" if limit_zenith is not None else ""}signal_events_e{energy}-e{energy+1}.parquet')
     # if energy < 6:
-    angular_loss_dicts[f'{energy}-{energy+1}'] = []
-    energy_loss_dicts[f'{energy}-{energy+1}'] = []
+    angular_loss_dicts[f'{energy}-{energy+1}'] = {}
+    energy_loss_dicts[f'{energy}-{energy+1}'] = {}
     # else:
     #     angular_loss_dicts[f'{energy}-{energy+2}'] = []
     #     energy_loss_dicts[f'{energy}-{energy+2}'] = []
@@ -144,8 +144,8 @@ for energy in [2,3,4,5,6,7]:
             if isinstance(energy_loss_dict[key], torch.Tensor):
                 energy_loss_dict[key] = energy_loss_dict[key].detach().cpu()
         # if energy < 6:
-        angular_loss_dicts[f'{energy}-{energy+1}'].append(ang_loss_dict)
-        energy_loss_dicts[f'{energy}-{energy+1}'].append(energy_loss_dict)
+        angular_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}'] = ang_loss_dict
+        energy_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}'] = energy_loss_dict
         # else:
             # angular_loss_dicts[f'{energy}-{energy+2}'].append(ang_loss_dict)
             # energy_loss_dicts[f'{energy}-{energy+2}'].append(energy_loss_dict)
@@ -157,11 +157,10 @@ copy_angular_loss_dicts = angular_loss_dicts.copy()
 copy_energy_loss_dicts = energy_loss_dicts.copy()
 for energy in range(2,8):
     # for angular_loss_dict in copy_angular_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
-    for angular_loss_dict in copy_angular_loss_dicts[f'{energy}-{energy+1}']:
-        del angular_loss_dict['resolution_params']
+    for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), spacing_count):
+        del copy_angular_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}']['resolution_params']
     # for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
-    for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}']:    
-        del energy_loss_dict['resolution_params']
+        del copy_energy_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}']['resolution_params']
 with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}angular_loss_dicts_energies.pkl', 'wb') as f:
     pickle.dump(copy_angular_loss_dicts, f)
 
