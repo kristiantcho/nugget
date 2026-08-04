@@ -121,6 +121,7 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
         signal_events = signal_sampler.sample_events(num_events=num_events)
     
     loss_params = {
+                'num_events': num_events,
                 'signal_sampler': signal_sampler,
                 'signal_event_params': signal_events,
                 'signal_surrogate_func': light_yield_surrogate,

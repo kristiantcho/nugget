@@ -609,7 +609,7 @@ class AnalysisLoss(LossFunction):
         pyff_config         = kwargs.get('pyff_config', None) # :str|dict
         weight_temp_path    = kwargs.get('weight_temp_path', None) # :str
         weight_pid          = kwargs.get('weight_pid', 14) # :int
-    
+        eff_kwargs = kwargs.copy()
         if signal_event_params is None:
             signal_event_params = signal_sampler.sample_events(num_events)
             weight_factor = live_time
@@ -623,7 +623,7 @@ class AnalysisLoss(LossFunction):
                 pid=weight_pid,
                 temp_path=weight_temp_path,
             )
-            kwargs['signal_event_params'] = signal_event_params
+            eff_kwargs['signal_event_params'] = signal_event_params
         else:
             # Provided events may or may not already carry weights (e.g. loaded
             # from a parquet that was run through friEnd/pyFF offline).
@@ -646,9 +646,9 @@ class AnalysisLoss(LossFunction):
                     precomputed_ly = precomputed_ly[selected_indices]
             else:
                 weight_factor = live_time
-            kwargs['signal_event_params'] = signal_event_params
-            kwargs['precomputed_fisher_info_per_string_per_event'] = precomputed_fisher
-            kwargs['precomputed_light_yield_per_point_per_event'] = precomputed_ly
+            eff_kwargs['signal_event_params'] = signal_event_params
+            eff_kwargs['precomputed_fisher_info_per_string_per_event'] = precomputed_fisher
+            eff_kwargs['precomputed_light_yield_per_point_per_event'] = precomputed_ly
 
         uncertainties = []
         # make a list of energy bin edges in logspace and zenith bin edges in linear space 
@@ -665,13 +665,13 @@ class AnalysisLoss(LossFunction):
                         resolution_type='angular',
                         fisher_info_params=['direction']
                 )
-            loss_stuff = weighted_resolution_loss(geom_dict, **kwargs)
+            loss_stuff = weighted_resolution_loss(geom_dict, **eff_kwargs)
             uncerainty = loss_stuff['resolution_per_event']
             if input_name == 'energy':
                 for i in range(len(uncerainty)):
                     uncerainty[i] =  uncerainty[i] / signal_event_params[i]['energy']
             elif input_name == 'zenith':
-                kwargs['precalculated_resolution_loss'] = loss_stuff
+                eff_kwargs['precalculated_resolution_loss'] = loss_stuff
                 for i in range(len(uncerainty)):
                     uncerainty[i] =  uncerainty[i] * torch.abs(torch.sin(signal_event_params[i]['zenith']))
             uncertainties.append(uncerainty.squeeze())
@@ -681,7 +681,7 @@ class AnalysisLoss(LossFunction):
                     resolution_type='angular',
                     fisher_info_params=self.fisher_info_params
                 )
-                selection_acceptance = selection_loss(geom_dict, **kwargs)['selection_per_event']
+                selection_acceptance = selection_loss(geom_dict, **eff_kwargs)['selection_per_event']
         
         # Acceptance = analysis selection x [trigger x transmission x interaction].
         # The bracket comes from EffectiveAreaLoss, which runs the trigger itself
@@ -703,9 +703,7 @@ class AnalysisLoss(LossFunction):
                     eff_area_cyl_radius = _as_float(signal_sampler.cylinder.radius)
                     eff_area_cyl_height = _as_float(signal_sampler.cylinder.height)
 
-            eff_kwargs = kwargs
             eff_kwargs.update({
-                'signal_event_params': signal_event_params,
                 'per_event_effective_area_loss': True,
                 'include_projected_area': False,
                 'use_batched_effective_area': True,})
@@ -717,7 +715,7 @@ class AnalysisLoss(LossFunction):
             # not be applied on top of it.
             acceptance = acceptance * eff_out['effective_area_per_event'].squeeze()
         elif trigger_loss is not None:
-            acceptance = acceptance * trigger_loss(geom_dict, **kwargs)['t_per_event'].squeeze()
+            acceptance = acceptance * trigger_loss(geom_dict, **eff_kwargs)['t_per_event'].squeeze()
         ########
         weights = []
         grad_weights = []
