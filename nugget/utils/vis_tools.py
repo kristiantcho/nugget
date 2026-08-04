@@ -5388,7 +5388,7 @@ class Visualizer:
                 angular_resolution_history = loss_dict.get('angular_resolution_loss', None)
 
             if angular_resolution_history is not None:
-                angular_resolution_history = np.array(angular_resolution_history) * 180.0  # Convert to degrees
+                angular_resolution_history = np.array(angular_resolution_history) * 180.0/np.pi  # Convert to degrees
                 # Plot the history of weighted total angular resolution
                 ax.plot(angular_resolution_history, color='blue', linewidth=2, markersize=4)
                 ax.set_title('Angular Resolution History')

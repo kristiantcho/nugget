@@ -230,10 +230,17 @@ class FoMLoss(LossFunction):
             & (resolution_per_event > 1e-12)
             & (effective_area_per_event >= 0.0)
         )
-        if include_e_term:
+        if include_e_term and effective_area_kwargs["signal_sampler"] is not None:
+            temp_sampler = effective_area_kwargs["signal_sampler"]
             energies = [event['energy'] for event in shared_events]
             energies = torch.as_tensor(energies, device=self.device)
-            norm_effective_area_per_event = effective_area_per_event*energies
+            if temp_sampler['energy_dist'] == 'log_uniform':
+                norm_effective_area_per_event = effective_area_per_event*energies
+            elif temp_sampler['gamma'] is not None:
+                norm_effective_area_per_event = effective_area_per_event*energies**temp_sampler['gamma']
+            else:
+                norm_effective_area_per_event = effective_area_per_event
+
         else:
             norm_effective_area_per_event = effective_area_per_event
         if finite_mask.any():
@@ -241,7 +248,7 @@ class FoMLoss(LossFunction):
             # safe_aeff = torch.clamp_min(effective_area_per_event[finite_mask], 0.0)
             safe_res = resolution_per_event[finite_mask]
             safe_aeff = norm_effective_area_per_event[finite_mask]
-            sum_term = torch.sum(safe_aeff / (4.0 * torch.pi * (safe_res ** 2)))
+            sum_term = torch.mean(safe_aeff / (4.0 * torch.pi * (safe_res ** 2)))
             combined_loss = 1.0 / torch.sqrt(torch.clamp_min(sum_term, 1e-20))
         else:
             combined_loss = torch.tensor(1.0, device=self.device, requires_grad=True)

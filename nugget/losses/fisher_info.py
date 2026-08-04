@@ -950,16 +950,18 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 energies = torch.stack([
                     params['energy'].to(self.device).reshape(()) for params in signal_event_params
                 ])                                                             # (N,)
-                resolution_per_event = resolution_per_event / energies
-            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
+                new_resolution_per_event = resolution_per_event / energies
+            else:
+                new_resolution_per_event = resolution_per_event
+            finite_mask = torch.isfinite(new_resolution_per_event) & (new_resolution_per_event > 1e-12)
             if finite_mask.any():
                 # nan_to_num FIRST so torch.where's backward can't leak 0*NaN = NaN
                 # (see the angular branch above for the full rationale).
-                res_clean = torch.nan_to_num(resolution_per_event, nan=1e6, posinf=1e6, neginf=1e6)
+                res_clean = torch.nan_to_num(new_resolution_per_event, nan=1e6, posinf=1e6, neginf=1e6)
                 safe_res = torch.where(
                     finite_mask,
                     torch.clamp_min(res_clean, 1e-12),
-                    torch.full_like(resolution_per_event, 1e6),
+                    torch.full_like(new_resolution_per_event, 1e6),
                 )
                 if fisher_res_metric == 'fom':
                     total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))

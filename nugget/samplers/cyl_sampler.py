@@ -675,6 +675,7 @@ class CylinderSampler(Sampler):
         """
         super().__init__(device, dim, domain_size)
         self.kwargs = kwargs
+        self.gamma = kwargs.get('gamma', 2.7)
         
         # Set up cylinder geometry
         if cylinder_center is None:
@@ -714,6 +715,8 @@ class CylinderSampler(Sampler):
         
         # Event type for energy sampling
         self.event_type = kwargs.get('event_type', 'signal')
+
+        self.energy_dist = kwargs.get('energy_dist', 'power_law')  # 'power_law' or 'log_uniform'
     
     def sample_power_law(self, E_min=0.8, E_max=1, gamma=2.7, n_samples=1):
         """
