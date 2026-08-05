@@ -148,7 +148,7 @@ class FoMLoss(LossFunction):
             k: v for k, v in signal_sampler.kwargs.items()
             if k not in self._CYLINDER_SAMPLER_RESERVED_KEYS
         }
-
+        radius += 55.4 # add 2x attenuation length
         return CylinderSampler(
             device=signal_sampler.device,
             dim=signal_sampler.dim,

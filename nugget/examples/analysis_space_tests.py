@@ -194,6 +194,7 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
         if isinstance(analysis_loss_dict[key], torch.Tensor):
             analysis_loss_dict[key] = analysis_loss_dict[key].detach().cpu()
     analysis_loss_dicts[f'{string_spacing}'] = analysis_loss_dict
+    torch.cuda.empty_cache()
 
   
 with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}analysis_loss_dicts.pkl', 'wb') as f:
