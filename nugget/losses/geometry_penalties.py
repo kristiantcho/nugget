@@ -219,7 +219,7 @@ class LocalRepulsionPenalty(LossFunction):
         radius_weight = torch.sigmoid((max_radius - dist) * sharpness)  # Sharp transition around max_radius
         # radius_mask  = (dist < max_radius) & (~self_mask)
         # radius_weight = radius_mask.int()
-        radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
+        radius_weight = radius_weight * (~self_mask).double()  # Zero out self-pairs
         # print(f"total radius weight: {torch.sum(radius_weight)}")
         repulsion_matrix = radius_weight / (dist_sq + min_dist)
         # print(f"Max repulsion value: {torch.max(repulsion_matrix)}")
@@ -326,13 +326,13 @@ class LocalStringRepulsionPenalty(LossFunction):
         h = 1.0 - dist / max_radius
         hinge = F.softplus(beta * h) / beta
         radius_weight = hinge ** 2
-        radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
+        radius_weight = radius_weight * (~self_mask).double()  # Zero out self-pairs
 
         if ignore_border:
             clamped_string_xy = torch.clamp(torch.abs(string_xy) - domain_size / 2, min=0.0) ** 2
             clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy, dim=1))
             border_mask = (clamped_string_xy < 1e-3).unsqueeze(1) | (clamped_string_xy < 1e-3).unsqueeze(0)
-            radius_weight = radius_weight * (~border_mask).float()
+            radius_weight = radius_weight * (~border_mask).double()
 
         if string_weights is not None:
             string_probs = torch.sigmoid(string_weights)
@@ -561,7 +561,7 @@ class LocalZDistRepulsionPenalty(LossFunction):
                     z_dist = torch.sqrt(z_dist_sq + 1e-10)  # Add small epsilon for numerical stability
                     self_mask = torch.eye(num_points, dtype=torch.bool, device=z_values.device)
                     radius_weight = torch.sigmoid((max_radius - z_dist) * sharpness)  # Sharp transition around max_radius
-                    radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
+                    radius_weight = radius_weight * (~self_mask).double()  # Zero out self-pairs
 
                     repulsion += torch.sum(radius_weight * (1.0 / (z_dist_sq + min_dist)))
                     total_valid_pairs += torch.sum(radius_weight > 0).item()
@@ -952,7 +952,7 @@ class ROVPenalty(LossFunction):
         if not soft_inside:
             inside_tri  = (x_rot >= 0) & (x_rot <= L_tri) & (y_rot_abs <= slope * x_rot)
             inside_rect = (x_rot >= L_tri) & (x_rot <= L_tri + L_rect) & (y_rot_abs <= half_height)
-            inside = (inside_rect | inside_tri).float()
+            inside = (inside_rect | inside_tri).double()
         else:
             k = inside_sharpness
 
@@ -970,9 +970,9 @@ class ROVPenalty(LossFunction):
             inside = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)
 
         if other_probs is not None:
-            blockage_per_angle = (inside.float() * other_probs.unsqueeze(-1)).sum(dim=1)
+            blockage_per_angle = (inside.double() * other_probs.unsqueeze(-1)).sum(dim=1)
         else:
-            blockage_per_angle = inside.float().sum(dim=1)
+            blockage_per_angle = inside.double().sum(dim=1)
 
         return blockage_per_angle
 
@@ -1516,7 +1516,7 @@ class DiversityPenalty(LossFunction):
             if value is None:
                 continue
             if not isinstance(value, torch.Tensor):
-                value = torch.as_tensor(value, device=self.device, dtype=torch.float32)
+                value = torch.as_tensor(value, device=self.device, dtype=torch.float64)
             elif value.device != self.device:
                 value = value.to(self.device)
             moved_geometry[key] = value

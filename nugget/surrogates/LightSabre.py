@@ -427,26 +427,26 @@ class LightSabre(Surrogate):
         for ep in event_params_list:
             pos = ep['position']
             if not isinstance(pos, torch.Tensor):
-                pos = torch.tensor(pos, dtype=torch.float32, device=self.device)
+                pos = torch.tensor(pos, dtype=torch.float64, device=self.device)
             positions.append(pos.to(self.device).reshape(3))
 
             energy = ep['energy']
             if not isinstance(energy, torch.Tensor):
-                energy = torch.tensor(energy, dtype=torch.float32, device=self.device)
+                energy = torch.tensor(energy, dtype=torch.float64, device=self.device)
             energies.append(energy.to(self.device).reshape(()))
 
             if 'direction' in ep:
                 d = ep['direction']
                 if not isinstance(d, torch.Tensor):
-                    d = torch.tensor(d, dtype=torch.float32, device=self.device)
+                    d = torch.tensor(d, dtype=torch.float64, device=self.device)
                 directions.append(d.to(self.device).reshape(3))
             else:
                 theta = ep['zenith']
                 phi   = ep['azimuth']
                 if not isinstance(theta, torch.Tensor):
-                    theta = torch.tensor(theta, dtype=torch.float32, device=self.device)
+                    theta = torch.tensor(theta, dtype=torch.float64, device=self.device)
                 if not isinstance(phi, torch.Tensor):
-                    phi = torch.tensor(phi, dtype=torch.float32, device=self.device)
+                    phi = torch.tensor(phi, dtype=torch.float64, device=self.device)
                 theta, phi = theta.to(self.device).squeeze(), phi.to(self.device).squeeze()
                 d = torch.stack([
                     torch.sin(theta) * torch.cos(phi),
@@ -509,7 +509,7 @@ class LightSabre(Surrogate):
         
         # Convert position to tensor and optionally enable gradients
         if not isinstance(track_pos, torch.Tensor):
-            track_pos = torch.tensor(track_pos, dtype=torch.float32, device=self.device)
+            track_pos = torch.tensor(track_pos, dtype=torch.float64, device=self.device)
         else:
             track_pos = track_pos.to(self.device)
         if gradient_mode:
@@ -517,7 +517,7 @@ class LightSabre(Surrogate):
         
         # Convert energy to tensor and optionally enable gradients
         if not isinstance(energy, torch.Tensor):
-            energy = torch.tensor(energy, dtype=torch.float32, device=self.device)
+            energy = torch.tensor(energy, dtype=torch.float64, device=self.device)
         else:
             energy = energy.to(self.device)
         if gradient_mode:
@@ -526,7 +526,7 @@ class LightSabre(Surrogate):
         # Build track direction: prefer 'direction', fall back to zenith/azimuth
         if angular_dir is not None:
             if not isinstance(angular_dir, torch.Tensor):
-                track_dir = torch.tensor(angular_dir, dtype=torch.float32, device=self.device).squeeze()
+                track_dir = torch.tensor(angular_dir, dtype=torch.float64, device=self.device).squeeze()
             else:
                 track_dir = angular_dir.to(self.device).squeeze()
             if gradient_mode:
@@ -539,11 +539,11 @@ class LightSabre(Surrogate):
                     "event_params must contain either 'direction' or both 'zenith' and 'azimuth'"
                 )
             if not isinstance(zenith, torch.Tensor):
-                theta = torch.tensor(zenith, dtype=torch.float32, device=self.device).squeeze()
+                theta = torch.tensor(zenith, dtype=torch.float64, device=self.device).squeeze()
             else:
                 theta = zenith.to(self.device).squeeze()
             if not isinstance(azimuth, torch.Tensor):
-                phi = torch.tensor(azimuth, dtype=torch.float32, device=self.device).squeeze()
+                phi = torch.tensor(azimuth, dtype=torch.float64, device=self.device).squeeze()
             else:
                 phi = azimuth.to(self.device).squeeze()
             if gradient_mode:
@@ -602,30 +602,30 @@ class LightSabrePATD(LightSabre):
         if isinstance(track_pos, torch.Tensor):
             track_pos = track_pos.to(self.device).squeeze()
         else:
-            track_pos = torch.tensor(track_pos, dtype=torch.float32, device=self.device).squeeze()
+            track_pos = torch.tensor(track_pos, dtype=torch.float64, device=self.device).squeeze()
 
         if isinstance(energy, torch.Tensor):
             energy = energy.to(self.device).squeeze()
         else:
-            energy = torch.tensor(energy, dtype=torch.float32, device=self.device).squeeze()
+            energy = torch.tensor(energy, dtype=torch.float64, device=self.device).squeeze()
 
         if angular_dir is not None:
             if isinstance(angular_dir, torch.Tensor):
                 track_dir = angular_dir.to(self.device).squeeze()
             else:
-                track_dir = torch.tensor(angular_dir, dtype=torch.float32, device=self.device).squeeze()
+                track_dir = torch.tensor(angular_dir, dtype=torch.float64, device=self.device).squeeze()
         else:
             zenith = event_params.get('zenith', None)
             azimuth = event_params.get('azimuth', None)
             if zenith is None or azimuth is None:
                 if self.particle_mode == 'cascade':
                     # Direction is irrelevant for cascade PATD geometry; keep a sane placeholder.
-                    track_dir = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
+                    track_dir = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64, device=self.device)
                 else:
                     raise ValueError("event_params must contain 'direction' or both 'zenith' and 'azimuth'")
             else:
-                theta = zenith.to(self.device).squeeze() if isinstance(zenith, torch.Tensor) else torch.tensor(zenith, dtype=torch.float32, device=self.device).squeeze()
-                phi = azimuth.to(self.device).squeeze() if isinstance(azimuth, torch.Tensor) else torch.tensor(azimuth, dtype=torch.float32, device=self.device).squeeze()
+                theta = zenith.to(self.device).squeeze() if isinstance(zenith, torch.Tensor) else torch.tensor(zenith, dtype=torch.float64, device=self.device).squeeze()
+                phi = azimuth.to(self.device).squeeze() if isinstance(azimuth, torch.Tensor) else torch.tensor(azimuth, dtype=torch.float64, device=self.device).squeeze()
                 track_dir = torch.stack([
                     torch.sin(theta) * torch.cos(phi),
                     torch.sin(theta) * torch.sin(phi),
@@ -657,12 +657,12 @@ class LightSabrePATD(LightSabre):
         if get_patd_probs:
             t_residual_probs = cpandel.pdf(t_residual_output, d=d_geom_numpy)
             if isinstance(t_residual_probs, np.ndarray):
-                t_residual_probs = torch.from_numpy(t_residual_probs).float().to(self.device)
+                t_residual_probs = torch.from_numpy(t_residual_probs).double().to(self.device)
 
         if isinstance(t_residual_output, torch.Tensor):
-            t_residual = t_residual_output.float().to(self.device)
+            t_residual = t_residual_output.double().to(self.device)
         else:
-            t_residual = torch.from_numpy(t_residual_output).float().to(self.device)
+            t_residual = torch.from_numpy(t_residual_output).double().to(self.device)
 
         hit_times = t_geom_i + t_residual
         if cascade_mode:
@@ -766,11 +766,11 @@ class LightSabrePATD(LightSabre):
         if event_params is None or opt_point is None:
             raise ValueError("event_params and opt_point must be provided")
 
-        # Normalise opt_point to a float32 device tensor
+        # Normalise opt_point to a float64 device tensor
         if not isinstance(opt_point, torch.Tensor):
-            opt_point = torch.tensor(opt_point, dtype=torch.float32, device=self.device)
+            opt_point = torch.tensor(opt_point, dtype=torch.float64, device=self.device)
         else:
-            opt_point = opt_point.to(self.device).float()
+            opt_point = opt_point.to(self.device).double()
 
         # Strip already-extracted keys so they aren't double-passed as kwargs
         rest = {k: v for k, v in kwargs.items() if k not in ('opt_point', 'event_params')}
@@ -1070,12 +1070,12 @@ class LightSabrePATD(LightSabre):
         track_pos, track_dir, _ = self._parse_event_params(event_params)
 
         if not isinstance(opt_point, torch.Tensor):
-            opt_point = torch.tensor(opt_point, dtype=torch.float32, device=self.device)
-        opt_point = opt_point.float().to(self.device)
+            opt_point = torch.tensor(opt_point, dtype=torch.float64, device=self.device)
+        opt_point = opt_point.double().to(self.device)
 
         if not isinstance(t_residuals_fixed, torch.Tensor):
-            t_residuals_fixed = torch.tensor(t_residuals_fixed, dtype=torch.float32, device=self.device)
-        t_residuals_fixed = t_residuals_fixed.float().to(self.device)
+            t_residuals_fixed = torch.tensor(t_residuals_fixed, dtype=torch.float64, device=self.device)
+        t_residuals_fixed = t_residuals_fixed.double().to(self.device)
 
         to_detector = opt_point - track_pos
         if self.particle_mode == 'cascade':

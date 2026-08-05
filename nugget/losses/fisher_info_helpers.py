@@ -8,7 +8,7 @@ from torch.func import jacrev, jacfwd, vmap, linearize
 from torch.func import jvp as func_jvp
 
 
-def _pos_norm_divisor_from_domain_size(domain_size, *, device, dtype=torch.float32):
+def _pos_norm_divisor_from_domain_size(domain_size, *, device, dtype=torch.float64):
     """Match LLRnet's norm_pos scaling.
 
     - Scalar domain_size: divide all coordinates by (domain_size/2).
@@ -210,7 +210,7 @@ def _sample_detector_responses_batched(
       responses_processed: (L, B) after noise + optional log scaling
       light_yields_true:   (L, B) pre-noise (used for masking)
     """
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
     B = pts_3.shape[0]
     responses_list = []
     ly_list = []
@@ -218,10 +218,10 @@ def _sample_detector_responses_batched(
         for _ in range(llr_iterations):
             resp = surrogate_func(opt_point=pts_3, event_params=params_for_sampling)
             if isinstance(resp, np.ndarray):
-                resp = torch.tensor(resp, device=device, dtype=torch.float32)
+                resp = torch.tensor(resp, device=device, dtype=torch.float64)
             elif not isinstance(resp, torch.Tensor):
-                resp = torch.tensor(resp, device=device, dtype=torch.float32)
-            resp = resp.float().to(device).reshape(-1)
+                resp = torch.tensor(resp, device=device, dtype=torch.float64)
+            resp = resp.double().to(device).reshape(-1)
             if resp.numel() != B:
                 if resp.numel() == 1:
                     resp = resp.expand(B)
@@ -266,7 +266,7 @@ def _build_features_from_cached_responses(
         fixed_params=fixed_params,
     )
 
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
     if pts_3.dim() == 1:
         pts_3 = pts_3.unsqueeze(0)
     B = pts_3.shape[0]
@@ -285,10 +285,10 @@ def _build_features_from_cached_responses(
     if bool(getattr(llr_net, 'add_relative_pos', False)) and ('position' in params):
         event_pos = params['position']
         if isinstance(event_pos, np.ndarray):
-            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float64)
         elif not isinstance(event_pos, torch.Tensor):
-            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
-        event_pos = event_pos.float().to(device)
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float64)
+        event_pos = event_pos.double().to(device)
         if event_pos.dim() == 1:
             event_pos = event_pos.unsqueeze(0)
         relative_pos = pts_3 - event_pos
@@ -297,19 +297,19 @@ def _build_features_from_cached_responses(
     if bool(getattr(llr_net, 'add_distance_from_beam', False)) and ("direction" in params) and ("position" in params):
         track_dir = params["direction"]
         if isinstance(track_dir, np.ndarray):
-            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float32)
+            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float64)
         elif not isinstance(track_dir, torch.Tensor):
-            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float32)
-        track_dir = track_dir.float().to(device)
+            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float64)
+        track_dir = track_dir.double().to(device)
         if track_dir.dim() == 1:
             track_dir = track_dir.unsqueeze(0)
 
         event_pos = params["position"]
         if isinstance(event_pos, np.ndarray):
-            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float64)
         elif not isinstance(event_pos, torch.Tensor):
-            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
-        event_pos = event_pos.float().to(device)
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float64)
+        event_pos = event_pos.double().to(device)
         if event_pos.dim() == 1:
             event_pos = event_pos.unsqueeze(0)
 
@@ -322,10 +322,10 @@ def _build_features_from_cached_responses(
             continue
         feature = params[key]
         if isinstance(feature, np.ndarray):
-            feature = torch.tensor(feature, device=device, dtype=torch.float32)
+            feature = torch.tensor(feature, device=device, dtype=torch.float64)
         elif not isinstance(feature, torch.Tensor):
-            feature = torch.tensor(feature, device=device, dtype=torch.float32)
-        feature = feature.float().to(device)
+            feature = torch.tensor(feature, device=device, dtype=torch.float64)
+        feature = feature.double().to(device)
         if bool(getattr(llr_net, 'log_scale_energy', False)) and key == 'energy':
             feature = torch.log10(feature + 1e-10)
         if bool(getattr(llr_net, 'norm_pos', False)) and key == 'position':
@@ -378,7 +378,7 @@ def _sample_rich_observations(
         for iteration l, point b. For charge: a scalar tensor. For PATD: a dict.
     cached_ly_true : (L, B) float tensor of light yields for masking.
     """
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
     B = pts_3.shape[0]
     is_patd = bool(getattr(llr_net, 'use_patd', False))
 
@@ -402,14 +402,14 @@ def _sample_rich_observations(
                                if isinstance(r.get('num_photons', 0), torch.Tensor)
                                else r.get('num_photons', 0))
                          for r in obs_row],
-                        dtype=torch.float32, device=device,
+                        dtype=torch.float64, device=device,
                     )
                 else:
                     if isinstance(batch_raw, dict):
                         batch_raw = batch_raw.get('light_yield', next(iter(batch_raw.values())))
                     if not isinstance(batch_raw, torch.Tensor):
                         raise TypeError
-                    batch_raw = batch_raw.detach().float().reshape(-1)
+                    batch_raw = batch_raw.detach().double().reshape(-1)
                     if batch_raw.numel() != B:
                         raise ValueError
                     obs_row = batch_raw          # keep as tensor, no per-element Python loop
@@ -426,12 +426,12 @@ def _sample_rich_observations(
                         if isinstance(raw, dict):
                             raw = raw.get('light_yield', next(iter(raw.values())))
                         if isinstance(raw, torch.Tensor):
-                            raw = raw.detach().float()
+                            raw = raw.detach().double()
                         else:
-                            raw = torch.tensor(float(raw), dtype=torch.float32, device=device)
+                            raw = torch.tensor(float(raw), dtype=torch.float64, device=device)
                         ly_vals.append(float(raw.item()))
                     obs_row.append(raw)
-                ly_row_t = torch.tensor(ly_vals, dtype=torch.float32, device=device)
+                ly_row_t = torch.tensor(ly_vals, dtype=torch.float64, device=device)
 
             cached_obs.append(obs_row)
             ly_tensor_rows.append(ly_row_t)
@@ -472,7 +472,7 @@ def _build_rich_features_from_cached_obs(
         fixed_params=fixed_params,
     )
 
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
     if pts_3.dim() == 1:
         pts_3 = pts_3.unsqueeze(0)
     B = pts_3.shape[0]
@@ -486,23 +486,23 @@ def _build_rich_features_from_cached_obs(
     if vert is None:
         raise KeyError("'position' not found in params for rich feature builder")
     if isinstance(vert, np.ndarray):
-        vert = torch.tensor(vert, device=device, dtype=torch.float32)
-    vert = vert.float().to(device).reshape(1, 3) / norm  # (1, 3)
+        vert = torch.tensor(vert, device=device, dtype=torch.float64)
+    vert = vert.double().to(device).reshape(1, 3) / norm  # (1, 3)
 
     direction = params.get('direction')
     if direction is None:
         raise KeyError("'direction' not found in params for rich feature builder")
     if isinstance(direction, np.ndarray):
-        direction = torch.tensor(direction, device=device, dtype=torch.float32)
-    direction = direction.float().to(device).reshape(1, 3)  # (1, 3)
+        direction = torch.tensor(direction, device=device, dtype=torch.float64)
+    direction = direction.double().to(device).reshape(1, 3)  # (1, 3)
     dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)  # (1, 1)
 
     energy = params.get('energy')
     if energy is None:
         raise KeyError("'energy' not found in params for rich feature builder")
     if isinstance(energy, np.ndarray):
-        energy = torch.tensor(energy, device=device, dtype=torch.float32)
-    log_energy = torch.log10(energy.float().to(device).squeeze() + 1e-10) / 8.0  # scalar
+        energy = torch.tensor(energy, device=device, dtype=torch.float64)
+    log_energy = torch.log10(energy.double().to(device).squeeze() + 1e-10) / 8.0  # scalar
 
     # Batched geometry over B points — one operation, not B scalar calls
     det = pts_3 / norm                                      # (B, 3)
@@ -537,9 +537,9 @@ def _build_rich_features_from_cached_obs(
             for b in range(B):
                 ly_raw = cached_obs[l][b]
                 if isinstance(ly_raw, torch.Tensor):
-                    val = ly_raw.float().to(device).squeeze()
+                    val = ly_raw.double().to(device).squeeze()
                 else:
-                    val = torch.tensor(float(ly_raw), dtype=torch.float32, device=device)
+                    val = torch.tensor(float(ly_raw), dtype=torch.float64, device=device)
                 obs_b.append(torch.log10(torch.abs(val) + 1e-10) / 4.0)
             obs_rows.append(torch.stack(obs_b))          # (B,)
         log_ly = torch.stack(obs_rows).unsqueeze(-1)     # (L, B, 1) — detached constants
@@ -555,14 +555,14 @@ def _build_rich_features_from_cached_obs(
         for l in range(L):
             for b in range(B):
                 raw = cached_obs[l][b]
-                hit_times = raw['hit_times'].float().to(device)
+                hit_times = raw['hit_times'].double().to(device)
                 if bool(getattr(llr_net, 'rel_time', False)):
                     t_geom_min = raw.get('t_geom_min', None)
                     if t_geom_min is not None:
                         if not isinstance(t_geom_min, torch.Tensor):
                             t_geom_min = torch.tensor(t_geom_min, device=device, dtype=hit_times.dtype)
                         else:
-                            t_geom_min = t_geom_min.float().to(device)
+                            t_geom_min = t_geom_min.double().to(device)
                         hit_times = hit_times - t_geom_min
                 t_scaled = torch.where(
                     hit_times < 0,
@@ -664,7 +664,7 @@ def _fisher_points_all_iters_jvp(
         B = pts_3.shape[0]
         L = llr_iterations
         norm_const = llr_net._pos_norm_divisor()
-        det_const = (pts_3.float().to(device) / norm_const).detach()
+        det_const = (pts_3.double().to(device) / norm_const).detach()
 
         # cached_ly_true is already (L, B) — use it directly, no Python loop needed.
         log_ly_const = (torch.log10(cached_ly_true.abs() + 1e-10) / 4.0).unsqueeze(-1).detach()  # (L, B, 1)
@@ -677,10 +677,10 @@ def _fisher_points_all_iters_jvp(
                 theta_numels=theta_numels,
                 fixed_params=fixed_params,
             )
-            vert = params['position'].float().to(device).reshape(1, 3) / norm_const
-            direction = params['direction'].float().to(device).reshape(1, 3)
+            vert = params['position'].double().to(device).reshape(1, 3) / norm_const
+            direction = params['direction'].double().to(device).reshape(1, 3)
             dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
-            energy = params['energy'].float().to(device).squeeze()
+            energy = params['energy'].double().to(device).squeeze()
             log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
 
             rel = det_const - vert
@@ -811,7 +811,7 @@ def _fisher_points_patd_quadrature(
     uninformative, but not exactly zero (so downstream inverses stay well-posed).
     """
     B = pts_3.shape[0]
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
 
     if llr_net is None and eval_patd_log_probs is None:
         raise ValueError(
@@ -848,7 +848,7 @@ def _fisher_points_patd_quadrature(
                 for b, r in enumerate(raw_batch):
                     if isinstance(r, dict):
                         tgm = r.get('t_geom_min', torch.tensor(0.0))
-                        tgm = tgm.float().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
+                        tgm = tgm.double().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
                         t_geom_min_per_pt[b] = tgm
                         n = r.get('expected_photons', r.get('num_photons', 0))
                         lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
@@ -859,7 +859,7 @@ def _fisher_points_patd_quadrature(
                 raise TypeError  # dict means single-point; fall through to loop
             elif isinstance(raw_batch, torch.Tensor):
                 # scalar surrogate: no t_geom_min available, default to 0
-                lambda_per_pt = raw_batch.detach().float().reshape(-1)[:B]
+                lambda_per_pt = raw_batch.detach().double().reshape(-1)[:B]
             else:
                 raise TypeError
         except Exception:
@@ -867,7 +867,7 @@ def _fisher_points_patd_quadrature(
                 r = surrogate_func(opt_point=pts_3[b], event_params=params0)
                 if isinstance(r, dict):
                     tgm = r.get('t_geom_min', torch.tensor(0.0))
-                    tgm = tgm.float().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
+                    tgm = tgm.double().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
                     t_geom_min_per_pt[b] = tgm
                     n = r.get('expected_photons', r.get('num_photons', 0))
                     lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
@@ -971,10 +971,10 @@ def _fisher_points_patd_quadrature(
                     theta_numels=theta_numels,
                     fixed_params=fixed_params,
                 )
-                vert = params['position'].float().to(device).reshape(1, 3) / norm_const
-                direction = params['direction'].float().to(device).reshape(1, 3)
+                vert = params['position'].double().to(device).reshape(1, 3) / norm_const
+                direction = params['direction'].double().to(device).reshape(1, 3)
                 dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
-                energy = params['energy'].float().to(device).squeeze()
+                energy = params['energy'].double().to(device).squeeze()
                 log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
 
                 rel = det_s - vert
@@ -1294,7 +1294,7 @@ def _fisher_points_charge_quadrature(
         )
 
     B = pts_3.shape[0]
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
 
     norm_const = llr_net._pos_norm_divisor()
     det_const = (pts_3 / norm_const).detach()  # (B, 3)
@@ -1315,10 +1315,10 @@ def _fisher_points_charge_quadrature(
             theta_numels=theta_numels,
             fixed_params=fixed_params,
         )
-        vert = params['position'].float().to(device).reshape(1, 3) / norm_const
-        direction = params['direction'].float().to(device).reshape(1, 3)
+        vert = params['position'].double().to(device).reshape(1, 3) / norm_const
+        direction = params['direction'].double().to(device).reshape(1, 3)
         dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
-        energy = params['energy'].float().to(device).squeeze()
+        energy = params['energy'].double().to(device).squeeze()
         log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(Bc, 1)
 
         rel = det_const - vert
@@ -1374,7 +1374,7 @@ def _fisher_points_charge_quadrature(
             try:
                 raw = surrogate_func(opt_point=pts_3, event_params=params0)
                 if isinstance(raw, torch.Tensor):
-                    lambda_per_pt = raw.detach().float().reshape(-1)[:B]
+                    lambda_per_pt = raw.detach().double().reshape(-1)[:B]
                 elif isinstance(raw, (list, tuple)) and len(raw) == B:
                     for b, r in enumerate(raw):
                         if isinstance(r, dict):
@@ -2085,14 +2085,14 @@ def compute_fisher_info_poisson_batched_events(
         if 'direction' in ep and ep['direction'] is not None:
             d = ep['direction']
             if not isinstance(d, torch.Tensor):
-                d = torch.tensor(d, dtype=torch.float32, device=device)
+                d = torch.tensor(d, dtype=torch.float64, device=device)
             return d.to(device).reshape(3)
         theta = ep['zenith']
         phi = ep['azimuth']
         if not isinstance(theta, torch.Tensor):
-            theta = torch.tensor(theta, dtype=torch.float32, device=device)
+            theta = torch.tensor(theta, dtype=torch.float64, device=device)
         if not isinstance(phi, torch.Tensor):
-            phi = torch.tensor(phi, dtype=torch.float32, device=device)
+            phi = torch.tensor(phi, dtype=torch.float64, device=device)
         theta = theta.to(device).squeeze()
         phi = phi.to(device).squeeze()
         return torch.stack([
@@ -2104,13 +2104,13 @@ def compute_fisher_info_poisson_batched_events(
     def _event_scalar(ep, key):
         v = ep[key]
         if not isinstance(v, torch.Tensor):
-            v = torch.tensor(v, dtype=torch.float32, device=device)
+            v = torch.tensor(v, dtype=torch.float64, device=device)
         return v.to(device).reshape(())
 
     def _event_pos(ep):
         pos = ep['position']
         if not isinstance(pos, torch.Tensor):
-            pos = torch.tensor(pos, dtype=torch.float32, device=device)
+            pos = torch.tensor(pos, dtype=torch.float64, device=device)
         return pos.to(device).reshape(3)
 
     # Per-parameter layout in the flat θ vector (order follows fisher_info_params).
@@ -2236,7 +2236,7 @@ def compute_fisher_info_poisson_batched_events(
                                      # batch of strings, not one per string
     # -1 sentinel for points that match no string (should not normally occur)
     point_to_string = torch.where(
-        matches.any(dim=0), matches.float().argmax(dim=0), torch.full((n_points,), -1, device=device)
+        matches.any(dim=0), matches.double().argmax(dim=0), torch.full((n_points,), -1, device=device)
     ).long()  # (n_points,)
 
     if detach_fisher_tensors:
@@ -2504,12 +2504,12 @@ def compute_fisher_info_single_averaged(
         all_params_detached = {k: v.detach().to(device) for k, v in event_params.items()}
 
         t_residuals_per_pt = [[] for _ in range(n_points)]
-        charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+        charge_sums = torch.zeros(n_points, dtype=torch.float64, device=device)
 
         with torch.no_grad():
             # Charge: llr_iterations calls
             # First, check if expected_photons is already in surrogate results
-            charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+            charge_sums = torch.zeros(n_points, dtype=torch.float64, device=device)
             use_expected_photons = False
             
             # Do a single initial call to check for expected_photons
@@ -2529,12 +2529,12 @@ def compute_fisher_info_single_averaged(
                             all_have_expected = False
                     use_expected_photons = all_have_expected
                 elif isinstance(results, torch.Tensor):
-                    charge_sums = results.detach().float().reshape(-1)[:n_points]
+                    charge_sums = results.detach().double().reshape(-1)[:n_points]
                     use_expected_photons = False
             
             # If expected_photons is not available, accumulate over iterations
             if not use_expected_photons:
-                charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+                charge_sums = torch.zeros(n_points, dtype=torch.float64, device=device)
                 for iter_idx in range(llr_iterations):
                     if n_points == 1:
                         res = surrogate_func(opt_point=point[0], event_params=all_params_detached)
@@ -2551,7 +2551,7 @@ def compute_fisher_info_single_averaged(
                                 else:
                                     charge_sums[_i] += float(res)
                         elif isinstance(results, torch.Tensor):
-                            charge_sums += results.detach().float().reshape(-1)[:n_points]
+                            charge_sums += results.detach().double().reshape(-1)[:n_points]
                 mean_charges = charge_sums / max(llr_iterations, 1)
             else:
                 mean_charges = charge_sums  # Use pre-computed expected_photons directly
@@ -2588,7 +2588,7 @@ def compute_fisher_info_single_averaged(
             if _parts:
                 _all_rt = torch.cat(_parts, dim=0)[:llr_iterations]
             else:
-                _all_rt = torch.tensor([], dtype=torch.float32)
+                _all_rt = torch.tensor([], dtype=torch.float64)
             t_residuals_compiled.append(_all_rt.to(device))
 
         # Grad phase: per-detector Fisher via jacrev (only mode supported for PATD)
@@ -2660,7 +2660,7 @@ def compute_fisher_info_single_averaged(
             p_end = min(p_start + pt_chunk_patd, n_points)
             pts_chunk = point[p_start:p_end]
             t_res_chunk = t_residuals_compiled[p_start:p_end]
-            n_hits_chunk = torch.tensor([int(t.numel()) for t in t_res_chunk], device=device, dtype=torch.float32)
+            n_hits_chunk = torch.tensor([int(t.numel()) for t in t_res_chunk], device=device, dtype=torch.float64)
             
             # Process chunk
             fishers_chunk = _process_point_chunk(pts_chunk, t_res_chunk, n_hits_chunk)

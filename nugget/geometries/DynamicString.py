@@ -37,10 +37,10 @@ class DynamicString(Geometry):
 
     def _make_z_segment(self, n_points):
         if n_points <= 0:
-            return torch.tensor([], device=self.device, dtype=torch.float32)
+            return torch.tensor([], device=self.device, dtype=torch.float64)
         if self.custom_z_spacing is not None:
             return self.custom_z_spacing * (
-                torch.arange(n_points, device=self.device, dtype=torch.float32)
+                torch.arange(n_points, device=self.device, dtype=torch.float64)
                 - (n_points - 1) / 2.0
             )
         return torch.linspace(-self.half_domain, self.half_domain, n_points, device=self.device)
@@ -78,7 +78,7 @@ class DynamicString(Geometry):
             if 'string_weights' in initial_geometry:
                 string_weights = initial_geometry['string_weights']
                 if not isinstance(string_weights, torch.Tensor):
-                    string_weights = torch.tensor(string_weights, device=self.device, dtype=torch.float32)
+                    string_weights = torch.tensor(string_weights, device=self.device, dtype=torch.float64)
                 elif string_weights.device != self.device:
                     string_weights = string_weights.to(self.device)
                 
@@ -92,7 +92,7 @@ class DynamicString(Geometry):
             if 'string_xy' in initial_geometry:
                 string_xy = initial_geometry['string_xy']
                 if not isinstance(string_xy, torch.Tensor):
-                    string_xy = torch.tensor(string_xy, device=self.device, dtype=torch.float32)
+                    string_xy = torch.tensor(string_xy, device=self.device, dtype=torch.float64)
                 elif string_xy.device != self.device:
                     string_xy = string_xy.to(self.device)
                 
@@ -119,7 +119,7 @@ class DynamicString(Geometry):
             if 'z_values' in initial_geometry:
                 z_values = initial_geometry['z_values']
                 if not isinstance(z_values, torch.Tensor):
-                    z_values = torch.tensor(z_values, device=self.device, dtype=torch.float32)
+                    z_values = torch.tensor(z_values, device=self.device, dtype=torch.float64)
                 elif z_values.device != self.device:
                     z_values = z_values.to(self.device)
                 
@@ -166,7 +166,7 @@ class DynamicString(Geometry):
                 # Extract z-values from points if available
                 points = initial_geometry['points_3d']
                 if not isinstance(points, torch.Tensor):
-                    points = torch.tensor(points, device=self.device, dtype=torch.float32)
+                    points = torch.tensor(points, device=self.device, dtype=torch.float64)
                 elif points.device != self.device:
                     points = points.to(self.device)
                 
@@ -351,7 +351,7 @@ class DynamicString(Geometry):
             if 'points_3d' in initial_geometry:
                 points = initial_geometry['points_3d']
                 if not isinstance(points, torch.Tensor):
-                    points = torch.tensor(points, device=self.device, dtype=torch.float32)
+                    points = torch.tensor(points, device=self.device, dtype=torch.float64)
                 elif points.device != self.device:
                     points = points.to(self.device)
                 
@@ -420,7 +420,7 @@ class DynamicString(Geometry):
                 string_indices_final.extend([s] * n_pts)
                 current_idx += n_pts
         z_values_final = torch.cat(_z_values_list) if _z_values_list else torch.tensor([], device=self.device)
-        points_per_string_list_final = torch.tensor(points_per_string_counts, dtype=torch.float32, device=self.device)
+        points_per_string_list_final = torch.tensor(points_per_string_counts, dtype=torch.float64, device=self.device)
 
         # Ensure points_3d is correctly filled if total_points was not perfectly met by allocation
         # This is more relevant for hard allocation if current_idx < self.total_points

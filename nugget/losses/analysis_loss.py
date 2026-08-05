@@ -87,7 +87,12 @@ def from_pandas_jax(df, sep=SEP):
         for k, arr in full.items():
             val = arr[row]  # flat (D,)
             target_shape = shapes.get(k, val.shape)  # fall back to flat shape if unknown (new key)
-            d[k] = torch.as_tensor(val).reshape(target_shape)
+            # Explicit dtype: parquet/pandas round trips can hand back whatever
+            # dtype was on disk (pyForwardFolding writes float64 via
+            # jax_enable_x64), which must not silently override the float64
+            # convention the rest of the pipeline (geometry, sampler, Fisher
+            # info) enforces.
+            d[k] = torch.as_tensor(val, dtype=torch.float64).reshape(target_shape)
         data_list.append(d)
     return data_list
 

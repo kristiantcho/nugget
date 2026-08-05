@@ -69,7 +69,7 @@ class EvanescentString(Geometry):
         active_weights_mode = kwargs.get('active_weights_mode', self.active_weights_mode)
         threshold = kwargs.get('weight_threshold', 0.7)
 
-        def _as_tensor(value, *, dtype=torch.float32):
+        def _as_tensor(value, *, dtype=torch.float64):
             if isinstance(value, torch.Tensor):
                 return value.to(device=self.device, dtype=dtype)
             return torch.tensor(value, device=self.device, dtype=dtype)
@@ -80,7 +80,7 @@ class EvanescentString(Geometry):
         def _default_z_values(n_strings: int) -> torch.Tensor:
             if self.custom_z_spacing is not None:
                 z_line = self.custom_z_spacing * (
-                    torch.arange(self.points_per_string, device=self.device, dtype=torch.float32)
+                    torch.arange(self.points_per_string, device=self.device, dtype=torch.float64)
                     - (self.points_per_string - 1) / 2.0
                 )
             else:
@@ -94,8 +94,8 @@ class EvanescentString(Geometry):
 
         def _default_raw_weights(n_strings: int) -> torch.Tensor:
             if not self.random_weights:
-                return torch.ones(n_strings, device=self.device, dtype=torch.float32) * self.starting_weight
-            return torch.rand(n_strings, device=self.device, dtype=torch.float32) * 8 - 4
+                return torch.ones(n_strings, device=self.device, dtype=torch.float64) * self.starting_weight
+            return torch.rand(n_strings, device=self.device, dtype=torch.float64) * 8 - 4
 
         if initial_geometry is not None:
             print("Using pre-trained evanescent string geometry as starting point")
@@ -133,7 +133,7 @@ class EvanescentString(Geometry):
 
             if active_weights_mode:
                 old_string_weights = raw_weights
-                string_weights = 2000 * (torch.sigmoid(old_string_weights) > threshold).to(dtype=torch.float32) - 1000
+                string_weights = 2000 * (torch.sigmoid(old_string_weights) > threshold).to(dtype=torch.float64) - 1000
             else:
                 string_weights = raw_weights
                 old_string_weights = raw_weights
@@ -143,7 +143,7 @@ class EvanescentString(Geometry):
             raw_weights = _default_raw_weights(self.n_strings)
             if active_weights_mode:
                 old_string_weights = raw_weights
-                string_weights = 2000 * (torch.sigmoid(old_string_weights) > threshold).to(dtype=torch.float32) - 1000
+                string_weights = 2000 * (torch.sigmoid(old_string_weights) > threshold).to(dtype=torch.float64) - 1000
             else:
                 string_weights = raw_weights
                 old_string_weights = raw_weights
@@ -208,7 +208,7 @@ class EvanescentString(Geometry):
         
 
         if active_weights_mode:
-            string_weights_to_return = 200*(torch.sigmoid(weights_for_thresholding) > threshold).to(dtype=torch.float32) - 100
+            string_weights_to_return = 200*(torch.sigmoid(weights_for_thresholding) > threshold).to(dtype=torch.float64) - 100
             old_string_weights_to_return = old_string_weights
         else:
             string_weights_to_return = old_string_weights
@@ -219,7 +219,7 @@ class EvanescentString(Geometry):
         
         # if n_active_strings == 0:
         #     # If no strings are active, return empty tensors
-        #     empty_points = torch.zeros(0, 3, device=self.device, dtype=torch.float32)
+        #     empty_points = torch.zeros(0, 3, device=self.device, dtype=torch.float64)
            
             
         #     return {

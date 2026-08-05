@@ -67,11 +67,11 @@ def hyp1f1(a, b, z):
     """
     # Convert inputs to tensors if needed
     if not isinstance(a, torch.Tensor):
-        a = torch.as_tensor(a, dtype=torch.float32)
+        a = torch.as_tensor(a, dtype=torch.float64)
     if not isinstance(b, torch.Tensor):
-        b = torch.as_tensor(b, dtype=torch.float32)
+        b = torch.as_tensor(b, dtype=torch.float64)
     if not isinstance(z, torch.Tensor):
-        z = torch.as_tensor(z, dtype=torch.float32)
+        z = torch.as_tensor(z, dtype=torch.float64)
     
     return Hyp1f1Function.apply(a, b, z)
 
@@ -232,8 +232,8 @@ class CPandel():
     # ------------------------------------------------------------------
 
     def pdf(self, t, d):
-        t = torch.as_tensor(t, dtype=torch.float32)
-        d = torch.as_tensor(d, dtype=torch.float32)
+        t = torch.as_tensor(t, dtype=torch.float64)
+        d = torch.as_tensor(d, dtype=torch.float64)
 
         xi = d / self.lambda_s
         eta = self.rho * self.s - t / self.s

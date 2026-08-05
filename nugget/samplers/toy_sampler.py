@@ -117,6 +117,6 @@ class ToySampler(Sampler):
         Returns:
             torch.Tensor: Sampled points within the detector volume.
         """
-        return torch.rand((num_points, self.dim), device=self.device, dtype=torch.float32) * self.domain_size - self.domain_size/2
+        return torch.rand((num_points, self.dim), device=self.device, dtype=torch.float64) * self.domain_size - self.domain_size/2
         
         

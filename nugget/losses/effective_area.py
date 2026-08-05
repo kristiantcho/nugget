@@ -36,7 +36,7 @@ def average_chord_length(cos_theta, cyl_radius, cyl_height):
     """Calculate average chord length of cylinder for a given direction"""
     # Convert to torch tensor if not already, preserve gradient
     if not isinstance(cos_theta, torch.Tensor):
-        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float32)
+        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float64)
     
     # Ensure it's at least 1D for indexing
     is_scalar = cos_theta.dim() == 0
@@ -71,7 +71,7 @@ def projected_area(cos_theta, cyl_radius, cyl_height):
     """Calculate projected area of cylinder for a given direction"""
     # Ensure cos_theta is a torch tensor
     if not isinstance(cos_theta, torch.Tensor):
-        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float32)
+        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float64)
 
     cap = np.pi*cyl_radius**2
     sides = 2*cyl_radius*cyl_height
@@ -241,7 +241,7 @@ def neutrino_effective_area(
         if isinstance(cos_theta, torch.Tensor):
             tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
         else:
-            tprob = torch.as_tensor(tprob, dtype=torch.float32)
+            tprob = torch.as_tensor(tprob, dtype=torch.float64)
 
     if average_nu_nubar:
         factor = 0.5

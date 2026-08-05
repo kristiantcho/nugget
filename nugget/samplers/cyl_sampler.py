@@ -773,7 +773,9 @@ class CylinderSampler(Sampler):
         """
         Adjusted to mirror ToySampler output:
         Keys: energy (1,), zenith (1,), azimuth (1,), position (1,3)
-        Dtypes: float32 except background zenith (float64) to match ToySampler's current behavior.
+        Dtypes: float64 throughout (nugget.__init__ sets float64 as the torch
+        default dtype; the Fisher-information matrix inversions and effective-area
+        calculations downstream are numerically fragile in float32).
         """
         E_min = self.kwargs.get('E_min', 0.8)
         E_max = self.kwargs.get('E_max', 1.0)
@@ -793,7 +795,7 @@ class CylinderSampler(Sampler):
             else:
                 energies = self.sample_power_law(E_min=E_min, E_max=E_max, gamma=gamma, n_samples=num_events)
         else:
-            energies = torch.full((num_events,), E_min, device=self.device)
+            energies = torch.full((num_events,), E_min, device=self.device, dtype=torch.float64)
         # Reuse existing geometric sampler for positions (discard directions afterward)
         cos_range = self.kwargs.get('cos_range', torch.tensor([-1.0, 1.0]))
         seed = self.kwargs.get('seed', None)
@@ -814,8 +816,8 @@ class CylinderSampler(Sampler):
             box_intersection=self.box_intersection,
         )
 
-        # Build bias tensor (float32)
-        # bias = torch.tensor([x_bias, y_bias, z_bias], device=self.device, dtype=torch.float32) * 1.0
+        # Build bias tensor (float64)
+        # bias = torch.tensor([x_bias, y_bias, z_bias], device=self.device, dtype=torch.float64) * 1.0
 
         # Override directions if point_towards_center is enabled
         if self.point_towards_center:
@@ -835,18 +837,18 @@ class CylinderSampler(Sampler):
 
             # Match ToySampler dtype behavior:
             
-            zenith_tensor = torch.tensor([theta.item()], device=self.device, dtype=torch.float32)
+            zenith_tensor = torch.tensor([theta.item()], device=self.device, dtype=torch.float64)
 
-            azimuth_tensor = torch.tensor([phi.item()], device=self.device, dtype=torch.float32)
+            azimuth_tensor = torch.tensor([phi.item()], device=self.device, dtype=torch.float64)
 
-            pos = positions[i].unsqueeze(0).to(torch.float32)  # (1,3) float32
+            pos = positions[i].unsqueeze(0).to(torch.float64)  # (1,3) float64
 
             event_params = {
-                'energy': energies[i:i+1],          # (1,) float32
-                'zenith': zenith_tensor,             # (1,) float32 or float64 (background)
-                'azimuth': azimuth_tensor,           # (1,) float32
-                'position': pos,                     # (1,3) float32
-                'direction': directions[i].to(torch.float32)  # (1,3) float32
+                'energy': energies[i:i+1],          # (1,) float64
+                'zenith': zenith_tensor,             # (1,) float64
+                'azimuth': azimuth_tensor,           # (1,) float64
+                'position': pos,                     # (1,3) float64
+                'direction': directions[i].to(torch.float64)  # (1,3) float64
                 # 'direction' removed to match ToySampler
             }
             event_params_list.append(event_params)
@@ -913,7 +915,7 @@ class CylinderSampler(Sampler):
                 )
             dirs = df[['pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z']].to_numpy()
             self._pmt_direction_cache[geometry_csv_path] = torch.tensor(
-                dirs, device=self.device, dtype=torch.float32
+                dirs, device=self.device, dtype=torch.float64
             )
         return self._pmt_direction_cache[geometry_csv_path]
 

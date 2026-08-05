@@ -63,7 +63,7 @@ class SpaceString(Geometry):
             if 'string_xy' in initial_geometry:
                 string_xy = initial_geometry['string_xy']
                 if not isinstance(string_xy, torch.Tensor):
-                    string_xy = torch.tensor(string_xy, device=self.device, dtype=torch.float32)
+                    string_xy = torch.tensor(string_xy, device=self.device, dtype=torch.float64)
                 elif string_xy.device != self.device:
                     string_xy = string_xy.to(self.device)
                 result['string_xy'] = string_xy
@@ -86,7 +86,7 @@ class SpaceString(Geometry):
                 #     print(f"Warning: z_values length {len(z_values)} does not match expected {len(result['string_xy']) * self.points_per_string}.")
                 #     not_matched = True
                 if not isinstance(z_values, torch.Tensor):
-                    z_values = torch.tensor(z_values, device=self.device, dtype=torch.float32)
+                    z_values = torch.tensor(z_values, device=self.device, dtype=torch.float64)
                 elif z_values.device != self.device:
                     z_values = z_values.to(self.device)
                 result['z_values'] = z_values
@@ -94,13 +94,13 @@ class SpaceString(Geometry):
                 if self.starting_z_spacing is None:
                     z_values = torch.linspace(-self.half_domain, self.half_domain, self.points_per_string, device=self.device)
                 else:
-                    z_values = torch.arange(0, self.points_per_string, device=self.device, dtype=torch.float32) * self.starting_z_spacing - (self.points_per_string - 1) * self.starting_z_spacing / 2.0
+                    z_values = torch.arange(0, self.points_per_string, device=self.device, dtype=torch.float64) * self.starting_z_spacing - (self.points_per_string - 1) * self.starting_z_spacing / 2.0
                 z_values = z_values.repeat(self.n_strings)
                 result['z_values'] = torch.tensor(z_values, device=self.device)
             if 'string_spacing' in initial_geometry:
                 string_spacing = initial_geometry['string_spacing']
                 if not isinstance(string_spacing, torch.Tensor):
-                    string_spacing = torch.tensor(string_spacing, device=self.device, dtype=torch.float32)
+                    string_spacing = torch.tensor(string_spacing, device=self.device, dtype=torch.float64)
                 elif string_spacing.device != self.device:
                     string_spacing = string_spacing.to(self.device)
                 result['string_spacing'] = string_spacing
@@ -112,7 +112,7 @@ class SpaceString(Geometry):
             if 'z_spacing' in initial_geometry:
                 z_spacing = initial_geometry['z_spacing']
                 if not isinstance(z_spacing, torch.Tensor):
-                    z_spacing = torch.tensor(z_spacing, device=self.device, dtype=torch.float32)
+                    z_spacing = torch.tensor(z_spacing, device=self.device, dtype=torch.float64)
                 elif z_spacing.device != self.device:
                     z_spacing = z_spacing.to(self.device)
                 result['z_spacing'] = z_spacing
@@ -142,7 +142,7 @@ class SpaceString(Geometry):
                 z_spacing = torch.tensor(torch.abs(z_values[1]-z_values[0]), device=self.device)
             else:
                 z_spacing = self.starting_z_spacing
-                z_values = torch.arange(0, self.points_per_string, device=self.device, dtype=torch.float32) * self.starting_z_spacing - (self.points_per_string - 1) * self.starting_z_spacing / 2.0
+                z_values = torch.arange(0, self.points_per_string, device=self.device, dtype=torch.float64) * self.starting_z_spacing - (self.points_per_string - 1) * self.starting_z_spacing / 2.0
             z_values = z_values.repeat(self.n_strings)
             points_per_string_list = [self.points_per_string] * self.n_strings
             
@@ -223,7 +223,7 @@ class SpaceString(Geometry):
             else:
                 # Recompute z_values based on optimized z_spacing
                 mid_point = (n_points - 1) / 2.0
-                new_z = (torch.arange(n_points, device=self.device, dtype=torch.float32) - mid_point) * z_spacing
+                new_z = (torch.arange(n_points, device=self.device, dtype=torch.float64) - mid_point) * z_spacing
                 new_points_3d[original_start_idx:original_end_idx, 2] = new_z
             count += n_points
             # new_z_values[new_start_idx:new_end_idx] = z_values[original_start_idx:original_end_idx]
