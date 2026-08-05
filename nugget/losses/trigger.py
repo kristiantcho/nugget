@@ -1,6 +1,27 @@
+import gc
+import os
 import torch
 from nugget.losses.base_loss import LossFunction
 from nugget.losses.fisher_info import WeightedResolutionLoss
+
+
+def _trigger_chunk_cleanup(device):
+    """Release Python-side objects between event chunks without forcing CUDA
+    cache flushes.
+
+    Mirrors fisher_info_helpers._fisher_chunk_cleanup: calling
+    torch.cuda.empty_cache() inside a tight loop can surface asynchronous CUDA
+    faults at cache-flush points and usually hurts throughput, so the default
+    cleanup is just Python GC (which lets freed chunk intermediates / autograd
+    graphs be reclaimed between chunks) plus an optional explicit sync for
+    debugging. A hard empty_cache() is opt-in via the caller's
+    empty_cache_after_event flag.
+    """
+    gc.collect()
+    if isinstance(device, torch.device) and device.type == 'cuda' \
+            and os.environ.get('NUGGET_TRIGGER_CUDA_SYNC', '0') == '1':
+        torch.cuda.synchronize(device)
+
 
 # Cache of torch.compile'd surrogate wrappers, keyed by the identity of the raw
 # callable. TriggerLoss's own math (sigmoid gating, sliding-bar logic, softmax
@@ -600,8 +621,14 @@ class TriggerLoss(LossFunction):
             - batched_surrogate_func : callable, used to compute light yields per chunk when
               precomputed yields are not provided
             - binned_trigger_batch_size : int, max number of events processed per chunk
-              (None processes all events in a single chunk)
+              (None processes all events in a single chunk). Set this to cap peak
+              memory: the batched trigger builds an (chunk, n_bars, n_points)
+              intermediate, so a large single chunk can OOM.
             - detach_light_yields : bool, detach computed light yields from the autograd graph
+            - empty_cache_after_event : bool, force torch.cuda.empty_cache() after each
+              chunk (and after the single-pass computation). Default False: cleanup is
+              just gc.collect() between chunks (see _trigger_chunk_cleanup), matching the
+              Fisher path. Enable to relieve allocator fragmentation at some throughput cost.
             - perfect_efficiency : bool, short-circuits to a trigger value of 1 for every event
 
         Returns:
@@ -619,6 +646,11 @@ class TriggerLoss(LossFunction):
         batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
         chunk_size = kwargs.get('binned_trigger_batch_size', None)
         detach_light_yields = kwargs.get('detach_light_yields', False)
+        # Between-chunk memory cleanup, mirroring the Fisher path. gc.collect()
+        # always runs (cheap, lets freed chunk tensors/graphs be reclaimed);
+        # empty_cache_after_event additionally forces a CUDA allocator flush,
+        # which relieves fragmentation across chunks at some throughput cost.
+        empty_cache_after_event = kwargs.get('empty_cache_after_event', False)
 
         # Auto-discover a batched light-yield callable from the surrogate when one
         # is not explicitly provided, mirroring the Poisson-Fisher path. This lets
@@ -706,6 +738,18 @@ class TriggerLoss(LossFunction):
             t_values = self._compute_t_values(
                 points_3d, event_params_list, surrogate_func, point_weights, ly, use_batched_trigger
             )
+            del ly
+            _trigger_chunk_cleanup(self.device if isinstance(self.device, torch.device)
+                                   else torch.device(self.device) if self.device is not None
+                                   else points_3d.device)
+            if empty_cache_after_event and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # NOTE: this single-pass branch builds the full (n_events, n_bars,
+            # n_points) trigger intermediate at once, which is the dominant peak
+            # allocation and can OOM for large event batches. Set
+            # binned_trigger_batch_size (chunk_size) to cap it -- the chunked
+            # branch below bounds peak memory to one chunk at a time and cleans up
+            # between chunks.
         else:
             # Chunked pass — process chunk_size events at a time to cap memory
             t_values = torch.zeros(n_events, device=points_3d.device, dtype=points_3d.dtype)
@@ -728,6 +772,17 @@ class TriggerLoss(LossFunction):
                     points_3d, chunk_events, surrogate_func, point_weights, chunk_ly, use_batched_trigger
                 )
                 t_values[chunk_start:chunk_end] = chunk_t_values
+
+                # Release this chunk's heavy intermediates (the (chunk, n_bars,
+                # n_points) in_bar_mask inside compute_trigger_probability_batched_events
+                # is the dominant allocation) before building the next chunk, so
+                # per-chunk memory does not accumulate across the loop.
+                del chunk_events, chunk_ly, chunk_t_values
+                _trigger_chunk_cleanup(self.device if isinstance(self.device, torch.device)
+                                       else torch.device(self.device) if self.device is not None
+                                       else points_3d.device)
+                if empty_cache_after_event and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Calculate detector efficiency: mean of t3 values
         detector_efficiency = torch.mean(t_values)
