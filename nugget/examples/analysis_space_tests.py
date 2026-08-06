@@ -47,7 +47,11 @@ effective_area_loss = nugget.losses.effective_area.EffectiveAreaLoss(
     trigger=trigger_loss
     )
 
-
+# pointsource_fom_loss = nugget.losses.pointsource_fom.FoMLoss(
+#     device=device,
+#     fisher_info_params=['direction', 'position'],
+#     effective_area_loss=effective_area_loss
+# )
 
 analysis_loss = nugget.losses.analysis_loss.AnalysisLoss(
     device=device,
@@ -156,7 +160,7 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
                 'use_relative_energy': True,
 
 
-                'trigger_use_torch_compile': True,
+                'trigger_use_torch_compile': False,
                 'binned_trigger_chunk_size': 2000,
                 'use_batched_trigger': True,
                 'use_batched_binned_trigger': True,

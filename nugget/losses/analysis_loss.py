@@ -21,12 +21,6 @@ from friEnd.pyff_friend import PyFF_Friend
 
 SEP = '::'  # separates base key from component index, e.g. 'position::0'
 
-# Fluxes in friEnd/pyForwardFolding are per cm^2 (MCEq, KRA, and the
-# PowerLawFlux baseline_norm convention all are), while nugget geometry is in
-# metres. This converts the generation area m^2 -> cm^2.
-_M2_TO_CM2 = 1e4
-
-
 def to_pandas_jax(data_list, sep=SEP):
     """List[dict[str, Tensor]] -> pd.DataFrame with flattened columns."""
   
@@ -89,11 +83,6 @@ def from_pandas_jax(df, sep=SEP):
         for k, arr in full.items():
             val = arr[row]  # flat (D,)
             target_shape = shapes.get(k, val.shape)  # fall back to flat shape if unknown (new key)
-            # Explicit dtype: parquet/pandas round trips can hand back whatever
-            # dtype was on disk (pyForwardFolding writes float64 via
-            # jax_enable_x64), which must not silently override the float64
-            # convention the rest of the pipeline (geometry, sampler, Fisher
-            # info) enforces.
             d[k] = torch.as_tensor(val, dtype=torch.float64).reshape(target_shape)
         data_list.append(d)
     return data_list
@@ -116,29 +105,10 @@ def _as_float(x):
 
 def describe_sampler_generation(signal_sampler):
     """Read the generation parameters straight off a CylinderSampler.
-
-    Returns a dict with the cylinder geometry, the energy range, the zenith
-    window, and — crucially — which *direction* sampling mode was used, since
-    that determines the form of the geometric part of the fluxless weight.
-
-    ``uniform_zenith_sampling=False`` (the CylinderSampler default) rejection
-    samples cos(theta) proportional to A_proj(theta) and places the vertex
-    uniformly over that same A_proj(theta). The two cancel, so the whole
-    geometric factor collapses to the single constant G = int A_proj dOmega.
-
-    ``uniform_zenith_sampling=True`` samples theta uniformly on
-    [theta_min, theta_max] (note: uniform in *theta*, not in cos(theta) — see
-    cyl_sampler.sample_uniform_ray). The vertex is still uniform over
-    A_proj(theta), so A_proj no longer cancels and must be applied per event
-    together with 1/p(Omega) = 2 pi * dtheta * sin(theta).
     """
     skw = getattr(signal_sampler, 'kwargs', {}) or {}
     cyl = getattr(signal_sampler, 'cylinder', None)
-    if cyl is None:
-        raise ValueError(
-            "signal_sampler has no 'cylinder' attribute; cannot infer the "
-            "generation geometry needed for fluxless weights."
-        )
+    
 
     cos_range = skw.get('cos_range', (-1.0, 1.0))
     if isinstance(cos_range, str):
@@ -192,8 +162,6 @@ def _inv_p_energy(energy, gen):
 def _geometric_weight(cos_theta, gen):
     """Geometric part of the fluxless weight, in m^2 sr.
 
-    Returns (values, description). ``values`` is either a scalar (projected-area
-    importance sampling) or a per-event array (uniform-zenith sampling).
     """
 
     R, H = gen['cyl_radius'], gen['cyl_height']
@@ -250,17 +218,10 @@ def _geometric_weight(cos_theta, gen):
 
 
 def compute_fluxless_weights(df, gen):
-    """OneWeight-style generation weight, in GeV cm^2 sr.
+    """OneWeight-style generation weight, in GeV m^2 sr.
 
         w_i = (1 / N_gen) * (1 / p(E_i)) * [geometric factor]
 
-    so that ``w_i * dPhi/(dE dOmega)`` is a rate in Hz. The geometric factor is
-    the constant G for projected-area sampling, or the per-event
-    ``2 pi dtheta sin(theta) A_proj(theta)`` for uniform-zenith sampling.
-
-    Note this covers *generation* only. The interaction and transmission
-    probabilities are applied separately as a per-event acceptance (see
-    ``effective_area_acceptance``), so that they are not double counted.
     """
 
 
@@ -290,11 +251,7 @@ def add_weights_to_signal_events(
     clear=True,
     verbose=False,
 ):
-    """Attach ``weights`` and ``grad_weights_*`` to a list of signal events.
-
-    Runs the friEnd step pipeline (coordinates, MCEq atmospheric splines,
-    galactic maps, ...) followed by pyForwardFolding, which evaluates the
-    parametric flux model and its per-event Jacobian w.r.t. the fit parameters.
+    """Attach ``weights`` and ``grad_weights_*`` to a list of signal events via friEnd and pyff.
 
     Parameters
     ----------
@@ -350,8 +307,6 @@ def add_weights_to_signal_events(
         temp_path = os.path.join('.', 'temp.parquet')
     os.makedirs(os.path.dirname(os.path.abspath(temp_path)), exist_ok=True)
 
-    # pyFF reads the dataset from disk and writes 'weights'/'grad_weights_*'
-    # back to the same path, so the round trip through parquet is required.
     df_out.to_parquet(temp_path)
     PyFF_Friend(pyffconfig=pyff_config, clear=clear).add_weights()
     df_weighted = pd.read_parquet(temp_path)
@@ -387,9 +342,7 @@ def bKDE(
         1D array of bKDE counts.
     """
 
-    # Follow the data: binning_var carries the device/dtype of the event tensors,
-    # so coerce the bin edges to match instead of assuming the caller built them
-    # on the right device (torch.linspace defaults to CPU).
+
     binning_var = torch.as_tensor(binning_var)
     bins = torch.as_tensor(bins, device=binning_var.device, dtype=binning_var.dtype)
     if torch.is_tensor(bandwidth):
@@ -409,8 +362,7 @@ def bKDE(
     counts = (event_cdf[1:, :] - event_cdf[:-1, :])
 
     if reflect_infinities:
-        # Fold the two overflow bins back into the first/last real bins so no
-        # kernel mass is lost outside the binning range.
+     
         counts = counts[1:-1].clone()
         counts[0] = counts[0] + event_cdf[1] - event_cdf[0]
         counts[-1] = counts[-1] + event_cdf[-1] - event_cdf[-2]
@@ -423,9 +375,7 @@ def bKDEnD(
         ):
     count_list = []
     for binning_var, uncert, bin1d in zip(binning_vars,uncerts,bins):
-        # bKDE aligns bins/bandwidth to binning_var's device, so a caller that
-        # built the bin edges on CPU (torch.linspace default) still works when
-        # the event tensors live on a GPU.
+
         counts = bKDE(binning_var,bin1d,uncert)
         count_list.append(counts)
 
@@ -525,12 +475,7 @@ class AnalysisLoss(LossFunction):
 
 
     def _get_geometry_bounding_cylinder(self, geom_dict, temperature, include_height=True, **circle_kwargs):
-        """Fit a cylinder to the current geometry (mirrors FoMLoss).
-
-        XY center/radius come from the smooth weighted minimum enclosing circle
-        of the string positions (weighted continuously in [0, 1] by
-        string_weights); height (if requested) is the unweighted z-extent of the
-        detector's points_3d.
+        """Fit a cylinder to the current geometry.
         """
         string_xy = geom_dict.get("string_xy", None)
         if string_xy is None:
@@ -558,26 +503,14 @@ class AnalysisLoss(LossFunction):
         center = torch.stack([center_xy[0], center_xy[1], center_z])
         return center, radius, height
 
-    # Constructor args of CylinderSampler that are captured explicitly (not in
-    # self.kwargs), so a from-scratch cylinder can be safely merged into a
-    # clone's **kwargs without colliding with these.
     _CYLINDER_SAMPLER_RESERVED_KEYS = ("device", "dim", "domain_size", "cylinder_center", "cylinder_height", "cylinder_radius")
 
     def _get_geometry_adjusted_sampler(self, geom_dict, kwargs):
         """Clone the configured signal_sampler onto the cylinder derived from the current geometry."""
         signal_sampler = kwargs.get("signal_sampler", None)
-        if signal_sampler is None:
-            raise ValueError("signal_sampler must be provided when analysis_adjust_cylinder_to_geometry=True")
-        if not isinstance(signal_sampler, CylinderSampler):
-            raise TypeError(
-                "analysis_adjust_cylinder_to_geometry=True requires signal_sampler to be a CylinderSampler, "
-                f"got {type(signal_sampler)}"
-            )
-
         temperature = kwargs.get("bounding_cylinder_temperature", 1)
         include_height = kwargs.get("analysis_adjust_cylinder_height", False)
-        # Forward the triggerability-gating options so the sampling cylinder
-        # matches the radius EffectiveAreaLoss derives (keeps the two consistent).
+
         circle_kwargs = {
             "downweight_untriggerable": kwargs.get("downweight_untriggerable", False),
             "trigger_neighbor_distance": kwargs.get("trigger_neighbor_distance", 550.0),
@@ -588,11 +521,8 @@ class AnalysisLoss(LossFunction):
         center, radius, height = self._get_geometry_bounding_cylinder(
             geom_dict, temperature, include_height=include_height, **circle_kwargs
         )
-
-        # Optional fixed margin (e.g. an attenuation length) so events generated
-        # just outside the geometry's own footprint are still sampled.
         radius = radius + 55.4  #2x attenuation length
-        # height = height + kwargs.get("analysis_cylinder_height_margin", 0.0)
+    
 
         sampler_kwargs = {
             k: v for k, v in signal_sampler.kwargs.items()
@@ -621,9 +551,7 @@ class AnalysisLoss(LossFunction):
     ):
         """Add ``weights``/``grad_weights_*`` to events that lack them.
 
-        Returns the list unchanged if the events already carry weights, so the
-        expensive friEnd + pyForwardFolding pass runs at most once per event set
-        rather than on every optimizer step.
+        Returns the list unchanged if the events already carry weights
         """
         if not signal_event_params:
             return signal_event_params
@@ -634,13 +562,7 @@ class AnalysisLoss(LossFunction):
         if has_weights and has_grads:
             return signal_event_params
 
-        if friend_config is None or pyff_config is None:
-            raise ValueError(
-                "Sampled events carry no flux weights and no 'friend_config'/"
-                "'pyff_config' were provided. Either pass events that already "
-                "have 'weights' and 'grad_weights_*', or supply both configs so "
-                "they can be computed."
-            )
+        
 
         weighted = add_weights_to_signal_events(
             signal_event_params,
@@ -674,10 +596,6 @@ class AnalysisLoss(LossFunction):
         - Acceptance
 
         """
-        # points_3d           = geom_dict.get('points_3d', None)
-
-        # uncertainties       = kwargs.get('uncertainties') # :List[Tensor]
-        # acceptance          = kwargs.get('detection_eff_func', None) # :Tensor
 
         binning_var_names   = kwargs.get('analysis_binning_var_names', ['energy', 'zenith']) # :List[str]
         num_events           = kwargs.get('num_events', 1) # :int
@@ -692,22 +610,16 @@ class AnalysisLoss(LossFunction):
         trigger_loss        = self.trigger_loss
         optimality          = kwargs.get('analysis_optimality','a') # :str
         live_time           = kwargs.get('live_time', 1.0) # :float
-        # Effective-area acceptance: replaces trigger_loss as the acceptance term.
-        # Pass an EffectiveAreaLoss instance; it already owns the cross-section
-        # and transmission tables and runs the trigger internally.
+
         effective_area_loss =  self.effective_area_loss
         eff_area_cyl_radius = kwargs.get('eff_area_cyl_radius', None) # :float
         eff_area_cyl_height = kwargs.get('eff_area_cyl_height', None) # :float
-        # Flux weighting (friEnd + pyForwardFolding), used when the sampled events
-        # do not already carry 'weights'/'grad_weights_*'.
+  
         friend_config       = kwargs.get('friend_config', None) # :str|dict
         pyff_config         = kwargs.get('pyff_config', None) # :str|dict
         weight_temp_path    = kwargs.get('weight_temp_path', None) # :str
         weight_pid          = kwargs.get('weight_pid', 14) # :int
-        # Sampling-cylinder adjustment (mirrors FoMLoss): resample fresh events
-        # from a cylinder fit to the *current* geometry instead of whatever fixed
-        # cylinder signal_sampler was constructed with. Only meaningful when
-        # events are actually (re)sampled here, i.e. signal_event_params is None.
+    
         adjust_cylinder_to_geometry = kwargs.get('analysis_adjust_cylinder_to_geometry', False)
         eff_kwargs = kwargs.copy()
 
@@ -719,10 +631,7 @@ class AnalysisLoss(LossFunction):
                 )
             signal_sampler = self._get_geometry_adjusted_sampler(geom_dict, kwargs)
             eff_kwargs['signal_sampler'] = signal_sampler
-            # The adjusted cylinder is geometry-derived, so the generation
-            # geometry used for the fluxless weight and for the effective-area
-            # acceptance must be read from it too, not from a stale
-            # eff_area_cyl_radius/height passed in by the caller.
+           
             eff_area_cyl_radius = None
             eff_area_cyl_height = None
 
@@ -731,8 +640,6 @@ class AnalysisLoss(LossFunction):
             signal_event_params = signal_sampler.sample_events(num_events)
             weight_factor = live_time
 
-            # Freshly sampled events have no flux weights yet. Weight them here,
-            # before any subsampling, so N_gen is the full generated sample.
             signal_event_params = self._ensure_weights(
                 signal_event_params,
                 friend_config=friend_config,
@@ -743,8 +650,6 @@ class AnalysisLoss(LossFunction):
             )
             eff_kwargs['signal_event_params'] = signal_event_params
         else:
-            # Provided events may or may not already carry weights (e.g. loaded
-            # from a parquet that was run through friEnd/pyFF offline).
             signal_event_params = self._ensure_weights(
                 signal_event_params,
                 friend_config=friend_config,
@@ -753,7 +658,7 @@ class AnalysisLoss(LossFunction):
                 pid=weight_pid,
                 temp_path=weight_temp_path,
             )
-            # randomly sample a subset of the provided signal events and corresponding precomputed values if more than num_events are given
+
             if len(signal_event_params) > num_events:
                 weight_factor = live_time*len(signal_event_params) / num_events
                 selected_indices = random.sample(range(len(signal_event_params)), num_events)
@@ -809,26 +714,11 @@ class AnalysisLoss(LossFunction):
                 )
                 selection_acceptance = selection_loss(geom_dict, **eff_kwargs)['selection_per_event']
         
-        # Acceptance = analysis selection x [trigger x transmission x interaction].
-        # The bracket comes from EffectiveAreaLoss, which runs the trigger itself
-        # and multiplies in the neutrino-physics factors. The projected area is
-        # deliberately excluded (include_projected_area=False) because A_proj is
-        # already inside the fluxless weight -- via the constant G for
-        # projected-area sampling, or explicitly per event for uniform-zenith
-        # sampling. Including it again would double count a strongly
-        # zenith-dependent factor and tilt the cos(zenith) distribution.
+
         acceptance = selection_acceptance.squeeze()
 
         if effective_area_loss is not None:
-            # Use the cylinder signal_event_params was actually generated from,
-            # so that w * P_int refers to interactions in the same target volume
-            # the weights were built for. Under analysis_adjust_cylinder_to_geometry,
-            # that is this iteration's geometry-derived cylinder (signal_sampler was
-            # reassigned to the adjusted clone above); otherwise it is the fixed
-            # generation cylinder. Either way it must NOT be a bounding cylinder
-            # independent of what actually generated the events, or w * P_int
-            # would drift against a stale G and produce a spurious
-            # "shrink the detector" gradient.
+
             if eff_area_cyl_radius is None or eff_area_cyl_height is None:
                 if signal_sampler is not None and hasattr(signal_sampler, 'cylinder'):
                     eff_area_cyl_radius = _as_float(signal_sampler.cylinder.radius)
@@ -842,12 +732,11 @@ class AnalysisLoss(LossFunction):
             if eff_area_cyl_radius is not None and eff_area_cyl_height is not None:
                 eff_kwargs['use_sampler_cyl_for_volume'] = True
             eff_out = effective_area_loss(geom_dict, **eff_kwargs)
-            # Already includes the trigger (t_per_event), so trigger_loss must
-            # not be applied on top of it.
+    
             acceptance = acceptance * eff_out['effective_area_per_event'].squeeze()
         elif trigger_loss is not None:
             acceptance = acceptance * trigger_loss(geom_dict, **eff_kwargs)['t_per_event'].squeeze()
-        ########
+
         weights = []
         grad_weights = []
         test_event = signal_event_params[0]
@@ -907,9 +796,7 @@ class AnalysisLoss(LossFunction):
         
         fisher_loss = opti(fim)
 
-        # Marginalized covariance of the signal flux parameters. Its diagonal is
-        # the per-parameter variance; ordering matches signal_flux_var_names,
-        # since calc_fisher_matrix moves signal_idx to the front.
+   
         cov = calc_cov(fim)
         param_variances = torch.diag(cov)
 

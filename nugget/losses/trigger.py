@@ -103,6 +103,7 @@ class TriggerLoss(LossFunction):
                  t1_temperature=1.0,
                  t3_temperature=1.0,
                  t_temperature=1.0,
+                 in_bar_temperature=5.0,
                  use_hard_cuts=False,
                  print_loss=False):
         """
@@ -127,6 +128,8 @@ class TriggerLoss(LossFunction):
             Temperature for per-bar thresholding sigmoid (higher = sharper transition).
         t_temperature : float
             Temperature for aggregating bar scores (higher = more focus on max).
+        in_bar_temperature : float
+            Temperature for the sigmoid used to determine if a point is inside a bar (higher = sharper transition).
         use_hard_cuts : bool
             If True, use hard thresholds to produce binary trigger outputs (0/1) instead of
             smooth differentiable sigmoid/softmax aggregations.
@@ -142,6 +145,7 @@ class TriggerLoss(LossFunction):
         self.distance_bar_step = distance_bar_step
         self.min_points_threshold = min_points_threshold
         self.t1_temperature = t1_temperature
+        self.in_bar_temperature = in_bar_temperature
         self.t3_temperature = t3_temperature
         self.t_temperature = t_temperature
         self.use_hard_cuts = use_hard_cuts
@@ -522,7 +526,7 @@ class TriggerLoss(LossFunction):
         if self.use_hard_cuts:    
             in_bar_mask = (point_s >= bar_starts.unsqueeze(2)) & (point_s <= bar_ends.unsqueeze(2))
         else:
-            in_bar_mask = torch.sigmoid(10 * (point_s - bar_starts.unsqueeze(2))) * torch.sigmoid(10 * (bar_ends.unsqueeze(2) - point_s))
+            in_bar_mask = torch.sigmoid(self.in_bar_temperature * (point_s - bar_starts.unsqueeze(2))) * torch.sigmoid(self.in_bar_temperature * (bar_ends.unsqueeze(2) - point_s))
         bar_activity = torch.sum(in_bar_mask.to(dtype=t1_values.dtype) * t1_values.unsqueeze(1), dim=2)  # (n_events, K)
 
         # Zero out invalid bars (so they don't contribute)

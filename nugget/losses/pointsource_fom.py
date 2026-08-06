@@ -234,10 +234,10 @@ class FoMLoss(LossFunction):
             temp_sampler = effective_area_kwargs["signal_sampler"]
             energies = [event['energy'] for event in shared_events]
             energies = torch.as_tensor(energies, device=self.device)
-            if temp_sampler['energy_dist'] == 'log_uniform':
+            if temp_sampler.energy_dist == 'log_uniform':
                 norm_effective_area_per_event = effective_area_per_event*energies
-            elif temp_sampler['gamma'] is not None:
-                norm_effective_area_per_event = effective_area_per_event*energies**temp_sampler['gamma']
+            elif temp_sampler.gamma is not None:
+                norm_effective_area_per_event = effective_area_per_event*energies**temp_sampler.gamma
             else:
                 norm_effective_area_per_event = effective_area_per_event
 
@@ -263,9 +263,8 @@ class FoMLoss(LossFunction):
             "bounding_cylinder_center": effective_area_out.get("bounding_cylinder_center", effective_area_out.get("weighted_bounding_cylinder_center", None)),
             "resolution_loss": resolution_out.get("angular_resolution_loss", None),
             "effective_area_loss": effective_area_out.get("effective_area_loss", None),
-            "resolution_details": resolution_out,
-            "effective_area_details": effective_area_out,
+            # "resolution_details": resolution_out,
+            # "effective_area_details": effective_area_out,
             "signal_event_params": shared_events,
             "detector_efficiencies": effective_area_out.get("detector_efficiencies", None),
-            "use_weighted_resolution": self.use_weighted_resolution,
         }

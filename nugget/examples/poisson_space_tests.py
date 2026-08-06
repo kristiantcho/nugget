@@ -4,6 +4,7 @@ import numpy as np
 import pickle
 
 device='cuda:3'
+ps_fom=True
 center = [0,0,0]
 radius = 600
 height = 1000
@@ -33,7 +34,7 @@ light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate_batched
 angular_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
         device=device,
         resolution_type='angular',
-        fisher_info_params=['direction']
+        fisher_info_params=['direction', 'position']
     )
 energy_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
     device=device,
@@ -41,9 +42,33 @@ energy_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
     fisher_info_params=['energy']
 )
 
+if ps_fom:
+    trigger_loss = nugget.losses.trigger.TriggerLoss(
+    device=device,
+    light_yield_threshold=6.0,
+    distance_bar_length=550.0,
+    distance_bar_step=50.0,
+    min_points_threshold=30.0,
+    t1_temperature=2.0,
+    t3_temperature=2.0,
+    t_temperature=4.0, 
+    use_hard_cuts=True,
+    )
+    effective_area_loss = nugget.losses.effective_area.EffectiveAreaLoss(
+        device=device,
+        domain_size=2000,
+        trigger=trigger_loss
+        )
+    pointsource_fom_loss = nugget.losses.pointsource_fom.FoMLoss(
+    device=device,
+    fisher_info_params=['direction', 'position'],
+    effective_area_loss=effective_area_loss
+   )
+
 num_events = 50000
 angular_loss_dicts = {}
 energy_loss_dicts = {}
+ps_fom_loss_dicts = {}
 spacing_min = 50
 spacing_max = 400
 spacing_count = 100
@@ -71,10 +96,11 @@ for energy in [2,3,4,5,6,7]:
     if not free_sim_volume:
         signal_events = signal_sampler.sample_events(num_events=num_events)
         # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1 if energy < 6 else energy+2}.parquet')
-        nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_{num_strings}_{event_type}_{limit_zenith+ "_" if limit_zenith is not None else ""}signal_events_e{energy}-e{energy+1}.parquet')
+        nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_{"" if not ps_fom else "ps_fom_"}{num_strings}_{event_type}_{limit_zenith+ "_" if limit_zenith is not None else ""}signal_events_e{energy}-e{energy+1}.parquet')
     # if energy < 6:
     angular_loss_dicts[f'{energy}-{energy+1}'] = {}
     energy_loss_dicts[f'{energy}-{energy+1}'] = {}
+    ps_fom_loss_dicts[f'{energy}-{energy+1}'] = {}
     # else:
     #     angular_loss_dicts[f'{energy}-{energy+2}'] = []
     #     energy_loss_dicts[f'{energy}-{energy+2}'] = []
@@ -128,28 +154,59 @@ for energy in [2,3,4,5,6,7]:
                     'fisher_res_metric': 'fom',  # 'fom' 'median' 'mean'
                     'fisher_info_use_torch_compile': True,
                     'use_relative_energy': True,
+                    'trigger_use_torch_compile': False,
+                    'use_batched_trigger': True,
+                    'use_batched_surrogate': True,
+                    'use_batched_binned_trigger': True,
+                    'use_batched_effective_area': True,
+                    'bounding_cylinder_temperature': 1,
+                
+                    'perfect_efficiency': False,
+                    'downweight_untriggerable': False,
+                    "trigger_neighbor_distance": 550.0,
+                    "trigger_min_neighbors": 30,
+                    'trigger_distance_sharpness': 0.05,
+                    'trigger_count_sharpness':1,
+                    # 'num_events_per_bin': 100,
+                    # 'num_energy_bins': 30,
+                    # 'num_zenith_bins': 30,
+                    'per_event_effective_area_loss': True,
+                    'fom_adjust_cylinder_to_geometry':False,
+                    'fom_include_uniform_log_e_term':True,
+                    'include_projected_area':True,
+                    'use_sampler_cyl_for_volume':True,
                     }
-        ang_loss_dict = angular_resolution_loss(
-                    geom_dict=geom_dict,
-                    **loss_params
-                    )
-        energy_loss_dict = energy_resolution_loss(
-                    geom_dict=geom_dict,
-                    **loss_params
-                    )
-        for key in ang_loss_dict:
-            if isinstance(ang_loss_dict[key], torch.Tensor):
-                ang_loss_dict[key] = ang_loss_dict[key].detach().cpu()
-        for key in energy_loss_dict:
-            if isinstance(energy_loss_dict[key], torch.Tensor):
-                energy_loss_dict[key] = energy_loss_dict[key].detach().cpu()
-        # if energy < 6:
-        angular_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}'] = ang_loss_dict
-        energy_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}'] = energy_loss_dict
-        # else:
-            # angular_loss_dicts[f'{energy}-{energy+2}'].append(ang_loss_dict)
-            # energy_loss_dicts[f'{energy}-{energy+2}'].append(energy_loss_dict)
-
+        if not ps_fom:
+            ang_loss_dict = angular_resolution_loss(
+                        geom_dict=geom_dict,
+                        **loss_params
+                        )
+            energy_loss_dict = energy_resolution_loss(
+                        geom_dict=geom_dict,
+                        **loss_params
+                        )
+            for key in ang_loss_dict:
+                if isinstance(ang_loss_dict[key], torch.Tensor):
+                    ang_loss_dict[key] = ang_loss_dict[key].detach().cpu()
+            for key in energy_loss_dict:
+                if isinstance(energy_loss_dict[key], torch.Tensor):
+                    energy_loss_dict[key] = energy_loss_dict[key].detach().cpu()
+            # if energy < 6:
+            angular_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}'] = ang_loss_dict
+            energy_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}'] = energy_loss_dict
+            # else:
+                # angular_loss_dicts[f'{energy}-{energy+2}'].append(ang_loss_dict)
+                # energy_loss_dicts[f'{energy}-{energy+2}'].append(energy_loss_dict)
+        else:
+            ps_fom_loss_dict = pointsource_fom_loss(
+                        geom_dict=geom_dict,
+                        **loss_params
+                        )
+            for key in ps_fom_loss_dict:
+                if isinstance(ps_fom_loss_dict[key], torch.Tensor):
+                    ps_fom_loss_dict[key] = ps_fom_loss_dict[key].detach().cpu()
+            ps_fom_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}'] = ps_fom_loss_dict
+            
 
 
 
@@ -161,8 +218,8 @@ for energy in range(2,8):
         del copy_angular_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}']['resolution_params']
     # for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
         del copy_energy_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}']['resolution_params']
-with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}angular_loss_dicts_energies.pkl', 'wb') as f:
+with open(f'pois_tests/pois_{"" if not ps_fom else "ps_fom_"}{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}angular_loss_dicts_energies.pkl', 'wb') as f:
     pickle.dump(copy_angular_loss_dicts, f)
 
-with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}energy_loss_dicts_energies.pkl', 'wb') as f:
+with open(f'pois_tests/pois_{"" if not ps_fom else "ps_fom_"}{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}energy_loss_dicts_energies.pkl', 'wb') as f:
     pickle.dump(copy_energy_loss_dicts, f)
