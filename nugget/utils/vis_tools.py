@@ -180,12 +180,13 @@ class Visualizer:
         self._angular_resolution_per_event_history = {}
         # History of the (weighted) average per-string mean distance to its 5 nearest
         # neighbours, accumulated across iterations for the 'nn_distance_history' plot.
-        self._nn_distance_history = []
-        self._last_recorded_iteration_nn_distance = None
+        # Keyed by iteration (see the iteration-dict rationale on the detector
+        # efficiency / effective area histories above) so the x-axis reflects the
+        # actual optimizer iteration count and NaN-revert replays overwrite cleanly.
+        self._nn_distance_history = {}
         # History of the global (weighted-softmin, if string_weights given) minimum
         # pairwise string-string distance, also shown on the 'nn_distance_history' plot.
-        self._min_pairwise_distance_history = []
-        self._last_recorded_iteration_min_pairwise_distance = None
+        self._min_pairwise_distance_history = {}
 
         # Cache of string XY positions (and weights) snapshotted once per unique
         # iteration whenever a 'string_history' plot is requested, so the full
@@ -5595,30 +5596,30 @@ class Visualizer:
                     num_neighbours=num_neighbours,
                     nn_tau=nn_tau,
                 )
-                if mean_metric is not None and np.isfinite(mean_metric) and iteration is not None \
-                        and iteration != self._last_recorded_iteration_nn_distance:
-                    self._nn_distance_history.append(mean_metric)
-                    self._last_recorded_iteration_nn_distance = iteration
+                if mean_metric is not None and np.isfinite(mean_metric) and iteration is not None:
+                    self._nn_distance_history[int(iteration)] = float(mean_metric)
 
                 min_metric = self._mean_min_nn_distance(
                     xy_np,
                     string_weights=string_weights,
                     min_tau=min_tau,
                 )
-                if min_metric is not None and np.isfinite(min_metric) and iteration is not None \
-                        and iteration != self._last_recorded_iteration_min_pairwise_distance:
-                    self._min_pairwise_distance_history.append(min_metric)
-                    self._last_recorded_iteration_min_pairwise_distance = iteration
+                if min_metric is not None and np.isfinite(min_metric) and iteration is not None:
+                    self._min_pairwise_distance_history[int(iteration)] = float(min_metric)
 
             if len(self._nn_distance_history) > 0 or len(self._min_pairwise_distance_history) > 0:
                 if len(self._nn_distance_history) > 0:
+                    nn_iters_sorted = sorted(self._nn_distance_history.keys())
                     ax.plot(
-                        self._nn_distance_history, color='teal', linewidth=2, markersize=4,
+                        nn_iters_sorted, [self._nn_distance_history[i] for i in nn_iters_sorted],
+                        color='teal', linewidth=2, markersize=4,
                         label=f'Mean {int(kwargs.get("nn_distance_num_neighbours", 5))} N.N.',
                     )
                 if len(self._min_pairwise_distance_history) > 0:
+                    min_iters_sorted = sorted(self._min_pairwise_distance_history.keys())
                     ax.plot(
-                        self._min_pairwise_distance_history, color='crimson', linewidth=2, markersize=4,
+                        min_iters_sorted, [self._min_pairwise_distance_history[i] for i in min_iters_sorted],
+                        color='crimson', linewidth=2, markersize=4,
                         label='Min.',
                     )
                 ax.set_title(f'String Spacing History')
@@ -7684,10 +7685,8 @@ class Visualizer:
         self._string_weights_history = []
         self._string_history_iterations = []
         self._last_recorded_iteration_string_history = None
-        self._nn_distance_history = []
-        self._last_recorded_iteration_nn_distance = None
-        self._min_pairwise_distance_history = []
-        self._last_recorded_iteration_min_pairwise_distance = None
+        self._nn_distance_history = {}
+        self._min_pairwise_distance_history = {}
 
 def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        param_names=None, param_ranges=None, n_points=50,
