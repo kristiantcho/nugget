@@ -620,14 +620,18 @@ class Visualizer:
         """Weighted average of each string's mean distance to its 5 nearest neighbours.
 
         All strings are included; the contribution of each string (and each of its
-        neighbours) is weighted by sigmoid(string_weights), matching the soft
-        neighbour-weighting used by ROVPenalty. The "5 nearest" is a soft selection
-        via softmax over -distance (like ROVPenalty._compute_away_theta), so the
-        metric varies smoothly:
+        neighbours) is weighted by string_weights, matching the soft neighbour-
+        weighting used by ROVPenalty. `string_weights` is expected to already be in
+        [0, 1] (i.e. sigmoid(raw_weights)) - the same convention `_create_plot` uses
+        everywhere else (it sigmoids `kwargs['string_weights']` once, up front) - so
+        this does NOT re-apply sigmoid internally; pass raw (pre-sigmoid) logits only
+        if you also apply sigmoid() yourself before calling this. The "5 nearest" is
+        a soft selection via softmax over -distance (like
+        ROVPenalty._compute_away_theta), so the metric varies smoothly:
 
-            w_ij   = sigmoid(w_j) * softmax_j(-dist_ij / tau)     (over j != i)
+            w_ij   = w_j * softmax_j(-dist_ij / tau)     (over j != i)
             d_i    = sum_j w_ij * dist_ij / sum_j w_ij
-            metric = sum_i sigmoid(w_i) * d_i / sum_i sigmoid(w_i)
+            metric = sum_i w_i * d_i / sum_i w_i
 
         tau defaults to 0.5 * (median k-th nearest distance) so it is robust to the
         absolute coordinate units.
@@ -662,10 +666,10 @@ class Visualizer:
         z -= z.max(axis=1, keepdims=True)  # numerical stability
         soft = np.exp(z)  # (n, n-1)
 
-        # Neighbour sigmoid weights (per column j, excluding self).
+        # Neighbour weights (per column j, excluding self). Already in [0, 1] - see
+        # the docstring note on why this does not apply sigmoid() itself.
         if string_weights is not None:
-            sw = np.asarray(string_weights, dtype=float).reshape(-1)
-            probs = 1.0 / (1.0 + np.exp(-sw))  # sigmoid
+            probs = np.asarray(string_weights, dtype=float).reshape(-1)
             probs_off = np.broadcast_to(probs[None, :], (n, n))[off].reshape(n, n - 1)
             own_probs = probs
         else:
@@ -694,9 +698,11 @@ class Visualizer:
         1-NN distance, avoiding a hard-argmin discontinuity):
 
             min_i  = -tau * log( sum_j exp(-dist_ij / tau) )     (j != i)
-            metric = sum_i sigmoid(w_i) * min_i / sum_i sigmoid(w_i)
+            metric = sum_i w_i * min_i / sum_i w_i
 
-        (plain mean over i if `string_weights` is None). `tau` defaults to
+        (plain mean over i if `string_weights` is None). `string_weights` is expected
+        to already be in [0, 1] (see `_weighted_mean_nn_distance`'s docstring for why
+        this does not apply sigmoid() itself). `tau` defaults to
         0.05 * (median 1-NN distance). Unlike the "soft top-5" averaging in
         `_weighted_mean_nn_distance` (which intentionally blends several neighbours
         together), this softmin is meant to track a single true minimum, so it needs
@@ -736,8 +742,7 @@ class Visualizer:
         min_per_string = -tau * logsumexp  # (n,)
 
         if string_weights is not None:
-            sw = np.asarray(string_weights, dtype=float).reshape(-1)
-            probs = 1.0 / (1.0 + np.exp(-sw))  # sigmoid
+            probs = np.asarray(string_weights, dtype=float).reshape(-1)
         else:
             probs = np.ones(n, dtype=float)
 
@@ -1068,17 +1073,22 @@ class Visualizer:
               (from 'effective_area_per_event' or 'effective_area_matrix' in kwargs, as returned
               by EffectiveAreaLoss/FoMLoss)
             - 'nn_distance_history': History of two distance series, computed from the current
-              'string_xy' each iteration and plotted together: (1) the (sigmoid-weight-weighted)
-              average per-string mean distance to its 5 nearest neighbours, and (2) the
-              (sigmoid-weight-weighted) average, across strings, of each string's own (soft)
-              nearest-neighbour distance -- i.e. a softmin per string over its distances to all
-              others, then a weighted average of those per-string minimums. Both fall back to a
-              plain (unweighted) average if 'string_weights' is not provided. Optional kwargs:
+              'string_xy' each iteration and plotted together: (1) the (weight-weighted) average
+              per-string mean distance to its 5 nearest neighbours, and (2) the (weight-weighted)
+              average, across strings, of each string's own (soft) nearest-neighbour distance --
+              i.e. a softmin per string over its distances to all others, then a weighted average
+              of those per-string minimums. If 'string_weights' is provided, strings with
+              sigmoid(weight) < 'weight_threshold' (default 0.7) are dropped entirely before
+              computing either series (matching the hard active_mask convention used by the ROV
+              penalty / string_xy plots), and the remaining strings' sigmoid-weights are used as
+              soft weighting on top of that. Both series fall back to a plain (unweighted)
+              average over all strings if 'string_weights' is not provided. Optional kwargs:
               'nn_distance_num_neighbours' (default 5), 'nn_distance_nn_tau' (soft-selection
               temperature as a multiple of the geometry's median k-th nearest distance; default
               None -> 0.5), 'nn_distance_min_tau' (per-string softmin temperature for the second
               series, same scale-aware convention but deliberately sharper since it targets a
-              single minimum rather than a top-5 blend; default None -> 0.05), 'string_weights'.
+              single minimum rather than a top-5 blend; default None -> 0.05), 'string_weights',
+              'weight_threshold'.
         make_gif : bool
             Whether to generate and save a GIF of the progress.
         gif_plot_selection : list of str or None
@@ -5579,20 +5589,41 @@ class Visualizer:
         elif plot_type == self.PLOT_NN_DISTANCE_HISTORY:
             # History of the (weighted) average per-string mean distance to its 5
             # nearest neighbours, accumulated across optimization iterations, alongside
-            # the global minimum pairwise string-string distance. Both are computed
-            # from the current string_xy (weighted by sigmoid(string_weights), matching
-            # the ROV penalty's soft weighting, when string_weights is provided).
+            # the global minimum pairwise string-string distance.
+            #
+            # When string_weights is provided, distances are restricted to active
+            # strings only - those with sigmoid(weight) >= weight_threshold (default
+            # 0.7), matching the hard active_mask convention used by the ROV penalty
+            # and string_xy plots (see 'weight_threshold' elsewhere, e.g. the
+            # string_xy_rov_penalty active_mask). kwargs['string_weights'] here is
+            # already sigmoided (done once, up front, for all plot types), so the
+            # threshold and the weights passed to the helpers below both operate
+            # directly on those probabilities. Within that active subset, the helpers
+            # still apply their own soft weighting/softmin, but since every remaining
+            # string has weight >= threshold, that soft weighting no longer
+            # meaningfully discounts any of them.
             if string_xy is not None:
                 num_neighbours = int(kwargs.get('nn_distance_num_neighbours', 5))
                 nn_tau = kwargs.get('nn_distance_nn_tau', None)
                 min_tau = kwargs.get('nn_distance_min_tau', None)
                 string_weights = kwargs.get('string_weights', None)
+                weight_threshold = kwargs.get('weight_threshold', 0.7)
 
                 xy_np = string_xy.clone().detach().cpu().numpy() if torch.is_tensor(string_xy) else np.asarray(string_xy)
 
+                nn_string_weights = string_weights
+                if string_weights is not None:
+                    string_weights_np = (
+                        string_weights.clone().detach().cpu().numpy()
+                        if torch.is_tensor(string_weights) else np.asarray(string_weights)
+                    ).reshape(-1)
+                    active_mask = string_weights_np >= weight_threshold
+                    xy_np = xy_np[active_mask]
+                    nn_string_weights = string_weights_np[active_mask]
+
                 mean_metric = self._weighted_mean_nn_distance(
                     xy_np,
-                    string_weights=string_weights,
+                    string_weights=nn_string_weights,
                     num_neighbours=num_neighbours,
                     nn_tau=nn_tau,
                 )
@@ -5601,7 +5632,7 @@ class Visualizer:
 
                 min_metric = self._mean_min_nn_distance(
                     xy_np,
-                    string_weights=string_weights,
+                    string_weights=nn_string_weights,
                     min_tau=min_tau,
                 )
                 if min_metric is not None and np.isfinite(min_metric) and iteration is not None:
