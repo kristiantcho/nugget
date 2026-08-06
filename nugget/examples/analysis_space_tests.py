@@ -55,7 +55,7 @@ analysis_loss = nugget.losses.analysis_loss.AnalysisLoss(
     effective_area_loss=effective_area_loss
 )
 
-num_events = 100000
+num_events = 50000
 angular_loss_dicts = {}
 energy_loss_dicts = {}
 spacing_min = 50
@@ -156,8 +156,8 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
                 'use_relative_energy': True,
 
 
-                'trigger_use_torch_compile': False,
-                'binned_trigger_chunk_size': 10000,
+                'trigger_use_torch_compile': True,
+                'binned_trigger_chunk_size': 2000,
                 'use_batched_trigger': True,
                 'use_batched_binned_trigger': True,
                 'use_batched_effective_area': True,

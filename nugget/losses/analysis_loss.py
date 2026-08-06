@@ -575,7 +575,7 @@ class AnalysisLoss(LossFunction):
             )
 
         temperature = kwargs.get("bounding_cylinder_temperature", 1)
-        include_height = kwargs.get("analysis_adjust_cylinder_height", True)
+        include_height = kwargs.get("analysis_adjust_cylinder_height", False)
         # Forward the triggerability-gating options so the sampling cylinder
         # matches the radius EffectiveAreaLoss derives (keeps the two consistent).
         circle_kwargs = {
