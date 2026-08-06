@@ -8,6 +8,7 @@ import os
 from nugget.losses.trigger import TriggerLoss, ResolutionSelectionLoss
 from nugget.losses.fisher_info import WeightedResolutionLoss
 from nugget.losses.effective_area import get_weighted_min_enclosing_circle
+from nugget.samplers.cyl_sampler import CylinderSampler
 from torch.special import ndtr
 from typing import Union, List
 from numpy.typing import ArrayLike as Array
@@ -523,6 +524,91 @@ class AnalysisLoss(LossFunction):
         self.trigger_loss = trigger_loss
 
 
+    def _get_geometry_bounding_cylinder(self, geom_dict, temperature, include_height=True, **circle_kwargs):
+        """Fit a cylinder to the current geometry (mirrors FoMLoss).
+
+        XY center/radius come from the smooth weighted minimum enclosing circle
+        of the string positions (weighted continuously in [0, 1] by
+        string_weights); height (if requested) is the unweighted z-extent of the
+        detector's points_3d.
+        """
+        string_xy = geom_dict.get("string_xy", None)
+        if string_xy is None:
+            raise ValueError("geom_dict must provide 'string_xy' to adjust the cylinder to geometry")
+        string_weights = geom_dict.get("string_weights", None)
+        string_probs = None
+        if string_weights is not None:
+            string_probs = torch.sigmoid(string_weights)
+
+        center_xy, radius = get_weighted_min_enclosing_circle(
+            string_xy, string_weights=string_probs, temperature=temperature, **circle_kwargs
+        )
+
+        if not include_height:
+            center_z = torch.zeros((), device=self.device, dtype=center_xy.dtype)
+            height = torch.zeros((), device=self.device, dtype=center_xy.dtype)
+        else:
+            points_3d = geom_dict.get("points_3d")
+            z_positions = points_3d[:, 2]
+            z_max = torch.max(z_positions)
+            z_min = torch.min(z_positions)
+            center_z = 0.5 * (z_min + z_max)
+            height = z_max - z_min
+
+        center = torch.stack([center_xy[0], center_xy[1], center_z])
+        return center, radius, height
+
+    # Constructor args of CylinderSampler that are captured explicitly (not in
+    # self.kwargs), so a from-scratch cylinder can be safely merged into a
+    # clone's **kwargs without colliding with these.
+    _CYLINDER_SAMPLER_RESERVED_KEYS = ("device", "dim", "domain_size", "cylinder_center", "cylinder_height", "cylinder_radius")
+
+    def _get_geometry_adjusted_sampler(self, geom_dict, kwargs):
+        """Clone the configured signal_sampler onto the cylinder derived from the current geometry."""
+        signal_sampler = kwargs.get("signal_sampler", None)
+        if signal_sampler is None:
+            raise ValueError("signal_sampler must be provided when analysis_adjust_cylinder_to_geometry=True")
+        if not isinstance(signal_sampler, CylinderSampler):
+            raise TypeError(
+                "analysis_adjust_cylinder_to_geometry=True requires signal_sampler to be a CylinderSampler, "
+                f"got {type(signal_sampler)}"
+            )
+
+        temperature = kwargs.get("bounding_cylinder_temperature", 1)
+        include_height = kwargs.get("analysis_adjust_cylinder_height", True)
+        # Forward the triggerability-gating options so the sampling cylinder
+        # matches the radius EffectiveAreaLoss derives (keeps the two consistent).
+        circle_kwargs = {
+            "downweight_untriggerable": kwargs.get("downweight_untriggerable", False),
+            "trigger_neighbor_distance": kwargs.get("trigger_neighbor_distance", 550.0),
+            "trigger_min_neighbors": kwargs.get("trigger_min_neighbors", 30.0),
+            "trigger_distance_sharpness": kwargs.get("trigger_distance_sharpness", 0.05),
+            "trigger_count_sharpness": kwargs.get("trigger_count_sharpness", 1.0),
+        }
+        center, radius, height = self._get_geometry_bounding_cylinder(
+            geom_dict, temperature, include_height=include_height, **circle_kwargs
+        )
+
+        # Optional fixed margin (e.g. an attenuation length) so events generated
+        # just outside the geometry's own footprint are still sampled.
+        radius = radius + 55.4  #2x attenuation length
+        # height = height + kwargs.get("analysis_cylinder_height_margin", 0.0)
+
+        sampler_kwargs = {
+            k: v for k, v in signal_sampler.kwargs.items()
+            if k not in self._CYLINDER_SAMPLER_RESERVED_KEYS
+        }
+
+        return CylinderSampler(
+            device=signal_sampler.device,
+            dim=signal_sampler.dim,
+            domain_size=signal_sampler.domain_size,
+            cylinder_center=center.detach(),
+            cylinder_height=height.detach(),
+            cylinder_radius=radius.detach(),
+            **sampler_kwargs,
+        )
+
     def _ensure_weights(
         self,
         signal_event_params,
@@ -618,7 +704,28 @@ class AnalysisLoss(LossFunction):
         pyff_config         = kwargs.get('pyff_config', None) # :str|dict
         weight_temp_path    = kwargs.get('weight_temp_path', None) # :str
         weight_pid          = kwargs.get('weight_pid', 14) # :int
+        # Sampling-cylinder adjustment (mirrors FoMLoss): resample fresh events
+        # from a cylinder fit to the *current* geometry instead of whatever fixed
+        # cylinder signal_sampler was constructed with. Only meaningful when
+        # events are actually (re)sampled here, i.e. signal_event_params is None.
+        adjust_cylinder_to_geometry = kwargs.get('analysis_adjust_cylinder_to_geometry', False)
         eff_kwargs = kwargs.copy()
+
+        if adjust_cylinder_to_geometry and signal_event_params is None:
+            if signal_sampler is None:
+                raise ValueError(
+                    "analysis_adjust_cylinder_to_geometry=True requires a "
+                    "'signal_sampler' to clone the geometry-adjusted cylinder from."
+                )
+            signal_sampler = self._get_geometry_adjusted_sampler(geom_dict, kwargs)
+            eff_kwargs['signal_sampler'] = signal_sampler
+            # The adjusted cylinder is geometry-derived, so the generation
+            # geometry used for the fluxless weight and for the effective-area
+            # acceptance must be read from it too, not from a stale
+            # eff_area_cyl_radius/height passed in by the caller.
+            eff_area_cyl_radius = None
+            eff_area_cyl_height = None
+
         if signal_event_params is None:
             
             signal_event_params = signal_sampler.sample_events(num_events)
@@ -713,10 +820,15 @@ class AnalysisLoss(LossFunction):
         acceptance = selection_acceptance.squeeze()
 
         if effective_area_loss is not None:
-            # Use the *generation* cylinder so that w * P_int refers to
-            # interactions in the same target volume the weights were built for.
-            # A geometry-derived bounding cylinder would drift against the frozen
-            # G and produce a spurious "shrink the detector" gradient.
+            # Use the cylinder signal_event_params was actually generated from,
+            # so that w * P_int refers to interactions in the same target volume
+            # the weights were built for. Under analysis_adjust_cylinder_to_geometry,
+            # that is this iteration's geometry-derived cylinder (signal_sampler was
+            # reassigned to the adjusted clone above); otherwise it is the fixed
+            # generation cylinder. Either way it must NOT be a bounding cylinder
+            # independent of what actually generated the events, or w * P_int
+            # would drift against a stale G and produce a spurious
+            # "shrink the detector" gradient.
             if eff_area_cyl_radius is None or eff_area_cyl_height is None:
                 if signal_sampler is not None and hasattr(signal_sampler, 'cylinder'):
                     eff_area_cyl_radius = _as_float(signal_sampler.cylinder.radius)
