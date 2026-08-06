@@ -10,7 +10,7 @@ radius = 600
 height = 1000
 num_strings = 61
 event_type = 'track'  # 'track' or 'cascade'
-limit_zenith = 'vertical'  # 'horizontal' or 'vertical'
+limit_zenith = None  # 'horizontal' or 'vertical'
 free_sim_volume = False  # If True, the simulation volume is not constrained to a cylinder. If False, the simulation volume is constrained to a cylinder with the specified center, radius, and height.
 lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = event_type)
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate_batched
@@ -124,6 +124,7 @@ for energy in [2,3,4,5,6,7]:
             signal_events = signal_sampler.sample_events(num_events=num_events)
         
         loss_params = {
+                    'signal_sampler': signal_sampler,
                     'signal_event_params': signal_events,
                     'signal_surrogate_func': light_yield_surrogate,
                     'llr_net': None,
@@ -148,18 +149,20 @@ for energy in [2,3,4,5,6,7]:
                     'precomputed_fisher_per_string_per_event': None,
                     'recompute_bad_points': False,
                     'empty_cache_after_event': True,
-                    'events_per_batch': 100000,
+                    'events_per_batch': 25000,
                     'fisher_info_detach_tensors': True,
                     'fisher_info_use_patd': False,
                     'fisher_res_metric': 'fom',  # 'fom' 'median' 'mean'
                     'fisher_info_use_torch_compile': True,
                     'use_relative_energy': True,
+
                     'trigger_use_torch_compile': False,
+                    'binned_trigger_chunk_size': 2000,
                     'use_batched_trigger': True,
-                    'use_batched_surrogate': True,
                     'use_batched_binned_trigger': True,
                     'use_batched_effective_area': True,
                     'bounding_cylinder_temperature': 1,
+                    'detach_light_yields': True,
                 
                     'perfect_efficiency': False,
                     'downweight_untriggerable': False,
@@ -206,8 +209,8 @@ for energy in [2,3,4,5,6,7]:
                 if isinstance(ps_fom_loss_dict[key], torch.Tensor):
                     ps_fom_loss_dict[key] = ps_fom_loss_dict[key].detach().cpu()
             ps_fom_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}'] = ps_fom_loss_dict
-            
-
+            print(f'PS FoM = {1/ps_fom_loss_dict["pointsource_fom_loss"]}')
+        torch.cuda.empty_cache()
 
 
 copy_angular_loss_dicts = angular_loss_dicts.copy()
@@ -215,11 +218,17 @@ copy_energy_loss_dicts = energy_loss_dicts.copy()
 for energy in range(2,8):
     # for angular_loss_dict in copy_angular_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
     for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), spacing_count):
-        del copy_angular_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}']['resolution_params']
-    # for energy_loss_dict in copy_energy_loss_dicts[f'{energy}-{energy+1}' if energy < 6 else f'{energy}-{energy+2}']:
-        del copy_energy_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}']['resolution_params']
-with open(f'pois_tests/pois_{"" if not ps_fom else "ps_fom_"}{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}angular_loss_dicts_energies.pkl', 'wb') as f:
-    pickle.dump(copy_angular_loss_dicts, f)
+        if not ps_fom:
+            del copy_angular_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}']['resolution_params']
+            del copy_energy_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}']['resolution_params']
+        else:
+            del ps_fom_loss_dicts[f'{energy}-{energy+1}'][f'{np.round(string_spacing, 3)}']['signal_event_params']
+if not ps_fom:
+    with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}angular_loss_dicts_energies.pkl', 'wb') as f:
+        pickle.dump(copy_angular_loss_dicts, f)
 
-with open(f'pois_tests/pois_{"" if not ps_fom else "ps_fom_"}{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}energy_loss_dicts_energies.pkl', 'wb') as f:
-    pickle.dump(copy_energy_loss_dicts, f)
+    with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}energy_loss_dicts_energies.pkl', 'wb') as f:
+        pickle.dump(copy_energy_loss_dicts, f)
+else:
+    with open(f'pois_tests/pois_{num_strings}_{event_type}_{limit_zenith + "_" if limit_zenith is not None else ""}{"free_" if free_sim_volume else ""}ps_fom_loss_dicts_energies.pkl', 'wb') as f:
+        pickle.dump(ps_fom_loss_dicts, f)

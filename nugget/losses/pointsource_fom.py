@@ -228,7 +228,7 @@ class FoMLoss(LossFunction):
             torch.isfinite(resolution_per_event)
             & torch.isfinite(effective_area_per_event)
             & (resolution_per_event > 1e-12)
-            & (effective_area_per_event >= 0.0)
+            & (effective_area_per_event > 0.0)
         )
         if include_e_term and effective_area_kwargs["signal_sampler"] is not None:
             temp_sampler = effective_area_kwargs["signal_sampler"]
@@ -249,7 +249,7 @@ class FoMLoss(LossFunction):
             safe_res = resolution_per_event[finite_mask]
             safe_aeff = norm_effective_area_per_event[finite_mask]
             sum_term = torch.mean(safe_aeff / (4.0 * torch.pi * (safe_res ** 2)))
-            combined_loss = 1.0 / torch.sqrt(torch.clamp_min(sum_term, 1e-20))
+            combined_loss = 1.0 / torch.sqrt(sum_term)
         else:
             combined_loss = torch.tensor(1.0, device=self.device, requires_grad=True)
 
