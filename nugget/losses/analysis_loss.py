@@ -7,6 +7,7 @@ import pandas as pd
 import os
 from nugget.losses.trigger import TriggerLoss, ResolutionSelectionLoss
 from nugget.losses.fisher_info import WeightedResolutionLoss
+from nugget.losses.effective_area import get_weighted_min_enclosing_circle
 from torch.special import ndtr
 from typing import Union, List
 from numpy.typing import ArrayLike as Array
@@ -268,9 +269,9 @@ def compute_fluxless_weights(df, gen):
     cos_theta = np.cos(df['zenith'].to_numpy(dtype=float))
 
     inv_pE = _inv_p_energy(energy, gen)
-    # geom, geom_kind = _geometric_weight(cos_theta, gen)
+    geom, geom_kind = _geometric_weight(cos_theta, gen)
 
-    # weights = inv_pE * np.asarray(geom) / N_gen
+    weights = inv_pE * np.asarray(geom) / N_gen
     weights = inv_pE * 1e6 * 4*np.pi/ N_gen
     geom_kind = 'None'
     #weights *= _M2_TO_CM2  # m^2 -> cm^2
@@ -466,9 +467,12 @@ def calc_fisher_matrix(mu,grad_hist,ssq,signal_idx):
     return marginalized_fim
 
 def calc_cov(fim):
+    fim = fim + 1e-10 * torch.eye(fim.shape[0], device=fim.device, dtype=fim.dtype)
+    print(f"FIM: {fim}")
     try:
         cov = torch.linalg.inv(fim)
     except RuntimeError as e:
+        
         cov = torch.linalg.pinv(fim)
     return cov
 
@@ -616,8 +620,10 @@ class AnalysisLoss(LossFunction):
         weight_pid          = kwargs.get('weight_pid', 14) # :int
         eff_kwargs = kwargs.copy()
         if signal_event_params is None:
+            
             signal_event_params = signal_sampler.sample_events(num_events)
             weight_factor = live_time
+
             # Freshly sampled events have no flux weights yet. Weight them here,
             # before any subsampling, so N_gen is the full generated sample.
             signal_event_params = self._ensure_weights(
@@ -668,18 +674,26 @@ class AnalysisLoss(LossFunction):
                 weighted_resolution_loss=WeightedResolutionLoss(
                         device=self.device,
                         resolution_type='angular',
-                        fisher_info_params=['direction']
+                        fisher_info_params=['direction', 'position']
                 )
             loss_stuff = weighted_resolution_loss(geom_dict, **eff_kwargs)
-            uncerainty = loss_stuff['resolution_per_event']
+            uncertainty = loss_stuff['resolution_per_event']
             if input_name == 'energy':
-                for i in range(len(uncerainty)):
-                    uncerainty[i] =  uncerainty[i] / signal_event_params[i]['energy']
+                energy_res_per_event = loss_stuff['resolution_per_event']
+                energies = torch.stack([
+                    params['energy'].to(self.device).reshape(())
+                    for params in signal_event_params
+                ])
+                uncertainty = uncertainty / energies
             elif input_name == 'zenith':
+                angular_res_per_event = loss_stuff['resolution_per_event']
                 eff_kwargs['precalculated_resolution_loss'] = loss_stuff
-                for i in range(len(uncerainty)):
-                    uncerainty[i] =  uncerainty[i] * torch.abs(torch.sin(signal_event_params[i]['zenith']))
-            uncertainties.append(uncerainty.squeeze())
+                zeniths = torch.stack([
+                    params['zenith'].to(self.device).reshape(())
+                    for params in signal_event_params
+                ])
+                uncertainty = uncertainty * torch.abs(torch.sin(zeniths))
+            uncertainties.append(uncertainty.squeeze())
             if input_name == 'zenith':
                 selection_loss = ResolutionSelectionLoss(
                     device=self.device,

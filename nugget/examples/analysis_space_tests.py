@@ -34,7 +34,7 @@ trigger_loss = nugget.losses.trigger.TriggerLoss(
     device=device,
     light_yield_threshold=6.0,
     distance_bar_length=550.0,
-    distance_bar_step=20.0,
+    distance_bar_step=50.0,
     min_points_threshold=30.0,
     t1_temperature=2.0,
     t3_temperature=2.0,
@@ -83,18 +83,19 @@ signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
                                                     # cos_range=torch.tensor((np.cos(np.radians(155)),np.cos(np.radians(180))))
                                                     )
 if not free_sim_volume:
-    signal_events = signal_sampler.sample_events(num_events=num_events)
-    signal_events = analysis_loss._ensure_weights(
-                    signal_events,
-                    friend_config='../other/friend_config.yaml',
-                    pyff_config='../other/pyff_config.yaml',
-                    signal_sampler=signal_sampler,
-                    pid=14,
-                    temp_path=None,
-                )
-    # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1 if energy < 6 else energy+2}.parquet')
-    nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_{num_strings}_{event_type}_{limit_zenith+ "_" if limit_zenith is not None else ""}signal_events_analysis.parquet')
-    signal_events = nugget.utils.data_tools.add_events_to_device(signal_events, device=device)
+    # signal_events = signal_sampler.sample_events(num_events=num_events)
+    # signal_events = analysis_loss._ensure_weights(
+    #                 signal_events,
+    #                 friend_config='../other/friend_config.yaml',
+    #                 pyff_config='../other/pyff_config.yaml',
+    #                 signal_sampler=signal_sampler,
+    #                 pid=14,
+    #                 temp_path=None,
+    #             )
+    # # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_127_signal_events_e{energy}-e{energy+1 if energy < 6 else energy+2}.parquet')
+    # nugget.utils.data_tools.save_signal_events_parquet(signal_events, f'pois_tests/pois_space_{num_strings}_{event_type}_{limit_zenith+ "_" if limit_zenith is not None else ""}signal_events_analysis.parquet')
+   signal_events = nugget.utils.data_tools.load_signal_events_parquet(f'pois_tests/pois_space_{num_strings}_{event_type}_{limit_zenith+ "_" if limit_zenith is not None else ""}signal_events_analysis.parquet')
+   signal_events = nugget.utils.data_tools.add_events_to_device(signal_events, device=device)
 # if energy < 6:
 
 # else:
@@ -129,7 +130,7 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
                 'llr_iterations': 1,
                 'skip_zero_response': False,
                 'verbose': True,
-                'jacrev_chunk_size': 50000,
+                'jacrev_chunk_size': 25000,
                 'point_chunk_size': 22000,
                 'grad_chunk_size': 7,
                 'llr_autodiff_mode': 'jvp',
@@ -147,7 +148,7 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
                 'precomputed_fisher_per_string_per_event': None,
                 'recompute_bad_points': False,
                 'empty_cache_after_event': True,
-                'events_per_batch': 100000,
+                'events_per_batch': 25000,
                 'fisher_info_detach_tensors': True,
                 'fisher_info_use_patd': False,
                 'fisher_res_metric': 'fom',  # 'fom' 'median' 'mean'
@@ -156,14 +157,16 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
 
 
                 'trigger_use_torch_compile': False,
+                'binned_trigger_chunk_size': 10000,
                 'use_batched_trigger': True,
                 'use_batched_binned_trigger': True,
                 'use_batched_effective_area': True,
                 'bounding_cylinder_temperature': 1,
-            
+                'detach_light_yields': True,
             
                 'downweight_untriggerable': True,
                 "trigger_neighbor_distance": 550.0,
+                'use_batched_surrogate': True,
                 "trigger_min_neighbors": 30,
                 'trigger_distance_sharpness': 0.05,
                 'trigger_count_sharpness':1,

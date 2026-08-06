@@ -912,7 +912,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     torch.full_like(resolution_per_event, 1e6),
                 )
                 if fisher_res_metric == 'fom':
-                    total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                    total_resolution = 1 / torch.sqrt(torch.mean(1 / (safe_res ** 2)))
                 elif fisher_res_metric == 'median':
                     total_resolution = torch.median(safe_res)
                 else:
@@ -945,7 +945,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
             # covariance matrix at once, then form the (relative) resolution.
             energy_idx = self.fisher_info_params.index('energy')
             var_energy = cov_matrix[:, energy_idx, energy_idx]                  # (N,)
-            resolution_per_event = torch.sqrt(torch.clamp_min(var_energy, 1e-10))  # (N,)
+            resolution_per_event = torch.sqrt(var_energy)  # (N,)
             if use_relative_energy:
                 energies = torch.stack([
                     params['energy'].to(self.device).reshape(()) for params in signal_event_params
@@ -964,7 +964,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     torch.full_like(new_resolution_per_event, 1e6),
                 )
                 if fisher_res_metric == 'fom':
-                    total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                    total_resolution = 1 / torch.sqrt(torch.mean(1 / (safe_res ** 2)))
                 elif fisher_res_metric == 'median':
                     total_resolution = torch.median(safe_res)
                 else:
