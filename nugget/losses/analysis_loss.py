@@ -761,10 +761,6 @@ class AnalysisLoss(LossFunction):
                 if key.startswith('grad_weights_'):
                     grad_weights[count].append(signal_event[key]*weight_factor)
                     count += 1
-                if key == 'energy' and 'energy' in binning_var_names:
-                    signal_event[key] = torch.log10(signal_event[key])
-                if key == 'zenith' and 'zenith' in binning_var_names:
-                    signal_event[key] = torch.cos(signal_event[key])
         weights = torch.stack(weights).squeeze()
         for i in range(len(grad_weights)):
             grad_weights[i] = torch.stack(grad_weights[i]).squeeze()
@@ -776,9 +772,20 @@ class AnalysisLoss(LossFunction):
                 bins.append(zenith_bins)
         # print(bins)
 
+        # Build the binning variables WITHOUT mutating signal_event_params: the
+        # caller may reuse the same event dicts across many calls (e.g. a scan
+        # over geometries), and writing log10(energy)/cos(zenith) back into them
+        # compounds the transform on every call --
+        # log10(log10(log10(E))) goes negative, then NaN, poisoning the
+        # cross-section/transmission splines and the whole FIM.
         for i, input_name in enumerate(binning_var_names):
             for signal_event in signal_event_params:
-                input_vars[i].append(signal_event[input_name])
+                value = signal_event[input_name]
+                if input_name == 'energy':
+                    value = torch.log10(value)
+                elif input_name == 'zenith':
+                    value = torch.cos(value)
+                input_vars[i].append(value)
             input_vars[i] = torch.stack(input_vars[i]).squeeze()
         # print(f"input_vars: {input_vars}")
         per_event_counts = bKDEnD(input_vars,bins,uncertainties)
