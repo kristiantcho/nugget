@@ -182,9 +182,9 @@ class FoMLoss(LossFunction):
 
         # Angular resolution (weighted or non-weighted)
         resolution_out = self.resolution_loss(geom_dict, **resolution_kwargs)
-        resolution_per_event = resolution_out.get("resolution_per_event", None)
+        resolution_per_event = resolution_out.get("angular_resolution_per_event", None)
         if resolution_per_event is None:
-            raise ValueError("Resolution loss did not return 'resolution_per_event'")
+            raise ValueError("Resolution loss did not return 'angular_resolution_per_event'")
         resolution_per_event = torch.as_tensor(resolution_per_event, device=self.device)
 
         # Use the exact event list that resolution used after any internal subsampling.
@@ -255,7 +255,7 @@ class FoMLoss(LossFunction):
 
         return {
             "pointsource_fom_loss": combined_loss,
-            "resolution_per_event": resolution_per_event,
+            "angular_resolution_per_event": resolution_per_event,
             "effective_area_per_event": norm_effective_area_per_event,
             "weighted_bounding_cylinder_center": effective_area_out.get("weighted_bounding_cylinder_center", effective_area_out.get("bounding_cylinder_center", None)),
             "weighted_bounding_cylinder_radius": effective_area_out.get("weighted_bounding_cylinder_radius", effective_area_out.get("bounding_cylinder_radius", None)),

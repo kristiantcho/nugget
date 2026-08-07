@@ -674,6 +674,8 @@ class AnalysisLoss(LossFunction):
             eff_kwargs['precomputed_light_yield_per_point_per_event'] = precomputed_ly
 
         uncertainties = []
+        angular_res_per_event = None
+        energy_res_per_event = None
         # make a list of energy bin edges in logspace and zenith bin edges in linear space 
         for input_name in binning_var_names:
             if input_name == 'energy':
@@ -689,22 +691,22 @@ class AnalysisLoss(LossFunction):
                         fisher_info_params=['direction', 'position']
                 )
             loss_stuff = weighted_resolution_loss(geom_dict, **eff_kwargs)
-            uncertainty = loss_stuff['resolution_per_event']
+            # uncertainty = loss_stuff['resolution_per_event']
             if input_name == 'energy':
-                energy_res_per_event = loss_stuff['resolution_per_event']
+                energy_res_per_event = loss_stuff['energy_resolution_per_event']
                 energies = torch.stack([
                     params['energy'].to(self.device).reshape(())
                     for params in signal_event_params
                 ])
-                uncertainty = uncertainty / energies
+                uncertainty = energy_res_per_event / energies
             elif input_name == 'zenith':
-                angular_res_per_event = loss_stuff['resolution_per_event']
+                angular_res_per_event = loss_stuff['angular_resolution_per_event']
                 eff_kwargs['precalculated_resolution_loss'] = loss_stuff
                 zeniths = torch.stack([
                     params['zenith'].to(self.device).reshape(())
                     for params in signal_event_params
                 ])
-                uncertainty = uncertainty * torch.abs(torch.sin(zeniths))
+                uncertainty = angular_res_per_event * torch.abs(torch.sin(zeniths))
             uncertainties.append(uncertainty.squeeze())
             if input_name == 'zenith':
                 selection_loss = ResolutionSelectionLoss(
@@ -815,4 +817,7 @@ class AnalysisLoss(LossFunction):
             'flux_param_names': signal_flux_var_names,
             'flux_param_covariance': cov,
             'flux_param_variances': param_variances,
+            'energy_resolution_per_event': energy_res_per_event,
+            'angular_resolution_per_event': angular_res_per_event,
+            'effective_area_loss_dict': eff_out if effective_area_loss is not None else None,
         }

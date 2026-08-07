@@ -9,13 +9,6 @@ def _trigger_chunk_cleanup(device):
     """Release Python-side objects between event chunks without forcing CUDA
     cache flushes.
 
-    Mirrors fisher_info_helpers._fisher_chunk_cleanup: calling
-    torch.cuda.empty_cache() inside a tight loop can surface asynchronous CUDA
-    faults at cache-flush points and usually hurts throughput, so the default
-    cleanup is just Python GC (which lets freed chunk intermediates / autograd
-    graphs be reclaimed between chunks) plus an optional explicit sync for
-    debugging. A hard empty_cache() is opt-in via the caller's
-    empty_cache_after_event flag.
     """
     gc.collect()
     if isinstance(device, torch.device) and device.type == 'cuda' \
@@ -34,12 +27,6 @@ _TRIGGER_SURROGATE_COMPILE_CACHE = {}
 def _resolve_batched_surrogate(surrogate_func):
     """Recover a batched light-yield callable from a (bound) per-event surrogate.
 
-    Mirrors the Poisson-Fisher path's auto-discovery (see
-    fisher_info_helpers._resolve_lightsabre_instance): the loss is handed the
-    *bound* per-event method (e.g. ``lightsabre.light_yield_surrogate``); if its
-    owning instance also exposes ``light_yield_surrogate_batched`` (as LightSabre
-    does), return that bound method so the trigger can compute all events for all
-    OMs in a single vectorized GPU call instead of a Python per-event loop.
 
     Returns the bound batched callable, or None if the surrogate does not support
     batching (in which case the caller falls back to the per-event path).
@@ -58,17 +45,7 @@ def _resolve_batched_surrogate(surrogate_func):
 def _compiled_surrogate(fn, torch_compile_kwargs=None):
     """Return a torch.compile'd wrapper around `fn`, cached by `fn`'s identity.
 
-    Disables AOTAutograd's "donated buffer" optimization before compiling.
-    Donated buffers assume a compiled function's backward runs at most once per
-    forward (so its saved-for-backward tensors can be freed immediately after
-    use). This codebase's training loop backprops several losses that share
-    upstream forward computation via ``loss.backward(retain_graph=True)`` (see
-    Optimizer.loss_update_step) -- when the trigger/effective-area loss isn't
-    the last one processed, its compiled surrogate's graph is still needed
-    after its own backward call, and a donated-buffer graph raises
-    ``RuntimeError: This backward function was compiled with non-empty donated
-    buffers...`` in that case. Disabling it costs a little memory reuse but is
-    required here for correctness.
+
     """
     cache_key = id(fn)
     cached = _TRIGGER_SURROGATE_COMPILE_CACHE.get(cache_key)
@@ -650,26 +627,14 @@ class TriggerLoss(LossFunction):
         batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
         chunk_size = kwargs.get('binned_trigger_batch_size', None)
         detach_light_yields = kwargs.get('detach_light_yields', False)
-        # Between-chunk memory cleanup, mirroring the Fisher path. gc.collect()
-        # always runs (cheap, lets freed chunk tensors/graphs be reclaimed);
-        # empty_cache_after_event additionally forces a CUDA allocator flush,
-        # which relieves fragmentation across chunks at some throughput cost.
+  
         empty_cache_after_event = kwargs.get('empty_cache_after_event', False)
 
-        # Auto-discover a batched light-yield callable from the surrogate when one
-        # is not explicitly provided, mirroring the Poisson-Fisher path. This lets
-        # the trigger compute all events x all OMs in one vectorized GPU call
-        # (LightSabre.light_yield_surrogate_batched) instead of a Python per-event
-        # loop over surrogate_func. Opt out with use_batched_surrogate=False.
+      
         if batched_surrogate_func is None and kwargs.get('use_batched_surrogate', True):
             batched_surrogate_func = _resolve_batched_surrogate(surrogate_func)
 
-        # Optional torch.compile of the surrogate call(s). TriggerLoss's own math
-        # has no torch.func transforms, so compiling the surrogate callable
-        # directly (rather than anything it's wrapped in) is safe -- see the
-        # module-level _compiled_surrogate helper. Cached per callable identity,
-        # so repeated calls (e.g. across training steps / energy-zenith bins)
-        # reuse the same compiled graph instead of re-tracing.
+
         use_torch_compile = kwargs.get('trigger_use_torch_compile', False)
         torch_compile_kwargs = kwargs.get('trigger_torch_compile_kwargs', None)
         if use_torch_compile:
@@ -678,10 +643,7 @@ class TriggerLoss(LossFunction):
             if batched_surrogate_func is not None:
                 batched_surrogate_func = _compiled_surrogate(batched_surrogate_func, torch_compile_kwargs)
 
-        # Optional override: choose computation mode
-        # - None: auto (batched if precomputed yields provided, else single loop)
-        # - True: force batched
-        # - False: force single-event loop
+   
         use_batched_trigger = kwargs.get('use_batched_trigger', None)
 
         signal_sampler = kwargs.get('signal_sampler', None)
@@ -777,10 +739,7 @@ class TriggerLoss(LossFunction):
                 )
                 t_values[chunk_start:chunk_end] = chunk_t_values
 
-                # Release this chunk's heavy intermediates (the (chunk, n_bars,
-                # n_points) in_bar_mask inside compute_trigger_probability_batched_events
-                # is the dominant allocation) before building the next chunk, so
-                # per-chunk memory does not accumulate across the loop.
+                
                 del chunk_events, chunk_ly, chunk_t_values
                 _trigger_chunk_cleanup(self.device if isinstance(self.device, torch.device)
                                        else torch.device(self.device) if self.device is not None
@@ -884,10 +843,10 @@ class ResolutionSelectionLoss(LossFunction):
                 fisher_info_params=self.fisher_info_params
             ) 
             loss_stuff = weighted_resolution_loss(geom_dict, **kwargs)
-            resolution_per_event = loss_stuff['resolution_per_event'].squeeze()
+            resolution_per_event = loss_stuff[f'{self.resolution_type}_resolution_per_event'].squeeze()
             signal_event_params = loss_stuff['resolution_params']
         else:
-            resolution_per_event = precalculated_resolution_loss['resolution_per_event'].squeeze()
+            resolution_per_event = precalculated_resolution_loss[f'{self.resolution_type}_resolution_per_event'].squeeze()
             signal_event_params = precalculated_resolution_loss['resolution_params']
         true_params = []
         if self.resolution_type =='angular':
@@ -903,7 +862,7 @@ class ResolutionSelectionLoss(LossFunction):
         else:
             raise ValueError(f"Unsupported resolution type: {self.resolution_type}. Supported types are 'angular' and 'energy'.")
         true_params = torch.stack(true_params).to(device=self.device).squeeze()
-        if kwargs.get('hard_selection', False):
+        if kwargs.get('hard_selection', True):
             # check if the resolution contour around the true parameter intersects the threshold range
             if self.resolution_type =='angular': # take cosine of zenith angle for angular resolution
                 cos_true_params = torch.cos(true_params)
@@ -933,7 +892,7 @@ class ResolutionSelectionLoss(LossFunction):
         return {
             'selection_loss': selection_loss,
             'selection_efficiency': selection_efficiency,
-            'resolution_per_event': resolution_per_event,
+            f'{self.resolution_type}_resolution_per_event': resolution_per_event,
             'resolution_params': signal_event_params,
             'selection_per_event': selection_mask
         }          

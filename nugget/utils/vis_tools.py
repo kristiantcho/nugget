@@ -1734,7 +1734,7 @@ class Visualizer:
                         continue
 
                     if plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
-                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_per_event = payload.get('angular_resolution_per_event', None)
                         resolution_params = payload.get('resolution_params', None)
                         n_bins = payload.get('n_zenith_bins', 10)
                         resolution_stat = payload.get('resolution_stat', None)
@@ -1987,7 +1987,7 @@ class Visualizer:
                         continue
 
                     if plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY:
-                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_per_event = payload.get('angular_resolution_per_event', None)
                         resolution_params = payload.get('resolution_params', None)
                         n_bins = payload.get('n_energy_bins', 10)
                         resolution_stat = payload.get('resolution_stat', None)
@@ -2233,7 +2233,7 @@ class Visualizer:
                         continue
 
                     if plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
-                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_per_event = payload.get('energy_resolution_per_event', None)
                         resolution_params = payload.get('resolution_params', None)
                         n_bins = payload.get('n_energy_bins', 10)
                         use_relative_energy = payload.get('use_relative_energy', False)
@@ -2450,7 +2450,7 @@ class Visualizer:
                         continue
 
                     if plot_type == self.PLOT_POINTSOURCE_FOM_VS_ENERGY:
-                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_per_event = payload.get('angular_resolution_per_event', None)
                         effective_area_per_event = payload.get('effective_area_per_event', None)
                         event_params = payload.get('resolution_params', None)
                         if event_params is None:
@@ -2460,7 +2460,7 @@ class Visualizer:
                         n_bins = payload.get('n_energy_bins', 10)
                         energy_range = payload.get('energy_range', None)
                         fom_min_resolution = payload.get('resolution_fom_min_resolution', 1e-12)
-                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
+                        resolution_logy = bool(payload.get('resolution_logy', payload.get('ps_fom_logy', False)))
                         if not resolution_logy:
                             resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
 
@@ -2682,6 +2682,8 @@ class Visualizer:
                     ax.set_xlabel('Iteration')
                     ax.set_ylabel('Pointsource FoM')
                     ax.grid(True, alpha=0.3)
+                    if payload.get('ps_fom_logy', False):
+                        ax.set_yscale('log')
                 elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
                     ax.set_title('Flux Parameter Variance History')
                     ax.set_xlabel('Iteration')
@@ -5512,7 +5514,7 @@ class Visualizer:
             # ('mean', 'median', or 'fom') those plots use. Falls back to the scalar
             # angular_resolution_loss history in uw_loss_dict when resolution_per_event
             # isn't provided (e.g. non-weighted resolution loss without per-event output).
-            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_per_event = kwargs.get('angular_resolution_per_event', None)
             resolution_stat = kwargs.get('resolution_stat', None)
             if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
                 resolution_stat = 'mean'
@@ -5847,7 +5849,7 @@ class Visualizer:
         
         elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
             # Plot binned angular resolution vs zenith angle
-            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_per_event = kwargs.get('angular_resolution_per_event', None)
             signal_event_params = kwargs.get('resolution_params', None)
             # max_angular_resolution = kwargs.get('max_angular_resolution', np.pi)
             n_bins = kwargs.get('n_zenith_bins', 10)
@@ -6167,7 +6169,7 @@ class Visualizer:
         
         elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY:
             # Plot binned angular resolution vs log10(energy)
-            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_per_event = kwargs.get('angular_resolution_per_event', None)
             signal_event_params = kwargs.get('resolution_params', None)
             n_bins = kwargs.get('n_energy_bins', 10)
             resolution_stat = kwargs.get('resolution_stat', None)
@@ -6462,7 +6464,7 @@ class Visualizer:
 
         elif plot_type == self.PLOT_POINTSOURCE_FOM_VS_ENERGY:
             # Plot binned pointsource FoM vs log10(energy)
-            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_per_event = kwargs.get('angular_resolution_per_event', None)
             effective_area_per_event = kwargs.get('effective_area_per_event', None)
             signal_event_params = kwargs.get('resolution_params', None)
             if signal_event_params is None:
@@ -6604,7 +6606,7 @@ class Visualizer:
 
         elif plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
             # Plot binned energy resolution vs energy
-            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_per_event = kwargs.get('energy_resolution_per_event', None)
             signal_event_params = kwargs.get('resolution_params', None)
             n_bins = kwargs.get('n_energy_bins', 10)
             use_relative_energy = kwargs.get('use_relative_energy', False)

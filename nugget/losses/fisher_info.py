@@ -920,7 +920,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
             else:
                 # Keep optimization stable when all events are invalid/singular.
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
-            return {'angular_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
+            return {'angular_resolution_loss': total_resolution, 'angular_resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
         elif self.resolution_type == 'energy':
             # Compute covariance matrix for energy resolution
             # Vectorized batch inverse
@@ -971,7 +971,7 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     total_resolution = torch.mean(safe_res)
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
-            return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
+            return {'energy_resolution_loss': total_resolution, 'energy_resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
 
 class ResolutionLoss(FisherInfoLoss):
     def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith'], resolution_type='angular'):
@@ -1139,7 +1139,7 @@ class ResolutionLoss(FisherInfoLoss):
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / safe_res**2))
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
-            return {'angular_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}
+            return {'angular_resolution_loss': total_resolution, 'angular_resolution_per_event': resolution_per_event, 'resolution_params': event_params}
         elif self.resolution_type == 'energy':
             # Compute covariance matrix for energy resolution
             # Vectorized batch inverse
@@ -1183,4 +1183,4 @@ class ResolutionLoss(FisherInfoLoss):
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
 
-            return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}
+            return {'energy_resolution_loss': total_resolution, 'energy_resolution_per_event': resolution_per_event, 'resolution_params': event_params}
