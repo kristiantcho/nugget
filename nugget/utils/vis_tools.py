@@ -398,6 +398,78 @@ class Visualizer:
             ax.tick_params(axis='x', rotation=0, pad=3)
             ax.tick_params(axis='y', rotation=0, pad=3)
     
+    def _draw_slice_lines(self, ax, xy_np=None, **kwargs):
+        """Overlay the N-fold slice (wedge) boundaries on an XY plot.
+
+        Used by the string_xy family of plots. `n_folds` reaches here
+        automatically via the geometry dict (the optimizer merges it into
+        vis_kwargs), so the wedges appear whenever the geometry is N-fold
+        symmetric -- e.g. NFoldString -- and nothing is drawn otherwise.
+
+        Parameters
+        ----------
+        ax : matplotlib axes
+            Axes to draw on. Its limits are restored afterwards so the long
+            boundary lines never rescale the view.
+        xy_np : np.ndarray or None
+            String XY positions, used only as a fallback for the line length
+            when the axes have no usable limits yet.
+
+        Recognised kwargs: ``n_folds``, ``fold_angle``, ``fold_offset``,
+        ``draw_slice_lines`` (default True), ``shade_slice`` (default False),
+        ``slice_line_color`` (default 'grey').
+        """
+        n_folds = kwargs.get('n_folds', None)
+        if n_folds is None or not kwargs.get('draw_slice_lines', True):
+            return
+        n_folds = int(n_folds)
+        # n_folds == 1 is degenerate: the whole plane is a single fold.
+        if n_folds <= 1:
+            return
+
+        fold_offset = float(kwargs.get('fold_offset', 0.0) or 0.0)
+        fold_angle = kwargs.get('fold_angle', None)
+        fold_angle = (2 * np.pi / n_folds) if fold_angle is None else float(fold_angle)
+
+        # Extend the lines past the plot edge so the wedges stay visible no
+        # matter how far out the strings wander.
+        x_lim, y_lim = ax.get_xlim(), ax.get_ylim()
+        line_len = max(abs(x_lim[0]), abs(x_lim[1]), abs(y_lim[0]), abs(y_lim[1])) * 1.5
+        if not np.isfinite(line_len) or line_len <= 0:
+            xy_np = np.asarray(xy_np) if xy_np is not None else None
+            line_len = float(np.max(np.abs(xy_np))) * 1.5 if (xy_np is not None and xy_np.size) else 1.0
+
+        slice_line_color = kwargs.get('slice_line_color', 'grey')
+        for k in range(n_folds):
+            ang = fold_offset + k * fold_angle
+            ax.plot(
+                [0, line_len * np.cos(ang)],
+                [0, line_len * np.sin(ang)],
+                color=slice_line_color,
+                linestyle=':',
+                linewidth=1.0,
+                alpha=0.5,
+                zorder=0,
+            )
+
+        # Optionally shade the first fold to show which wedge is the one
+        # actually being parameterized.
+        if kwargs.get('shade_slice', False):
+            ax.add_patch(mpatches.Wedge(
+                (0.0, 0.0),
+                line_len,
+                np.degrees(fold_offset),
+                np.degrees(fold_offset + fold_angle),
+                color=slice_line_color,
+                alpha=0.08,
+                zorder=0,
+            ))
+
+        # Restore limits -- the long lines/wedge would otherwise rescale the
+        # axes and shrink the strings.
+        ax.set_xlim(x_lim)
+        ax.set_ylim(y_lim)
+
     def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=1, zoom_range=None, half_domain=None):
         """
         Draw ROV safe space shape on the given axes.
@@ -3190,58 +3262,9 @@ class Visualizer:
                     ax.add_patch(circle)
                     # ax.legend()
 
-                # Draw the N-fold slice (wedge) boundaries for NFoldString
-                # geometries. `n_folds` is supplied automatically via the geom
-                # dict, so this simply switches on whenever the geometry is
-                # N-fold symmetric. Set draw_slice_lines=False to suppress it.
-                n_folds = kwargs.get('n_folds', None)
-                if n_folds is not None and kwargs.get('draw_slice_lines', True):
-                    n_folds = int(n_folds)
-                    if n_folds > 1:
-                        fold_offset = float(kwargs.get('fold_offset', 0.0) or 0.0)
-                        fold_angle = kwargs.get('fold_angle', None)
-                        fold_angle = (2 * np.pi / n_folds) if fold_angle is None else float(fold_angle)
-
-                        # Extend the lines to the plot edge so the wedges stay
-                        # visible no matter how far out the strings wander.
-                        x_lim, y_lim = ax.get_xlim(), ax.get_ylim()
-                        line_len = max(
-                            abs(x_lim[0]), abs(x_lim[1]), abs(y_lim[0]), abs(y_lim[1])
-                        ) * 1.5
-                        if not np.isfinite(line_len) or line_len <= 0:
-                            line_len = float(np.max(np.abs(xy_np))) * 1.5 if xy_np.size else 1.0
-
-                        slice_line_color = kwargs.get('slice_line_color', 'grey')
-                        for k in range(n_folds):
-                            ang = fold_offset + k * fold_angle
-                            ax.plot(
-                                [0, line_len * np.cos(ang)],
-                                [0, line_len * np.sin(ang)],
-                                color=slice_line_color,
-                                linestyle=':',
-                                linewidth=1.0,
-                                alpha=0.5,
-                                zorder=0,
-                            )
-
-                        # Shade the first fold so it is clear which wedge is the
-                        # one actually being parameterized.
-                        if kwargs.get('shade_slice', False):
-                            wedge = mpatches.Wedge(
-                                (0.0, 0.0),
-                                line_len,
-                                np.degrees(fold_offset),
-                                np.degrees(fold_offset + fold_angle),
-                                color=slice_line_color,
-                                alpha=0.08,
-                                zorder=0,
-                            )
-                            ax.add_patch(wedge)
-
-                        # Restore limits -- the long lines/wedge would otherwise
-                        # rescale the axes and shrink the strings.
-                        ax.set_xlim(x_lim)
-                        ax.set_ylim(y_lim)
+                # Draw the N-fold slice (wedge) boundaries, if this is an
+                # N-fold symmetric geometry.
+                self._draw_slice_lines(ax, xy_np, **kwargs)
 
                 # Draw weighted bounding cylinder overlay if requested.
                 if draw_weighted_cylinder:
@@ -3404,6 +3427,7 @@ class Visualizer:
                     ax.set_title('ROV Penalty per String')
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
+                    self._draw_slice_lines(ax, xy_np, **kwargs)
                 else:
                     ax.text(0.5, 0.5, "ROV penalty per string data not available", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -3458,6 +3482,7 @@ class Visualizer:
                         ax.set_title('Local String Repulsion per String')
                         ax.set_xlabel('X')
                         ax.set_ylabel('Y')
+                        self._draw_slice_lines(ax, xy_np, **kwargs)
                 else:
                     ax.text(0.5, 0.5, "Local string repulsion per string data not available", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -4336,7 +4361,8 @@ class Visualizer:
                     ax.set_ylabel('Y Coordinate')
                     ax.set_title(f'Active strings = {len(weights_np[weights_np > 0.7])}, Total strings = {len(weights_np)}')
                     set_axis_limits(ax)
-                    
+                    self._draw_slice_lines(ax, xy_np, **kwargs)
+
                     # Add ROV safe space visualization if ROV penalty is available
                     # rov_penalty = kwargs.get('rov_penalty', None)
                     # if rov_penalty is not None:
