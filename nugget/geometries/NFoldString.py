@@ -33,7 +33,13 @@ class NFoldString(Geometry):
         unconstrained during optimization.
     init_radius : float or None
         Optional maximum radius used when placing the initial slice strings.
-        
+    slice_init : {'sunflower', 'hex', 'random'}
+        How the initial strings are laid out inside the wedge. 'sunflower'
+        (default) uses a golden-angle spiral; 'hex' takes the points of a
+        hexagonal lattice that fall in the wedge, so the mirrored detector
+        starts on a true hex packing; 'random' samples uniformly over the
+        wedge area. Initialization only -- the strings move freely afterwards.
+
     """
 
     def __init__(
@@ -52,6 +58,7 @@ class NFoldString(Geometry):
         fold_offset=0.0,
         radius_margin=0.0,
         init_radius=None,
+        slice_init='sunflower',
         random_slice_init=False,
         seed=None,
     ):
@@ -69,6 +76,14 @@ class NFoldString(Geometry):
         self.radius_margin = float(radius_margin)
         self.init_radius = init_radius
         self.random_slice_init = random_slice_init
+        # random_slice_init is the older boolean form of the same choice; keep
+        # honouring it so existing callers are unaffected.
+        self.slice_init = 'random' if random_slice_init else slice_init
+        valid_inits = ('sunflower', 'hex', 'hexagonal', 'random')
+        if str(self.slice_init).lower() not in valid_inits:
+            raise ValueError(
+                f"slice_init must be one of {valid_inits}, got {self.slice_init!r}"
+            )
         self.seed = seed
 
         if self.n_folds < 1:
@@ -132,31 +147,122 @@ class NFoldString(Geometry):
         """
         return slice_weights.repeat(self.n_folds)
 
-    def _default_slice_polar(self):
-        """Initial slice strings: a spiral that fills the wedge evenly."""
+    def _hexagonal_slice_polar(self):
+        """Initial slice strings taken from a hexagonal lattice.
+
+        A full hexagonal lattice is generated ring by ring (the same
+        centre-outward construction the base class uses), then only the points
+        falling inside the first wedge are kept, ordered by radius. 
+
+        The lattice spacing is chosen so that at least ``strings_per_fold``
+        points land in the wedge; if the wedge still cannot supply enough, the
+        remainder is topped up from the sunflower placement so the requested
+        string count is always honoured.
+        """
+        n = self.strings_per_fold
+        two_pi = 2.0 * np.pi
+
+        # Start from a spacing that would put ~n points in one wedge, then
+        # shrink until the wedge actually contains enough lattice sites.
+        # Area of the wedge is (fold_angle / 2) * max_radius^2; a hex lattice
+        # with spacing s has one point per (sqrt(3)/2) * s^2 of area.
+        wedge_area = 0.5 * self.fold_angle * self.max_radius ** 2
+        spacing = float(np.sqrt(max(wedge_area, 1e-12) / (max(n, 1) * np.sqrt(3) / 2)))
+        spacing = max(spacing, 1e-6)
+
+        sqrt3_half = np.sqrt(3.0) / 2.0
+        eps = 1e-9
+
+        sel_r, sel_a = [], []
+        for _ in range(60):  # shrink-and-retry; converges well before this
+            pts = []
+            # Enough rings to cover max_radius at this spacing.
+            n_rings = int(np.ceil(self.max_radius / (spacing * sqrt3_half))) + 2
+            # Build sites straight from integer axial coordinates (q, r) rather
+            # than by stepping around each ring: accumulating float steps drifts
+            # by ~1e-8 over the outer rings, which would show up as the lattice
+            # sitting slightly off its ideal ring.
+            for q in range(-n_rings, n_rings + 1):
+                lo = max(-n_rings, -q - n_rings)
+                hi = min(n_rings, -q + n_rings)
+                for rr in range(lo, hi + 1):
+                    pts.append((
+                        spacing * (q + 0.5 * rr),
+                        spacing * sqrt3_half * rr,
+                    ))
+
+            sel_r, sel_a = [], []
+            for (px, py) in pts:
+                r = float(np.hypot(px, py))
+                if r > self.max_radius + eps:
+                    continue
+                if r <= eps:
+                    # r = 0 is invariant under rotation, so a string there
+                    # would be mirrored onto itself n_folds times.
+                    continue
+                a = float(np.arctan2(py, px)) % two_pi
+                # Half-open wedge [0, fold_angle): the trailing edge belongs to
+                # the next fold, so excluding it prevents mirrored duplicates.
+                if a < self.fold_angle - eps:
+                    sel_r.append(r)
+                    sel_a.append(a)
+
+            if len(sel_r) >= n:
+                break
+            spacing *= 0.85  # too few sites in the wedge -> denser lattice
+
+        order = np.argsort(np.asarray(sel_r, dtype=float), kind='stable')[:n]
+        slice_radius = torch.tensor(
+            [sel_r[i] for i in order], device=self.device, dtype=torch.float64
+        )
+        slice_angle = torch.tensor(
+            [sel_a[i] for i in order], device=self.device, dtype=torch.float64
+        )
+
+        # Top up from the sunflower placement if the wedge could not supply
+        # enough lattice sites (very large n or a very narrow fold).
+        missing = n - int(slice_radius.numel())
+        if missing > 0:
+            fb_r, fb_a = self._sunflower_slice_polar()
+            slice_radius = torch.cat([slice_radius, fb_r[-missing:]])
+            slice_angle = torch.cat([slice_angle, fb_a[-missing:]])
+
+        return slice_radius, slice_angle
+
+    def _random_slice_polar(self):
+        """Initial slice strings drawn uniformly over the wedge's area."""
+        n = self.strings_per_fold
+        if self.seed is not None:
+            gen = torch.Generator(device='cpu').manual_seed(int(self.seed))
+            rand = torch.rand(2, n, generator=gen, dtype=torch.float64).to(self.device)
+        else:
+            rand = torch.rand(2, n, device=self.device, dtype=torch.float64)
+        # sqrt for uniform area density in the wedge
+        slice_radius = self.max_radius * torch.sqrt(rand[0])
+        slice_angle = self.fold_angle * rand[1]
+        return slice_radius, slice_angle
+
+    def _sunflower_slice_polar(self):
+        """Initial slice strings on a golden-angle spiral filling the wedge."""
         n = self.strings_per_fold
         idx = torch.arange(n, device=self.device, dtype=torch.float64)
-
-        if self.random_slice_init:
-            gen = None
-            if self.seed is not None:
-                gen = torch.Generator(device='cpu').manual_seed(int(self.seed))
-                rand = torch.rand(2, n, generator=gen, dtype=torch.float64).to(self.device)
-            else:
-                rand = torch.rand(2, n, device=self.device, dtype=torch.float64)
-            # sqrt for uniform area density in the wedge
-            slice_radius = self.max_radius * torch.sqrt(rand[0])
-            slice_angle = self.fold_angle * rand[1]
-            return slice_radius, slice_angle
-
-        # Deterministic: sqrt-spaced radii (uniform areal density) paired with
-        # angles spread across the wedge, giving a sunflower-like slice.
+        # sqrt-spaced radii (uniform areal density) paired with angles spread
+        # across the wedge, giving a sunflower-like slice.
         slice_radius = self.max_radius * torch.sqrt((idx + 0.5) / n)
         golden = np.pi * (3.0 - np.sqrt(5.0))
         slice_angle = torch.remainder(idx * golden, self.fold_angle)
         if n == 1:
             slice_angle = torch.full_like(slice_angle, self.fold_angle / 2.0)
         return slice_radius, slice_angle
+
+    def _default_slice_polar(self):
+        """Place the initial slice strings per the chosen ``slice_init`` mode."""
+        mode = (self.slice_init or 'sunflower').lower()
+        if mode in ('hex', 'hexagonal'):
+            return self._hexagonal_slice_polar()
+        if mode == 'random':
+            return self._random_slice_polar()
+        return self._sunflower_slice_polar()
 
     def _default_z_values(self, n_strings):
         if self.custom_z_spacing is not None:
