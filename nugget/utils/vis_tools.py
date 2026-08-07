@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
+import matplotlib.patches as mpatches
 from matplotlib.colors import Normalize
 from matplotlib.ticker import MaxNLocator, FuncFormatter
 import math
@@ -3184,10 +3185,63 @@ class Visualizer:
                 
                 # Draw radius circle around origin if requested
                 if draw_radius and max_radius is not None:
-                    circle = plt.Circle((0, 0), max_radius, color='blue', fill=False, 
+                    circle = plt.Circle((0, 0), max_radius, color='blue', fill=False,
                                        linewidth=5, linestyle='--', alpha=0.2)
                     ax.add_patch(circle)
                     # ax.legend()
+
+                # Draw the N-fold slice (wedge) boundaries for NFoldString
+                # geometries. `n_folds` is supplied automatically via the geom
+                # dict, so this simply switches on whenever the geometry is
+                # N-fold symmetric. Set draw_slice_lines=False to suppress it.
+                n_folds = kwargs.get('n_folds', None)
+                if n_folds is not None and kwargs.get('draw_slice_lines', True):
+                    n_folds = int(n_folds)
+                    if n_folds > 1:
+                        fold_offset = float(kwargs.get('fold_offset', 0.0) or 0.0)
+                        fold_angle = kwargs.get('fold_angle', None)
+                        fold_angle = (2 * np.pi / n_folds) if fold_angle is None else float(fold_angle)
+
+                        # Extend the lines to the plot edge so the wedges stay
+                        # visible no matter how far out the strings wander.
+                        x_lim, y_lim = ax.get_xlim(), ax.get_ylim()
+                        line_len = max(
+                            abs(x_lim[0]), abs(x_lim[1]), abs(y_lim[0]), abs(y_lim[1])
+                        ) * 1.5
+                        if not np.isfinite(line_len) or line_len <= 0:
+                            line_len = float(np.max(np.abs(xy_np))) * 1.5 if xy_np.size else 1.0
+
+                        slice_line_color = kwargs.get('slice_line_color', 'grey')
+                        for k in range(n_folds):
+                            ang = fold_offset + k * fold_angle
+                            ax.plot(
+                                [0, line_len * np.cos(ang)],
+                                [0, line_len * np.sin(ang)],
+                                color=slice_line_color,
+                                linestyle=':',
+                                linewidth=1.0,
+                                alpha=0.5,
+                                zorder=0,
+                            )
+
+                        # Shade the first fold so it is clear which wedge is the
+                        # one actually being parameterized.
+                        if kwargs.get('shade_slice', False):
+                            wedge = mpatches.Wedge(
+                                (0.0, 0.0),
+                                line_len,
+                                np.degrees(fold_offset),
+                                np.degrees(fold_offset + fold_angle),
+                                color=slice_line_color,
+                                alpha=0.08,
+                                zorder=0,
+                            )
+                            ax.add_patch(wedge)
+
+                        # Restore limits -- the long lines/wedge would otherwise
+                        # rescale the axes and shrink the strings.
+                        ax.set_xlim(x_lim)
+                        ax.set_ylim(y_lim)
 
                 # Draw weighted bounding cylinder overlay if requested.
                 if draw_weighted_cylinder:

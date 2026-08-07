@@ -3,4 +3,5 @@ from . import ContinuousString
 from . import DynamicString
 from . import EvanescentString
 from . import FreePoints
+from . import NFoldString
 from . import SpaceString
