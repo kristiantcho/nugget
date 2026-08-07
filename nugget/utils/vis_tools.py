@@ -131,6 +131,7 @@ class Visualizer:
     PLOT_ANGULAR_RESOLUTION_VS_ENERGY = "angular_resolution_vs_energy"
     PLOT_ENERGY_RESOLUTION_VS_ENERGY = "energy_resolution_vs_energy"
     PLOT_POINTSOURCE_FOM_VS_ENERGY = "pointsource_fom_vs_energy"
+    PLOT_EFFECTIVE_AREA_VS_ENERGY = "effective_area_vs_energy"
     PLOT_LOSS_COMPONENTS = "loss_components"
     PLOT_UW_LOSS_COMPONENTS = "uw_loss_components"
     PLOT_LLR_HISTOGRAM_POINTS = "llr_histogram_points"
@@ -1131,6 +1132,13 @@ class Visualizer:
             - 'angular_resolution_vs_zenith': Binned angular resolution vs zenith
             - 'angular_resolution_vs_energy': Binned angular resolution vs energy
             - 'energy_resolution_vs_energy': Binned energy resolution vs energy
+            - 'effective_area_vs_energy': Binned (mean/median) effective area vs energy, from
+              'effective_area_per_event' and event params (same source as
+              'pointsource_fom_vs_energy'). Supports 'resolution_stat' ('mean' or 'median';
+              'fom' is not applicable here), 'show_resolution_ci' /
+              'resolution_ci_percentiles' / 'resolution_ci_level', 'energy_range',
+              'n_energy_bins', and 'effective_area_logy' for a log-scale y-axis (independent
+              of the other vs-plots' log-y toggles - see 'effective_area_logy' below).
             - 'loss_components': Individual loss components and total loss from loss dictionary.
               Pass 'moving_average_losses' (list of loss names) to draw those components'
               raw series faded with a moving average (window 'moving_average_window',
@@ -1199,23 +1207,23 @@ class Visualizer:
             - background_funcs: List of background functions (old format)
             - signal_surrogate_func: Surrogate function for signal (e.g., light_yield_surrogate method)
             - signal_event_params: Event parameters dict for signal surrogate function
-                        - background_surrogate_func: Surrogate function for background
-                        - background_event_params: Event parameters dict for background surrogate function
-                        - rov_penalty / rov_penalty_func: ROVPenalty object used by `string_xy_rov_penalty`
-                        - rov_draw_safe_space_on_violations: bool, optional. If True, the `string_xy_rov_penalty` plot will
-                            draw a per-string ROV safe-space corridor for strings with violation >= 1, oriented by
-                            `rov_least_blocked_angle_per_string` (both are expected to be present in kwargs from `ROVPenalty`).
-                        - rov_draw_safe_space_active_only: bool, optional. If True, further restricts
-                            `rov_draw_safe_space_on_violations` to only draw the per-string corridor for active strings
-                            (string_weights >= weight_threshold).
-                        - rov_draw_safe_space_union: bool, optional. If True, the `string_xy_rov_penalty` plot will draw
-                            the unioned shape of the best (least-blocked-angle) ROV safe spaces across all active strings
-                            (string_weights >= weight_threshold, or all strings if string_weights is not provided).
-                            Requires the optional `shapely` package.
-                        - rov_union_per_space_colors: bool, optional. If True, draws each string's individual ROV safe
-                            space in its own (semi-transparent, overlap-blending) color instead of one merged union shape.
-                            Colors are keyed on the global string index so they stay consistent across iterations. In this
-                            mode no union outline is drawn and shapely is not required.
+            - background_surrogate_func: Surrogate function for background
+            - background_event_params: Event parameters dict for background surrogate function
+            - rov_penalty / rov_penalty_func: ROVPenalty object used by `string_xy_rov_penalty`
+            - rov_draw_safe_space_on_violations: bool, optional. If True, the `string_xy_rov_penalty` plot will
+                draw a per-string ROV safe-space corridor for strings with violation >= 1, oriented by
+                `rov_least_blocked_angle_per_string` (both are expected to be present in kwargs from `ROVPenalty`).
+            - rov_draw_safe_space_active_only: bool, optional. If True, further restricts
+                `rov_draw_safe_space_on_violations` to only draw the per-string corridor for active strings
+                (string_weights >= weight_threshold).
+            - rov_draw_safe_space_union: bool, optional. If True, the `string_xy_rov_penalty` plot will draw
+                the unioned shape of the best (least-blocked-angle) ROV safe spaces across all active strings
+                (string_weights >= weight_threshold, or all strings if string_weights is not provided).
+                Requires the optional `shapely` package.
+            - rov_union_per_space_colors: bool, optional. If True, draws each string's individual ROV safe
+                space in its own (semi-transparent, overlap-blending) color instead of one merged union shape.
+                Colors are keyed on the global string index so they stay consistent across iterations. In this
+                mode no union outline is drawn and shapely is not required.
             - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range] 
               instead of the default domain boundaries [-half_domain, half_domain]
             - plot_with_surrogate: bool, optional. If True and 'light_surrogate_func' and 'surrogate_event_params' 
@@ -1226,29 +1234,30 @@ class Visualizer:
               Can be a single dict containing 'position', 'zenith', 'azimuth', 'energy', etc., or a list of such dicts.
               If a list is provided, the light yield will be averaged over all events in the list.
 
-                        For resolution-vs-* plots ('angular_resolution_vs_zenith', 'angular_resolution_vs_energy', 'energy_resolution_vs_energy'):
-                        - resolution_per_event: array-like, per-event resolution values
-                        - resolution_params: list of dicts, each containing 'zenith' and/or 'energy'
-                                                - resolution_stat: {'median', 'mean'}, optional. Defaults to 'median'.
-                                                        If 'median': the line is the median and `resolution_ci_percentiles` apply to residuals around the median.
-                                                        If 'mean': the line is the mean and the band is ±2σ per bin (ignores residual quantiles).
-                                                        (Backwards-compat alias: resolution_use_mean=True)
-                                                - resolution_use_fom: bool, optional. If True, plots per-bin FOM = sqrt(sum(1/resolution^2)).
-                                                    Error bars are propagated as (1/(2*FOM))*sqrt(sum(1/resolution^4)).
-                                                - resolution_fom_min_resolution: float, optional. Minimum allowed resolution used in FOM mode
-                                                    to avoid divide-by-zero (default: 1e-12).
-                                                - show_resolution_ci: bool, optional. If True, draws a two-sided residual-quantile band around the median in each bin
-                                                - resolution_ci_percentiles: tuple(float, float), optional. Percentiles for the residual band (default: (16, 84))
-                                                - resolution_ci_level: float in (0, 1), optional. Alternative specification as a central containment level. Ignored if
-                                                    resolution_ci_percentiles is provided.
-                        - zenith_range / zenith_range_deg: tuple(min, max), optional. Restrict zenith range for binning.
-                        - energy_range: tuple(min, max), optional. Restrict energy range for binning.
-                                                - resolution_logy: bool, optional. If True, uses log scale for y-axis on all resolution/FoM-vs plots
-                                                    ('angular_resolution_vs_zenith', 'angular_resolution_vs_energy',
-                                                    'energy_resolution_vs_energy', 'pointsource_fom_vs_energy').
-                                                    (Backwards-compat aliases: resolution_logy_angular, resolution_logy_vs_zenith,
-                                                    resolution_logy_vs_energy)
-                        - n_zenith_bins / n_energy_bins: int, optional. Number of bins
+            For resolution-vs-* plots ('angular_resolution_vs_zenith', 'angular_resolution_vs_energy', 'energy_resolution_vs_energy'):
+            - resolution_per_event: array-like, per-event resolution values
+            - resolution_params: list of dicts, each containing 'zenith' and/or 'energy'
+                                    - resolution_stat: {'median', 'mean'}, optional. Defaults to 'median'.
+                                            If 'median': the line is the median and `resolution_ci_percentiles` apply to residuals around the median.
+                                            If 'mean': the line is the mean and the band is ±2σ per bin (ignores residual quantiles).
+                                            (Backwards-compat alias: resolution_use_mean=True)
+                                    - resolution_use_fom: bool, optional. If True, plots per-bin FOM = sqrt(sum(1/resolution^2)).
+                                        Error bars are propagated as (1/(2*FOM))*sqrt(sum(1/resolution^4)).
+                                    - resolution_fom_min_resolution: float, optional. Minimum allowed resolution used in FOM mode
+                                        to avoid divide-by-zero (default: 1e-12).
+                                    - show_resolution_ci: bool, optional. If True, draws a two-sided residual-quantile band around the median in each bin
+                                    - resolution_ci_percentiles: tuple(float, float), optional. Percentiles for the residual band (default: (16, 84))
+                                    - resolution_ci_level: float in (0, 1), optional. Alternative specification as a central containment level. Ignored if
+                                        resolution_ci_percentiles is provided.
+            - zenith_range / zenith_range_deg: tuple(min, max), optional. Restrict zenith range for binning.
+            - energy_range: tuple(min, max), optional. Restrict energy range for binning.
+                                    - Log-y toggles are independent per plot type - setting one never affects another:
+                                        - resolution_logy_angular: 'angular_resolution_vs_zenith' and 'angular_resolution_vs_energy'
+                                        - resolution_logy_energy: 'energy_resolution_vs_energy'
+                                        - ps_fom_logy: 'pointsource_fom_vs_energy'
+                                        - effective_area_logy: 'effective_area_vs_energy'
+                                        There is no shared/generic 'resolution_logy' switch; each plot only reads its own key above.
+            - n_zenith_bins / n_energy_bins: int, optional. Number of bins
         """
         # Backwards-compat: allow callers to pass `points_3d`.
         if points is None and points_3d is not None:
@@ -5868,12 +5877,13 @@ class Visualizer:
             resolution_ci_level = kwargs.get('resolution_ci_level', None)
             zenith_range = kwargs.get('zenith_range', None)
             zenith_range_deg = kwargs.get('zenith_range_deg', None)
-            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
+            # Dedicated to this plot only: does not fall back to the generic
+            # 'resolution_logy' or to the energy-resolution/FoM/effective-area plots'
+            # keys, so toggling log-y on one vs-plot never silently affects another.
+            resolution_logy = bool(kwargs.get('resolution_logy_angular', kwargs.get('resolution_logy_vs_zenith', False)))
             min_ang_res = kwargs.get('min_angular_resolution', None)
             max_ang_res = kwargs.get('max_angular_resolution', None)
-            if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
-            
+
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
                 if isinstance(resolution_per_event, torch.Tensor):
@@ -6186,11 +6196,13 @@ class Visualizer:
             resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
             resolution_ci_level = kwargs.get('resolution_ci_level', None)
             energy_range = kwargs.get('energy_range', None)
-            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
+            # Dedicated to this plot only: shares 'resolution_logy_angular' with the
+            # angular-vs-zenith plot (both are angular resolution), but does not fall
+            # back to the generic 'resolution_logy' or to the energy-resolution/FoM/
+            # effective-area plots' keys.
+            resolution_logy = bool(kwargs.get('resolution_logy_angular', kwargs.get('resolution_logy_vs_energy', False)))
             min_ang_res = kwargs.get('min_angular_resolution', None)
             max_ang_res = kwargs.get('max_angular_resolution', None)
-            if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
 
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
@@ -6474,9 +6486,10 @@ class Visualizer:
             n_bins = kwargs.get('n_energy_bins', 10)
             energy_range = kwargs.get('energy_range', None)
             fom_min_resolution = kwargs.get('resolution_fom_min_resolution', 1e-12)
-            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
-            if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
+            # Dedicated to this plot only: does not fall back to the generic
+            # 'resolution_logy' or to the angular/energy-resolution/effective-area
+            # plots' keys, so e.g. setting only 'ps_fom_logy' never affects them.
+            resolution_logy = bool(kwargs.get('ps_fom_logy', False))
 
             if (
                 resolution_per_event is not None
@@ -6604,6 +6617,201 @@ class Visualizer:
                     fontsize=12,
                 )
 
+        elif plot_type == self.PLOT_EFFECTIVE_AREA_VS_ENERGY:
+            # Plot binned (mean or median) effective area vs energy, from the same
+            # per-event 'effective_area_per_event' + event params used by
+            # 'pointsource_fom_vs_energy'. Unlike the resolution/FoM-vs plots, there is
+            # no 'fom' aggregation here - effective area isn't a resolution, so a FOM
+            # transform (1/r^2-style) doesn't apply; only 'mean'/'median' are supported
+            # for resolution_stat, same as the other vs-energy plots otherwise.
+            effective_area_per_event = kwargs.get('effective_area_per_event', None)
+            signal_event_params = kwargs.get('resolution_params', None)
+            if signal_event_params is None:
+                signal_event_params = kwargs.get('effective_area_params', None)
+            if signal_event_params is None:
+                signal_event_params = kwargs.get('signal_event_params', None)
+            n_bins = kwargs.get('n_energy_bins', 10)
+            resolution_stat = kwargs.get('resolution_stat', None)
+            if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
+                resolution_stat = 'mean'
+            resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+            if resolution_stat not in ('median', 'mean'):
+                resolution_stat = 'median'
+            show_resolution_ci = bool(kwargs.get('show_resolution_ci', False))
+            resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
+            resolution_ci_level = kwargs.get('resolution_ci_level', None)
+            energy_range = kwargs.get('energy_range', None)
+            # Dedicated to this plot only: does not fall back to the generic
+            # 'resolution_logy' or to the angular/energy-resolution/FoM plots' keys.
+            resolution_logy = bool(kwargs.get('effective_area_logy', False))
+
+            if effective_area_per_event is not None and signal_event_params is not None:
+                if isinstance(effective_area_per_event, torch.Tensor):
+                    aeff_values = effective_area_per_event.clone().detach().cpu().numpy().flatten()
+                else:
+                    aeff_values = np.array(effective_area_per_event).flatten()
+
+                energy_values = []
+                for event_params in signal_event_params:
+                    if isinstance(event_params, dict) and 'energy' in event_params:
+                        energy = event_params['energy']
+                        if isinstance(energy, torch.Tensor):
+                            energy_values.append(energy.detach().cpu().item())
+                        else:
+                            energy_values.append(float(energy))
+                energy_values = np.array(energy_values)
+
+                n = min(len(aeff_values), len(energy_values))
+                if n > 0:
+                    aeff_values = aeff_values[:n]
+                    energy_values = energy_values[:n]
+
+                valid_mask = np.isfinite(aeff_values) & np.isfinite(energy_values) & (energy_values > 0)
+                aeff_values = aeff_values[valid_mask]
+                energy_values = energy_values[valid_mask]
+
+                if energy_range is not None and len(energy_range) == 2:
+                    try:
+                        emin, emax = float(energy_range[0]), float(energy_range[1])
+                        if emax < emin:
+                            emin, emax = emax, emin
+                        range_mask = (energy_values >= emin) & (energy_values <= emax)
+                        aeff_values = aeff_values[range_mask]
+                        energy_values = energy_values[range_mask]
+                    except Exception:
+                        pass
+
+                if resolution_logy:
+                    pos_mask = aeff_values > 0
+                    aeff_values = aeff_values[pos_mask]
+                    energy_values = energy_values[pos_mask]
+
+                if len(aeff_values) > 0 and len(energy_values) > 0:
+                    log_energy_min = np.log10(energy_values.min())
+                    log_energy_max = np.log10(energy_values.max())
+                    bin_edges = np.logspace(log_energy_min, log_energy_max, n_bins + 1)
+                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])  # Geometric mean for log scale
+
+                    bin_medians = []
+                    band_lower = []
+                    band_upper = []
+
+                    for i in range(n_bins):
+                        mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
+                        if mask.sum() > 0:
+                            vals = np.array(aeff_values[mask], dtype=float)
+                            if resolution_stat == 'mean':
+                                center_val = float(np.nanmean(vals))
+                                spread_val = float(np.nanstd(vals))
+                            else:
+                                center_val = float(np.nanmedian(vals))
+                                spread_val = np.nan
+                            bin_medians.append(center_val)
+                            if show_resolution_ci:
+                                if resolution_stat == 'mean':
+                                    band_lower.append(center_val - 2.0 * spread_val)
+                                    band_upper.append(center_val + 2.0 * spread_val)
+                                else:
+                                    q_lo = None
+                                    q_hi = None
+                                    if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                        try:
+                                            q_lo = float(resolution_ci_percentiles[0])
+                                            q_hi = float(resolution_ci_percentiles[1])
+                                        except Exception:
+                                            q_lo, q_hi = None, None
+                                    if q_lo is None or q_hi is None:
+                                        if resolution_ci_level is not None:
+                                            try:
+                                                lvl = float(resolution_ci_level)
+                                                lvl = float(np.clip(lvl, 0.0, 1.0))
+                                                alpha = 0.5 * (1.0 - lvl)
+                                                q_lo = 100.0 * alpha
+                                                q_hi = 100.0 * (1.0 - alpha)
+                                            except Exception:
+                                                q_lo, q_hi = 16.0, 84.0
+                                        else:
+                                            q_lo, q_hi = 16.0, 84.0
+                                    if q_hi < q_lo:
+                                        q_lo, q_hi = q_hi, q_lo
+                                    resid = vals - center_val
+                                    band_lower.append(center_val + np.nanpercentile(resid, q_lo))
+                                    band_upper.append(center_val + np.nanpercentile(resid, q_hi))
+                            else:
+                                band_lower.append(np.nan)
+                                band_upper.append(np.nan)
+                        else:
+                            bin_medians.append(np.nan)
+                            band_lower.append(np.nan)
+                            band_upper.append(np.nan)
+
+                    bin_medians = np.array(bin_medians)
+                    band_lower = np.array(band_lower)
+                    band_upper = np.array(band_upper)
+
+                    valid_bins = np.isfinite(bin_medians)
+                    if resolution_logy:
+                        valid_bins = valid_bins & (bin_medians > 0)
+
+                    if show_resolution_ci:
+                        valid_ci = valid_bins & np.isfinite(band_lower) & np.isfinite(band_upper)
+                        if np.any(valid_ci):
+                            q_lo, q_hi = 16.0, 84.0
+                            if resolution_stat == 'mean':
+                                ci_label = 'Mean ± 2σ'
+                            else:
+                                if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                    try:
+                                        q_lo = float(resolution_ci_percentiles[0])
+                                        q_hi = float(resolution_ci_percentiles[1])
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                elif resolution_ci_level is not None:
+                                    try:
+                                        lvl = float(resolution_ci_level)
+                                        lvl = float(np.clip(lvl, 0.0, 1.0))
+                                        alpha = 0.5 * (1.0 - lvl)
+                                        q_lo = 100.0 * alpha
+                                        q_hi = 100.0 * (1.0 - alpha)
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                if q_hi < q_lo:
+                                    q_lo, q_hi = q_hi, q_lo
+                                ci_label = f"Residual band (p{q_lo:g}-p{q_hi:g})"
+                            ax.fill_between(
+                                bin_centers[valid_ci],
+                                band_lower[valid_ci],
+                                band_upper[valid_ci],
+                                alpha=0.2,
+                                label=str(ci_label),
+                                zorder=1,
+                            )
+
+                    ax.plot(
+                        bin_centers[valid_bins],
+                        bin_medians[valid_bins],
+                        'o-',
+                        linewidth=2,
+                        markersize=8,
+                        label=('Mean' if resolution_stat == 'mean' else 'Median'),
+                        color='orange',
+                    )
+
+                    ax.set_xlabel('Energy (GeV)', fontsize=10)
+                    ax.set_ylabel('Effective Area (m$^2$)', fontsize=10)
+                    ax.set_title('Effective Area vs Energy', fontsize=12)
+                    ax.set_xscale('log')
+                    if resolution_logy:
+                        ax.set_yscale('log')
+                    ax.grid(True, alpha=0.3, which='both')
+                    ax.legend()
+                else:
+                    ax.text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                           transform=ax.transAxes, fontsize=14)
+            else:
+                ax.text(0.5, 0.5, 'Data not available\nProvide effective_area_per_event and event params',
+                       ha='center', va='center', transform=ax.transAxes, fontsize=12)
+
         elif plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
             # Plot binned energy resolution vs energy
             resolution_per_event = kwargs.get('energy_resolution_per_event', None)
@@ -6624,10 +6832,11 @@ class Visualizer:
             resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
             resolution_ci_level = kwargs.get('resolution_ci_level', None)
             energy_range = kwargs.get('energy_range', None)
-            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
-            if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
-            
+            # Dedicated to this plot only: does not fall back to the generic
+            # 'resolution_logy' or to the angular-resolution/FoM/effective-area
+            # plots' keys.
+            resolution_logy = bool(kwargs.get('resolution_logy_energy', False))
+
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
                 if isinstance(resolution_per_event, torch.Tensor):
