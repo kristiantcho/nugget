@@ -10,7 +10,7 @@ height = 1000
 num_strings = 61
 event_type = 'track'  # 'track' or 'cascade'
 limit_zenith = None  # 'horizontal' or 'vertical'
-free_sim_volume = False  # If True, the simulation volume is not constrained to a cylinder. If False, the simulation volume is constrained to a cylinder with the specified center, radius, and height.
+free_sim_volume = True  # If True, the simulation volume is not constrained to a cylinder. If False, the simulation volume is constrained to a cylinder with the specified center, radius, and height.
 lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = event_type)
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate_batched
 # signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
@@ -121,9 +121,18 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
     geom_dict = geometry.initialize_points()
     if free_sim_volume:
         # change cylinder parameters to match the geometry for bigger volume:
-        radius = torch.max(torch.linalg.vector_norm(geom_dict['string_xy'], axis=1))
+        radius = torch.max(torch.linalg.vector_norm(geom_dict['string_xy'], axis=1)) + 54.4
         signal_sampler.cylinder_radius = radius
         signal_events = signal_sampler.sample_events(num_events=num_events)
+        signal_events = analysis_loss._ensure_weights(
+                            signal_events,
+                            friend_config='../other/friend_config.yaml',
+                            pyff_config='../other/pyff_config.yaml',
+                            signal_sampler=signal_sampler,
+                            pid=14,
+                            temp_path=None,
+                        )
+        signal_events = nugget.utils.data_tools.add_events_to_device(signal_events, device=device)
     
     loss_params = {
                 'num_events': num_events,
@@ -161,7 +170,7 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
 
 
                 'trigger_use_torch_compile': False,
-                'binned_trigger_chunk_size': 2000,
+                'binned_trigger_chunk_size': 500,
                 'use_batched_trigger': True,
                 'use_batched_binned_trigger': True,
                 'use_batched_effective_area': True,

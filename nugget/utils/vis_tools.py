@@ -5749,7 +5749,7 @@ class Visualizer:
                     pointsource_fom_history = loss_dict.get('pointsource_fom', None)
 
             if pointsource_fom_history is not None:
-                pointsource_fom_history = np.array(pointsource_fom_history)
+                pointsource_fom_history = 1/np.array(pointsource_fom_history)
                 ax.plot(pointsource_fom_history, color='purple', linewidth=2, markersize=4)
                 ax.set_title('Pointsource FoM History')
                 ax.set_xlabel('Iteration')
