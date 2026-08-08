@@ -256,7 +256,7 @@ class FoMLoss(LossFunction):
         return {
             "pointsource_fom_loss": combined_loss,
             "angular_resolution_per_event": resolution_per_event,
-            "effective_area_per_event": norm_effective_area_per_event,
+            "effective_area_per_event": effective_area_per_event,
             "weighted_bounding_cylinder_center": effective_area_out.get("weighted_bounding_cylinder_center", effective_area_out.get("bounding_cylinder_center", None)),
             "weighted_bounding_cylinder_radius": effective_area_out.get("weighted_bounding_cylinder_radius", effective_area_out.get("bounding_cylinder_radius", None)),
             "weighted_bounding_cylinder_height": effective_area_out.get("weighted_bounding_cylinder_height", effective_area_out.get("bounding_cylinder_height", None)),

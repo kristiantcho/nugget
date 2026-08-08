@@ -170,7 +170,7 @@ for string_spacing in np.logspace(np.log10(spacing_min), np.log10(spacing_max), 
 
 
                 'trigger_use_torch_compile': False,
-                'binned_trigger_chunk_size': 500,
+                'binned_trigger_batch_size': 1000,
                 'use_batched_trigger': True,
                 'use_batched_binned_trigger': True,
                 'use_batched_effective_area': True,
