@@ -99,20 +99,24 @@ class DynamicString(Geometry):
                 # Apply string filtering if weight mask is available
                 if active_strings_mask is not None:
                     string_xy = string_xy[active_strings_mask]
-                    # Update n_strings to reflect filtered strings
-                    self.n_strings = len(string_xy)
-                    self._sync_total_points_from_points_per_string()
-                    print(f"Filtered string_xy to {self.n_strings} strings")
+                    print(f"Filtered string_xy to {len(string_xy)} strings")
+                # Always re-sync n_strings from the geometry actually being used.
+                # This instance is reused across calls (e.g. Evaluator.evaluate_multi
+                # loops over geom_dicts with one shared geometry object), so a value
+                # left over from a previous call would otherwise leak into the index
+                # bounds checks below and read past the end of string_xy.
+                self.n_strings = int(string_xy.shape[0])
+                self._sync_total_points_from_points_per_string()
                 result['string_xy'] = string_xy
             else:
-                # Fall back to default initialization
+                # Fall back to default initialization. self.hex_grid was built at
+                # construction time for the original n_strings, so restore n_strings
+                # to match it (a previous call may have shrunk it via filtering).
+                self.n_strings = int(self.hex_grid.shape[0])
+                self._sync_total_points_from_points_per_string()
                 string_xy = self.hex_grid.clone()
                 if self.random_xy:
                     string_xy = torch.rand(self.n_strings, 2, device=self.device) * self.domain_size - self.half_domain
-                # if active_strings_mask is not None:
-                #     string_xy = string_xy[active_strings_mask]
-                #     self.n_strings = len(string_xy)
-                #     self._sync_total_points_from_points_per_string()
                 result['string_xy'] = string_xy
             
             # Process z_values if available
@@ -249,8 +253,22 @@ class DynamicString(Geometry):
                     old_to_new_mapping = torch.full((active_strings_mask.size(0),), -1, device=self.device, dtype=torch.long)
                     old_to_new_mapping[active_string_indices] = torch.arange(len(active_string_indices), device=self.device)
                     
-                    # Handle different cases of string_indices
-                    if len(string_indices) == len(active_strings_mask):
+                    # Handle different cases of string_indices.
+                    # Decide per-point vs per-string by comparing against the
+                    # *unfiltered* point count rather than by length alone: when
+                    # n_points == n_strings (one point per string) a bare length
+                    # check against the mask is ambiguous and picks the wrong branch.
+                    n_raw_points = None
+                    if 'z_values' in initial_geometry and initial_geometry['z_values'] is not None:
+                        n_raw_points = len(initial_geometry['z_values'])
+                    elif 'points_3d' in initial_geometry and initial_geometry['points_3d'] is not None:
+                        n_raw_points = len(initial_geometry['points_3d'])
+
+                    is_per_point = (
+                        n_raw_points is not None and len(string_indices) == n_raw_points
+                    )
+
+                    if not is_per_point and len(string_indices) == len(active_strings_mask):
                         # EvanescentString case: string_indices is per-string, need to expand to per-point
                         if 'points_per_string_list' in initial_geometry:
                             points_per_string_list = initial_geometry['points_per_string_list']
@@ -289,6 +307,20 @@ class DynamicString(Geometry):
                         print(f"Filtered per-point string_indices, total_points now: {self.total_points}")
                 
                 result['string_indices'] = string_indices.tolist() if isinstance(string_indices, torch.Tensor) else string_indices
+
+                # Validate that every per-point index addresses a real string.
+                # Silently skipping out-of-range indices (as the point-construction
+                # loops below do) desynchronizes string_indices / z_values /
+                # points_per_string_list and resurfaces much later as an opaque
+                # shape mismatch inside update_points.
+                if 'string_xy' in result and len(result['string_indices']) > 0:
+                    n_avail_strings = result['string_xy'].shape[0]
+                    max_idx = max(result['string_indices'])
+                    min_idx = min(result['string_indices'])
+                    if max_idx >= n_avail_strings or min_idx < 0:
+                        raise ValueError(
+                            f"string_indices reference strings outside string_xy"
+                        )
             else:
                 # If we have z_values and string_xy, calculate string_indices
                 if 'z_values' in result and 'string_xy' in result:
@@ -340,11 +372,17 @@ class DynamicString(Geometry):
                 # Calculate points per string from string_indices if available
                 if 'string_indices' in result:
                     string_indices = result['string_indices']
-                    default_points_per_string = [0] * self.n_strings
+                    # Size the counts by string_xy, which is what these indices
+                    # address, so the list stays consistent with the geometry even
+                    # if self.n_strings disagrees.
+                    n_avail_strings = (
+                        result['string_xy'].shape[0] if 'string_xy' in result else self.n_strings
+                    )
+                    default_points_per_string = [0] * n_avail_strings
                     for idx in string_indices:
-                        if 0 <= idx < self.n_strings:  # Validate index
+                        if 0 <= idx < n_avail_strings:  # Validate index
                             default_points_per_string[idx] += 1
-                    
+
                     result['points_per_string_list'] = default_points_per_string
             
             # Get the points
@@ -364,14 +402,19 @@ class DynamicString(Geometry):
                     # Create points tensor
                     n_points = len(result['z_values'])
                     points_3d = torch.zeros(n_points, 3, device=self.device)
-                    
+
+                    # Bound the index check by the tensor actually being indexed,
+                    # not by self.n_strings -- the two can disagree if a caller
+                    # supplies string_indices that were not remapped after filtering.
+                    n_avail_strings = result['string_xy'].shape[0]
+
                     # Set xy and z coordinates
                     for i, (s_idx, z_val) in enumerate(zip(result['string_indices'], result['z_values'])):
-                        if 0 <= s_idx < self.n_strings:  # Validate index
+                        if 0 <= s_idx < n_avail_strings:  # Validate index
                             points_3d[i, 0] = result['string_xy'][s_idx, 0]  # x value
                             points_3d[i, 1] = result['string_xy'][s_idx, 1]  # y value
                             points_3d[i, 2] = z_val  # z value
-                    
+
                     result['points_3d'] = points_3d
             
             # Final check to ensure all necessary components are available
@@ -379,13 +422,14 @@ class DynamicString(Geometry):
             if 'points_3d' not in result and 'string_xy' in result and 'z_values' in result and 'string_indices' in result:
                 n_points = len(result['z_values'])
                 points_3d = torch.zeros(n_points, 3, device=self.device)
-                
+                n_avail_strings = result['string_xy'].shape[0]
+
                 for i, (s_idx, z_val) in enumerate(zip(result['string_indices'], result['z_values'])):
-                    if 0 <= s_idx < self.n_strings:  # Validate index
+                    if 0 <= s_idx < n_avail_strings:  # Validate index
                         points_3d[i, 0] = result['string_xy'][s_idx, 0]  # x value
                         points_3d[i, 1] = result['string_xy'][s_idx, 1]  # y value
                         points_3d[i, 2] = z_val  # z value
-                
+
                 result['points_3d'] = points_3d
             
             # Return the initialized geometry dict
