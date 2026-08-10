@@ -6778,14 +6778,14 @@ class Visualizer:
                                 if q_hi < q_lo:
                                     q_lo, q_hi = q_hi, q_lo
                                 ci_label = f"Residual band (p{q_lo:g}-p{q_hi:g})"
-                            ax.fill_between(
-                                bin_centers[valid_ci],
-                                band_lower[valid_ci],
-                                band_upper[valid_ci],
-                                alpha=0.2,
-                                label=str(ci_label),
-                                zorder=1,
-                            )
+                            # ax.fill_between(
+                            #     bin_centers[valid_ci],
+                            #     band_lower[valid_ci],
+                            #     band_upper[valid_ci],
+                            #     alpha=0.2,
+                            #     label=str(ci_label),
+                            #     zorder=1,
+                            # )
 
                     ax.plot(
                         bin_centers[valid_bins],
