@@ -240,7 +240,7 @@ class Visualizer:
 
         inv_sq = 1.0 / np.square(vals)
         fom = float(np.sqrt(np.sum(inv_sq)))
-        if not np.isfinite(fom) or fom <= 0.0:
+        if not np.isfinite(fom) or fom < 0.0:
             return np.nan, np.nan
 
         inv_four = np.square(inv_sq)
@@ -289,7 +289,7 @@ class Visualizer:
 
         terms = aeff / (4.0 * np.pi * np.square(res))
         fom = float(np.sqrt(np.sum(terms)))
-        if not np.isfinite(fom) or fom <= 0.0:
+        if not np.isfinite(fom) or fom < 0.0:
             return np.nan, np.nan
 
         # First-order propagation for F = sqrt(S): sigma_F ≈ (1/(2F)) * sigma_S.
@@ -1570,6 +1570,7 @@ class Visualizer:
             self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
             self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
             self.PLOT_POINTSOURCE_FOM_VS_ENERGY,
+            self.PLOT_EFFECTIVE_AREA_VS_ENERGY,
             self.PLOT_LOSS_COMPONENTS,
             self.PLOT_UW_LOSS_COMPONENTS,
             self.PLOT_ALM_MU,
@@ -1597,6 +1598,7 @@ class Visualizer:
             self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
             self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
             self.PLOT_POINTSOURCE_FOM_VS_ENERGY,
+            self.PLOT_EFFECTIVE_AREA_VS_ENERGY,
         }
 
         if ratio_baseline_geometry is not None:
@@ -1633,20 +1635,24 @@ class Visualizer:
                 any_series = False
                 any_fom_series = False
 
-                # Shared y-log toggle across all resolution/FoM-vs overlay plots.
-                if plot_type in ratio_plot_types:
-                    overlay_resolution_logy = bool(shared_kwargs.get('resolution_logy', False))
-                    if not overlay_resolution_logy:
-                        overlay_resolution_logy = bool(shared_kwargs.get('resolution_logy_angular', False))
-                    if not overlay_resolution_logy:
-                        overlay_resolution_logy = bool(
-                            shared_kwargs.get('resolution_logy_vs_zenith', shared_kwargs.get('resolution_logy_vs_energy', False))
-                        )
+                # Y-log toggle for this plot_type only. Each vs-plot has its own dedicated
+                # key (matching the single-geometry _create_plot path) so setting one never
+                # affects another: resolution_logy_angular for the two angular plots,
+                # resolution_logy_energy for energy resolution, ps_fom_logy for pointsource
+                # FoM, effective_area_logy for effective area. There is no shared/generic key.
+                _logy_key_by_plot_type = {
+                    self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH: 'resolution_logy_angular',
+                    self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY: 'resolution_logy_angular',
+                    self.PLOT_ENERGY_RESOLUTION_VS_ENERGY: 'resolution_logy_energy',
+                    self.PLOT_POINTSOURCE_FOM_VS_ENERGY: 'ps_fom_logy',
+                    self.PLOT_EFFECTIVE_AREA_VS_ENERGY: 'effective_area_logy',
+                }
+                logy_key = _logy_key_by_plot_type.get(plot_type)
+                if logy_key is not None:
+                    overlay_resolution_logy = bool(shared_kwargs.get(logy_key, False))
                     if not overlay_resolution_logy:
                         overlay_resolution_logy = any(
-                            bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
-                            or bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
-                            for _, payload in geom_items
+                            bool(payload.get(logy_key, False)) for _, payload in geom_items
                         )
                 else:
                     overlay_resolution_logy = False
@@ -1761,11 +1767,9 @@ class Visualizer:
                         resolution_ci_level = payload.get('resolution_ci_level', None)
                         zenith_range = payload.get('zenith_range', None)
                         zenith_range_deg = payload.get('zenith_range_deg', None)
-                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
+                        resolution_logy = bool(payload.get('resolution_logy_angular', False))
                         min_ang_res = payload.get('min_angular_resolution', None)
                         max_ang_res = payload.get('max_angular_resolution', None)
-                        if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
 
                         if resolution_per_event is not None and resolution_params is not None:
                             try:
@@ -2013,9 +2017,7 @@ class Visualizer:
                         resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
                         resolution_ci_level = payload.get('resolution_ci_level', None)
                         energy_range = payload.get('energy_range', None)
-                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
-                        if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
+                        resolution_logy = bool(payload.get('resolution_logy_angular', False))
                         min_ang_res = payload.get('min_angular_resolution', None)
                         max_ang_res = payload.get('max_angular_resolution', None)
 
@@ -2260,9 +2262,7 @@ class Visualizer:
                         resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
                         resolution_ci_level = payload.get('resolution_ci_level', None)
                         energy_range = payload.get('energy_range', None)
-                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
-                        if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
+                        resolution_logy = bool(payload.get('resolution_logy_energy', False))
 
                         if resolution_per_event is not None and resolution_params is not None:
                             try:
@@ -2469,9 +2469,7 @@ class Visualizer:
                         n_bins = payload.get('n_energy_bins', 10)
                         energy_range = payload.get('energy_range', None)
                         fom_min_resolution = payload.get('resolution_fom_min_resolution', 1e-12)
-                        resolution_logy = bool(payload.get('resolution_logy', payload.get('ps_fom_logy', False)))
-                        if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
+                        resolution_logy = bool(payload.get('ps_fom_logy', False))
 
                         if (
                             resolution_per_event is not None
@@ -2588,6 +2586,108 @@ class Visualizer:
                                             color=geom_color.get(geom_name_str, None),
                                         )
                                     any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_EFFECTIVE_AREA_VS_ENERGY:
+                        effective_area_per_event = payload.get('effective_area_per_event', None)
+                        event_params = payload.get('resolution_params', None)
+                        if event_params is None:
+                            event_params = payload.get('effective_area_params', None)
+                        if event_params is None:
+                            event_params = payload.get('signal_event_params', None)
+                        n_bins = payload.get('n_energy_bins', 10)
+                        energy_range = payload.get('energy_range', None)
+                        resolution_stat = payload.get('resolution_stat', None)
+                        if resolution_stat is None and bool(payload.get('resolution_use_mean', False)):
+                            resolution_stat = 'mean'
+                        resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+                        if resolution_stat not in ('median', 'mean'):
+                            resolution_stat = 'median'
+                        resolution_logy = bool(payload.get('effective_area_logy', False))
+
+                        if effective_area_per_event is not None and event_params is not None:
+                            try:
+                                aeff_values = effective_area_per_event.clone().detach().cpu().numpy().flatten()
+                            except Exception:
+                                aeff_values = np.array(effective_area_per_event).flatten()
+
+                            energy_values = []
+                            for ep in event_params:
+                                if isinstance(ep, dict) and 'energy' in ep:
+                                    energy = ep['energy']
+                                    try:
+                                        energy_values.append(float(energy.detach().cpu().item()))
+                                    except Exception:
+                                        try:
+                                            energy_values.append(float(energy))
+                                        except Exception:
+                                            pass
+                            energy_values = np.array(energy_values)
+
+                            n = min(len(aeff_values), len(energy_values))
+                            if n > 0:
+                                aeff_values = aeff_values[:n]
+                                energy_values = energy_values[:n]
+
+                            valid_mask = np.isfinite(aeff_values) & np.isfinite(energy_values) & (energy_values > 0)
+                            aeff_values = aeff_values[valid_mask]
+                            energy_values = energy_values[valid_mask]
+
+                            if energy_range is not None and len(energy_range) == 2:
+                                try:
+                                    emin, emax = float(energy_range[0]), float(energy_range[1])
+                                    if emax < emin:
+                                        emin, emax = emax, emin
+                                    range_mask = (energy_values >= emin) & (energy_values <= emax)
+                                    aeff_values = aeff_values[range_mask]
+                                    energy_values = energy_values[range_mask]
+                                except Exception:
+                                    pass
+
+                            if resolution_logy:
+                                pos_mask = aeff_values > 0
+                                aeff_values = aeff_values[pos_mask]
+                                energy_values = energy_values[pos_mask]
+
+                            if len(aeff_values) > 0 and len(energy_values) > 0:
+                                log_energy_min = np.log10(energy_values.min())
+                                log_energy_max = np.log10(energy_values.max())
+                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+
+                                bin_medians = []
+                                for i in range(int(n_bins)):
+                                    mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
+                                    if mask.sum() > 0:
+                                        vals = np.array(aeff_values[mask], dtype=float)
+                                        if resolution_stat == 'mean':
+                                            bin_medians.append(float(np.nanmean(vals)))
+                                        else:
+                                            bin_medians.append(float(np.nanmedian(vals)))
+                                    else:
+                                        bin_medians.append(np.nan)
+
+                                bin_medians = np.array(bin_medians)
+                                x_plot = np.log10(bin_centers)
+                                valid_bins = np.isfinite(bin_medians)
+                                if resolution_logy:
+                                    valid_bins = valid_bins & (bin_medians > 0)
+                                if np.any(valid_bins):
+                                    ratio_cache[geom_name_str] = (
+                                        np.array(x_plot)[valid_bins],
+                                        np.array(bin_medians)[valid_bins],
+                                    )
+                                    any_series = True
+
+                                    ax.plot(
+                                        x_plot[valid_bins],
+                                        bin_medians[valid_bins],
+                                        'o-',
+                                        linewidth=2,
+                                        markersize=6,
+                                        label=geom_name_str,
+                                        color=geom_color.get(geom_name_str, None),
+                                    )
                         continue
 
                 # Add ratio subplot if requested for resolution-vs-* plots.
@@ -2744,6 +2844,13 @@ class Visualizer:
                     ax.set_title('Pointsource FoM vs log$_{10}$(Energy)')
                     ax.set_xlabel('log$_{10}$(Energy / GeV)')
                     ax.set_ylabel('Pointsource FoM')
+                    ax.grid(True, alpha=0.3)
+                    if overlay_resolution_logy:
+                        ax.set_yscale('log')
+                elif plot_type == self.PLOT_EFFECTIVE_AREA_VS_ENERGY:
+                    ax.set_title('Effective Area vs log$_{10}$(Energy)')
+                    ax.set_xlabel('log$_{10}$(Energy / GeV)')
+                    ax.set_ylabel('Effective Area (m$^2$)')
                     ax.grid(True, alpha=0.3)
                     if overlay_resolution_logy:
                         ax.set_yscale('log')
