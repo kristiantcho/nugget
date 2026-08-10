@@ -1657,6 +1657,59 @@ class Visualizer:
                 else:
                     overlay_resolution_logy = False
 
+                # Shared bin edges for the vs-energy plots below (angular/energy
+                # resolution, pointsource FoM, effective area).
+           
+                _energy_binned_plot_types = {
+                    self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
+                    self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
+                    self.PLOT_POINTSOURCE_FOM_VS_ENERGY,
+                    self.PLOT_EFFECTIVE_AREA_VS_ENERGY,
+                }
+                shared_bin_edges = None
+                shared_bin_centers = None
+                if plot_type in _energy_binned_plot_types:
+                    n_bins_shared = int(shared_kwargs.get('n_energy_bins', 10))
+                    all_energies = []
+                    for _, geom_payload in geom_items:
+                        merged_payload = dict(geom_payload)
+                        merged_payload.update(shared_kwargs)
+                        event_params = merged_payload.get('resolution_params', None)
+                        if event_params is None:
+                            event_params = merged_payload.get('effective_area_params', None)
+                        if event_params is None:
+                            event_params = merged_payload.get('signal_event_params', None)
+                        if not event_params:
+                            continue
+                        for ep in event_params:
+                            if isinstance(ep, dict) and 'energy' in ep:
+                                raw_val = ep['energy']
+                                try:
+                                    all_energies.append(float(raw_val.detach().cpu().item()))
+                                except Exception:
+                                    try:
+                                        all_energies.append(float(raw_val))
+                                    except Exception:
+                                        pass
+
+                    all_energies = np.asarray(all_energies, dtype=float)
+                    all_energies = all_energies[np.isfinite(all_energies) & (all_energies > 0)]
+
+                    if all_energies.size > 0:
+                        vmin, vmax = float(all_energies.min()), float(all_energies.max())
+                        shared_energy_range = shared_kwargs.get('energy_range', None)
+                        if shared_energy_range is not None and len(shared_energy_range) == 2:
+                            try:
+                                emin, emax = float(shared_energy_range[0]), float(shared_energy_range[1])
+                                if emax < emin:
+                                    emin, emax = emax, emin
+                                vmin, vmax = max(vmin, emin), min(vmax, emax)
+                            except Exception:
+                                pass
+                        if vmax > vmin:
+                            shared_bin_edges = np.logspace(np.log10(vmin), np.log10(vmax), n_bins_shared + 1)
+                            shared_bin_centers = np.sqrt(shared_bin_edges[:-1] * shared_bin_edges[1:])
+
                 # For ratio subplot: store y(x) per geometry.
                 ratio_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
                 for geom_name, payload in geom_items:
@@ -2061,17 +2114,22 @@ class Visualizer:
                                 energy_values = np.array(energy_values)[pos_mask]
 
                             if len(res_values) > 0 and len(energy_values) > 0:
-                                log_energy_min = np.log10(energy_values.min())
-                                log_energy_max = np.log10(energy_values.max())
-                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
-                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                if shared_bin_edges is not None:
+                                    bin_edges = shared_bin_edges
+                                    bin_centers = shared_bin_centers
+                                else:
+                                    log_energy_min = np.log10(energy_values.min())
+                                    log_energy_max = np.log10(energy_values.max())
+                                    bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                n_bins_effective = len(bin_edges) - 1
 
                                 bin_medians = []
                                 band_lower = []
                                 band_upper = []
                                 fom_errors = []
                                 bin_counts = []
-                                for i in range(int(n_bins)):
+                                for i in range(n_bins_effective):
                                     mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         vals = np.array(res_values[mask], dtype=float)
@@ -2304,17 +2362,22 @@ class Visualizer:
                                 energy_values = np.array(energy_values)[pos_mask]
 
                             if len(res_values) > 0 and len(energy_values) > 0:
-                                log_energy_min = np.log10(energy_values.min())
-                                log_energy_max = np.log10(energy_values.max())
-                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
-                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                if shared_bin_edges is not None:
+                                    bin_edges = shared_bin_edges
+                                    bin_centers = shared_bin_centers
+                                else:
+                                    log_energy_min = np.log10(energy_values.min())
+                                    log_energy_max = np.log10(energy_values.max())
+                                    bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                n_bins_effective = len(bin_edges) - 1
 
                                 bin_medians = []
                                 band_lower = []
                                 band_upper = []
                                 fom_errors = []
                                 bin_counts = []
-                                for i in range(int(n_bins)):
+                                for i in range(n_bins_effective):
                                     mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         vals = np.array(res_values[mask], dtype=float)
@@ -2528,14 +2591,19 @@ class Visualizer:
                                     pass
 
                             if len(res_values) > 0 and len(aeff_values) > 0 and len(energy_values) > 0:
-                                log_energy_min = np.log10(energy_values.min())
-                                log_energy_max = np.log10(energy_values.max())
-                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
-                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                if shared_bin_edges is not None:
+                                    bin_edges = shared_bin_edges
+                                    bin_centers = shared_bin_centers
+                                else:
+                                    log_energy_min = np.log10(energy_values.min())
+                                    log_energy_max = np.log10(energy_values.max())
+                                    bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                n_bins_effective = len(bin_edges) - 1
 
                                 bin_fom = []
                                 bin_fom_err = []
-                                for i in range(int(n_bins)):
+                                for i in range(n_bins_effective):
                                     mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         fval, ferr = self._compute_pointsource_fom_from_resolution_and_aeff(
@@ -2650,13 +2718,18 @@ class Visualizer:
                                 energy_values = energy_values[pos_mask]
 
                             if len(aeff_values) > 0 and len(energy_values) > 0:
-                                log_energy_min = np.log10(energy_values.min())
-                                log_energy_max = np.log10(energy_values.max())
-                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
-                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                if shared_bin_edges is not None:
+                                    bin_edges = shared_bin_edges
+                                    bin_centers = shared_bin_centers
+                                else:
+                                    log_energy_min = np.log10(energy_values.min())
+                                    log_energy_max = np.log10(energy_values.max())
+                                    bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                n_bins_effective = len(bin_edges) - 1
 
                                 bin_medians = []
-                                for i in range(int(n_bins)):
+                                for i in range(n_bins_effective):
                                     mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         vals = np.array(aeff_values[mask], dtype=float)
