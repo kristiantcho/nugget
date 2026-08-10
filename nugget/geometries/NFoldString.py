@@ -264,127 +264,30 @@ class NFoldString(Geometry):
             return self._random_slice_polar()
         return self._sunflower_slice_polar()
 
-    def _fold_alignment_cost(self, angles_np, offset):
-        """Residual of folding ``angles_np`` into one wedge at ``offset``.
+    def _slice_from_symmetric_xy(self, string_xy):
+        """Split an already-symmetric ``string_xy`` into a single slice.
 
-        Every string is mapped into the wedge by taking its angle modulo
-        ``fold_angle``; the cost is the summed circular variance of the
-        resulting clusters. For a geometry that really is N-fold symmetric this
-        is ~0 for any offset, so the tie is broken by a second term that
-        rewards offsets putting the wedge *boundary* in an empty gap rather
-        than through a group of strings -- which is what makes the recovered
-        slice a clean cut instead of one splitting a ring of strings.
-        """
-        folded = np.mod(angles_np - offset, self.fold_angle)
-        if folded.size == 0:
-            return 0.0
+        The geometry is assumed to already have the N-fold symmetry, and
+        ``fold_offset`` is taken as given (it is a constructor argument, not
+        something inferred). Each string is assigned to the fold its angle
+        falls in; the strings in the first fold become the slice.
 
-        # How far each string sits from the nearest wedge edge. For a genuinely
-        # N-fold symmetric input every offset folds the strings perfectly, so
-        # this clearance term is what actually picks the cut: we want the wedge
-        # boundary to fall in an empty gap rather than slicing through a group
-        # of strings (which would split one ring across two folds and make the
-        # recovered slice hard to read).
-        edge_dist = np.minimum(folded, self.fold_angle - folded)
-        # Soft-min: dominated by the closest strings but, unlike a hard min,
-        # still improves as the *second* closest string moves away, which gives
-        # the refinement a usable gradient.
-        scale = 0.02 * self.fold_angle
-        clearance = -scale * np.log(np.exp(-edge_dist / scale).sum())
-        clearance /= (0.5 * self.fold_angle)
-
-        # Residual of the folding itself: ~0 when the input really has the
-        # assumed symmetry, non-zero (and offset-dependent) when it does not.
-        phase = 2.0 * np.pi * folded / self.fold_angle
-        r = np.hypot(np.cos(phase).mean(), np.sin(phase).mean())
-        spread = 1.0 - r
-
-        return float(spread - clearance)
-
-    def _find_fold_offset(self, string_xy, n_coarse=720, n_refine=40):
-        """Search for the fold offset that best aligns ``string_xy`` to the wedge.
-
-        Coarse scan over ``[0, fold_angle)`` followed by a golden-section style
-        bracket refinement around the best candidate. Returns the offset in
-        radians.
-        """
-        xy = string_xy.detach().cpu().numpy()
-        r = np.hypot(xy[:, 0], xy[:, 1])
-        keep = r > 1e-9  # a string at the origin has no meaningful angle
-        if not np.any(keep):
-            return 0.0
-        angles = np.arctan2(xy[keep, 1], xy[keep, 0])
-
-        # Coarse scan.
-        cands = np.linspace(0.0, self.fold_angle, n_coarse, endpoint=False)
-        costs = np.array([self._fold_alignment_cost(angles, c) for c in cands])
-        best_i = int(np.argmin(costs))
-        best = float(cands[best_i])
-
-        # Refine within the neighbouring coarse cells by repeated bisection.
-        step = self.fold_angle / n_coarse
-        lo, hi = best - step, best + step
-        for _ in range(n_refine):
-            m1 = lo + (hi - lo) / 3.0
-            m2 = hi - (hi - lo) / 3.0
-            if self._fold_alignment_cost(angles, m1) <= self._fold_alignment_cost(angles, m2):
-                hi = m2
-            else:
-                lo = m1
-            if hi - lo < 1e-12:
-                break
-        best = 0.5 * (lo + hi)
-        return float(np.mod(best, self.fold_angle))
-
-    def _slice_from_symmetric_xy(self, string_xy, fold_offset=None):
-        """Recover slice parameters from a full, already-symmetric ``string_xy``.
-
-        Given a detector that is (approximately) N-fold symmetric, find the
-        wedge offset, fold every string into that wedge, and pick one
-        representative per symmetry orbit. Returns
-        ``(slice_radius, slice_angle, fold_offset, slice_source_indices)``.
-
-        ``strings_per_fold`` is set from the number of representatives found,
-        so a geometry with n_strings not divisible by n_folds still yields a
-        usable slice (the leftover strings simply share orbits).
+        Returns ``(slice_radius, slice_angle, slice_source_indices)``.
         """
         xy = self._as_tensor(string_xy).reshape(-1, 2)
         xy_np = xy.detach().cpu().numpy()
 
-        if fold_offset is None:
-            fold_offset = self._find_fold_offset(xy)
-
         r_np = np.hypot(xy_np[:, 0], xy_np[:, 1])
-        a_np = np.mod(np.arctan2(xy_np[:, 1], xy_np[:, 0]) - fold_offset, self.fold_angle)
+        a_np = np.mod(np.arctan2(xy_np[:, 1], xy_np[:, 0]) - self.fold_offset, 2.0 * np.pi)
 
-        # Group strings into symmetry orbits: same radius and (folded) angle.
-        # Sorting by radius then angle keeps the representative choice stable.
-        order = np.lexsort((a_np, np.round(r_np, 9)))
-        reps = []
-        tol_r = max(1e-6, 1e-6 * float(r_np.max() if r_np.size else 1.0))
-        tol_a = 1e-6
-        for idx in order:
-            if r_np[idx] <= 1e-9:
-                # Origin strings are their own orbit and cannot be mirrored;
-                # keep at most one and place it on the wedge's leading edge.
-                if not any(r_np[k] <= 1e-9 for k in reps):
-                    reps.append(int(idx))
-                continue
-            dup = False
-            for k in reps:
-                if abs(r_np[idx] - r_np[k]) <= tol_r and (
-                    min(abs(a_np[idx] - a_np[k]),
-                        self.fold_angle - abs(a_np[idx] - a_np[k])) <= tol_a
-                ):
-                    dup = True
-                    break
-            if not dup:
-                reps.append(int(idx))
+        # Strings in the first wedge [0, fold_angle), innermost first.
+        in_slice = np.where(a_np < self.fold_angle - 1e-12)[0]
+        in_slice = in_slice[np.lexsort((a_np[in_slice], r_np[in_slice]))]
+        reps = [int(i) for i in in_slice]
 
-        reps = sorted(reps, key=lambda k: (r_np[k], a_np[k]))
         slice_radius = torch.tensor(r_np[reps], device=self.device, dtype=torch.float64)
         slice_angle = torch.tensor(a_np[reps], device=self.device, dtype=torch.float64)
-        return slice_radius, slice_angle, float(fold_offset), reps
+        return slice_radius, slice_angle, reps
 
     def _default_z_values(self, n_strings):
         if self.custom_z_spacing is not None:
@@ -473,28 +376,34 @@ class NFoldString(Geometry):
                 slice_angle = self._as_tensor(initial_geometry['slice_angle']).reshape(-1)
 
             # A plain symmetric geometry (only string_xy, no slice params):
-            # search for the wedge offset that best matches the geometry's own
-            # symmetry, then fold the strings down into a single slice.
+            # take the strings in the first fold as the slice and infer
+            # strings_per_fold from them. fold_offset is used as supplied.
             if (slice_radius is None and slice_angle is None
                     and initial_geometry.get('string_xy', None) is not None
                     and self.n_folds > 1):
-                found_offset = kwargs.get('fold_offset', initial_geometry.get('fold_offset', None))
-                slice_radius, slice_angle, found_offset, reps = self._slice_from_symmetric_xy(
-                    initial_geometry['string_xy'], fold_offset=found_offset
-                )
-                self.fold_offset = found_offset
-                self.fold_rotations = (
-                    torch.arange(self.n_folds, device=self.device, dtype=torch.float64)
-                    * self.fold_angle
-                    + self.fold_offset
+                if initial_geometry.get('fold_offset', None) is not None:
+                    self.fold_offset = float(initial_geometry['fold_offset'])
+                    self.fold_rotations = (
+                        torch.arange(self.n_folds, device=self.device, dtype=torch.float64)
+                        * self.fold_angle
+                        + self.fold_offset
+                    )
+                slice_radius, slice_angle, reps = self._slice_from_symmetric_xy(
+                    initial_geometry['string_xy']
                 )
                 self.strings_per_fold = int(slice_radius.numel())
                 self.n_strings = self.n_folds * self.strings_per_fold
+                n_given = int(self._as_tensor(initial_geometry['string_xy']).reshape(-1, 2).shape[0])
                 print(
-                    f"Recovered {self.strings_per_fold} strings/fold from a symmetric "
-                    f"geometry of {len(self._as_tensor(initial_geometry['string_xy']).reshape(-1, 2))} "
-                    f"strings (fold_offset = {found_offset:.6f} rad)"
+                    f"Using {self.strings_per_fold} strings/fold from a symmetric geometry "
+                    f"of {n_given} strings (fold_offset = {self.fold_offset:.6f} rad)"
                 )
+                if self.strings_per_fold * self.n_folds != n_given:
+                    print(
+                        f"  warning: {n_given} strings is not {self.n_folds} x "
+                        f"{self.strings_per_fold}; the geometry may not be "
+                        f"{self.n_folds}-fold symmetric about the given fold_offset"
+                    )
                 # Per-string values loaded below are indexed by the *original*
                 # string order, so remember which originals we kept.
                 self._slice_source_indices = reps
