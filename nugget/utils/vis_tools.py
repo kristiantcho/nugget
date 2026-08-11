@@ -6077,6 +6077,8 @@ class Visualizer:
                 ax.plot(pointsource_fom_history, color='purple', linewidth=2, markersize=4)
                 ax.set_title('Pointsource FoM History')
                 ax.set_xlabel('Iteration')
+                if kwargs.get('ps_fom_logy', False):
+                    ax.set_yscale('log')
                 ax.set_ylabel('Pointsource FoM')
                 ax.grid(True, alpha=0.3)
             else:
