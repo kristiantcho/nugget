@@ -2127,13 +2127,21 @@ class LLRnet(Surrogate):
         torch.Tensor
             Network output (raw logits, i.e. the LLR). Apply a sigmoid for probabilities.
         """
+        # Match the network's own weight dtype rather than hardcoding float32:
+        # checkpoints trained before nugget defaulted to float64 hold float32
+        # weights, while newly-built networks are float64. Casting the input to
+        # self.param_dtype keeps F.linear happy either way (otherwise:
+        # "mat1 and mat2 must have the same dtype, but got Float and Double").
+        target_dtype = self.param_dtype
         if not isinstance(points, torch.Tensor):
-            points = torch.tensor(points, device=self.device, dtype=torch.float32)
+            points = torch.tensor(points, device=self.device, dtype=target_dtype)
         else:
-            points = points.float().to(self.device)  # Ensure float32 and correct device
+            points = points.to(device=self.device, dtype=target_dtype)
 
         if self.standardize_inputs and self.input_mean is not None:
-            points = (points - self.input_mean) / self.input_std
+            mean = self.input_mean.to(device=points.device, dtype=points.dtype)
+            std = self.input_std.to(device=points.device, dtype=points.dtype)
+            points = (points - mean) / std
 
         # Process through each parallel branch
         branch_outputs = []
@@ -2942,8 +2950,81 @@ class LLRnet(Surrogate):
             if self.reduce_lr_on_plateau and self.lr_scheduler is not None:
                 if 'lr_scheduler_state_dict' in checkpoint and checkpoint['lr_scheduler_state_dict'] is not None:
                     self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
-        
+
+        # Keep the checkpoint's own weight dtype (an old model trained in float32
+        # stays float32) and make the standalone restored tensors agree with it,
+        # so nothing silently mixes precisions. `_forward_pass` casts incoming
+        # features to `self.param_dtype`, so both old float32 and new float64
+        # checkpoints run without a dtype mismatch in F.linear.
+        self._align_aux_tensors_to_params()
+
         self.is_trained = True
+
+    def _align_aux_tensors_to_params(self):
+        """Match the standalone restored tensors to the network's weight dtype.
+
+        `input_mean`, `input_std` and `pmt_directions` are plain attributes rather
+        than registered buffers, so `Module.to()` never touches them. Without this
+        an old float32 checkpoint under a float64 default dtype (or vice versa)
+        mixes precisions inside the standardisation / feature code.
+        """
+        dtype = self.param_dtype
+        for attr in ('input_mean', 'input_std', 'pmt_directions'):
+            value = getattr(self, attr, None)
+            if torch.is_tensor(value):
+                setattr(self, attr, value.to(dtype))
+        return self
+
+    def to_dtype(self, dtype):
+        """Explicitly convert the whole network (and its aux tensors) to `dtype`.
+
+        Optional escape hatch: an old float32 checkpoint runs fine as-is (see
+        `_forward_pass`), but converting it to float64 lets it share dtype with
+        the rest of the float64 pipeline, e.g. when its output is combined with
+        float64 tensors downstream.
+        """
+        for module in (
+            getattr(self, 'shared_branch_mlp', None),
+            getattr(self, 'final_mlp', None),
+        ):
+            if module is not None:
+                module.to(dtype)
+
+        for module_list in (
+            getattr(self, 'mlp_branches', None),
+            getattr(self, 'fourier_features_list', None),
+        ):
+            if module_list is not None:
+                for module in module_list:
+                    if module is not None:
+                        module.to(dtype)
+
+        self._align_aux_tensors_to_params()
+        return self
+
+    @property
+    def param_dtype(self):
+        """dtype of the network's own weights.
+
+        The feature builders use this instead of a hardcoded torch.float32 so an
+        old float32 checkpoint (or a float64 one) always gets features matching
+        its weights, rather than raising
+        "mat1 and mat2 must have the same dtype" inside F.linear.
+        """
+        for module in (
+            getattr(self, 'final_mlp', None),
+            getattr(self, 'shared_branch_mlp', None),
+        ):
+            if module is not None:
+                for param in module.parameters():
+                    return param.dtype
+        branches = getattr(self, 'mlp_branches', None)
+        if branches is not None:
+            for branch in branches:
+                if branch is not None:
+                    for param in branch.parameters():
+                        return param.dtype
+        return torch.get_default_dtype()
 
     class EventDataset(Dataset):
         """
@@ -4420,11 +4501,7 @@ class LLRnet(Surrogate):
             import pandas as pd
 
             self.llrnet = llrnet_instance
-            # Samples are always built on CPU, regardless of the model's device. With
-            # num_workers > 0, __getitem__ runs in a forked worker process; addressing
-            # a CUDA device there is unsafe (each process needs its own CUDA context)
-            # and unnecessary, since train_with_dataloader moves each collated batch to
-            # self.llrnet.device right before the forward pass anyway.
+       
             self.device = torch.device('cpu')
             self.zero_ly_prob = float(zero_ly_prob)
             self.zero_ly_value = float(zero_ly_value)
