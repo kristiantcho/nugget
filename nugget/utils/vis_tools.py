@@ -774,17 +774,7 @@ class Visualizer:
             min_i  = -tau * log( sum_j exp(-dist_ij / tau) )     (j != i)
             metric = sum_i w_i * min_i / sum_i w_i
 
-        (plain mean over i if `string_weights` is None). `string_weights` is expected
-        to already be in [0, 1] (see `_weighted_mean_nn_distance`'s docstring for why
-        this does not apply sigmoid() itself). `tau` defaults to
-        0.05 * (median 1-NN distance). Unlike the "soft top-5" averaging in
-        `_weighted_mean_nn_distance` (which intentionally blends several neighbours
-        together), this softmin is meant to track a single true minimum, so it needs
-        a much smaller temperature: with several comparably-close neighbours (e.g. a
-        hex-packed string with ~6 near-equidistant neighbours, which is the common
-        case, not an edge case), a softmin biases below the true minimum by an amount
-        that grows with the temperature and the number of near-tied neighbours -- at
-        0.5x (the other helper's default) the bias can exceed 40%.
+      
 
         Returns
         -------
@@ -825,6 +815,85 @@ class Visualizer:
             return None
         metric = float((probs * min_per_string).sum() / probs_sum)
         return metric
+
+    @staticmethod
+    def _tile_rov_safe_spaces_across_folds(origins_xy, angles_rad, string_indices, kwargs):
+        """Repeat one fold's ROV safe-space corridors across every other fold.
+
+        For an N-fold symmetric geometry (e.g. `NFoldString`), each fold is a rigid
+        rotation of fold 0 by `fold_angle * k + fold_offset` about the origin. Rather
+        than computing (and drawing) a safe-space corridor per string in every fold -
+        which, for a geometry that already IS N-fold symmetric, is redundant work that
+        produces `n_folds` identical-up-to-rotation shapes - this restricts the input
+        to fold 0's strings only, then reuses that fold's `(origin_xy, angle_rad)`
+        pairs to derive every other fold's corridors by rotation. This also means the
+        safe-space visualization stays clean/consistent even if the geometry hasn't
+        fully converged to exact symmetry yet, since it only ever reflects fold 0.
+
+        Parameters
+        ----------
+        origins_xy, angles_rad, string_indices : array-like
+            The already-selected (e.g. active-only) global strings' corridor inputs,
+            as built by the caller (same shapes/order as each other).
+        kwargs : dict
+            The plot's kwargs, used to read `fold_indices`, `n_folds`, `fold_angle`,
+            `fold_offset`.
+
+        Returns
+        -------
+        tuple(np.ndarray, np.ndarray, np.ndarray)
+            Expanded `(origins_xy, angles_rad, string_indices)` covering all folds, or
+            the inputs unchanged (as arrays) if fold info isn't available or there's
+            only one fold.
+        """
+        origins_xy = np.asarray(origins_xy, dtype=float)
+        angles_rad = np.asarray(angles_rad, dtype=float)
+        string_indices = np.asarray(string_indices)
+
+        fold_indices = kwargs.get('fold_indices', None)
+        n_folds = kwargs.get('n_folds', None)
+        if fold_indices is None or n_folds is None or origins_xy.shape[0] == 0:
+            return origins_xy, angles_rad, string_indices
+        n_folds = int(n_folds)
+        if n_folds <= 1:
+            return origins_xy, angles_rad, string_indices
+
+        if torch.is_tensor(fold_indices):
+            fold_indices_np = fold_indices.detach().cpu().numpy()
+        else:
+            fold_indices_np = np.asarray(fold_indices)
+        if fold_indices_np.shape[0] < int(np.max(string_indices)) + 1:
+            # fold_indices doesn't cover the given string indices - can't restrict.
+            return origins_xy, angles_rad, string_indices
+
+        # Keep only fold 0's strings among the ones the caller already selected.
+        fold0_mask = fold_indices_np[string_indices] == 0
+        if not np.any(fold0_mask):
+            return origins_xy, angles_rad, string_indices
+
+        fold0_origins = origins_xy[fold0_mask]
+        fold0_angles = angles_rad[fold0_mask]
+        fold0_indices = string_indices[fold0_mask]
+
+        fold_angle = kwargs.get('fold_angle', None)
+        fold_angle = (2.0 * np.pi / n_folds) if fold_angle is None else float(fold_angle)
+
+        tiled_origins = []
+        tiled_angles = []
+        tiled_indices = []
+        for k in range(n_folds):
+            rot = k * fold_angle
+            c, s = np.cos(rot), np.sin(rot)
+            rot_mat = np.array([[c, -s], [s, c]])
+            tiled_origins.append(fold0_origins @ rot_mat.T)
+            tiled_angles.append(fold0_angles + rot)
+            tiled_indices.append(fold0_indices)
+
+        return (
+            np.concatenate(tiled_origins, axis=0),
+            np.concatenate(tiled_angles, axis=0),
+            np.concatenate(tiled_indices, axis=0),
+        )
 
     def _draw_rov_safe_space_union(
         self,
@@ -1102,20 +1171,7 @@ class Visualizer:
             - 'string_xy_local_string_repulsion_penalty': String XY scatter colored by per-string local string repulsion penalty
             - 'string_history': Traced path of each string's XY position across every recorded
               iteration, from its start-of-optimization position (red) to its current/final
-              position (green), with a legend distinguishing the two. Positions are cached
-              automatically on this Visualizer instance from the `string_xy`/`string_weights`
-              passed in kwargs each time this plot type is requested (e.g. via `vis_freq` during
-              `optimizer.optimize()`) - no need to pass a starting geometry or history yourself;
-              the first snapshot recorded becomes the trajectory's start. Call
-              `clear_string_history()` before a fresh optimization run to reset the cache.
-              Requires at least 2 recorded snapshots (i.e. this plot type must have already been
-              requested at least twice) before it renders anything. Optional kwargs:
-              'weight_threshold' (default 0.7, applied to the final snapshot's `string_weights`
-              to drop inactive strings); 'string_history_apply_sigmoid' (default True);
-              'string_history_match_strings' (bool or None, auto-detects string count mismatches
-              between consecutive snapshots and uses Hungarian matching); 'string_history_min_segment_length';
-              'string_history_color_start'/'string_history_color_end'; 'string_history_line_kwargs';
-              'string_history_title'.
+              position (green)
             - 'signal_light_yield_contour': Signal light yield contour plot based on per-string values
             - 'signal_light_yield_contour_points': Signal light yield contour plot based on per-point values
             - 'fisher_info_logdet': Log determinant of Fisher Information matrix contour plot
@@ -1157,19 +1213,7 @@ class Visualizer:
               'string_xy' each iteration and plotted together: (1) the (weight-weighted) average
               per-string mean distance to its 5 nearest neighbours, and (2) the (weight-weighted)
               average, across strings, of each string's own (soft) nearest-neighbour distance --
-              i.e. a softmin per string over its distances to all others, then a weighted average
-              of those per-string minimums. If 'string_weights' is provided, strings with
-              sigmoid(weight) < 'weight_threshold' (default 0.7) are dropped entirely before
-              computing either series (matching the hard active_mask convention used by the ROV
-              penalty / string_xy plots), and the remaining strings' sigmoid-weights are used as
-              soft weighting on top of that. Both series fall back to a plain (unweighted)
-              average over all strings if 'string_weights' is not provided. Optional kwargs:
-              'nn_distance_num_neighbours' (default 5), 'nn_distance_nn_tau' (soft-selection
-              temperature as a multiple of the geometry's median k-th nearest distance; default
-              None -> 0.5), 'nn_distance_min_tau' (per-string softmin temperature for the second
-              series, same scale-aware convention but deliberately sharper since it targets a
-              single minimum rather than a top-5 blend; default None -> 0.05), 'string_weights',
-              'weight_threshold'.
+          
         make_gif : bool
             Whether to generate and save a GIF of the progress.
         gif_plot_selection : list of str or None
@@ -1224,7 +1268,11 @@ class Visualizer:
                 space in its own (semi-transparent, overlap-blending) color instead of one merged union shape.
                 Colors are keyed on the global string index so they stay consistent across iterations. In this
                 mode no union outline is drawn and shapely is not required.
-            - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range] 
+            - rov_safe_space_one_fold_only: bool, optional. For N-fold symmetric geometries (e.g. `NFoldString`,
+                which puts `fold_indices`/`n_folds`/`fold_angle` in the geometry dict), restricts the
+                `rov_draw_safe_space_on_violations` / `rov_draw_safe_space_union` corridors to fold 0's strings
+                only, then reuses that fold's corridors
+            - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range]
               instead of the default domain boundaries [-half_domain, half_domain]
             - plot_with_surrogate: bool, optional. If True and 'light_surrogate_func' and 'surrogate_event_params' 
               are provided, will generate full domain contour plot using the surrogate function for 'signal_light_yield_contour'
@@ -3512,6 +3560,7 @@ class Visualizer:
                 draw_rov_safe_space_active_only = bool(kwargs.get('rov_draw_safe_space_active_only', False))
                 draw_rov_safe_space_union = bool(kwargs.get('rov_draw_safe_space_union', False))
                 rov_union_per_space_colors = bool(kwargs.get('rov_union_per_space_colors', False))
+                rov_safe_space_one_fold_only = bool(kwargs.get('rov_safe_space_one_fold_only', False))
                 weight_threshold = kwargs.get('weight_threshold', 0.7)
                 if rov_penalty_per_string is not None:
                     # Convert ROV penalty per string to numpy
@@ -3551,11 +3600,16 @@ class Visualizer:
                             if draw_rov_safe_space_active_only and active_mask is not None:
                                 violation_mask = violation_mask & active_mask
                             viol_idx = np.where(violation_mask)[0]
-                            for i in viol_idx:
+                            viol_origins, viol_angles, viol_idx_expanded = xy_np[viol_idx], rov_angles_np[viol_idx], viol_idx
+                            if rov_safe_space_one_fold_only:
+                                viol_origins, viol_angles, viol_idx_expanded = self._tile_rov_safe_spaces_across_folds(
+                                    viol_origins, viol_angles, viol_idx_expanded, kwargs,
+                                )
+                            for origin_xy, angle_rad in zip(viol_origins, viol_angles):
                                 self._draw_rov_safe_space_at_string(
                                     ax,
-                                    origin_xy=xy_np[i],
-                                    angle_rad=rov_angles_np[i],
+                                    origin_xy=origin_xy,
+                                    angle_rad=angle_rad,
                                     rov_penalty=rov_penalty_func,
                                     zorder=1,
                                 )
@@ -3567,14 +3621,19 @@ class Visualizer:
                             union_idx_mask = active_mask if active_mask is not None else np.ones(len(xy_np), dtype=bool)
                             union_idx = np.where(union_idx_mask)[0]
                             if union_idx.size > 0:
+                                union_origins, union_angles, union_idx_expanded = xy_np[union_idx], rov_angles_np[union_idx], union_idx
+                                if rov_safe_space_one_fold_only:
+                                    union_origins, union_angles, union_idx_expanded = self._tile_rov_safe_spaces_across_folds(
+                                        union_origins, union_angles, union_idx_expanded, kwargs,
+                                    )
                                 self._draw_rov_safe_space_union(
                                     ax,
-                                    origins_xy=xy_np[union_idx],
-                                    angles_rad=rov_angles_np[union_idx],
+                                    origins_xy=union_origins,
+                                    angles_rad=union_angles,
                                     rov_penalty=rov_penalty_func,
                                     zorder=1,
                                     per_space_colors=rov_union_per_space_colors,
-                                    string_indices=union_idx,
+                                    string_indices=union_idx_expanded,
                                 )
 
                     # Use string weights for alpha transparency (no threshold filtering)
