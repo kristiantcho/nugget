@@ -64,8 +64,15 @@ class DynamicString(Geometry):
         --------
         dict
             Dictionary with initialized torch tensors
-        
+
         """
+        # A custom_z_spacing carried in the geometry dict overrides the one
+        # given to the constructor, so a saved geometry restores the z spacing
+        # it was built with. Stored on self because _make_z_segment (used by
+        # both the pre-trained and the fresh-init paths below) reads it there.
+        if initial_geometry is not None and initial_geometry.get('custom_z_spacing', None) is not None:
+            self.custom_z_spacing = initial_geometry['custom_z_spacing']
+
         if initial_geometry is not None:
             print(f"Using pre-trained dynamic string geometry as starting point")
             # Extract and validate components from the initial geometry
@@ -471,10 +478,10 @@ class DynamicString(Geometry):
         # For soft allocation, points_3d is always (self.total_points, 3)
 
         return {
-            "points_3d": points_3d, 
-            "z_values": z_values_final, 
+            "points_3d": points_3d,
+            "z_values": z_values_final,
             "string_xy": string_xy,
-            "string_indices": string_indices_final, 
+            "string_indices": string_indices_final,
             "points_per_string_list": points_per_string_list_final,
         }
     
