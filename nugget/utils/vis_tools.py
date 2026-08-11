@@ -820,15 +820,7 @@ class Visualizer:
     def _tile_rov_safe_spaces_across_folds(origins_xy, angles_rad, string_indices, kwargs):
         """Repeat one fold's ROV safe-space corridors across every other fold.
 
-        For an N-fold symmetric geometry (e.g. `NFoldString`), each fold is a rigid
-        rotation of fold 0 by `fold_angle * k + fold_offset` about the origin. Rather
-        than computing (and drawing) a safe-space corridor per string in every fold -
-        which, for a geometry that already IS N-fold symmetric, is redundant work that
-        produces `n_folds` identical-up-to-rotation shapes - this restricts the input
-        to fold 0's strings only, then reuses that fold's `(origin_xy, angle_rad)`
-        pairs to derive every other fold's corridors by rotation. This also means the
-        safe-space visualization stays clean/consistent even if the geometry hasn't
-        fully converged to exact symmetry yet, since it only ever reflects fold 0.
+       
 
         Parameters
         ----------
@@ -884,9 +876,11 @@ class Visualizer:
         for k in range(n_folds):
             rot = k * fold_angle
             c, s = np.cos(rot), np.sin(rot)
+    
             rot_mat = np.array([[c, -s], [s, c]])
             tiled_origins.append(fold0_origins @ rot_mat.T)
-            tiled_angles.append(fold0_angles + rot)
+       
+            tiled_angles.append(fold0_angles - rot)
             tiled_indices.append(fold0_indices)
 
         return (
