@@ -357,10 +357,10 @@ for i in range(num_trials):
     if not use_fold:
         opt_list = [('string_xy', 10)] if not spacing_test else [('string_spacing', 5)]
     else:
-        opt_list=[('slice_radius', 5), ('slice_angle', 0.05)],
+        opt_list = [('slice_radius', 5), ('slice_angle', 0.05)]
     optimizer.init_geometry(
         # opt_list=[('string_weights', 0.5)],  # Learning rate for string weights (without sigmoid applied)
-        opt_list=opt_list,  # Learning rate for string weights (without sigmoid applied)
+        opt_list=opt_list  # Learning rate for string weights (without sigmoid applied)
     )  
     if spacing_test:
         save_geom_folder = f'{folder_name}/geom_e{i+2}_e{i+3}' if bin_energies else f'{folder_name}/geom_{i}'
