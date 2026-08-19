@@ -297,19 +297,7 @@ for i in range(num_trials):
         loss_params.update({
             'signal_sampler': signal_sampler,
             })
-    if not spacing_test:
-        geometry = nugget.geometries.DynamicString.DynamicString(
-                device=device,
-                hex_type='hexagonal',
-                domain_size=1000,  # Size of detector domain
-                dim=3,  # 3D geometry
-                n_strings=num_strings,  # Initial number of detector strings
-                points_per_string=20,  # Number of PMTs/sensors per string
-                custom_z_spacing=50,
-                # random_weights=True
-                # starting_weight = 100,
-            )
-    elif use_fold:
+    if use_fold:
         geometry = nugget.geometries.NFoldString.NFoldString(
                 device=device,
                 domain_size=1000,  # Size of detector domain
@@ -324,6 +312,18 @@ for i in range(num_trials):
                 slice_init = 'sunflower',
                 add_center_string=True,
                 # fold_offset=2*np.pi/3
+            )
+    elif not spacing_test:
+        geometry = nugget.geometries.DynamicString.DynamicString(
+                device=device,
+                hex_type='hexagonal',
+                domain_size=1000,  # Size of detector domain
+                dim=3,  # 3D geometry
+                n_strings=num_strings,  # Initial number of detector strings
+                points_per_string=20,  # Number of PMTs/sensors per string
+                custom_z_spacing=50,
+                # random_weights=True
+                # starting_weight = 100,
             )
     else:
         geometry = nugget.geometries.SpaceString.SpaceString(
