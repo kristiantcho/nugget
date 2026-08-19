@@ -116,8 +116,8 @@ class StringBoundaryPenaltyCircle(LossFunction):
         domain_size = kwargs.get('boundary_range', 2.0)
         string_weights = geom_dict.get('string_weights', None)
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else 1.0
-        boundary_sharpness = kwargs.get('boundary_sharpness', 10.0)
-        clamped_string_xy = torch.sigmoid(boundary_sharpness * (torch.sqrt(string_xy[:,0] ** 2 + string_xy[:,1] ** 2) - domain_size/2))
+        # boundary_sharpness = kwargs.get('boundary_sharpness', 10.0)
+        clamped_string_xy = torch.nn.functional.softplus((torch.sqrt(string_xy[:,0] ** 2 + string_xy[:,1] ** 2 + 1e-8) - domain_size/2))
         # clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy))
         return {'string_boundary_penalty': torch.mean(clamped_string_xy * string_probs)}
 
