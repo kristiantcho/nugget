@@ -4,7 +4,7 @@ import nugget
 import pickle
 import os
 
-device="cuda:2"
+device="cuda:1"
 string_number_penalty = nugget.losses.geometry_penalties.StringNumberPenalty(device=device)
 string_boundary_penalty = nugget.losses.geometry_penalties.StringBoundaryPenaltyCircle(device=device)
 weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizationPenalty(device=device)
@@ -31,6 +31,8 @@ use_rov = 'no_rov'
 num_events = 'inf'
 event_type = 'track'
 res_param = 'angle'
+use_fold = True
+n_folds = 6
 spacing_test = False
 num_strings = 61
 limit_zenith = 'vertical'
@@ -38,7 +40,7 @@ center = [0,0,0]
 radius = 600
 height = 1000
 bin_energies = True
-folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}{"_"+limit_zenith if limit_zenith is not None else ""}{"_spacing_test" if spacing_test else ""}'
+folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}{"_"+limit_zenith if limit_zenith is not None else ""}{"_spacing_test" if spacing_test else ""}{"_{n_folds}fold" if use_fold else ""}'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -307,6 +309,22 @@ for i in range(num_trials):
                 # random_weights=True
                 # starting_weight = 100,
             )
+    elif use_fold:
+        geometry = nugget.geometries.NFoldString.NFoldString(
+                device=device,
+                domain_size=1000,  # Size of detector domain
+                dim=3,  # 3D geometry
+                n_folds=n_folds,
+                strings_per_fold=(num_strings-1)//n_folds,
+                points_per_string=20,  # Number of PMTs/sensors per string
+                custom_z_spacing=50,
+                use_weights=False,
+                starting_weight=6,
+                random_weights=False,
+                slice_init = 'sunflower',
+                add_center_string=True,
+                # fold_offset=2*np.pi/3
+            )
     else:
         geometry = nugget.geometries.SpaceString.SpaceString(
                     device=device,
@@ -336,9 +354,13 @@ for i in range(num_trials):
             'epsilon': 1e-8,
             }
         )
+    if not use_fold:
+        opt_list = [('string_xy', 10)] if not spacing_test else [('string_spacing', 5)]
+    else:
+        opt_list=[('slice_radius', 5), ('slice_angle', 0.05)],
     optimizer.init_geometry(
         # opt_list=[('string_weights', 0.5)],  # Learning rate for string weights (without sigmoid applied)
-        opt_list=[('string_xy', 10)] if not spacing_test else [('string_spacing', 5)],  # Learning rate for string weights (without sigmoid applied)
+        opt_list=opt_list,  # Learning rate for string weights (without sigmoid applied)
     )  
     if spacing_test:
         save_geom_folder = f'{folder_name}/geom_e{i+2}_e{i+3}' if bin_energies else f'{folder_name}/geom_{i}'

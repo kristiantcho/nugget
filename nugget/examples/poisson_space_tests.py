@@ -4,13 +4,13 @@ import numpy as np
 import pickle
 
 device='cuda:3'
-ps_fom=True
+ps_fom=False
 center = [0,0,0]
 radius = 600
 height = 1000
 num_strings = 61
 event_type = 'track'  # 'track' or 'cascade'
-limit_zenith = None  # 'horizontal' or 'vertical'
+limit_zenith = 'vertical'  # 'horizontal' or 'vertical'
 free_sim_volume = False  # If True, the simulation volume is not constrained to a cylinder. If False, the simulation volume is constrained to a cylinder with the specified center, radius, and height.
 lightsabre_surrogate = nugget.surrogates.LightSabre.LightSabre(device=device, use_poisson=False, domain_size=1600, particle_mode = event_type)
 light_yield_surrogate = lightsabre_surrogate.light_yield_surrogate_batched
@@ -39,7 +39,7 @@ angular_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
 energy_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
     device=device,
     resolution_type='energy',
-    fisher_info_params=['energy']
+    fisher_info_params=['energy', 'position']
 )
 
 if ps_fom:
