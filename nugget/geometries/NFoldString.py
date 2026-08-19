@@ -39,6 +39,16 @@ class NFoldString(Geometry):
         hexagonal lattice that fall in the wedge, so the mirrored detector
         starts on a true hex packing; 'random' samples uniformly over the
         wedge area. Initialization only -- the strings move freely afterwards.
+    add_center_string : bool
+        If True, one extra string is fixed at ``(x, y) = (0, 0)``, on top of
+        the ``n_folds * strings_per_fold`` mirrored strings. Its xy position
+        is a constant, not a parameter -- the origin is invariant under the
+        fold rotation, so it has no orbit of its own the way every other
+        string does. It uses the same points_per_string / z spacing as every
+        other string, and (if ``use_weights``) gets its own optimizable weight.
+    center_string_weight : float or None
+        Starting raw weight for the center string when ``use_weights`` is set.
+        Defaults to ``starting_weight``.
 
     """
 
@@ -60,6 +70,8 @@ class NFoldString(Geometry):
         init_radius=None,
         slice_init='sunflower',
         random_slice_init=False,
+        add_center_string=False,
+        center_string_weight=None,
         seed=None,
     ):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
@@ -85,6 +97,8 @@ class NFoldString(Geometry):
                 f"slice_init must be one of {valid_inits}, got {self.slice_init!r}"
             )
         self.seed = seed
+        self.add_center_string = bool(add_center_string)
+        self.center_string_weight = center_string_weight
 
         if self.n_folds < 1:
             raise ValueError("n_folds must be >= 1")
@@ -343,11 +357,13 @@ class NFoldString(Geometry):
         use_weights = kwargs.get('use_weights', self.use_weights)
         active_weights_mode = kwargs.get('active_weights_mode', self.active_weights_mode) and use_weights
         threshold = kwargs.get('weight_threshold', 0.7)
+        add_center_string = kwargs.get('add_center_string', self.add_center_string)
 
         slice_radius = None
         slice_angle = None
         slice_z_values = None
         raw_weights = None
+        raw_center_weight = None
         # Set when a slice is recovered from a full symmetric geometry: maps
         # each slice string back to the original string it came from.
         self._slice_source_indices = None
@@ -453,6 +469,12 @@ class NFoldString(Geometry):
                         raw_weights = cand[:self.strings_per_fold]
                         break
 
+            if add_center_string and use_weights:
+                for key in ('old_center_weight', 'center_weight'):
+                    if initial_geometry.get(key, None) is not None:
+                        raw_center_weight = self._as_tensor(initial_geometry[key]).reshape(-1)[:1]
+                        break
+
         if slice_radius is None or slice_angle is None:
             default_r, default_a = self._default_slice_polar()
             slice_radius = default_r if slice_radius is None else slice_radius
@@ -461,6 +483,13 @@ class NFoldString(Geometry):
             slice_z_values = self._default_z_values(self.strings_per_fold)
         if use_weights and (raw_weights is None or raw_weights.numel() != self.strings_per_fold):
             raw_weights = self._default_raw_weights(self.strings_per_fold)
+        if add_center_string and use_weights and (raw_center_weight is None or raw_center_weight.numel() != 1):
+            if self.center_string_weight is not None:
+                raw_center_weight = torch.tensor(
+                    [self.center_string_weight], device=self.device, dtype=torch.float64
+                )
+            else:
+                raw_center_weight = self._default_raw_weights(1)
 
         return self.update_points(
             slice_radius=slice_radius,
@@ -471,6 +500,9 @@ class NFoldString(Geometry):
             use_weights=use_weights,
             active_weights_mode=active_weights_mode,
             weight_threshold=threshold,
+            add_center_string=add_center_string,
+            center_weight=raw_center_weight,
+            old_center_weight=raw_center_weight,
         )
 
     def update_points(
@@ -480,6 +512,8 @@ class NFoldString(Geometry):
         slice_z_values,
         slice_weights=None,
         old_slice_weights=None,
+        center_weight=None,
+        old_center_weight=None,
         **kwargs
     ):
         """Rebuild the full N-fold geometry from the current slice parameters.
@@ -500,6 +534,10 @@ class NFoldString(Geometry):
             when weights are disabled.
         old_slice_weights : torch.Tensor or None
             Raw (pre-threshold) weights carried through ``active_weights_mode``.
+        center_weight, old_center_weight : torch.Tensor or None
+            Raw weight for the fixed center string (see ``add_center_string``),
+            mirroring ``slice_weights`` / ``old_slice_weights``. Ignored unless
+            ``add_center_string`` is set.
 
         Returns
         -------
@@ -508,11 +546,15 @@ class NFoldString(Geometry):
             ...) alongside the slice parameters, so the optimizer keeps
             stepping the slice while losses see the whole mirrored detector.
             Weight keys (``string_weights``, ``slice_weights``, ...) are present
-            only when ``use_weights`` is set.
+            only when ``use_weights`` is set. If ``add_center_string`` is set, an
+            extra string fixed at the origin is appended after the mirrored
+            strings (its ``fold_indices`` / ``slice_indices`` entry is ``-1``,
+            since it belongs to no fold).
         """
         use_weights = kwargs.get('use_weights', self.use_weights)
         active_weights_mode = kwargs.get('active_weights_mode', self.active_weights_mode) and use_weights
         threshold = kwargs.get('weight_threshold', 0.7)
+        add_center_string = kwargs.get('add_center_string', self.add_center_string)
 
         if use_weights:
             # Backwards compatibility with dicts saved before the split.
@@ -526,6 +568,16 @@ class NFoldString(Geometry):
                 slice_weights = self._default_raw_weights(self.strings_per_fold)
                 old_slice_weights = slice_weights
 
+            if add_center_string:
+                if old_center_weight is None:
+                    old_center_weight = center_weight
+                if center_weight is None:
+                    center_weight = old_center_weight
+                if center_weight is None:
+                    start = self.starting_weight if self.center_string_weight is None else self.center_string_weight
+                    center_weight = torch.tensor([start], device=self.device, dtype=torch.float64)
+                    old_center_weight = center_weight
+
         # Keep the derived counts in sync if the slice size changed.
         self.strings_per_fold = int(slice_radius.shape[0])
         self.n_strings = self.n_folds * self.strings_per_fold
@@ -537,17 +589,33 @@ class NFoldString(Geometry):
         # to match string_xy's ordering.
         z_values = slice_z_values.reshape(1, -1).expand(self.n_folds, -1).reshape(-1)
 
+        n_total_strings = self.n_strings
+        if add_center_string:
+            # Fixed at the origin -- not a parameter, so it carries no grad and
+            # is built fresh every call rather than threaded through as state.
+            # Its z profile uses the same spacing/points_per_string as every
+            # other string, for the same reason.
+            center_xy = torch.zeros(1, 2, device=self.device, dtype=torch.float64)
+            string_xy = torch.cat([string_xy, center_xy], dim=0)
+            z_values = torch.cat([z_values, self._default_z_values(1)])
+            n_total_strings = self.n_strings + 1
+
         points_3d = self._build_points(string_xy, z_values)
 
-        string_indices = torch.arange(self.n_strings, device=self.device, dtype=torch.long)
+        string_indices = torch.arange(n_total_strings, device=self.device, dtype=torch.long)
         # Which fold each full-detector string came from, and which slice
-        # string it is a copy of -- handy for plotting / analysis.
+        # string it is a copy of -- handy for plotting / analysis. The center
+        # string (if any) belongs to no fold, marked with -1.
         fold_indices = torch.arange(
             self.n_folds, device=self.device, dtype=torch.long
         ).repeat_interleave(self.strings_per_fold)
         slice_indices = torch.arange(
             self.strings_per_fold, device=self.device, dtype=torch.long
         ).repeat(self.n_folds)
+        if add_center_string:
+            minus_one = torch.tensor([-1], device=self.device, dtype=torch.long)
+            fold_indices = torch.cat([fold_indices, minus_one])
+            slice_indices = torch.cat([slice_indices, minus_one])
 
         geom = {
             'points_3d': points_3d,
@@ -556,7 +624,7 @@ class NFoldString(Geometry):
             'z_values': z_values,
             'string_indices': string_indices,
             'active_string_indices': string_indices,
-            'points_per_string_list': [self.points_per_string] * self.n_strings,
+            'points_per_string_list': [self.points_per_string] * n_total_strings,
             # slice-level (optimizable) parameters
             'slice_radius': slice_radius,
             'slice_angle': slice_angle,
@@ -569,13 +637,12 @@ class NFoldString(Geometry):
             'fold_angle': self.fold_angle,
             'fold_offset': self.fold_offset,
             'use_weights': use_weights,
+            'add_center_string': add_center_string,
         }
 
         if not use_weights:
-       
             return geom
 
-   
         if active_weights_mode:
             slice_weights_to_return = 200 * (
                 torch.sigmoid(old_slice_weights) > threshold
@@ -585,12 +652,33 @@ class NFoldString(Geometry):
             slice_weights_to_return = old_slice_weights
             old_slice_weights_to_return = slice_weights_to_return
 
+        string_weights = self._tile_weights(slice_weights_to_return)
+        old_string_weights = self._tile_weights(old_slice_weights_to_return)
+
         geom.update({
-            'string_weights': self._tile_weights(slice_weights_to_return),
-            'old_string_weights': self._tile_weights(old_slice_weights_to_return),
             'slice_weights': slice_weights_to_return,
             'old_slice_weights': old_slice_weights_to_return,
             'active_weights_mode': active_weights_mode,
             'weight_threshold': threshold,
         })
+
+        if add_center_string:
+            if active_weights_mode:
+                center_weight_to_return = 200 * (
+                    torch.sigmoid(old_center_weight) > threshold
+                ).to(dtype=torch.float64) - 100
+                old_center_weight_to_return = old_center_weight
+            else:
+                center_weight_to_return = old_center_weight
+                old_center_weight_to_return = center_weight_to_return
+
+            string_weights = torch.cat([string_weights, center_weight_to_return])
+            old_string_weights = torch.cat([old_string_weights, old_center_weight_to_return])
+            geom.update({
+                'center_weight': center_weight_to_return,
+                'old_center_weight': old_center_weight_to_return,
+            })
+
+        geom['string_weights'] = string_weights
+        geom['old_string_weights'] = old_string_weights
         return geom
