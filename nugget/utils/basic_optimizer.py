@@ -422,17 +422,7 @@ class Optimizer():
             for key in self.optimizers:
                 self.optimizer_phases[key] = False
         
-        # Resuming a previous optimize() call only requires resupplying loss_dict/
-        # uw_loss_dict (the histories actually used for plotting/logging); callers
-        # commonly forget the separate loss_iterations_dict kwarg, since it's easy to
-        # miss - it isn't a named optimize() parameter, just an entry in **kwargs. If
-        # it's missing/empty while loss_dict/uw_loss_dict already have entries, using
-        # loss_iterations_dict alone would silently restart the iteration counter at 0
-        # and overwrite those iterations' visualizer-side history (e.g. any history
-        # keyed by iteration number, like the *_history plots in vis_tools.py) instead
-        # of continuing to append after them. Falling back to the max length across all
-        # three history dicts keeps the resumed iteration count correct regardless of
-        # which of them the caller remembered to resupply.
+  
         max_iter = max(
             [len(v) for v in self.loss_iterations_dict.values()]
             + [len(v) for v in self.loss_dict.values()]

@@ -12,12 +12,12 @@ local_string_repulsion_penalty = nugget.losses.geometry_penalties.LocalStringRep
 weighted_angular_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
     device=device,
     resolution_type='angular',
-    fisher_info_params=['direction']
+    fisher_info_params=['direction', 'position']
     )
 weighted_energy_resolution_loss = nugget.losses.fisher_info.WeightedResolutionLoss(
     device=device,
     resolution_type='energy',
-    fisher_info_params=['energy']
+    fisher_info_params=['energy', 'position']
 )
 rov_penalty = nugget.losses.geometry_penalties.ROVPenalty( 
     device=device,
@@ -31,13 +31,14 @@ use_rov = 'no_rov'
 num_events = 'inf'
 event_type = 'track'
 res_param = 'angle'
+spacing_test = False
 num_strings = 61
-limit_zenith = 'horizontal'
+limit_zenith = 'vertical'
 center = [0,0,0]
 radius = 600
 height = 1000
 bin_energies = True
-folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}{"_"+limit_zenith if limit_zenith is not None else ""}'
+folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}{"_"+limit_zenith if limit_zenith is not None else ""}{"_spacing_test" if spacing_test else ""}'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -57,7 +58,7 @@ loss_params = {
     # 'background_surrogate_func': light_yield_surrogate,
     # 'signal_sampler': signal_sampler,
     # 'background_sampler': background_sampler,
-    'num_events': 1000,  # Number of events to sample per optimization step
+    'num_events': 3000,  # Number of events to sample per optimization step
     'signal_noise_scale': 0,  # Noise level for signal events
     # 'background_noise_scale': 0.2,  # Noise level for background events
     'boundary_range': 1200,  # Size of boundary region
@@ -215,14 +216,14 @@ lightsabre = nugget.surrogates.LightSabre.LightSabre(
                 device=device,
                 use_poisson=False, 
                 num_track_points=2000, 
-                domain_size=2000,
+                domain_size=1600,
                 particle_mode=event_type,
                 )
 light_yield_surrogate = lightsabre.light_yield_surrogate
 signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
     device=device,
     event_type='signal', 
-    domain_size=2000, 
+    domain_size=1600, 
     E_min=10**2, 
     E_max=10**8, 
     energy_dist='log_uniform', 
@@ -279,7 +280,7 @@ for i in range(num_trials):
         signal_sampler = nugget.samplers.cyl_sampler.CylinderSampler(
         device=device,
         event_type='signal', 
-        domain_size=2000, 
+        domain_size=1600, 
         E_min=10**(i+2), 
         E_max=10**(i+3), 
         energy_dist='log_uniform', 
@@ -294,18 +295,33 @@ for i in range(num_trials):
         loss_params.update({
             'signal_sampler': signal_sampler,
             })
-    geometry = nugget.geometries.DynamicString.DynamicString(
-            device=device,
-            hex_type='hexagonal',
-            domain_size=400,  # Size of detector domain
-            dim=3,  # 3D geometry
-            n_strings=num_strings,  # Initial number of detector strings
-            points_per_string=20,  # Number of PMTs/sensors per string
-            custom_z_spacing=50,
-            # random_weights=True
-            # starting_weight = 100,
-        )
-    
+    if not spacing_test:
+        geometry = nugget.geometries.DynamicString.DynamicString(
+                device=device,
+                hex_type='hexagonal',
+                domain_size=1000,  # Size of detector domain
+                dim=3,  # 3D geometry
+                n_strings=num_strings,  # Initial number of detector strings
+                points_per_string=20,  # Number of PMTs/sensors per string
+                custom_z_spacing=50,
+                # random_weights=True
+                # starting_weight = 100,
+            )
+    else:
+        geometry = nugget.geometries.SpaceString.SpaceString(
+                    device=device,
+                    hex_type='hexagonal',
+                    # random_xy=True,
+                    domain_size=300,  # Size of detector domain
+                    dim=3,  # 3D geometry
+                    n_strings=num_strings,  # Initial number of detector strings
+                    points_per_string=20,  # Number of PMTs/sensors per string
+                    # starting_weight=-0.5,  # Initial weight for each string (controls visibility)
+                    # custom_string_spacing=0.09  # Custom spacing between strings
+                    # custom_string_spacing=300.0,
+                    starting_z_spacing=50,
+                    starting_spacing=50.0,
+                )
     optimizer = nugget.utils.basic_optimizer.Optimizer(
         device=geometry.device, 
         geometry=geometry,
@@ -322,17 +338,22 @@ for i in range(num_trials):
         )
     optimizer.init_geometry(
         # opt_list=[('string_weights', 0.5)],  # Learning rate for string weights (without sigmoid applied)
-        opt_list=[('string_xy', 10)],
+        opt_list=[('string_xy', 10)] if not spacing_test else [('string_spacing', 5)],  # Learning rate for string weights (without sigmoid applied)
     )  
-        
+    if spacing_test:
+        save_geom_folder = f'{folder_name}/geom_e{i+2}_e{i+3}' if bin_energies else f'{folder_name}/geom_{i}'
+    else:
+        save_geom_folder = None 
     geom_dict = optimizer.optimize(
         clear_cuda_cache=True,
         loss_func_dict=loss_func_dict,          # Dictionary of loss functions to use
         loss_weights_dict=loss_weights_dict,    # Weights for combining multiple losses
         loss_params_dict=loss_params,           # Parameters for loss function computation
-        n_iter=1500,                           # Maximum number of optimization iterations
-        print_freq=100,                          # Print progress every N iterations
+        n_iter=1000,                           # Maximum number of optimization iterations
+        print_freq=50,                          # Print progress every N iterations
         sigmoid_loss_list=loss_sigmoid_list,         # Which losses to apply sigmoid to (for better optimization dynamics)
+        save_geom_folder=save_geom_folder,  # Folder to save intermediate geometries
+        save_geom_freq=25,
         # save_best_geom_file = f'{folder_name}geom_e{(2*i)+2}_e{2*(i+1) + 2}.pkl',  # File to save best geometry found
         save_best_geom_file = f'{folder_name}/geom_{i}.pkl' if not bin_energies else f'{folder_name}/geom_e{i+2}_e{i+3}.pkl',  # File to save best geometry found
         # save_best_geom_file = f'{folder_name}geom_e{i+2}_e{i+3}.pkl',
@@ -340,3 +361,5 @@ for i in range(num_trials):
         revert_on_nan=True,                      # Revert geometry if loss becomes NaN
         max_nan_retries=5,  
     )
+    if spacing_test:
+        pickle.dump(optimizer.uw_loss_dict, open(f'{folder_name}/geom_e{i+2}_e{i+3}_loss_dict.pkl', 'wb') if bin_energies else open(f'{folder_name}/geom_{i}_loss_dict.pkl', 'wb'))
