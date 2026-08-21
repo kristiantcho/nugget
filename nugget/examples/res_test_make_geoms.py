@@ -4,7 +4,7 @@ import nugget
 import pickle
 import os
 
-device="cuda:1"
+device="cuda:3"
 string_number_penalty = nugget.losses.geometry_penalties.StringNumberPenalty(device=device)
 string_boundary_penalty = nugget.losses.geometry_penalties.StringBoundaryPenaltyCircle(device=device)
 weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizationPenalty(device=device)
@@ -27,7 +27,7 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
 )
 fisher_res_metric = 'mean'  # 'fom' 'median' 'mean'
 version = '_poisson'
-use_rov = 'no_rov'
+use_rov = 'rov'
 num_events = 'inf'
 event_type = 'track'
 res_param = 'angle'
@@ -40,7 +40,7 @@ center = [0,0,0]
 radius = 600
 height = 1000
 bin_energies = True
-folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}{"_"+limit_zenith if limit_zenith is not None else ""}{"_spacing_test" if spacing_test else ""}{"_{n_folds}fold" if use_fold else ""}'
+folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}{"_"+limit_zenith if limit_zenith is not None else ""}{"_spacing_test" if spacing_test else ""}{"_6fold" if use_fold else ""}'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -160,7 +160,7 @@ loss_params = {
 loss_weights_dict = {
     'angular_resolution_loss': 1,
     'pointsource_fom_loss': 1e2,
-    'energy_resolution_loss': 1,
+    'energy_resolution_loss': 0.01,
     # 'fisher_loss': 0.005, 
     'signal_yield_loss': 0.01,        # High weight: maximize light collection
     # 'signal_llr_loss': 2.5,          # Moderate weight: good signal discrimination
@@ -292,6 +292,7 @@ for i in range(num_trials):
         cylinder_center=center,
         cylinder_radius=radius,
         cylinder_height=height,
+        cos_range = torch.tensor([-1,0]) if limit_zenith is None else limit_zenith
         # cos_range=torch.tensor((np.cos(np.pi/2),np.cos(np.pi/2)))
         )
         loss_params.update({

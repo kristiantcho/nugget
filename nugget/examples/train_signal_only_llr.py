@@ -21,10 +21,10 @@ import pickle
 INPUT_DIM = 16
 
 llr_net = nugget.surrogates.LLRnet.LLRnet(
-    device='cuda:2',
+    device=None,
     domain_size=5000,  # Size of the detector domain
     dim=3,  # 3D spatial coordinates
-    hidden_dims=[250 for _ in range(14)],  # Neural network architecture
+    hidden_dims=[250 for _ in range(15)],  # Neural network architecture
     use_fourier_features=False,  # Use Fourier features for better spatial encoding
     num_parallel_branches=1,  # Multiple branches for ensemble learning
     frequency_scales=[0.1, 0.4],  # Different frequency scales for fourier features
@@ -35,7 +35,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     # geometry (every feature on its own is identically distributed in both classes), so
     # the loss starts on a flat ln(2) plateau. A large batch with a warmup escapes it in
     # ~1k steps; batch 32 at lr 1e-4 was still at ~0.689 after 30k steps.
-    learning_rate=1e-3,  # peak LR for the OneCycle schedule
+    learning_rate=5e-3,  # peak LR for the OneCycle schedule
     # lr_schedule='onecycle',
     # warmup_frac=0.15,
     standardize_inputs=False,
@@ -88,22 +88,17 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
 #     )
 
 GEOM = '../other/800_40_40_geom.csv'
-TEST_PARQUET = './llrnet_models/mc_ly_muon_llr_v5_test_samples.parquet'
+TEST_PARQUET = './llrnet_models/mc_ly_muon_llr_v6_test_samples.parquet'
 
 EPOCHS = 4000
 
 train_dataloader = llr_net.create_light_yield_parquet_dataloader(
-    parquet_path='new_accepted_photons_ly_all.parquet',
+    parquet_path='ly_mu_mc_all.parquet',
     geometry_csv_path=GEOM,
-    # Each epoch is num_samples_per_epoch matched/mismatched pairs = 2x that many
-    # samples. Batches of 4096 need a much bigger epoch than 2048 samples to be
-    # meaningful, and it also makes the reported per-epoch loss far less noisy.
-    num_samples_per_epoch=500000,
+
+    num_samples_per_epoch=None,
     batch_size=4096,     # large batch: the interaction gradient is tiny at init
-    # num_workers=0 is ~12x FASTER here (measured 12,100 vs 980 samples/s at batch 4096).
-    # Building one item costs only 0.09 ms, so the per-item worker IPC dominates; the
-    # workers also each fork a copy of the multi-GB dataset.
-    num_workers=0,
+    num_workers=5,
     shuffle=True,
     zero_ly_prob=0.00,   # zeros are handled by a separate hit/no-hit network
     uniform_energy_zenith=True,
@@ -116,32 +111,32 @@ train_dataloader = llr_net.create_light_yield_parquet_dataloader(
 
 # Event-disjoint validation from the held-out split, so early stopping and the saved
 # checkpoint track generalisation rather than the training loss.
-# val_dataloader = llr_net.create_light_yield_parquet_val_dataloader(
-#     parquet_path=TEST_PARQUET,
-#     geometry_csv_path=GEOM,
-#     num_samples_per_epoch=10000,
-#     batch_size=5000,
-#     num_workers=0,
-#     seed=0,
-#     uniform_energy_zenith=True,
-#     n_energy_bins=20,
-#     n_coszen_bins=20,
-#     filter_vertex_in_domain=True,
-#     )
+val_dataloader = llr_net.create_light_yield_parquet_val_dataloader(
+        parquet_path=TEST_PARQUET,
+        geometry_csv_path=GEOM,
+        num_samples_per_epoch=None,
+        batch_size=4096,
+        num_workers=5,
+        # seed=0,
+        uniform_energy_zenith=True,
+        n_energy_bins=20,
+        n_coszen_bins=20,
+        filter_vertex_in_domain=True,
+        )
 
 history = llr_net.train_with_dataloader(
     train_dataloader=train_dataloader,
-    # val_dataloader=val_dataloader,
+    val_dataloader=val_dataloader,
     epochs=EPOCHS,
     input_dim=INPUT_DIM,
     grad_clip=None,
     early_stopping_patience=300,
-    save_every_n_epochs=10,
-    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v5.pt',
+    save_every_n_epochs=20,
+    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v6.pt',
 )
 
 # Save the best model for later use
 # llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v5_training_history.pkl', 'wb'))
+pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v6_training_history.pkl', 'wb'))
