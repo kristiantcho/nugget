@@ -54,7 +54,7 @@ import glob
 import os
 
 import pandas as pd
-import pyarrow.parquet as pq
+# import pyarrow.parquet as pq
 
 
 # Preferred column ordering.  Any keys present in the rows are ordered by this
@@ -138,51 +138,51 @@ def load_parquet(path):
     return pd.read_parquet(path, engine="pyarrow")
 
 
-def collect_parquets(folder, output_path, pattern="*.parquet"):
-    """Concatenate every parquet file in a folder into one output parquet file.
+# def collect_parquets(folder, output_path, pattern="*.parquet"):
+#     """Concatenate every parquet file in a folder into one output parquet file.
 
-    Files are streamed row-group by row-group through a single
-    ``pyarrow.parquet.ParquetWriter`` rather than being loaded as full
-    DataFrames and concatenated, so peak memory use stays roughly constant
-    regardless of how many input files there are. All matched files must
-    share the same schema (e.g. all produced by the same
-    ``extract_accepted_photons.py`` mode).
+#     Files are streamed row-group by row-group through a single
+#     ``pyarrow.parquet.ParquetWriter`` rather than being loaded as full
+#     DataFrames and concatenated, so peak memory use stays roughly constant
+#     regardless of how many input files there are. All matched files must
+#     share the same schema (e.g. all produced by the same
+#     ``extract_accepted_photons.py`` mode).
 
-    Args:
-        folder (str): Directory to search for input parquet files.
-        output_path (str): Path of the combined parquet file to write.
-        pattern (str): Glob pattern (relative to ``folder``) selecting which
-            files to collect. Defaults to ``"*.parquet"``.
+#     Args:
+#         folder (str): Directory to search for input parquet files.
+#         output_path (str): Path of the combined parquet file to write.
+#         pattern (str): Glob pattern (relative to ``folder``) selecting which
+#             files to collect. Defaults to ``"*.parquet"``.
 
-    Returns:
-        str: ``output_path``, for convenience.
-    """
-    paths = sorted(glob.glob(os.path.join(folder, pattern)))
-    paths = [p for p in paths if os.path.abspath(p) != os.path.abspath(output_path)]
-    if not paths:
-        raise FileNotFoundError(
-            "No parquet files matching %r found in %s" % (pattern, folder)
-        )
+#     Returns:
+#         str: ``output_path``, for convenience.
+#     """
+#     paths = sorted(glob.glob(os.path.join(folder, pattern)))
+#     paths = [p for p in paths if os.path.abspath(p) != os.path.abspath(output_path)]
+#     if not paths:
+#         raise FileNotFoundError(
+#             "No parquet files matching %r found in %s" % (pattern, folder)
+#         )
 
-    writer = None
-    total_rows = 0
-    try:
-        for path in paths:
-            pf = pq.ParquetFile(path)
-            for batch in pf.iter_batches():
-                if writer is None:
-                    writer = pq.ParquetWriter(output_path, batch.schema)
-                writer.write_batch(batch)
-                total_rows += batch.num_rows
-    finally:
-        if writer is not None:
-            writer.close()
+#     writer = None
+#     total_rows = 0
+#     try:
+#         for path in paths:
+#             pf = pq.ParquetFile(path)
+#             for batch in pf.iter_batches():
+#                 if writer is None:
+#                     writer = pq.ParquetWriter(output_path, batch.schema)
+#                 writer.write_batch(batch)
+#                 total_rows += batch.num_rows
+#     finally:
+#         if writer is not None:
+#             writer.close()
 
-    print(
-        "Collected %d row(s) from %d file(s) into %s"
-        % (total_rows, len(paths), output_path)
-    )
-    return output_path
+#     print(
+#         "Collected %d row(s) from %d file(s) into %s"
+#         % (total_rows, len(paths), output_path)
+#     )
+#     return output_path
 
 
 def iter_events(df):

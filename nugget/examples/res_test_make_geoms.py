@@ -29,18 +29,19 @@ fisher_res_metric = 'mean'  # 'fom' 'median' 'mean'
 version = '_poisson'
 use_rov = 'rov'
 num_events = 'inf'
-event_type = 'track'
-res_param = 'angle'
-use_fold = True
+event_type = 'cascade'
+res_param = 'energy'
+use_weights = True
+use_fold = False
 n_folds = 6
 spacing_test = False
 num_strings = 61
-limit_zenith = 'vertical'
+limit_zenith = None
 center = [0,0,0]
 radius = 600
 height = 1000
 bin_energies = True
-folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}{"_"+limit_zenith if limit_zenith is not None else ""}{"_spacing_test" if spacing_test else ""}{"_6fold" if use_fold else ""}'
+folder_name = f'res_test/opt_geoms/opt_geoms_dyn_{num_strings}_{num_events}_r{radius}_50{version}_{use_rov}_{event_type}_{res_param}_{fisher_res_metric}{"_"+limit_zenith if limit_zenith is not None else ""}{"_spacing_test" if spacing_test else ""}{"_6fold" if use_fold else ""}{"_weights" if use_weights else ""}'
 print(f"Saving optimized geometries to folder: {folder_name}")
 # if folder does not exist, create it
 
@@ -74,7 +75,7 @@ loss_params = {
     # 'llr_event_labels': ['position','energy', 'direction'],
     # 'precomputed_fisher_info_per_string_per_event': fisher_info_precomp#[selection_inds]
 
-    'eva_min_num_strings': 70,  # Minimum number of active strings
+    'eva_min_num_strings': num_strings,  # Minimum number of active strings
     'string_number_use_binarization_weight': False,
     'max_radius': 80,  # Maximum radius for string placement
     'num_angles': 360,  # Number of angles (divided into 360 degrees) to test for rov
@@ -109,7 +110,7 @@ loss_params = {
     'fisher_info_jacrev_chunk_size': 50000,
     'fisher_info_point_chunk_size': 40100,
     'fisher_info_llr_autodiff_mode': 'jvp',
-    'fisher_info_detach_tensors': False,
+    'fisher_info_detach_tensors': False if not use_weights else True,
     'fisher_info_use_patd': False,
     'fisher_res_metric': 'mean',  # 'fom' 'median' 'mean'
     'fisher_info_use_torch_compile': True,
@@ -153,7 +154,7 @@ loss_params = {
                 'local_string_repulsion_penalty', 
                 'string_number_penalty', 
                 # 'string_weights_penalty',
-                # 'weight_binarization_penalty',
+                'weight_binarization_penalty',
                 # 'diversity_penalty',
                 ],  # Constraints to enforce
 }
@@ -213,6 +214,10 @@ elif res_param == 'energy':
 if use_rov == 'rov':
     loss_func_dict['rov_penalty'] = rov_penalty
     loss_func_dict['local_string_repulsion_penalty'] = local_string_repulsion_penalty
+
+if use_weights:
+    loss_func_dict['weight_binarization_penalty'] = weighted_binarization_penalty
+    loss_func_dict['string_number_penalty'] = string_number_penalty
 
 lightsabre = nugget.surrogates.LightSabre.LightSabre(
                 device=device,
@@ -314,33 +319,45 @@ for i in range(num_trials):
                 add_center_string=True,
                 # fold_offset=2*np.pi/3
             )
-    elif not spacing_test:
-        geometry = nugget.geometries.DynamicString.DynamicString(
-                device=device,
-                hex_type='hexagonal',
-                domain_size=1000,  # Size of detector domain
-                dim=3,  # 3D geometry
-                n_strings=num_strings,  # Initial number of detector strings
-                points_per_string=20,  # Number of PMTs/sensors per string
-                custom_z_spacing=50,
-                # random_weights=True
-                # starting_weight = 100,
-            )
-    else:
+    elif spacing_test:
         geometry = nugget.geometries.SpaceString.SpaceString(
-                    device=device,
-                    hex_type='hexagonal',
-                    # random_xy=True,
-                    domain_size=300,  # Size of detector domain
-                    dim=3,  # 3D geometry
-                    n_strings=num_strings,  # Initial number of detector strings
-                    points_per_string=20,  # Number of PMTs/sensors per string
-                    # starting_weight=-0.5,  # Initial weight for each string (controls visibility)
-                    # custom_string_spacing=0.09  # Custom spacing between strings
-                    # custom_string_spacing=300.0,
-                    starting_z_spacing=50,
-                    starting_spacing=50.0,
-                )
+                            device=device,
+                            hex_type='hexagonal',
+                            # random_xy=True,
+                            domain_size=300,  # Size of detector domain
+                            dim=3,  # 3D geometry
+                            n_strings=num_strings,  # Initial number of detector strings
+                            points_per_string=20,  # Number of PMTs/sensors per string
+                            # starting_weight=-0.5,  # Initial weight for each string (controls visibility)
+                            # custom_string_spacing=0.09  # Custom spacing between strings
+                            # custom_string_spacing=300.0,
+                            starting_z_spacing=50,
+                            starting_spacing=50.0,
+                        )
+    elif use_weights:
+        geometry = nugget.geometries.EvanescentString.EvanescentString(
+                        device=device,
+                        hex_type='hexagonal',
+                        domain_size=2000,  # Size of detector domain
+                        dim=3,  # 3D geometry
+                        n_strings=1951,  # Initial number of detector strings
+                        points_per_string=20,  # Number of PMTs/sensors per string
+                        starting_weight=6,  # Initial weight for each string (controls visibility)
+                        random_weights=False,
+                        custom_z_spacing=50,
+                    )
+    else:
+        geometry = nugget.geometries.DynamicString.DynamicString(
+                        device=device,
+                        hex_type='hexagonal',
+                        domain_size=1000,  # Size of detector domain
+                        dim=3,  # 3D geometry
+                        n_strings=num_strings,  # Initial number of detector strings
+                        points_per_string=20,  # Number of PMTs/sensors per string
+                        custom_z_spacing=50,
+                        # random_weights=True
+                        # starting_weight = 100,
+                    )
     optimizer = nugget.utils.basic_optimizer.Optimizer(
         device=geometry.device, 
         geometry=geometry,
@@ -355,10 +372,14 @@ for i in range(num_trials):
             'epsilon': 1e-8,
             }
         )
-    if not use_fold:
-        opt_list = [('string_xy', 10)] if not spacing_test else [('string_spacing', 5)]
-    else:
+    if spacing_test:
+        opt_list = [('string_spacing', 5)]
+    elif use_fold:
         opt_list = [('slice_radius', 5), ('slice_angle', 0.05)]
+    elif use_weights:
+        opt_list = [('string_weights', 0.5)]
+    else:
+        opt_list = [('string_xy', 5)]
     optimizer.init_geometry(
         # opt_list=[('string_weights', 0.5)],  # Learning rate for string weights (without sigmoid applied)
         opt_list=opt_list  # Learning rate for string weights (without sigmoid applied)
@@ -372,7 +393,7 @@ for i in range(num_trials):
         loss_func_dict=loss_func_dict,          # Dictionary of loss functions to use
         loss_weights_dict=loss_weights_dict,    # Weights for combining multiple losses
         loss_params_dict=loss_params,           # Parameters for loss function computation
-        n_iter=1000,                           # Maximum number of optimization iterations
+        n_iter=1500,                           # Maximum number of optimization iterations
         print_freq=50,                          # Print progress every N iterations
         sigmoid_loss_list=loss_sigmoid_list,         # Which losses to apply sigmoid to (for better optimization dynamics)
         save_geom_folder=save_geom_folder,  # Folder to save intermediate geometries
