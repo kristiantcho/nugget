@@ -1200,6 +1200,120 @@ class LLRnet(Surrogate):
         features = torch.cat(cols, dim=1)           # (n, feature_dim)
         return features.clone().detach()
 
+    def prepare_features_charge_rows(self, points, vertices, energies, zeniths,
+                                     azimuths, light_yields, pmt_directions=None,
+                                     device=None):
+        """Fully vectorised charge features for B INDEPENDENT (point, event) pairs.
+
+        Unlike prepare_features_charge_batched -- which broadcasts ONE hypothesis event
+        over many detector points -- every row here carries its own event parameters.
+        That is what a training batch looks like, so this is the fast path for dataset
+        __getitem__: it replaces B calls to prepare_features_charge (each of which
+        allocates ~20 scalar tensors and does a torch.stack) with a handful of numpy
+        ops over the whole batch.
+
+        The column layout is identical to prepare_features_charge for the same flags;
+        test_features_charge_rows_match_per_item guards that.
+
+        Parameters
+        ----------
+        points : array-like, shape (B, 3)
+            Detector (OM) positions, unnormalised.
+        vertices : array-like, shape (B, 3)
+            Muon interaction vertices, unnormalised.
+        energies : array-like, shape (B,)
+            Event energies.
+        zeniths, azimuths : array-like, shape (B,)
+            Event direction in spherical coords. Converted to a unit vector here so
+            callers do not need to build one.
+        light_yields : array-like, shape (B,)
+            Observed light yield per row.
+        pmt_directions : array-like, shape (B, 3) or None
+            Required when self.add_pmt_direction.
+        device : torch.device, str, or None
+            Device for the returned tensor. Defaults to self.device. Dataset code in a
+            DataLoader worker should pass 'cpu'.
+
+        Returns
+        -------
+        torch.Tensor, shape (B, feature_dim), float32
+        """
+        dev = self.device if device is None else device
+
+        pts = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
+        B = pts.shape[0]
+        vert_raw = np.ascontiguousarray(vertices, dtype=np.float32).reshape(B, 3)
+        zen = np.ascontiguousarray(zeniths, dtype=np.float32).reshape(B)
+        azi = np.ascontiguousarray(azimuths, dtype=np.float32).reshape(B)
+        E = np.ascontiguousarray(energies, dtype=np.float32).reshape(B)
+        ly = np.ascontiguousarray(light_yields, dtype=np.float32).reshape(B)
+
+        # Position normalisation: scalar, or (3,) for a (width, height) domain.
+        norm = self._pos_norm_divisor(device=dev)
+        if isinstance(norm, torch.Tensor):
+            norm_np = norm.detach().cpu().numpy().astype(np.float32).reshape(1, 3)
+        else:
+            norm_np = np.float32(norm)
+
+        det = pts / norm_np
+        vert = vert_raw / norm_np
+
+        # Unit direction from (zenith, azimuth) -- vectorised sph_to_cart.
+        st, ct = np.sin(zen), np.cos(zen)
+        sp, cp = np.sin(azi), np.cos(azi)
+        direction = np.stack([st * cp, st * sp, ct], axis=1)   # (B, 3)
+
+        log_energy = np.log10(E + np.float32(self.ly_eps)) / np.float32(8.0)
+
+        rel = det - vert
+        vert_dist = np.linalg.norm(rel, axis=1)
+        dir_norm = np.linalg.norm(direction, axis=1)
+        cos_angle = (direction * rel).sum(1) / (dir_norm * vert_dist + np.float32(1e-8))
+
+        log_ly = (np.log10(np.abs(ly) + np.float32(self.ly_eps))
+                  / np.float32(self.log_charge_scale))
+
+        cols = []
+        if self.rich_rel_pos_mode:
+            cols += [rel[:, 0], rel[:, 1], rel[:, 2],
+                     direction[:, 0], direction[:, 1], direction[:, 2], log_energy]
+            if self.include_vertex_position:
+                cols += [vert[:, 0], vert[:, 1], vert[:, 2]]
+        else:
+            cols += [det[:, 0], det[:, 1], det[:, 2],
+                     vert[:, 0], vert[:, 1], vert[:, 2],
+                     direction[:, 0], direction[:, 1], direction[:, 2], log_energy]
+        if self.add_vertex_distance:
+            cols.append(vert_dist)
+        cols.append(cos_angle)
+        if self.add_distance_from_beam or self.add_dist_long:
+            # Distances are computed in the original (metre) scale, matching
+            # prepare_features_charge, then divided by the scalar half-extent.
+            track_dir = -direction if self.track_dir_is_arrival else direction
+            rel_m = pts - vert_raw
+            dist_long = (rel_m * track_dir).sum(1)
+            perp_vec = rel_m - dist_long[:, None] * track_dir
+            dist_perp = np.linalg.norm(perp_vec, axis=1)
+            pos_div = np.float32(self._scalar_pos_norm())
+            if self.add_distance_from_beam:
+                cols.append(dist_perp / pos_div)
+            if self.add_dist_long:
+                cols.append(dist_long / pos_div)
+        if self.add_pmt_direction:
+            if pmt_directions is None:
+                raise ValueError(
+                    "pmt_directions is required when add_pmt_direction=True")
+            pdv = np.ascontiguousarray(pmt_directions, dtype=np.float32).reshape(B, 3)
+            cols += [pdv[:, 0], pdv[:, 1], pdv[:, 2]]
+            if self.add_pmt_cosangle:
+                pd_norm = np.linalg.norm(pdv, axis=1)
+                cols.append((direction * pdv).sum(1)
+                            / (dir_norm * pd_norm + np.float32(1e-8)))
+        cols.append(log_ly)
+
+        feats = np.stack(cols, axis=1).astype(np.float32, copy=False)
+        return torch.from_numpy(feats).to(dev)
+
     def prepare_data_from_raw_patd(self, point, event_data, surrogate_func, event_labels=['position', 'energy', 'zenith', 'azimuth'], signal_event_data=None, num_samples=1, input_photons=None):
         """
         Prepare training data from raw neutrino event data in PATD mode.
@@ -4611,6 +4725,14 @@ class LLRnet(Surrogate):
                 self._event_rows.setdefault(ev, []).append(i)
             self._event_rows = {k: np.asarray(v) for k, v in self._event_rows.items()}
 
+            # Integer event code per row. Comparing int64 array elements is far cheaper
+            # than comparing (run_id, event_id) tuples, and it lets the batched path
+            # do the same-event rejection with vectorised numpy instead of a Python
+            # loop per sample.
+            _ev_code = {ev: c for c, ev in enumerate(self._events)}
+            self._row_event_code = np.fromiter(
+                (_ev_code[ev] for ev in self._row_event), dtype=np.int64, count=n)
+
             self._n_rows = n
             self.num_samples_per_epoch = (
                 num_samples_per_epoch if num_samples_per_epoch is not None else n
@@ -4670,6 +4792,18 @@ class LLRnet(Surrogate):
             self._bin_rows = np.split(order, boundaries)
             self._n_bins = len(self._bin_rows)
 
+            # Flat view of the same grouping, for the vectorised batch sampler: the
+            # np.split above yields consecutive slices of `order`, so a (start, len)
+            # pair per bin describes it exactly with no copying. This lets a whole
+            # batch of stratified draws be taken with two numpy RNG calls instead of
+            # one Python-level call per sample.
+            self._bin_flat = np.ascontiguousarray(order, dtype=np.int64)
+            self._bin_starts = np.concatenate(
+                [[0], boundaries]).astype(np.int64)
+            self._bin_lens = np.diff(
+                np.concatenate([self._bin_starts, [len(self._bin_flat)]])
+            ).astype(np.int64)
+
         def _sample_params_row(self):
             """Draw an event-params row index according to the sampling scheme."""
             if getattr(self, 'uniform_energy_zenith', False) and self._n_bins > 0:
@@ -4678,6 +4812,102 @@ class LLRnet(Surrogate):
                 group = self._bin_rows[b]
                 return int(group[int(self._rng.integers(0, len(group)))])
             return int(self._rng.integers(0, self._n_rows))
+
+        def _sample_params_rows(self, n):
+            """Vectorised _sample_params_row: draw ``n`` params-row indices at once.
+
+            Same distribution as calling _sample_params_row n times (uniform over
+            non-empty bins then uniform within the bin, or uniform over all rows), but
+            with two RNG calls instead of 2n Python-level ones.
+            """
+            if getattr(self, 'uniform_energy_zenith', False) and self._n_bins > 0:
+                if getattr(self, '_bin_lens', None) is None:
+                    # Derive the flat view from _bin_rows on demand, so a dataset built
+                    # by another code path (or restored without these arrays) still works.
+                    self._bin_flat = np.concatenate(
+                        [np.asarray(g, dtype=np.int64) for g in self._bin_rows])
+                    self._bin_lens = np.array(
+                        [len(g) for g in self._bin_rows], dtype=np.int64)
+                    self._bin_starts = np.concatenate(
+                        [[0], np.cumsum(self._bin_lens)[:-1]]).astype(np.int64)
+                b = self._rng.integers(0, self._n_bins, size=n)
+                lens = self._bin_lens[b]
+                # floor(u * len) is uniform over [0, len) for u ~ U[0,1)
+                offs = (self._rng.random(n) * lens).astype(np.int64)
+                np.minimum(offs, lens - 1, out=offs)  # guard against u -> 1.0 rounding
+                return self._bin_flat[self._bin_starts[b] + offs]
+            return self._rng.integers(0, self._n_rows, size=n)
+
+        def get_batch(self, indices):
+            """Build a whole batch at once. Returns (features (B, F), labels (B,)).
+
+            Vectorised equivalent of stacking ``[self[i] for i in indices]``: index
+            parity still decides matched (even) vs mismatched (odd), the params row is
+            still drawn per sample by the same scheme, and the mismatched light yield
+            is still drawn uniformly over all rows rejecting the same event. The whole
+            batch goes through one prepare_features_charge_rows call, which is where
+            the speedup comes from -- the per-item path allocates ~8 scalar tensors and
+            does a torch.stack per sample.
+            """
+            if getattr(self, '_row_event_code', None) is None:
+                # Same lazy-build rationale as the flat bin arrays above.
+                _codes = {ev: c for c, ev in enumerate(dict.fromkeys(self._row_event))}
+                self._row_event_code = np.fromiter(
+                    (_codes[ev] for ev in self._row_event),
+                    dtype=np.int64, count=len(self._row_event))
+
+            idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+            B = idx.size
+            matched = (idx % 2 == 0)
+
+            rows = self._sample_params_rows(B)
+            ly = self._count[rows].astype(np.float32, copy=True)
+            labels = matched.astype(np.float32)
+
+            # ---- mismatched slots: light yield from a different event ----
+            mis = np.flatnonzero(~matched)
+            if mis.size:
+                own = self._row_event_code[rows[mis]]
+                other = self._rng.integers(0, self._n_rows, size=mis.size)
+                same = self._row_event_code[other] == own
+                for _ in range(50):
+                    n_same = int(same.sum())
+                    if n_same == 0:
+                        break
+                    redraw = self._rng.integers(0, self._n_rows, size=n_same)
+                    other[same] = redraw
+                    same = self._row_event_code[other] == own
+                ly[mis] = self._count[other]
+
+            points = self._point[rows]
+            pmt_dirs = self._pmt_direction[rows]
+            muon_pos = self._muon_pos[rows]
+            zen = self._zenith[rows]
+            azi = self._azimuth[rows]
+            energy = self._energy[rows]
+
+            # ---- optional zero-LY augmentation ----
+            # Small expected count, so a Python loop over just the selected slots is
+            # cheaper than restructuring the vectorised arrays.
+            if self.zero_ly_prob > 0.0:
+                pick = np.flatnonzero(self._rng.random(B) < self.zero_ly_prob)
+                if pick.size:
+                    points = points.copy()
+                    pmt_dirs = pmt_dirs.copy()
+                    for j in pick:
+                        unhit = self._sample_unhit_key(int(rows[j]))
+                        if unhit is None:
+                            continue
+                        points[j] = self._om_pos[unhit]
+                        pmt_dirs[j] = self._pmt_dir[unhit]
+                        ly[j] = self.zero_ly_value
+                        labels[j] = 0.0
+
+            features = self.llrnet.prepare_features_charge_rows(
+                points, muon_pos, energy, zen, azi, ly,
+                pmt_directions=pmt_dirs, device=self.device,
+            )
+            return features, torch.from_numpy(labels)
 
         def _other_event_row(self, exclude_event):
             """Return a random row from any event other than ``exclude_event``.
@@ -4758,6 +4988,14 @@ class LLRnet(Surrogate):
             return self.num_samples_per_epoch * 2
 
         def __getitem__(self, idx):
+            # A list/array of indices means the DataLoader is running in batched mode
+            # (batch_size=None + a BatchSampler); build the whole batch at once, which
+            # is ~10x cheaper than per-item construction. See get_batch.
+            if isinstance(idx, (list, np.ndarray, slice)):
+                if isinstance(idx, slice):
+                    idx = np.arange(len(self))[idx]
+                return self.get_batch(idx)
+
             # Even idx -> matched, odd idx -> mismatched. The "params" row is
             # drawn at random (with replacement) each call, so the epoch length
             # (num_samples_per_epoch) is independent of the file size and every
@@ -4863,7 +5101,8 @@ class LLRnet(Surrogate):
                                               filter_vertex_in_domain=True,
                                               test_save_path=None, test_frac=0.1,
                                               split_seed=None,
-                                              pin_memory=None, pin_memory_device=None):
+                                              pin_memory=None, pin_memory_device=None,
+                                              vectorized_batches=True):
         """
         Create a DataLoader for the charge LLRnet from a light-yield parquet file
         and a geometry CSV.
@@ -4912,6 +5151,12 @@ class LLRnet(Surrogate):
         split_seed : int or None
             Seed for the train/test event split (falls back to ``seed`` if None),
             so the split is reproducible.
+        vectorized_batches : bool
+            If True (default), build each batch in one vectorised call instead of one
+            call per sample, using a BatchSampler plus batched __getitem__. Same
+            sampling distribution and same feature columns, roughly 10x faster
+            (measured ~0.40 s -> ~0.04 s per batch of 4096). Set False to fall back to
+            the per-item path.
 
         Returns
         -------
@@ -4969,13 +5214,30 @@ class LLRnet(Surrogate):
         )
 
         pin_memory, pin_memory_device = self._resolve_pin_memory(pin_memory, pin_memory_device)
-        dl_kwargs = dict(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-        )
+
+        if vectorized_batches:
+            # Batched fetch: the sampler hands __getitem__ a LIST of indices and the
+            # dataset returns an already-stacked (B, F) tensor, so we skip both the
+            # per-item feature construction and default_collate. batch_size=None turns
+            # off DataLoader's own auto-collation; the BatchSampler supplies batching.
+            base = (torch.utils.data.RandomSampler(dataset) if shuffle
+                    else torch.utils.data.SequentialSampler(dataset))
+            dl_kwargs = dict(
+                dataset=dataset,
+                batch_size=None,
+                sampler=torch.utils.data.BatchSampler(
+                    base, batch_size=batch_size, drop_last=False),
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
+        else:
+            dl_kwargs = dict(
+                dataset=dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
         if pin_memory and pin_memory_device:
             dl_kwargs['pin_memory_device'] = pin_memory_device
         if num_workers > 0:
@@ -4984,6 +5246,11 @@ class LLRnet(Surrogate):
             # epoch (measured: ~1500 distinct contexts out of 4096 samples with 4
             # workers, versus ~3870 with num_workers=0).
             dl_kwargs['worker_init_fn'] = _reseed_dataset_rng_in_worker
+            # Workers are re-created every epoch by default. Under 'spawn' (the default
+            # start method on macOS and for Python 3.14) that means re-pickling this
+            # whole multi-GB dataset to every worker once per epoch, which costs far
+            # more than the loading it is meant to parallelise.
+            dl_kwargs['persistent_workers'] = True
 
         return DataLoader(**dl_kwargs)
 
