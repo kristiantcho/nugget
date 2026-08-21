@@ -5817,6 +5817,8 @@ class Visualizer:
                 ax.set_title(f'Angular Resolution History ({title_stat})')
                 ax.set_xlabel('Iteration')
                 ax.set_ylabel('Angular FoM (rad$^{-1}$)' if is_fom else 'Angular Resolution (degrees)')
+                if kwargs.get('resolution_logy_angular', False):
+                    ax.set_yscale('log')
                 ax.grid(True, alpha=0.3)
             else:
                 ax.text(0.5, 0.5, "Angular resolution history not available\n(Pass 'resolution_per_event' or 'angular_resolution_history' in kwargs)",

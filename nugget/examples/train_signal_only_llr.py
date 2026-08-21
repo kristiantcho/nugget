@@ -35,7 +35,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     # geometry (every feature on its own is identically distributed in both classes), so
     # the loss starts on a flat ln(2) plateau. A large batch with a warmup escapes it in
     # ~1k steps; batch 32 at lr 1e-4 was still at ~0.689 after 30k steps.
-    learning_rate=5e-3,  # peak LR for the OneCycle schedule
+    learning_rate=5e-4,  # peak LR for the OneCycle schedule
     # lr_schedule='onecycle',
     # warmup_frac=0.15,
     standardize_inputs=False,

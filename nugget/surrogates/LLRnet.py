@@ -5153,10 +5153,7 @@ class LLRnet(Surrogate):
             so the split is reproducible.
         vectorized_batches : bool
             If True (default), build each batch in one vectorised call instead of one
-            call per sample, using a BatchSampler plus batched __getitem__. Same
-            sampling distribution and same feature columns, roughly 10x faster
-            (measured ~0.40 s -> ~0.04 s per batch of 4096). Set False to fall back to
-            the per-item path.
+            call per sample, using a BatchSampler plus batched __getitem__.
 
         Returns
         -------
