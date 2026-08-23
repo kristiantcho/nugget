@@ -21,8 +21,8 @@ import pickle
 INPUT_DIM = 16
 
 llr_net = nugget.surrogates.LLRnet.LLRnet(
-    device=None,
-    domain_size=5000,  # Size of the detector domain
+    device="cuda:0",
+    domain_size=8000,  # Size of the detector domain
     dim=3,  # 3D spatial coordinates
     hidden_dims=[250 for _ in range(15)],  # Neural network architecture
     use_fourier_features=False,  # Use Fourier features for better spatial encoding
@@ -35,7 +35,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     # geometry (every feature on its own is identically distributed in both classes), so
     # the loss starts on a flat ln(2) plateau. A large batch with a warmup escapes it in
     # ~1k steps; batch 32 at lr 1e-4 was still at ~0.689 after 30k steps.
-    learning_rate=5e-4,  # peak LR for the OneCycle schedule
+    learning_rate=0.1e-4,  # peak LR for the OneCycle schedule
     # lr_schedule='onecycle',
     # warmup_frac=0.15,
     standardize_inputs=False,
@@ -49,22 +49,22 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
     log_scale_energy=True,  # Whether to log-scale the energy inputs
     # Track geometry. dist_perp alone is blind to up/downstream, so pair it with the
     # signed dist_long. Together these were worth ~0.04 nats of achievable loss.
-    add_distance_from_beam=False,
+    add_distance_from_beam=True,
     add_dist_long=False,
     # zenith/azimuth in this parquet are the ARRIVAL direction, so the muon travels along
     # -direction. Verified on the data: 95% of hit PMTs are downstream of the vertex
     # under this convention versus 5% under the other.
     track_dir_is_arrival=False,
     reduce_lr_on_plateau=True,  # superseded by lr_schedule='onecycle'
-    lr_scheduler_patience=20,  # Patience for LR scheduler
+    lr_scheduler_patience=30,  # Patience for LR scheduler
     use_rich_features=True,  # Whether to use rich features from the surrogate model
     add_vertex_distance=False,
     rich_rel_pos_mode=True,
     include_vertex_position=True,
-    log_charge_scale=4,
+    log_charge_scale=5,
     ly_eps=1e-6,
     add_pmt_direction=True,
-    add_pmt_cosangle=True
+    add_pmt_cosangle=False
     )
 
 # llr_net.load_model('llrnet_models/best_mc_ly_muon_llr_model_v4.pt')
@@ -88,7 +88,7 @@ llr_net = nugget.surrogates.LLRnet.LLRnet(
 #     )
 
 GEOM = '../other/800_40_40_geom.csv'
-TEST_PARQUET = './llrnet_models/mc_ly_muon_llr_v6_test_samples.parquet'
+TEST_PARQUET = './llrnet_models/mc_ly_muon_llr_v7_test_samples.parquet'
 
 EPOCHS = 4000
 
@@ -96,9 +96,9 @@ train_dataloader = llr_net.create_light_yield_parquet_dataloader(
     parquet_path='ly_mu_mc_all.parquet',
     geometry_csv_path=GEOM,
 
-    num_samples_per_epoch=None,
-    batch_size=4096,     # large batch: the interaction gradient is tiny at init
-    num_workers=5,
+    num_samples_per_epoch=5000000,
+    batch_size=5000,     # large batch: the interaction gradient is tiny at init
+    num_workers=0,
     shuffle=True,
     zero_ly_prob=0.00,   # zeros are handled by a separate hit/no-hit network
     uniform_energy_zenith=True,
@@ -114,9 +114,9 @@ train_dataloader = llr_net.create_light_yield_parquet_dataloader(
 val_dataloader = llr_net.create_light_yield_parquet_val_dataloader(
         parquet_path=TEST_PARQUET,
         geometry_csv_path=GEOM,
-        num_samples_per_epoch=None,
-        batch_size=4096,
-        num_workers=5,
+        num_samples_per_epoch=100000,
+        batch_size=5000,
+        num_workers=0,
         # seed=0,
         uniform_energy_zenith=True,
         n_energy_bins=20,
@@ -132,11 +132,11 @@ history = llr_net.train_with_dataloader(
     grad_clip=None,
     early_stopping_patience=300,
     save_every_n_epochs=20,
-    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v6.pt',
+    checkpoint_path='llrnet_models/best_mc_ly_muon_llr_model_v7.pt',
 )
 
 # Save the best model for later use
 # llr_net.save_model('best_cascade_charge_llr_model_v1')
 
 # #save history as pickle
-pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v6_training_history.pkl', 'wb'))
+pickle.dump(history, open('llrnet_models/mc_ly_muon_llr_v7_training_history.pkl', 'wb'))

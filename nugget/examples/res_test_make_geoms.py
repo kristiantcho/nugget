@@ -4,7 +4,7 @@ import nugget
 import pickle
 import os
 
-device="cuda:3"
+device="cuda:2"
 string_number_penalty = nugget.losses.geometry_penalties.StringNumberPenalty(device=device)
 string_boundary_penalty = nugget.losses.geometry_penalties.StringBoundaryPenaltyCircle(device=device)
 weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizationPenalty(device=device)
@@ -29,14 +29,14 @@ fisher_res_metric = 'mean'  # 'fom' 'median' 'mean'
 version = '_poisson'
 use_rov = 'rov'
 num_events = 'inf'
-event_type = 'cascade'
-res_param = 'energy'
+event_type = 'track'
+res_param = 'angle'
 use_weights = True
 use_fold = False
 n_folds = 6
 spacing_test = False
 num_strings = 61
-limit_zenith = None
+limit_zenith = 'vertical'
 center = [0,0,0]
 radius = 600
 height = 1000
@@ -87,7 +87,7 @@ loss_params = {
     'rov_soft_inside':True,
     'rov_inside_sharpness': 10,
     'rov_angle_softmin_tau': 0.05,
-    'rov_angle_chunk_size': 360,
+    'rov_angle_chunk_size': 60,
     'rov_away_weight': 0.00,
     'rov_away_num_neighbours':5,
     'rov_use_torch_compile': False,
@@ -126,7 +126,7 @@ loss_params = {
     'adaptive_t_max_floor_ns':10,
     'uninformative_fisher_value':1e-6,
     'empty_cache_after_event': False,
-    'events_per_batch': 10000,
+    'events_per_batch': 1000,
 
     'trigger_use_torch_compile': False,
     'use_batched_trigger': True,
@@ -134,6 +134,7 @@ loss_params = {
     'use_batched_effective_area': True,
     'use_irregular_cylinder': False,
     'bounding_cylinder_temperature': 1,
+    'binned_trigger_chunk_size': 500,
     # 'num_events_per_bin': 100,
     # 'num_energy_bins': 30,
     # 'num_zenith_bins': 30,
@@ -161,7 +162,7 @@ loss_params = {
 loss_weights_dict = {
     'angular_resolution_loss': 1,
     'pointsource_fom_loss': 1e2,
-    'energy_resolution_loss': 0.01,
+    'energy_resolution_loss': 0.05,
     # 'fisher_loss': 0.005, 
     'signal_yield_loss': 0.01,        # High weight: maximize light collection
     # 'signal_llr_loss': 2.5,          # Moderate weight: good signal discrimination
@@ -303,6 +304,12 @@ for i in range(num_trials):
         loss_params.update({
             'signal_sampler': signal_sampler,
             })
+        if i > 1:
+            loss_weights_dict['energy_resolution_loss'] = 0.5
+        if i > 3:
+            loss_weights_dict['energy_resolution_loss'] = 5
+        if i > 5:
+            loss_weights_dict['energy_resolution_loss'] = 10
     if use_fold:
         geometry = nugget.geometries.NFoldString.NFoldString(
                 device=device,
