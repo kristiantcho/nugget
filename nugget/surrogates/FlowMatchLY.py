@@ -162,6 +162,13 @@ class LightYieldFlowDataset(Dataset):
 
         self._n_rows = len(self._count)
         self._n_events = int(self._row_event_code.max()) + 1
+        # Event -> row indices. Mirrors LLRnet's parquet dataset so this class can be
+        # passed straight to vis_tools.plot_nll_landscape as `parquet_dataset`.
+        _order = np.argsort(self._row_event_code, kind='stable')
+        _codes = self._row_event_code[_order]
+        _bounds = np.flatnonzero(np.diff(_codes)) + 1
+        self._event_rows = {int(_codes[g[0]]): g for g in np.split(_order, _bounds)}
+        self._events = np.fromiter(self._event_rows.keys(), dtype=np.int64)
         self.num_samples_per_epoch = (int(num_samples_per_epoch)
                                       if num_samples_per_epoch else self._n_rows)
 
@@ -238,6 +245,23 @@ class LightYieldFlowDataset(Dataset):
             return self.get_batch(idx)
         ctx, q = self.get_batch([idx])
         return ctx[0], q[0]
+
+    def _event_data(self, i, pmt_direction=None):
+        """Event-parameter dict for row i (same keys as LLRnet's parquet dataset)."""
+        zen = torch.tensor(float(self._zenith[i]))
+        azi = torch.tensor(float(self._azimuth[i]))
+        st, ct = torch.sin(zen), torch.cos(zen)
+        direction = torch.stack([st * torch.cos(azi), st * torch.sin(azi), ct])
+        pmt = self._pmt_direction[i] if pmt_direction is None else pmt_direction
+        return {
+            'position': torch.from_numpy(np.ascontiguousarray(self._muon_pos[i])),
+            'energy': torch.tensor(float(self._energy[i])),
+            'direction': direction,
+            'pmt_direction': torch.from_numpy(
+                np.ascontiguousarray(np.asarray(pmt, dtype=np.float32))),
+            'zenith': zen,
+            'azimuth': azi,
+        }
 
     def count_stats(self):
         """(mu, sigma) of log10(count + U(0,1)), for target standardisation."""
@@ -338,20 +362,31 @@ class FlowMatchLY(Surrogate):
             return float(ds[0]) / 2.0
         return float(ds) / 2.0
 
-    def build_context(self, points, vertices, energies, zeniths, azimuths,
-                      pmt_directions=None):
-        """(B,3),(B,3),(B,),(B,),(B,),(B,3) -> (B, context_dim). Differentiable."""
+    def build_context(self, points, vertices, energies, zeniths=None, azimuths=None,
+                      pmt_directions=None, directions=None):
+        """(B,3),(B,3),(B,) + angles or a (B,3) unit vector -> (B, context_dim).
+
+        Pass ``directions`` instead of ``zeniths``/``azimuths`` when the caller already
+        holds a unit vector, which avoids a lossy round trip through angles.
+        Differentiable throughout.
+        """
         pts = points.reshape(-1, 3)
         vert_raw = vertices.reshape(-1, 3).to(pts.dtype)
-        zen = zeniths.reshape(-1).to(pts.dtype)
-        azi = azimuths.reshape(-1).to(pts.dtype)
         E = energies.reshape(-1).to(pts.dtype)
         norm = self._norm_divisor()
 
         det = pts / norm
         vert = vert_raw / norm
-        st, ct = torch.sin(zen), torch.cos(zen)
-        direction = torch.stack([st * torch.cos(azi), st * torch.sin(azi), ct], dim=1)
+        if directions is not None:
+            direction = directions.reshape(-1, 3).to(pts.dtype)
+        else:
+            if zeniths is None or azimuths is None:
+                raise ValueError("build_context needs either (zeniths, azimuths) "
+                                 "or directions")
+            zen = zeniths.reshape(-1).to(pts.dtype)
+            azi = azimuths.reshape(-1).to(pts.dtype)
+            st, ct = torch.sin(zen), torch.cos(zen)
+            direction = torch.stack([st * torch.cos(azi), st * torch.sin(azi), ct], dim=1)
         log_e = torch.log10(E + self.ly_eps) / 8.0
         rel = det - vert
         vert_dist = torch.linalg.norm(rel, dim=1)

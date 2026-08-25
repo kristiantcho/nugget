@@ -8259,7 +8259,35 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        plot_opposite_direction_true_params=False,
                        use_rich_features=False,
                        progress_print_every_n_points=None,
-                       parquet_dataset=None, parquet_event_seed=None):
+                       parquet_dataset=None, parquet_event_seed=None,
+                       flow_model=None, flow_n_steps=32, flow_seed=0,
+                       flow_pmt_direction=(0.0, 0.0, -1.0)):
+    # flow_model : FlowMatchLY or None
+    #     If provided, the per-PMT term is the flow's log p(q | theta, x) instead of
+    #     the LLRnet log-ratio, and `llrnet` may be None.
+    #
+    #     With parquet_dataset: detector positions and observed light yields come
+    #     from a real event, exactly as on the LLRnet path.
+    #     Without parquet_dataset: the flow generates its own pseudo-data -- the
+    #     true event comes from signal_sampler, detector points are sampled as
+    #     usual, and each light yield is DRAWN FROM THE FLOW at the true params.
+    #     That makes the scan a self-consistency test: the NLL minimum should sit
+    #     at the parameters the data were generated from.
+    #
+    #     Flow and LLRnet landscapes have the same SHAPE: the LLR differs from the
+    #     true log-likelihood by + log p_marg(q), which is theta-independent and
+    #     cancels once the landscape is shifted to NLL=0 at its minimum. The flow
+    #     version is properly normalised, so its absolute scale is meaningful too.
+    #
+    #     flow_n_steps : ODE steps per hypothesis evaluation (cost scales with this).
+    #     flow_seed    : seeds both the pseudo-data light yields and the
+    #         dequantisation draw q~ = q + u. The dequantisation is fixed ONCE and
+    #         reused at every grid point, so the landscape is smooth and
+    #         reproducible instead of carrying fresh U(0,1) noise per hypothesis.
+    #     flow_pmt_direction : PMT direction used on the synthetic (non-parquet)
+    #         path when the flow was trained with add_pmt_direction=True. Real PMT
+    #         directions only exist for parquet events; the same value is used for
+    #         generation and evaluation, so the test stays self-consistent.
     # parquet_dataset : LLRnet.LightYieldParquetDataset or None
     #     If provided, the true event, detector points (OM positions) and the
     #     observed light yields are taken from a randomly chosen event in this
@@ -8354,10 +8382,20 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
 
    """
 
-    
-    if not llrnet.is_trained:
-        raise RuntimeError("LLRnet must be trained before plotting NLL landscape")
-    
+    if flow_model is None:
+        if llrnet is None:
+            raise ValueError("provide either llrnet or flow_model")
+        if not llrnet.is_trained:
+            raise RuntimeError("LLRnet must be trained before plotting NLL landscape")
+    else:
+        if not getattr(flow_model, 'is_trained', False):
+            raise RuntimeError("flow_model must be trained before plotting NLL landscape")
+        if llrnet is None:
+            # The flow exposes the same device / domain_size / add_pmt_direction
+            # attributes, so all the geometry and bookkeeping below work unchanged.
+            # Every call that would hit an LLRnet-only method is routed to the flow.
+            llrnet = flow_model
+
     # Default parameter names
     if param_names is None:
         param_names = ['energy', 'zenith']
@@ -8452,6 +8490,60 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     # use_rich_features is now stored on the model — read from it,
     # falling back to the explicit parameter for backward compatibility.
     use_rich_features = getattr(llrnet, 'use_rich_features', use_rich_features)
+    if flow_model is not None:
+        # The flow always evaluates through the batched charge-style path.
+        use_rich_features = True
+
+        _flow_pmt_dir_t = torch.as_tensor(
+            flow_pmt_direction, device=flow_model.device, dtype=flow_model.param_dtype
+        ).reshape(1, 3)
+
+        def _flow_context(points, event):
+            """(n,3) detector points + one hypothesis event -> (n, context_dim)."""
+            pts = (points if torch.is_tensor(points) else torch.as_tensor(points))
+            pts = pts.to(device=flow_model.device,
+                         dtype=flow_model.param_dtype).reshape(-1, 3)
+            n = pts.shape[0]
+
+            def _v3(v):
+                t = v if torch.is_tensor(v) else torch.tensor(v)
+                return t.reshape(-1)[:3].to(device=flow_model.device,
+                                            dtype=flow_model.param_dtype
+                                            ).unsqueeze(0).expand(n, 3)
+
+            def _sc(v):
+                t = v if torch.is_tensor(v) else torch.tensor(v)
+                return t.reshape(-1)[0].to(device=flow_model.device,
+                                           dtype=flow_model.param_dtype).expand(n)
+
+            # parquet_pmt_dir_stacked only exists when the parquet block ran AND the
+            # model wants PMT directions; fall back to the fixed synthetic direction.
+            if (parquet_light_yields is not None
+                    and getattr(flow_model, 'add_pmt_direction', False)):
+                pmt_dirs = parquet_pmt_dir_stacked.to(device=flow_model.device,
+                                                      dtype=flow_model.param_dtype)
+            else:
+                pmt_dirs = _flow_pmt_dir_t.expand(n, 3)
+            return flow_model.build_context(
+                pts, _v3(event['position']), _sc(event['energy']),
+                pmt_directions=pmt_dirs, directions=_v3(event['direction']),
+            )
+
+        if parquet_light_yields is None:
+            # No parquet: the flow generates its own observations. Replacing the
+            # surrogate here means the existing detector-point selection, the
+            # min_detector_response filtering and the true-light-yield bookkeeping
+            # all work unchanged downstream.
+            # A dedicated generator (rather than torch.manual_seed) keeps this
+            # reproducible without disturbing global RNG state for the caller.
+            _flow_gen = torch.Generator(device=flow_model.device)
+            _flow_gen.manual_seed(int(flow_seed))
+
+            def signal_surrogate_func(opt_point=None, event_params=None, **_kw):
+                ctx = _flow_context(opt_point, event_params)
+                q = flow_model.sample_light_yield(ctx, n_steps=flow_n_steps,
+                                                  generator=_flow_gen)
+                return q.reshape(-1)[0].detach()
 
     progress_print_every_n_points = (
         int(progress_print_every_n_points)
@@ -8529,13 +8621,48 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         merged['pmt_direction'] = parquet_pmt_event_data[det_idx]['pmt_direction']
         return merged
 
-    def _parquet_charge_llr_sum(event):
-        """Summed log-LLR over all parquet detector points for one hypothesis.
+    _flow_state = {}
 
-        Builds features for every detector point in a single batch and runs one
-        network forward pass, instead of looping per detector. Only used on the
-        parquet charge path (use_rich_features, not PATD).
+    def _flow_loglik_sum(event):
+        """Summed log p(q_i | theta, x_i) over all detector points, via the flow.
+
+        The dequantisation q~ = q + u is drawn once on the first call and cached, so
+        every hypothesis in the scan is scored against the SAME observation and the
+        landscape is smooth rather than noisy.
         """
+        if not _flow_state:
+            if parquet_light_yields is not None:
+                pts = parquet_points_stacked
+                lys = parquet_ly_stacked.reshape(-1)
+            else:
+                pts = torch.stack([
+                    p.reshape(-1)[:3] if torch.is_tensor(p) else torch.as_tensor(p).reshape(-1)[:3]
+                    for p in detector_points])
+                lys = torch.as_tensor([float(l) for l in true_light_yields])
+            pts = pts.to(device=flow_model.device, dtype=flow_model.param_dtype)
+            lys = lys.to(device=flow_model.device, dtype=flow_model.param_dtype)
+            g = torch.Generator(device='cpu').manual_seed(int(flow_seed) + 1)
+            u = torch.rand(lys.shape[0], generator=g).to(lys.device, lys.dtype)
+            q_deq = lys + u
+            _flow_state['points'] = pts
+            _flow_state['z'] = flow_model.to_z(q_deq)
+            # theta-independent Jacobian; kept so absolute NLL values are correct.
+            _flow_state['logdet'] = float(flow_model.log_det_dz_dq(q_deq).sum().item())
+
+        ctx = _flow_context(_flow_state['points'], event)
+        with torch.no_grad():
+            lp = flow_model.log_prob_z(_flow_state['z'], ctx, n_steps=flow_n_steps)
+        return float(lp.sum().item()) + _flow_state['logdet']
+
+    def _parquet_charge_llr_sum(event):
+        """Summed per-PMT log-likelihood term for one hypothesis, in one forward pass.
+
+        Builds features for every detector point in a single batch instead of looping
+        per detector. Dispatches to the flow model when one was supplied; otherwise
+        the LLRnet parquet charge path (use_rich_features, not PATD).
+        """
+        if flow_model is not None:
+            return _flow_loglik_sum(event)
         feats = llrnet.prepare_features_charge_batched(
             parquet_points_stacked, event, parquet_ly_stacked,
             pmt_directions=parquet_pmt_dir_stacked,
@@ -8723,7 +8850,8 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                         ly = signal_surrogate_func(opt_point=det_point, event_params=true_event)
                     true_light_yields.append(ly)
 
-            if parquet_light_yields is not None and use_rich_features:
+            if flow_model is not None or (parquet_light_yields is not None
+                                          and use_rich_features):
                 # Fast batched path: one forward pass over all detector points.
                 true_llr_sum = _parquet_charge_llr_sum(true_event)
             else:
@@ -8809,9 +8937,10 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                     llr_sum = llrnet.evaluate_patd_likelihood_batched_hypothesis(
                         modified_event, patd_precomputed_obs
                     )
-            elif parquet_light_yields is not None and use_rich_features and not use_patd:
-                # Fast batched charge path for parquet events: one forward pass
-                # over all detector points for this hypothesis.
+            elif flow_model is not None or (parquet_light_yields is not None
+                                            and use_rich_features and not use_patd):
+                # Fast batched charge path: one forward pass over all detector
+                # points for this hypothesis.
                 llr_sum = _parquet_charge_llr_sum(modified_event)
             else:
                 patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
@@ -9042,6 +9171,12 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                         llr_sum = llrnet.evaluate_patd_likelihood_batched_hypothesis(
                             modified_event, patd_precomputed_obs
                         )
+                elif flow_model is not None or (parquet_light_yields is not None
+                                                and use_rich_features and not use_patd):
+                    # Fast batched charge path: one forward pass over all detector
+                    # points for this hypothesis. (The 2-D grid previously fell
+                    # through to the per-detector loop even for parquet events.)
+                    llr_sum = _parquet_charge_llr_sum(modified_event)
                 else:
                     patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
                     ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
