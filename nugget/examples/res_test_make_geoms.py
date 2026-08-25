@@ -27,16 +27,16 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
 )
 fisher_res_metric = 'mean'  # 'fom' 'median' 'mean'
 version = '_poisson'
-use_rov = 'rov'
+use_rov = 'no_rov' # rov or no_rov
 num_events = 'inf'
-event_type = 'track'
-res_param = 'angle'
+event_type = 'track' # cascade or track
+res_param = 'angle' # angle or energy
 use_weights = True
 use_fold = False
 n_folds = 6
 spacing_test = False
 num_strings = 61
-limit_zenith = 'vertical'
+limit_zenith = 'vertical' # vertical, horizontal, or None for full range
 center = [0,0,0]
 radius = 600
 height = 1000
@@ -172,7 +172,7 @@ loss_weights_dict = {
     # 'string_weights_penalty': 0,     # Encourage sparse solutions
     'string_weights_penalty': 0.05,     # Encourage sparse solutions
     'string_number_penalty': 10,      # Limit detector complexity
-    'weight_binarization_penalty': 0.1,
+    'weight_binarization_penalty': 0.0001,
     'rov_penalty': 1,
     'diversity_penalty': 0.001
 }
