@@ -10,7 +10,7 @@ CHECKPOINT = './flow_models/best_mc_ly_muon_flow_model_v1.pt'
 EPOCHS = 300
 
 flow = nugget.surrogates.FlowMatchLY.FlowMatchLY(
-    device="cuda:0",
+    device="cuda:1",
     domain_size=8000,
     dim=3,
 
