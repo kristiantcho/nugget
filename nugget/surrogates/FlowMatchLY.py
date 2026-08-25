@@ -489,6 +489,30 @@ class FlowMatchLY(Surrogate):
         log_p0 = -0.5 * (z ** 2) - 0.5 * math.log(2 * math.pi)
         return (log_p0 - div_acc).reshape(-1)
 
+    @torch.no_grad()
+    def transport_to_base(self, z1, context, n_steps=64):
+        """Integrate the flow backwards: data-space z -> base-space z0."""
+        c = self._apply_context_norm(self._prep(context))
+        z = self._prep(z1).reshape(-1, 1)
+        B = z.shape[0]
+        dt = 1.0 / n_steps
+        for i in reversed(range(n_steps)):
+            tm = torch.full((B,), (i + 0.5) * dt, device=z.device, dtype=z.dtype)
+            k1 = self._velocity(z, tm, c)
+            z = z - dt * self._velocity(z - 0.5 * dt * k1, tm, c)
+        return z.reshape(-1)
+
+    def cdf_z(self, z1, context, n_steps=64):
+        """P(Z <= z1 | c). Exact: the 1-D flow map is monotone, so the CDF is
+        the base-space Gaussian CDF of the transported point."""
+        z0 = self.transport_to_base(z1, context, n_steps=n_steps)
+        return 0.5 * (1.0 + torch.erf(z0 / math.sqrt(2.0)))
+
+    def cdf_light_yield(self, q_deq, context, n_steps=64):
+        """P(q~ <= q_deq | c) for the dequantised light yield."""
+        return self.cdf_z(self.to_z(self._prep(q_deq).reshape(-1)), context,
+                          n_steps=n_steps)
+
     # ---------------- light-yield level API ----------------
 
     def sample_light_yield(self, context, n_steps=64, discrete=True, generator=None):
