@@ -12,6 +12,47 @@ from nugget.surrogates.FlowMatchLY import (
 C_VAC = 0.299792458          # speed of light in vacuum, m/ns
 
 
+def _times_to_flat(series):
+    """Flatten a `times` column to (flat float32 times, per-row photon counts).
+
+    Accepts either layout that shows up in these files:
+      * a ragged list/array per row  -- one row = one PMT with several photons;
+      * a plain scalar per row       -- one row = one photon (already exploded).
+    Null entries count as zero photons and their rows are dropped upstream.
+    """
+    obj = series.to_numpy()
+    n = len(obj)
+    if n == 0:
+        return np.empty(0, np.float32), np.zeros(0, np.int64)
+
+    # Fast path: genuine ragged list column.
+    try:
+        counts = np.fromiter((len(x) for x in obj), np.int64, n)
+        return np.concatenate(obj).astype(np.float32, copy=False), counts
+    except (TypeError, ValueError):
+        pass
+
+    # Scalar numeric column: one photon per row.
+    if series.dtype.kind in 'fiub':
+        vals = series.to_numpy(np.float32)
+        ok = np.isfinite(vals)
+        return vals[ok], ok.astype(np.int64)
+
+    # Mixed object column: normalise element by element.
+    counts = np.zeros(n, np.int64)
+    pieces = []
+    for i, x in enumerate(obj):
+        if x is None:
+            continue
+        a = np.atleast_1d(np.asarray(x, dtype=np.float32))
+        if np.ndim(x) == 0 and not np.isfinite(a[0]):
+            continue                      # scalar NaN placeholder
+        counts[i] = a.size
+        pieces.append(a)
+    flat = np.concatenate(pieces) if pieces else np.empty(0, np.float32)
+    return flat, counts
+
+
 def _ragged_indices(starts, counts):
     """Flat indices for the concatenation of slices [s, s+c) — a vectorised
     equivalent of ``np.concatenate([np.arange(s, s+c) for s, c in zip(starts, counts)])``.
@@ -63,8 +104,17 @@ class ArrivalTimeFlowDataset(Dataset):
         # Flatten the ragged `times` column up front, then drop it: the per-row
         # object column is by far the heaviest thing here, and carrying it through
         # the filter/merge below would copy it repeatedly.
-        counts_all = df['times'].str.len().to_numpy(np.int64)
-        flat_all = np.concatenate(df['times'].to_numpy()).astype(np.float32)
+        flat_all, counts_all = _times_to_flat(df['times'])
+        if flat_all.size == 0:
+            raise ValueError(
+                f"No photons found in the 'times' column of {parquet_path}. Expected "
+                "either a ragged list per row or one scalar time per row; got dtype "
+                f"{df['times'].dtype}.")
+        if verbose:
+            kind = ('scalar (1 photon/row)' if counts_all.max() <= 1
+                    else 'ragged list per row')
+            print(f"ArrivalTimeFlowDataset: 'times' layout = {kind}; "
+                  f"{flat_all.size:,} photons over {len(counts_all):,} rows")
         starts_all = np.concatenate([[0], np.cumsum(counts_all)[:-1]]).astype(np.int64)
         df = df.drop(columns=['times'])
         df['_orig'] = np.arange(len(df), dtype=np.int64)
