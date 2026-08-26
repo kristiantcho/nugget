@@ -25,28 +25,38 @@ def _times_to_flat(series):
     if n == 0:
         return np.empty(0, np.float32), np.zeros(0, np.int64)
 
-    # Fast path: genuine ragged list column.
+    # Fast path: genuine ragged list column. The ndim/size check rejects nested
+    # (2-D) entries, for which len() counts rows but concatenate flattens elements.
     try:
         counts = np.fromiter((len(x) for x in obj), np.int64, n)
-        return np.concatenate(obj).astype(np.float32, copy=False), counts
+        flat = np.concatenate(obj).astype(np.float32, copy=False)
+        if flat.ndim == 1 and flat.size == counts.sum():
+            return flat, counts
     except (TypeError, ValueError):
         pass
 
-    # Scalar numeric column: one photon per row.
-    if series.dtype.kind in 'fiub':
-        vals = series.to_numpy(np.float32)
+    # Scalar numeric column: one photon per row. Test the dtype of the materialised
+    # numpy array, not the pandas dtype -- an Arrow-backed extension dtype has no
+    # usable `.kind` and would otherwise fall through or raise.
+    if getattr(obj, 'dtype', None) is not None and obj.dtype.kind in 'fiub':
+        vals = obj.astype(np.float32)
         ok = np.isfinite(vals)
         return vals[ok], ok.astype(np.int64)
 
-    # Mixed object column: normalise element by element.
+    # Anything else (object column of scalars / lists / arrays / None), element-wise.
     counts = np.zeros(n, np.int64)
     pieces = []
     for i, x in enumerate(obj):
         if x is None:
             continue
-        a = np.atleast_1d(np.asarray(x, dtype=np.float32))
-        if np.ndim(x) == 0 and not np.isfinite(a[0]):
-            continue                      # scalar NaN placeholder
+        try:
+            a = np.atleast_1d(np.asarray(x, dtype=np.float32)).ravel()
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Could not interpret entry {i} of the 'times' column as photon "
+                f"times: type={type(x).__name__}, value={x!r:.80}") from exc
+        if a.size == 0 or (a.size == 1 and not np.isfinite(a[0])):
+            continue                      # empty list, or a scalar NaN placeholder
         counts[i] = a.size
         pieces.append(a)
     flat = np.concatenate(pieces) if pieces else np.empty(0, np.float32)
