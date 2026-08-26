@@ -400,13 +400,17 @@ class FlowMatchATime(FlowMatchLY):
         with d_along/d_perp measured along the muon TRAVEL direction from the vertex.
         Differentiable in the event parameters.
         """
+        # Everything follows `points`: that keeps the dataset path entirely on CPU
+        # (where points are CPU tensors) while a caller that has already moved its
+        # inputs to the GPU gets a GPU result, with no silent cross-device mixing.
         pts = points.reshape(-1, 3)
-        vert = vertices.reshape(-1, 3).to(pts.dtype)
+        dev, dt = pts.device, pts.dtype
+        vert = vertices.reshape(-1, 3).to(device=dev, dtype=dt)
         if directions is not None:
-            u = directions.reshape(-1, 3).to(pts.dtype)
+            u = directions.reshape(-1, 3).to(device=dev, dtype=dt)
         else:
-            zen = zeniths.reshape(-1).to(pts.dtype)
-            azi = azimuths.reshape(-1).to(pts.dtype)
+            zen = zeniths.reshape(-1).to(device=dev, dtype=dt)
+            azi = azimuths.reshape(-1).to(device=dev, dtype=dt)
             st, ct = torch.sin(zen), torch.cos(zen)
             u = torch.stack([st * torch.cos(azi), st * torch.sin(azi), ct], dim=1)
         travel = -u if self.track_dir_is_arrival else u
@@ -424,7 +428,7 @@ class FlowMatchATime(FlowMatchLY):
                       directions=None):
         """t_hit - t_geom. Negative values are physical (PMT timing jitter)."""
         t_geom = self.geometric_time(points, vertices, zeniths, azimuths, directions)
-        return t_hit.reshape(-1).to(t_geom.dtype) - t_geom
+        return t_hit.reshape(-1).to(device=t_geom.device, dtype=t_geom.dtype) - t_geom
 
     # ---------------- target transform ----------------
 
@@ -486,10 +490,15 @@ class FlowMatchATime(FlowMatchLY):
     def sample_arrival_time(self, context, points, vertices, zeniths=None,
                             azimuths=None, directions=None, n_steps=64,
                             generator=None):
-        """Sample t_hit = t_geom + t_res."""
+        """Sample t_hit = t_geom + t_res.
+
+        `t_res` comes back on the model's device; `t_geom` follows whatever device the
+        caller's `points` live on (often CPU), so align them explicitly.
+        """
         t_res = self.sample_time_residual(context, n_steps=n_steps, generator=generator)
         t_geom = self.geometric_time(points, vertices, zeniths, azimuths, directions)
-        return t_geom.reshape(-1) + t_res
+        t_geom = t_geom.reshape(-1).to(device=t_res.device, dtype=t_res.dtype)
+        return t_geom + t_res
 
     def log_prob_time_residual(self, t_res, context, n_steps=64):
         """log p(t_res | c). Equals log p(t_hit | c): the shift has unit Jacobian."""
