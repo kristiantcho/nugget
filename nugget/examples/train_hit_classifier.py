@@ -11,7 +11,7 @@ CHECKPOINT = './flow_models/best_mc_hit_model_v1.pt'
 EPOCHS = 200
 
 hit = nugget.surrogates.HitClassifier.HitClassifier(
-    device="cuda:1",
+    device="cuda:2",
     domain_size=8000,
     dim=3,
 
