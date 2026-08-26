@@ -43,6 +43,27 @@ def _times_to_flat(series):
         ok = np.isfinite(vals)
         return vals[ok], ok.astype(np.int64)
 
+    # String column: the lists were serialised as text, e.g. '[1.0, 2.0]'. Parse them
+    # back, vectorised over the column rather than row by row.
+    if n and isinstance(obj[0], (str, bytes, np.str_)):
+        import pandas as pd
+        s = pd.Series(obj).astype(str).str.strip()
+        if s.str.contains('...', regex=False).any():
+            raise ValueError(
+                "The 'times' column holds TRUNCATED string reprs (they contain "
+                "'...'), so photons have already been lost on disk. Rewrite the "
+                "parquet from the original list column instead of parsing these.")
+        s = s.str.strip('[]()').str.replace(',', ' ', regex=False).str.strip()
+        parts = s.str.split()
+        counts = parts.str.len().fillna(0).to_numpy(np.int64)
+        vals = pd.to_numeric(parts.explode(), errors='coerce').to_numpy(np.float32)
+        flat = vals[np.isfinite(vals)]      # empty entries explode to a NaN placeholder
+        if flat.size != counts.sum():
+            raise ValueError(
+                f"Failed to parse the stringified 'times' column: recovered "
+                f"{flat.size:,} values but row lengths sum to {counts.sum():,}.")
+        return flat, counts
+
     # Anything else (object column of scalars / lists / arrays / None), element-wise.
     counts = np.zeros(n, np.int64)
     pieces = []
