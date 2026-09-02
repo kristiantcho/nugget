@@ -4,7 +4,7 @@ import nugget
 import pickle
 import os
 
-device="cuda:2"
+device="cuda:3"
 string_number_penalty = nugget.losses.geometry_penalties.StringNumberPenalty(device=device)
 string_boundary_penalty = nugget.losses.geometry_penalties.StringBoundaryPenaltyCircle(device=device)
 weighted_binarization_penalty = nugget.losses.geometry_penalties.WeightBinarizationPenalty(device=device)
@@ -27,7 +27,7 @@ rov_penalty = nugget.losses.geometry_penalties.ROVPenalty(
 )
 fisher_res_metric = 'mean'  # 'fom' 'median' 'mean'
 version = '_poisson'
-use_rov = 'no_rov' # rov or no_rov
+use_rov = 'rov' # rov or no_rov
 num_events = 'inf'
 event_type = 'track' # cascade or track
 res_param = 'angle' # angle or energy
@@ -217,7 +217,7 @@ if use_rov == 'rov':
     loss_func_dict['local_string_repulsion_penalty'] = local_string_repulsion_penalty
 
 if use_weights:
-    loss_func_dict['weight_binarization_penalty'] = weighted_binarization_penalty
+    # loss_func_dict['weight_binarization_penalty'] = weighted_binarization_penalty
     loss_func_dict['string_number_penalty'] = string_number_penalty
 
 lightsabre = nugget.surrogates.LightSabre.LightSabre(

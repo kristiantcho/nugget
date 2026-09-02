@@ -5,13 +5,13 @@ import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'ly_mu_mc_all.parquet'
-TEST_PARQUET = './flow_models/mc_hit_v1_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_hit_model_v1.pt'
+TEST_PARQUET = './flow_models/mc_hit_v2_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_hit_model_v2.pt'
 
 EPOCHS = 200
 
 hit = nugget.surrogates.HitClassifier.HitClassifier(
-    device="cuda:2",
+    device="cuda:1",
     domain_size=8000,
     dim=3,
 
@@ -52,6 +52,7 @@ train_dataloader = hit.create_hit_parquet_dataloader(
     # exact prior shift (log_prior_odds), which is stored in the checkpoint.
     pos_frac=0.5,
     uniform_energy_zenith=True,
+    importance_weight=True,
     n_energy_bins=20,
     n_coszen_bins=20,
     filter_vertex_in_domain=True,
@@ -81,7 +82,7 @@ history = hit.train_with_dataloader(
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_hit_v1_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_hit_v2_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------
