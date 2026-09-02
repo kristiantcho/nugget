@@ -54,6 +54,7 @@ class HitLabelDataset(Dataset):
     def __init__(self, model, parquet_path, geometry_csv_path,
                  num_samples_per_epoch=1_000_000, seed=None, pos_frac=0.5,
                  uniform_energy_zenith=False, n_energy_bins=20, n_coszen_bins=20,
+                 importance_weight=False,
                  filter_vertex_in_domain=True, event_filter=None, verbose=True):
         import pandas as pd
 
@@ -126,9 +127,26 @@ class HitLabelDataset(Dataset):
 
         self.num_samples_per_epoch = int(num_samples_per_epoch)
         self.uniform_energy_zenith = bool(uniform_energy_zenith)
+        self.importance_weight = bool(importance_weight) and self.uniform_energy_zenith
         self._n_bins = 0
         if self.uniform_energy_zenith:
             self._build_bins(int(n_energy_bins), int(n_coszen_bins))
+
+        if self.importance_weight:
+            # Hits of one event occupy a contiguous run of the sorted key array, so a
+            # positive can be drawn from a CHOSEN event rather than uniformly overall.
+            starts = np.searchsorted(self._hit_key,
+                                     np.arange(self._n_events) * self._n_geo)
+            ends = np.searchsorted(self._hit_key,
+                                   (np.arange(self._n_events) + 1) * self._n_geo)
+            self._ev_hit_start = starts.astype(np.int64)
+            self._ev_hit_count = (ends - starts).astype(np.int64)
+            # g(ev) for the stratified draw: pick a bin uniformly, then a row in it.
+            self._g_event = np.empty(self._n_events, dtype=np.float64)
+            for b in range(self._n_bins):
+                rows = self._bin_flat[self._bin_starts[b]:
+                                      self._bin_starts[b] + self._bin_lens[b]]
+                self._g_event[rows] = 1.0 / (self._n_bins * max(len(rows), 1))
 
         if verbose:
             print(f"HitLabelDataset: {self._n_hits:,} hits, {self._n_events:,} events, "
@@ -194,7 +212,14 @@ class HitLabelDataset(Dataset):
         n_neg = n - n_pos
 
         # --- positives: existing hits ---
-        hk = self._hit_key[self._rng.integers(0, self._n_hits, size=n_pos)]
+        if self.importance_weight:
+            # stratified event, then one of ITS hits, so both classes share g(ev)
+            ev_p = self._sample_events(n_pos)
+            k = (self._rng.random(n_pos) * self._ev_hit_count[ev_p]).astype(np.int64)
+            np.minimum(k, self._ev_hit_count[ev_p] - 1, out=k)
+            hk = self._hit_key[self._ev_hit_start[ev_p] + k]
+        else:
+            hk = self._hit_key[self._rng.integers(0, self._n_hits, size=n_pos)]
         ev_p, gi_p = hk // self._n_geo, hk % self._n_geo
 
         # --- negatives: (event, PMT) pairs that are not hits ---
@@ -221,7 +246,20 @@ class HitLabelDataset(Dataset):
             torch.from_numpy(self._ev_azimuth[ev]),
             torch.from_numpy(self._geo_dir[gi]),
         )
-        return ctx, torch.from_numpy(y)
+        if not self.importance_weight:
+            return ctx, torch.from_numpy(y)
+
+        # Correct the stratified event draw g(ev) back to the true distribution:
+        #   positives  target p(ev | hit) = n_hits(ev) / n_hits
+        #   negatives  target uniform over events = 1 / n_events
+        # Normalising each class to mean 1 leaves the class balance (and hence
+        # log_prior_odds) untouched.
+        w_p = (self._ev_hit_count[ev_p] / self._n_hits) / self._g_event[ev_p]
+        w_n = (1.0 / self._n_events) / self._g_event[ev_n]
+        w_p /= max(w_p.mean(), 1e-30)
+        w_n /= max(w_n.mean(), 1e-30)
+        w = np.concatenate([w_p, w_n]).astype(np.float32)
+        return ctx, torch.from_numpy(y), torch.from_numpy(w)
 
     def __getitem__(self, idx):
         if isinstance(idx, slice):
@@ -271,9 +309,16 @@ class HitClassifier(FlowMatchLY):
 
     # ---------------- loss / prediction ----------------
 
-    def hit_loss(self, context, labels):
+    def hit_loss(self, context, labels, weights=None):
         c = self._apply_context_norm(self._prep(context))
-        return self.loss_fn(self.net(c), self._prep(labels).reshape(-1))
+        z = self.net(c)
+        y = self._prep(labels).reshape(-1)
+        if weights is None:
+            return self.loss_fn(z, y)
+        w = self._prep(weights).reshape(-1)
+        per = torch.nn.functional.binary_cross_entropy_with_logits(
+            z, y, reduction='none')
+        return (per * w).sum() / w.sum().clamp(min=1e-30)
 
     def predict_hit_logit(self, context, calibrated=True):
         """Logit of P(hit | c).
@@ -313,10 +358,10 @@ class HitClassifier(FlowMatchLY):
     def fit_normalisers(self, dataloader, max_batches=20):
         tot = tot_sq = None
         n = 0
-        for i, (ctx, _y) in enumerate(dataloader):
+        for i, batch in enumerate(dataloader):
             if i >= max_batches:
                 break
-            ctx = self._prep(ctx)
+            ctx = self._prep(batch[0])
             if tot is None:
                 tot = torch.zeros(ctx.shape[1], device=self.device, dtype=ctx.dtype)
                 tot_sq = torch.zeros(ctx.shape[1], device=self.device, dtype=ctx.dtype)
@@ -357,9 +402,11 @@ class HitClassifier(FlowMatchLY):
             self.net.train()
             tl, nb = 0.0, 0
             t0 = time.time()
-            for ctx, y in train_dataloader:
+            for batch in train_dataloader:
+                ctx, y = batch[0], batch[1]
+                w = batch[2] if len(batch) > 2 else None
                 self.optimizer.zero_grad()
-                loss = self.hit_loss(ctx, y)
+                loss = self.hit_loss(ctx, y, weights=w)
                 loss.backward()
                 if grad_clip:
                     torch.nn.utils.clip_grad_norm_(self.net.parameters(), grad_clip)
@@ -377,8 +424,10 @@ class HitClassifier(FlowMatchLY):
                 vs, vn = 0.0, 0
                 probs, ys = [], []
                 with torch.no_grad():
-                    for ctx, y in val_dataloader:
-                        vs += self.hit_loss(ctx, y).item(); vn += 1
+                    for batch in val_dataloader:
+                        ctx, y = batch[0], batch[1]
+                        w = batch[2] if len(batch) > 2 else None
+                        vs += self.hit_loss(ctx, y, weights=w).item(); vn += 1
                         # uncalibrated: matches the balanced validation sample
                         probs.append(torch.sigmoid(
                             self.predict_hit_logit(ctx, calibrated=False)).cpu())
@@ -471,6 +520,7 @@ class HitClassifier(FlowMatchLY):
                                       shuffle=True, num_workers=0, seed=None,
                                       pos_frac=0.5, uniform_energy_zenith=False,
                                       n_energy_bins=20, n_coszen_bins=20,
+                                      importance_weight=False,
                                       filter_vertex_in_domain=True,
                                       test_save_path=None, test_frac=0.1,
                                       split_seed=None, pin_memory=None):
@@ -500,6 +550,7 @@ class HitClassifier(FlowMatchLY):
             num_samples_per_epoch=num_samples_per_epoch, seed=seed, pos_frac=pos_frac,
             uniform_energy_zenith=uniform_energy_zenith,
             n_energy_bins=n_energy_bins, n_coszen_bins=n_coszen_bins,
+            importance_weight=importance_weight,
             filter_vertex_in_domain=filter_vertex_in_domain,
             event_filter=train_filter)
 
