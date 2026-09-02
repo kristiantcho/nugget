@@ -41,7 +41,7 @@ gif_temp/
 *.gif
 *.log
 *.pdf
-*.pt
+# *.pt
 *.pkl
 *.sh
 *.pickle
@@ -60,3 +60,4 @@ nugget/examples/*.h5
 nugget/examples/res_test
 nugget/other/geom_2nd_optimization_counts.py
 *800_40_40_geom.csv
+nugget/examples/llrnet_models
