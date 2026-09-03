@@ -5,36 +5,36 @@ import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'atimes_mu_mc_all.parquet'
-TEST_PARQUET = './flow_models/mc_atime_muon_flow_v1_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v1.pt'
+TEST_PARQUET = './flow_models/mc_atime_muon_flow_v3_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v3.pt'
 
 EPOCHS = 300
 
 flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
-    device="cuda:1",
+    device="cuda:3",
     domain_size=8000,
     dim=3,
 
     # --- velocity network ---
     width=256,
-    depth=6,
+    depth=15,
     time_dim=64,        # sinusoidal embedding of the FLOW time t (not the arrival time)
     cond_width=256,
     dropout=0.0,
 
     # --- optimisation ---
-    learning_rate=1e-3,
+    learning_rate=5e-4,
     lr_schedule='onecycle',
     warmup_frac=0.1,
     weight_decay=1e-5,
     reduce_lr_on_plateau=False,
 
     # --- flow ---
-    sigma_min=1e-4,
+    sigma_min=1e-5,
 
     # --- arrival-time target ---
     refractive_index=1.33,   # water; sets the Cherenkov angle in t_geom
-    time_scale=10.0,         # ns; asinh(t/scale). ~ the width of the direct peak
+    time_scale=2.0,         # ns; asinh(t/scale). ~ the width of the direct peak
     time_transform='asinh',  # 'signlog' reproduces the LLRnet PATD convention
     # zenith/azimuth in this parquet are the ARRIVAL direction, so the muon travels
     # along -direction. Verified on the data: median |t_res| is 6.9 ns with this
@@ -65,7 +65,7 @@ train_dataloader = flow.create_atime_parquet_dataloader(
     n_coszen_bins=20,
     filter_vertex_in_domain=True,
     # A few PMTs record >1000 photons; capping keeps them from dominating an epoch.
-    max_photons_per_row=None,
+    max_photons_per_row=100,
     test_save_path=TEST_PARQUET,
     test_frac=0.1,
 )
@@ -94,7 +94,7 @@ history = flow.train_with_dataloader(
 )
 
 pickle.dump(history,
-            open('./flow_models/mc_atime_muon_flow_v1_training_history.pkl', 'wb'))
+            open('./flow_models/mc_atime_muon_flow_v3_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------
