@@ -11,13 +11,13 @@ CHECKPOINT = './flow_models/best_mc_hit_model_v3.pt'
 EPOCHS = 300
 
 hit = nugget.surrogates.HitClassifier.HitClassifier(
-    device="cuda:2",
+    device="cuda:1",
     domain_size=8000,
     dim=3,
 
     # --- network ---
     width=256,
-    depth=12,
+    depth=8,
     dropout=0.0,
 
     # --- optimisation ---
@@ -33,8 +33,8 @@ hit = nugget.surrogates.HitClassifier.HitClassifier(
     include_vertex_position=True,
     add_vertex_distance=False,
     add_distance_from_beam=True,
-    add_dist_long=False,
-    track_dir_is_arrival=False,
+    add_dist_long=True,
+    track_dir_is_arrival=True,
     add_pmt_direction=True,
     add_pmt_cosangle=False,
     standardize_context=True,
@@ -77,7 +77,7 @@ history = hit.train_with_dataloader(
     train_dataloader=train_dataloader,
     val_dataloader=val_dataloader,
     epochs=EPOCHS,
-    grad_clip=1.0,
+    # grad_clip=1.0,
     early_stopping_patience=30,
     save_every_n_epochs=10,
     checkpoint_path=CHECKPOINT,

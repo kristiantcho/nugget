@@ -56,7 +56,7 @@ flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
 train_dataloader = flow.create_atime_parquet_dataloader(
     parquet_path=TRAIN_PARQUET,
     geometry_csv_path=GEOM,
-    num_samples_per_epoch=500_000,
+    num_samples_per_epoch=1000_000,
     batch_size=4096,
     num_workers=0,
     shuffle=True,
@@ -65,7 +65,7 @@ train_dataloader = flow.create_atime_parquet_dataloader(
     n_coszen_bins=20,
     filter_vertex_in_domain=True,
     # A few PMTs record >1000 photons; capping keeps them from dominating an epoch.
-    max_photons_per_row=100,
+    max_photons_per_row=None,
     test_save_path=TEST_PARQUET,
     test_frac=0.1,
 )
@@ -76,7 +76,7 @@ val_dataloader = flow.create_atime_parquet_val_dataloader(
     num_samples_per_epoch=100_000,
     batch_size=4096,
     num_workers=0,
-    seed=0,
+    # seed=0,
     uniform_energy_zenith=True,
     n_energy_bins=20,
     n_coszen_bins=20,
