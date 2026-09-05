@@ -54,7 +54,7 @@ class HitLabelDataset(Dataset):
     def __init__(self, model, parquet_path, geometry_csv_path,
                  num_samples_per_epoch=1_000_000, seed=None, pos_frac=0.5,
                  uniform_energy_zenith=False, n_energy_bins=20, n_coszen_bins=20,
-                 importance_weight=False,
+                 n_mult_bins=0, importance_weight=False,
                  filter_vertex_in_domain=True, event_filter=None, verbose=True):
         import pandas as pd
 
@@ -120,6 +120,9 @@ class HitLabelDataset(Dataset):
         gidx = df['_gidx'].to_numpy(np.int64)
         self._hit_key = np.sort(codes * self._n_geo + gidx)
         self._n_hits = len(self._hit_key)
+        # hits per event: the stratification axis, and identical to _ev_hit_count
+        self._ev_mult = np.bincount(self._hit_key // self._n_geo,
+                                    minlength=self._n_events).astype(np.int64)
 
         cells = self._n_events * self._n_geo
         self.p_hit = self._n_hits / cells
@@ -129,8 +132,9 @@ class HitLabelDataset(Dataset):
         self.uniform_energy_zenith = bool(uniform_energy_zenith)
         self.importance_weight = bool(importance_weight) and self.uniform_energy_zenith
         self._n_bins = 0
+        self.n_mult_bins = int(n_mult_bins)
         if self.uniform_energy_zenith:
-            self._build_bins(int(n_energy_bins), int(n_coszen_bins))
+            self._build_bins(int(n_energy_bins), int(n_coszen_bins), self.n_mult_bins)
 
         if self.importance_weight:
             # Hits of one event occupy a contiguous run of the sorted key array, so a
@@ -140,7 +144,7 @@ class HitLabelDataset(Dataset):
             ends = np.searchsorted(self._hit_key,
                                    (np.arange(self._n_events) + 1) * self._n_geo)
             self._ev_hit_start = starts.astype(np.int64)
-            self._ev_hit_count = (ends - starts).astype(np.int64)
+            self._ev_hit_count = self._ev_mult
             # g(ev) for the stratified draw: pick a bin uniformly, then a row in it.
             self._g_event = np.empty(self._n_events, dtype=np.float64)
             for b in range(self._n_bins):
@@ -153,6 +157,10 @@ class HitLabelDataset(Dataset):
                   f"{self._n_geo:,} PMTs")
             print(f"  {cells:,} (event, PMT) cells -> occupancy "
                   f"P(hit) = {self.p_hit:.6g} ({100*self.p_hit:.4f}%)")
+            if self.uniform_energy_zenith:
+                print(f"  stratified over {self._n_bins} non-empty bins"
+                      f"{' (incl. multiplicity)' if self.n_mult_bins else ''}; "
+                      f"importance_weight={self.importance_weight}")
             print(f"  training at pos_frac={self.pos_frac}; calibrated logits need a "
                   f"shift of log_prior_odds = {self.log_prior_odds:.4f}")
 
@@ -166,10 +174,19 @@ class HitLabelDataset(Dataset):
         h = float(ds) / 2.0
         return np.array([h, h, h], dtype=np.float64)
 
-    def _build_bins(self, n_e, n_c):
-        """Stratify EVENTS over (log10 energy, cos zenith)."""
-        log_e = np.log10(np.clip(self._ev_energy, 1e-12, None))
-        cz = np.cos(self._ev_zenith)
+    def _build_bins(self, n_e, n_c, n_m=0):
+        """Stratify EVENTS over (log10 energy, cos zenith[, log10 multiplicity]).
+
+        The multiplicity axis buys coverage of faint events, which are otherwise
+        ~0.05% of positives because positives are drawn proportional to hit count.
+        importance_weight=True corrects the resulting bias back out.
+        """
+        axes = [np.log10(np.clip(self._ev_energy, 1e-12, None)),
+                np.cos(self._ev_zenith)]
+        nbins = [int(n_e), int(n_c)]
+        if n_m and int(n_m) > 0:
+            axes.append(np.log10(np.maximum(self._ev_mult, 1)))
+            nbins.append(int(n_m))
 
         def edges(v, nb):
             lo, hi = float(v.min()), float(v.max())
@@ -177,9 +194,10 @@ class HitLabelDataset(Dataset):
                 hi = lo + 1e-6
             return np.linspace(lo, hi, nb + 1)
 
-        ei = np.clip(np.digitize(log_e, edges(log_e, n_e)) - 1, 0, n_e - 1)
-        ci = np.clip(np.digitize(cz, edges(cz, n_c)) - 1, 0, n_c - 1)
-        flat = ei * n_c + ci
+        flat = np.zeros(self._n_events, dtype=np.int64)
+        for v, nb in zip(axes, nbins):
+            i = np.clip(np.digitize(v, edges(v, nb)) - 1, 0, nb - 1)
+            flat = flat * nb + i
         order = np.argsort(flat, kind='stable')
         bounds = np.flatnonzero(np.diff(flat[order])) + 1
         self._bin_flat = np.ascontiguousarray(order, dtype=np.int64)
@@ -520,7 +538,7 @@ class HitClassifier(FlowMatchLY):
                                       shuffle=True, num_workers=0, seed=None,
                                       pos_frac=0.5, uniform_energy_zenith=False,
                                       n_energy_bins=20, n_coszen_bins=20,
-                                      importance_weight=False,
+                                      n_mult_bins=0, importance_weight=False,
                                       filter_vertex_in_domain=True,
                                       test_save_path=None, test_frac=0.1,
                                       split_seed=None, pin_memory=None):
@@ -550,7 +568,7 @@ class HitClassifier(FlowMatchLY):
             num_samples_per_epoch=num_samples_per_epoch, seed=seed, pos_frac=pos_frac,
             uniform_energy_zenith=uniform_energy_zenith,
             n_energy_bins=n_energy_bins, n_coszen_bins=n_coszen_bins,
-            importance_weight=importance_weight,
+            n_mult_bins=n_mult_bins, importance_weight=importance_weight,
             filter_vertex_in_domain=filter_vertex_in_domain,
             event_filter=train_filter)
 
