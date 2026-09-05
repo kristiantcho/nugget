@@ -4,15 +4,15 @@ import torch
 import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
-TRAIN_PARQUET = 'atimes_mu_mc_all.parquet'
+TRAIN_PARQUET = 'big_mu_accepted.parquet'
 TEST_PARQUET = './flow_models/mc_atime_muon_flow_v3_test_samples.parquet'
 CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v3.pt'
 
-EPOCHS = 300
+EPOCHS = 500
 
 flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
-    device="cuda:3",
-    domain_size=8000,
+    device="cuda:1",
+    domain_size=10000,
     dim=3,
 
     # --- velocity network ---
@@ -87,8 +87,8 @@ history = flow.train_with_dataloader(
     train_dataloader=train_dataloader,
     val_dataloader=val_dataloader,
     epochs=EPOCHS,
-    grad_clip=1.0,
-    early_stopping_patience=40,
+    # grad_clip=1.0,
+    early_stopping_patience=50,
     save_every_n_epochs=10,
     checkpoint_path=CHECKPOINT,
 )

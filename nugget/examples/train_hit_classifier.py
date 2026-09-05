@@ -4,7 +4,7 @@ import torch
 import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
-TRAIN_PARQUET = 'ly_mu_mc_all.parquet'
+TRAIN_PARQUET = 'big_mu_accepted.parquet'
 TEST_PARQUET = './flow_models/mc_hit_v3_test_samples.parquet'
 CHECKPOINT = './flow_models/best_mc_hit_model_v3.pt'
 
@@ -12,7 +12,7 @@ EPOCHS = 300
 
 hit = nugget.surrogates.HitClassifier.HitClassifier(
     device="cuda:1",
-    domain_size=8000,
+    domain_size=10000,
     dim=3,
 
     # --- network ---
@@ -48,14 +48,13 @@ train_dataloader = hit.create_hit_parquet_dataloader(
     batch_size=4096,
     num_workers=0,
     shuffle=True,
-    # Occupancy is ~0.01%, so a faithful sample would be >99.98% negatives and carry
-    # almost no gradient. Train balanced; predict_hit_prob() undoes this with the
-    # exact prior shift (log_prior_odds), which is stored in the checkpoint.
+
     pos_frac=0.5,
     uniform_energy_zenith=True,
     importance_weight=True,
     n_energy_bins=20,
     n_coszen_bins=20,
+    n_mult_bins=12,
     filter_vertex_in_domain=True,
     test_save_path=TEST_PARQUET,
     test_frac=0.1,
@@ -67,9 +66,13 @@ val_dataloader = hit.create_hit_parquet_val_dataloader(
     num_samples_per_epoch=200_000,
     batch_size=4096,
     num_workers=0,
-    seed=0,
+    # seed=0,
     pos_frac=0.5,
     uniform_energy_zenith=True,
+    importance_weight=True,
+    n_energy_bins=20,
+    n_coszen_bins=20,
+    n_mult_bins=15,
     filter_vertex_in_domain=True,
 )
 
@@ -78,7 +81,7 @@ history = hit.train_with_dataloader(
     val_dataloader=val_dataloader,
     epochs=EPOCHS,
     # grad_clip=1.0,
-    early_stopping_patience=30,
+    early_stopping_patience=50,
     save_every_n_epochs=10,
     checkpoint_path=CHECKPOINT,
 )
