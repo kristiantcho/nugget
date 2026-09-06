@@ -3,41 +3,41 @@ import pickle
 import torch
 
 GEOM = '../other/800_40_40_geom.csv'
-TRAIN_PARQUET = 'ly_mu_mc_all.parquet'
-TEST_PARQUET = './flow_models/mc_ly_muon_flow_v1_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_ly_muon_flow_model_v1.pt'
+TRAIN_PARQUET = 'big_mu_accepted.parquet'
+TEST_PARQUET = './flow_models/mc_ly_muon_flow_v2_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_ly_muon_flow_model_v2.pt'
 
-EPOCHS = 300
+EPOCHS = 500
 
 flow = nugget.surrogates.FlowMatchLY.FlowMatchLY(
     device="cuda:1",
-    domain_size=8000,
+    domain_size=10000,
     dim=3,
 
     # --- velocity network ---
     width=256,          # hidden width of the residual trunk
-    depth=6,            # number of residual blocks
+    depth=8,            # number of residual blocks
     time_dim=64,        # sinusoidal embedding size for the flow time t
     cond_width=256,     # width of the context encoder
     dropout=0.0,
 
     # --- optimisation ---
-    learning_rate=1e-3,
+    learning_rate=5e-4,
     lr_schedule='onecycle',
     warmup_frac=0.1,
     weight_decay=1e-5,
     reduce_lr_on_plateau=False,
 
     # --- flow ---
-    sigma_min=1e-4,     # 0 gives exactly straight (rectified-flow) paths
+    sigma_min=1e-6,     # 0 gives exactly straight (rectified-flow) paths
 
     # --- context features (same conventions as LLRnet) ---
     rich_rel_pos_mode=True,
     include_vertex_position=True,
     add_vertex_distance=False,
     add_distance_from_beam=True,
-    add_dist_long=False,
-    track_dir_is_arrival=False,
+    add_dist_long=True,
+    track_dir_is_arrival=True,
     add_pmt_direction=True,
     add_pmt_cosangle=False,
     standardize_context=True,
@@ -47,7 +47,7 @@ flow = nugget.surrogates.FlowMatchLY.FlowMatchLY(
 train_dataloader = flow.create_flow_parquet_dataloader(
     parquet_path=TRAIN_PARQUET,
     geometry_csv_path=GEOM,
-    num_samples_per_epoch=500_000,
+    num_samples_per_epoch=1000_000,
     batch_size=4096,
     num_workers=0,
     shuffle=True,
@@ -62,10 +62,10 @@ train_dataloader = flow.create_flow_parquet_dataloader(
 val_dataloader = flow.create_flow_parquet_val_dataloader(
     parquet_path=TEST_PARQUET,
     geometry_csv_path=GEOM,
-    num_samples_per_epoch=100_000,
+    num_samples_per_epoch=200_000,
     batch_size=4096,
     num_workers=0,
-    seed=0,
+    # seed=0,
     uniform_energy_zenith=True,
     n_energy_bins=20,
     n_coszen_bins=20,
@@ -76,13 +76,13 @@ history = flow.train_with_dataloader(
     train_dataloader=train_dataloader,
     val_dataloader=val_dataloader,
     epochs=EPOCHS,
-    grad_clip=1.0,
+    # grad_clip=1.0,
     early_stopping_patience=40,
     save_every_n_epochs=10,
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_ly_muon_flow_v1_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_ly_muon_flow_v2_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------
