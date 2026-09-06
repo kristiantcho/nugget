@@ -114,6 +114,7 @@ class ArrivalTimeFlowDataset(Dataset):
     def __init__(self, model, parquet_path, geometry_csv_path,
                  num_samples_per_epoch=None, seed=None,
                  uniform_energy_zenith=False, n_energy_bins=20, n_coszen_bins=20,
+                 n_count_bins=0,
                  filter_vertex_in_domain=True, event_filter=None,
                  max_photons_per_row=None, verbose=True):
         import pandas as pd
@@ -236,7 +237,8 @@ class ArrivalTimeFlowDataset(Dataset):
         self.uniform_energy_zenith = bool(uniform_energy_zenith)
         self._n_bins = 0
         if self.uniform_energy_zenith:
-            self._build_bins(int(n_energy_bins), int(n_coszen_bins))
+            self._build_bins(int(n_energy_bins), int(n_coszen_bins),
+                             int(n_count_bins))
 
         if verbose:
             print(f"ArrivalTimeFlowDataset: {self._n_rows:,} rows (PMTs), "
@@ -244,6 +246,18 @@ class ArrivalTimeFlowDataset(Dataset):
                   f"{self.num_samples_per_epoch:,} samples/epoch")
             print(f"  photons/row: mean {counts.mean():.2f}, median "
                   f"{np.median(counts):.0f}, max {counts.max()}")
+            if self._n_bins > 0:
+                # share of draws reaching bright rows vs their share of photons,
+                # i.e. of the likelihood terms the model is evaluated on
+                w = np.zeros(self._n_rows)
+                w[self._bin_flat] = np.repeat(
+                    1.0 / self._bin_lens, self._bin_lens) / self._n_bins
+                bright = counts > 100
+                print(f"  {self._n_bins:,} occupied bins"
+                      + (f" ({n_count_bins} count strata)" if n_count_bins else "")
+                      + f"; rows with >100 photons get {w[bright].sum():.1%} of "
+                        f"draws and hold "
+                        f"{counts[bright].sum() / counts.sum():.1%} of photons")
 
     # ---- geometry / binning helpers (mirror LightYieldFlowDataset) ----
 
@@ -257,9 +271,22 @@ class ArrivalTimeFlowDataset(Dataset):
         h = float(ds) / 2.0
         return np.array([h, h, h], dtype=np.float64)
 
-    def _build_bins(self, n_e, n_c):
-        log_e = np.log10(np.clip(self._energy, 1e-12, None))
-        cz = np.cos(self._zenith)
+    def _build_bins(self, n_e, n_c, n_q=0):
+        """Stratification grid over (log10 E, cos zenith) and optionally
+        log10(photons in the row).
+
+        Without the count axis a row is drawn uniformly within its (E, zenith)
+        cell and contributes ONE photon, so a PMT with 10^5 photons carries the
+        same weight as one with 1 -- while bright PMTs hold most of the photons
+        the model is actually evaluated on. The count axis restores them.
+        Keep n_e/n_c coarse (~10) or most cells hold no bright rows and the
+        count strata are empty.
+        """
+        axes = [np.log10(np.clip(self._energy, 1e-12, None)), np.cos(self._zenith)]
+        nbins = [int(n_e), int(n_c)]
+        if n_q and int(n_q) > 0:
+            axes.append(np.log10(np.maximum(self._photons_per_row, 1)))
+            nbins.append(int(n_q))
 
         def edges(v, nb):
             lo, hi = float(v.min()), float(v.max())
@@ -267,9 +294,10 @@ class ArrivalTimeFlowDataset(Dataset):
                 hi = lo + 1e-6
             return np.linspace(lo, hi, nb + 1)
 
-        ei = np.clip(np.digitize(log_e, edges(log_e, n_e)) - 1, 0, n_e - 1)
-        ci = np.clip(np.digitize(cz, edges(cz, n_c)) - 1, 0, n_c - 1)
-        flat = ei * n_c + ci
+        flat = np.zeros(self._n_rows, dtype=np.int64)
+        for v, nb in zip(axes, nbins):
+            i = np.clip(np.digitize(v, edges(v, nb)) - 1, 0, nb - 1)
+            flat = flat * nb + i
         order = np.argsort(flat, kind='stable')
         bounds = np.flatnonzero(np.diff(flat[order])) + 1
         self._bin_flat = np.ascontiguousarray(order, dtype=np.int64)
@@ -576,6 +604,7 @@ class FlowMatchATime(FlowMatchLY):
                                         shuffle=True, num_workers=0, seed=None,
                                         uniform_energy_zenith=False,
                                         n_energy_bins=20, n_coszen_bins=20,
+                                        n_count_bins=0,
                                         filter_vertex_in_domain=True,
                                         max_photons_per_row=None,
                                         test_save_path=None, test_frac=0.1,
@@ -608,6 +637,7 @@ class FlowMatchATime(FlowMatchLY):
             num_samples_per_epoch=num_samples_per_epoch, seed=seed,
             uniform_energy_zenith=uniform_energy_zenith,
             n_energy_bins=n_energy_bins, n_coszen_bins=n_coszen_bins,
+            n_count_bins=n_count_bins,
             filter_vertex_in_domain=filter_vertex_in_domain,
             max_photons_per_row=max_photons_per_row,
             event_filter=train_filter)
