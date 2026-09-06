@@ -101,6 +101,39 @@ class VelocityNet(torch.nn.Module):
         return self.out(torch.nn.functional.silu(self.out_norm(h)))
 
 
+def _times_row_lengths(series):
+    """Photons per row from a `times` column -- the light yield of that PMT.
+
+    Handles the layouts these files come in: a ragged list/array per row, a plain
+    scalar per row (already exploded, one photon), or a stringified list.
+    """
+    obj = series.to_numpy()
+    n = len(obj)
+    if n == 0:
+        return np.zeros(0, np.float32)
+
+    # stringified lists, e.g. '[16659.7, 16702.3]'
+    if isinstance(obj[0], (str, bytes, np.str_)):
+        import pandas as pd
+        s = pd.Series(obj).astype(str).str.strip()
+        if s.str.contains('...', regex=False).any():
+            raise ValueError(
+                "The 'times' column holds TRUNCATED string reprs (they contain "
+                "'...'), so the photon counts on disk are already wrong.")
+        s = (s.str.strip('[]()').str.replace(',', ' ', regex=False).str.strip())
+        return s.str.split().str.len().fillna(0).to_numpy(np.float32)
+
+    # plain numeric column: one photon per row (NaN = none)
+    if getattr(obj, 'dtype', None) is not None and obj.dtype.kind in 'fiub':
+        return np.isfinite(obj.astype(np.float64)).astype(np.float32)
+
+    try:
+        return np.fromiter((0 if x is None else len(x) for x in obj), np.float32, n)
+    except TypeError:
+        return np.fromiter((0 if x is None else np.size(x) for x in obj),
+                           np.float32, n)
+
+
 # --------------------------------------------------------------------------- #
 #  Dataset                                                                     #
 # --------------------------------------------------------------------------- #
@@ -122,9 +155,25 @@ class LightYieldFlowDataset(Dataset):
         geo = pd.read_csv(geometry_csv_path,
                           usecols=['string', 'om', 'pmt', 'om_x', 'om_y', 'om_z',
                                    'pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z'])
-        cols = ['run_id', 'event_id', 'count', 'string', 'om', 'pmt',
-                'muon_x', 'muon_y', 'muon_z', 'neutrino_energy', 'zenith', 'azimuth']
-        df = pd.read_parquet(parquet_path, columns=cols)
+        base_cols = ['run_id', 'event_id', 'string', 'om', 'pmt',
+                     'muon_x', 'muon_y', 'muon_z', 'neutrino_energy',
+                     'zenith', 'azimuth']
+        # Prefer an explicit 'count' column; otherwise derive the light yield from
+        # the length of each row's 'times' list, which is the same quantity. Both
+        # parquet engines validate column names before reading, so the failed
+        # attempt is cheap.
+        try:
+            df = pd.read_parquet(parquet_path, columns=base_cols + ['count'])
+            counts = df['count'].to_numpy(np.float32)
+            src = 'count'
+        except (ValueError, KeyError):
+            df = pd.read_parquet(parquet_path, columns=base_cols + ['times'])
+            counts = _times_row_lengths(df['times'])
+            df = df.drop(columns=['times'])
+            src = 'len(times)'
+        df = df.assign(_ly=counts)
+        if verbose:
+            print(f"LightYieldFlowDataset: light yield taken from '{src}'")
 
         half = self._domain_half_extent()
         if filter_vertex_in_domain:
@@ -141,6 +190,14 @@ class LightYieldFlowDataset(Dataset):
             df = df[mask.to_numpy()]
 
         df = df.merge(geo, on=['string', 'om', 'pmt'], how='inner', copy=False)
+        # The flow models q >= 1; a zero-photon row would give log10(0 + u) -> -inf.
+        n_zero = int((df['_ly'] < 1).sum())
+        if n_zero:
+            if verbose:
+                print(f"LightYieldFlowDataset: dropped {n_zero:,} row(s) with zero "
+                      f"light yield (q >= 1 is modelled; zeros belong to the "
+                      f"hit/no-hit classifier)")
+            df = df[df['_ly'] >= 1]
         if len(df) == 0:
             raise ValueError("No usable rows: parquet and geometry CSV do not overlap "
                              "(or every vertex fell outside the domain).")
@@ -154,7 +211,7 @@ class LightYieldFlowDataset(Dataset):
         self._energy = df.neutrino_energy.to_numpy(np.float32)
         self._zenith = df.zenith.to_numpy(np.float32)
         self._azimuth = df.azimuth.to_numpy(np.float32)
-        self._count = df['count'].to_numpy(np.float32)
+        self._count = df['_ly'].to_numpy(np.float32)
         codes, _ = pd.factorize(
             pd.Series(list(zip(df.run_id.astype(int), df.event_id.astype(int))),
                       dtype=object))
