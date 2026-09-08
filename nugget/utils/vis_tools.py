@@ -10074,3 +10074,100 @@ def plot_nll_landscape_with_sampling(
         'num_detector_points': num_detector_points,
         'num_iterations': num_iterations
     }
+
+
+def plot_corner_compare(sets, variables=None, bins=40, levels=(0.393, 0.865),
+                        smooth=1.0, colors=None, range_pct=(0.5, 99.5),
+                        ranges=None, weights=None, fill_contours=True,
+                        title=None, save_path=None, legend_fontsize=11,
+                        show=True, **corner_kwargs):
+    """Overlay corner plots of two or more labelled sample sets.
+
+    Parameters
+    ----------
+    sets : dict
+        ``{set name: {variable label: 1-D array}}``, e.g.
+        ``{'data': {...}, 'sim': {...}}``. Insertion order sets the draw order.
+    variables : list of str, optional
+        Which variable labels to plot, in order. Defaults to the keys of the
+        first set. Pass a subset to drop panels.
+    ranges : list of (lo, hi), optional
+        Per-variable axis ranges. By default taken from the ``range_pct``
+        percentiles of all sets pooled, so the overlay stays aligned.
+    weights : dict, optional
+        ``{set name: 1-D array}`` of per-sample weights.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import corner as _corner
+
+    names = list(sets.keys())
+    if not names:
+        raise ValueError("sets is empty")
+    if variables is None:
+        variables = list(sets[names[0]].keys())
+    variables = list(variables)
+    if len(variables) < 2:
+        raise ValueError("need at least 2 variables for a corner plot")
+
+    if colors is None:
+        colors = ['C0', 'C1', 'C2', 'C3', 'C4'][:len(names)]
+
+    arrs, wts = {}, {}
+    for nm in names:
+        missing = [v for v in variables if v not in sets[nm]]
+        if missing:
+            raise KeyError(f"set '{nm}' is missing variables {missing}")
+        cols = [np.asarray(sets[nm][v], dtype=float).ravel() for v in variables]
+        n = min(len(c) for c in cols)
+        a = np.column_stack([c[:n] for c in cols])
+        w = None
+        if weights is not None and nm in weights and weights[nm] is not None:
+            w = np.asarray(weights[nm], dtype=float).ravel()[:n]
+        keep = np.isfinite(a).all(axis=1)
+        if w is not None:
+            keep &= np.isfinite(w)
+        arrs[nm] = a[keep]
+        wts[nm] = None if w is None else w[keep]
+        if len(arrs[nm]) < 10:
+            raise ValueError(f"set '{nm}' has only {len(arrs[nm])} finite rows")
+
+    if ranges is None:
+        pooled = np.vstack([arrs[nm] for nm in names])
+        ranges = []
+        for k in range(len(variables)):
+            lo, hi = np.percentile(pooled[:, k], range_pct)
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo, hi = float(pooled[:, k].min()), float(pooled[:, k].max())
+            if hi <= lo:
+                hi = lo + 1e-9
+            pad = 0.03 * (hi - lo)
+            ranges.append((lo - pad, hi + pad))
+
+    fig = None
+    for nm, col in zip(names, colors):
+        fig = _corner.corner(
+            arrs[nm], labels=variables, range=ranges, bins=bins, levels=levels,
+            smooth=smooth, color=col, fig=fig, weights=wts[nm],
+            plot_datapoints=False, plot_density=False,
+            fill_contours=fill_contours, no_fill_contours=not fill_contours,
+            contour_kwargs=dict(linewidths=1.5),
+            contourf_kwargs=dict(alpha=0.2),
+            hist_kwargs=dict(density=True, lw=1.8),
+            label_kwargs=dict(fontsize=11), max_n_ticks=4,
+            **corner_kwargs)
+
+    handles = [mpatches.Patch(color=c, label=f'{nm}  (n={len(arrs[nm]):,})')
+               for nm, c in zip(names, colors)]
+    fig.legend(handles=handles, loc='upper right', frameon=False,
+               fontsize=legend_fontsize,
+               bbox_to_anchor=(0.98, 0.98) if len(variables) > 2 else (1.0, 1.0))
+    if title:
+        fig.suptitle(title, fontsize=13, y=1.01)
+    if save_path:
+        fig.savefig(save_path, dpi=130, bbox_inches='tight')
+    if show:
+        plt.show()
+    return fig
