@@ -5,19 +5,19 @@ import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_atime_muon_flow_v3_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v3.pt'
+TEST_PARQUET = './flow_models/mc_atime_muon_flow_v5_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v5.pt'
 
-EPOCHS = 500
+EPOCHS = 700
 
 flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
-    device="cuda:1",
+    device="cuda:3",
     domain_size=10000,
     dim=3,
 
     # --- velocity network ---
     width=256,
-    depth=15,
+    depth=12,
     time_dim=64,        # sinusoidal embedding of the FLOW time t (not the arrival time)
     cond_width=256,
     dropout=0.0,
@@ -30,7 +30,7 @@ flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
     reduce_lr_on_plateau=False,
 
     # --- flow ---
-    sigma_min=1e-5,
+    sigma_min=1e-6,
 
     # --- arrival-time target ---
     refractive_index=1.33,   # water; sets the Cherenkov angle in t_geom
@@ -46,7 +46,7 @@ flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
     include_vertex_position=True,
     add_vertex_distance=False,
     add_distance_from_beam=True,
-    add_dist_long=False,
+    add_dist_long=True,
     add_pmt_direction=True,
     add_pmt_cosangle=False,
     standardize_context=True,
@@ -63,6 +63,7 @@ train_dataloader = flow.create_atime_parquet_dataloader(
     uniform_energy_zenith=True,
     n_energy_bins=20,
     n_coszen_bins=20,
+    n_count_bins=25,
     filter_vertex_in_domain=True,
     # A few PMTs record >1000 photons; capping keeps them from dominating an epoch.
     max_photons_per_row=None,
@@ -80,6 +81,7 @@ val_dataloader = flow.create_atime_parquet_val_dataloader(
     uniform_energy_zenith=True,
     n_energy_bins=20,
     n_coszen_bins=20,
+    n_count_bins=25,
     filter_vertex_in_domain=True,
 )
 
@@ -94,7 +96,7 @@ history = flow.train_with_dataloader(
 )
 
 pickle.dump(history,
-            open('./flow_models/mc_atime_muon_flow_v3_training_history.pkl', 'wb'))
+            open('./flow_models/mc_atime_muon_flow_v5_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------
