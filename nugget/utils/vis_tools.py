@@ -10171,3 +10171,149 @@ def plot_corner_compare(sets, variables=None, bins=40, levels=(0.393, 0.865),
     if show:
         plt.show()
     return fig
+
+
+def animate_flow_transport(model, context, z_range=(-4.5, 4.5), n_z=321,
+                           n_steps=64, n_particles=1200, n_traj=21,
+                           frame_stride=1, fps=12, save_path=None,
+                           z_label='z  (standardised target)', title=None,
+                           figsize=(13, 5.2), dens_max=None, verbose=True):
+    """Animate a conditional flow transporting N(0,1) into p(z | c).
+
+    The density is tracked in Lagrangian form: a fixed grid of base-space
+    quantiles is integrated forward once while accumulating the divergence, so
+    ``log p_t(z_t) = log p_0(z_0) - int_0^t div v dt'`` comes out of the same
+    single pass that produces the trajectories. That is exact (up to the ODE
+    step) and costs one integration for the whole animation rather than one per
+    frame.
+
+    Parameters
+    ----------
+    model : FlowMatchLY | FlowMatchATime | any subclass
+        Needs ``_apply_context_norm``, ``_prep``, ``_velocity`` and ``_v_and_div``.
+    context : Tensor, shape (context_dim,) or (1, context_dim)
+        The single event/PMT context to condition on.
+    n_particles : int
+        Base-space quantile grid size; sets how smooth the density curve is.
+    n_traj : int
+        How many of those particles to draw as trajectories on the (z, t) plane.
+    save_path : str or None
+        Write a GIF here as well as returning the animation.
+
+    Returns
+    -------
+    matplotlib.animation.FuncAnimation
+        Display with ``HTML(anim.to_jshtml())`` for a play/pause control and a
+        frame slider.
+    """
+    import math
+    from matplotlib import animation
+
+    # _velocity/_v_and_div want the STANDARDISED context; the public API
+    # (log_prob_z, transport_to_base) standardises internally and must be given
+    # the raw one. Passing a pre-normalised context to those double-standardises
+    # it and silently returns a completely different flow.
+    raw = model._prep(context.reshape(1, -1))
+    c1 = model._apply_context_norm(raw)
+    dt = 1.0 / int(n_steps)
+
+    # ---- base-space quantile grid: deterministic, ordered, smooth ----
+    u = (torch.arange(n_particles, dtype=c1.dtype, device=c1.device) + 0.5) / n_particles
+    z0 = math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+    z = z0.reshape(-1, 1)
+    logp = -0.5 * z ** 2 - 0.5 * math.log(2.0 * math.pi)
+    cB = c1.expand(z.shape[0], -1)
+
+    Z = [z.reshape(-1).clone()]
+    LP = [logp.reshape(-1).clone()]
+    for i in range(int(n_steps)):
+        tm = torch.full((z.shape[0],), (i + 0.5) * dt, device=c1.device, dtype=c1.dtype)
+        v, div = model._v_and_div(z, tm, cB)
+        z = z + dt * v
+        logp = logp - dt * div
+        Z.append(z.reshape(-1).clone())
+        LP.append(logp.reshape(-1).clone())
+    Z = [a.detach().cpu().numpy() for a in Z]
+    P = [np.exp(a.detach().cpu().numpy()) for a in LP]
+
+    if verbose:
+        # (i) the tracked density must integrate to 1 at every t -- this checks the
+        #     divergence accumulation on its own terms
+        ii = [0, len(Z) // 2, len(Z) - 1]
+        norms = ' '.join(f'{np.trapezoid(P[j], Z[j]):.4f}' for j in ii)
+        print(f'int p_t dz at t = 0, 0.5, 1: {norms}  (want 1; the deficit is the '
+              f'quantile grid missing the tails)')
+        # (ii) and it must agree with the model's own backward integrator
+        with torch.no_grad():
+            k = np.linspace(0, n_particles - 1, 9).astype(int)
+            zt = torch.as_tensor(Z[-1][k], device=c1.device, dtype=c1.dtype)
+            ref = model.log_prob_z(zt, raw.expand(len(k), -1), n_steps=int(n_steps))
+        err = np.abs(ref.detach().cpu().numpy() - LP[-1].detach().cpu().numpy()[k]).max()
+        print(f'max |log p_1 Lagrangian - log_prob_z| = {err:.2e} nats')
+
+    # ---- velocity field on a fixed (z, t) mesh, for the contour background ----
+    zg = torch.linspace(z_range[0], z_range[1], int(n_z), device=c1.device, dtype=c1.dtype)
+    tg = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=c1.device, dtype=c1.dtype)
+    cZ = c1.expand(int(n_z), -1)
+    with torch.no_grad():
+        V = torch.stack([
+            model._velocity(zg.reshape(-1, 1),
+                            torch.full((int(n_z),), float(tv), device=c1.device,
+                                       dtype=c1.dtype), cZ).reshape(-1)
+            for tv in tg]).detach().cpu().numpy()
+    zg_np, tg_np = zg.detach().cpu().numpy(), tg.detach().cpu().numpy()
+
+    frames = list(range(0, int(n_steps) + 1, max(int(frame_stride), 1)))
+    if frames[-1] != int(n_steps):
+        frames.append(int(n_steps))
+    if dens_max is None:
+        dens_max = 1.15 * max(float(np.nanmax(p)) for p in P)
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=figsize)
+
+    # static reference curves
+    axL.plot(Z[0], P[0], color='0.65', lw=1.4, ls=':', label='t = 0  (Gaussian)')
+    axL.plot(Z[-1], P[-1], color='0.25', lw=1.4, ls='--', label='t = 1  (learned)')
+    (line_d,) = axL.plot([], [], color='C3', lw=2.4, label='p_t(z)')
+    fill_d = [axL.fill_between(Z[0], 0, P[0], color='C3', alpha=.15, lw=0)]
+    axL.set_xlim(*z_range); axL.set_ylim(0, dens_max)
+    axL.set_xlabel(z_label); axL.set_ylabel('density')
+    axL.legend(fontsize=8, loc='upper left'); axL.grid(alpha=.3)
+
+    vmax = float(np.nanmax(np.abs(V))) or 1.0
+    axR.contourf(zg_np, tg_np, V, levels=25, cmap='RdBu_r', vmin=-vmax, vmax=vmax)
+    axR.contour(zg_np, tg_np, V, levels=11, colors='k', linewidths=.4, alpha=.35)
+    sm = cm.ScalarMappable(norm=Normalize(-vmax, vmax), cmap='RdBu_r')
+    fig.colorbar(sm, ax=axR, label='velocity  v(z, t | c)')
+    tr_idx = np.linspace(0, n_particles - 1, min(int(n_traj), n_particles)).astype(int)
+    traj = np.stack([Z[k][tr_idx] for k in range(len(Z))])        # (n_t, n_traj)
+    tr_lines = [axR.plot([], [], color='0.15', lw=.9, alpha=.75)[0]
+                for _ in range(len(tr_idx))]
+    (pts,) = axR.plot([], [], 'o', color='C3', ms=3.5)
+    hline = axR.axhline(0.0, color='C3', lw=1.4, ls='--')
+    axR.set_xlim(*z_range); axR.set_ylim(0, 1)
+    axR.set_xlabel(z_label); axR.set_ylabel('flow time  t')
+    axR.set_title('velocity field and trajectories', fontsize=10)
+
+    def _update(k):
+        line_d.set_data(Z[k], P[k])
+        fill_d[0].remove()
+        fill_d[0] = axL.fill_between(Z[k], 0, P[k], color='C3', alpha=.15, lw=0)
+        axL.set_title(f't = {k * dt:.3f}', fontsize=10)
+        for j, ln in enumerate(tr_lines):
+            ln.set_data(traj[:k + 1, j], tg_np[:k + 1])
+        pts.set_data(Z[k][tr_idx], np.full(len(tr_idx), tg_np[k]))
+        hline.set_ydata([tg_np[k], tg_np[k]])
+        return [line_d, fill_d[0], pts, hline, *tr_lines]
+
+    if title:
+        fig.suptitle(title, y=1.0)
+    plt.tight_layout()
+    anim = animation.FuncAnimation(fig, _update, frames=frames,
+                                   interval=1000 / max(fps, 1), blit=False)
+    if save_path:
+        anim.save(save_path, writer='pillow', fps=fps, dpi=95)
+        if verbose:
+            print(f'GIF -> {save_path}  ({len(frames)} frames)')
+    plt.close(fig)
+    return anim
