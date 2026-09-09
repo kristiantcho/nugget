@@ -5,13 +5,13 @@ import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_hit_v3_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_hit_model_v3.pt'
+TEST_PARQUET = './flow_models/mc_hit_v4_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_hit_model_v4.pt'
 
-EPOCHS = 300
+EPOCHS = 500
 
 hit = nugget.surrogates.HitClassifier.HitClassifier(
-    device="cuda:1",
+    device="cuda:3",
     domain_size=10000,
     dim=3,
 
@@ -54,7 +54,7 @@ train_dataloader = hit.create_hit_parquet_dataloader(
     importance_weight=True,
     n_energy_bins=20,
     n_coszen_bins=20,
-    n_mult_bins=12,
+    n_mult_bins=25,
     filter_vertex_in_domain=True,
     test_save_path=TEST_PARQUET,
     test_frac=0.1,
@@ -72,7 +72,7 @@ val_dataloader = hit.create_hit_parquet_val_dataloader(
     importance_weight=True,
     n_energy_bins=20,
     n_coszen_bins=20,
-    n_mult_bins=15,
+    n_mult_bins=25,
     filter_vertex_in_domain=True,
 )
 
@@ -81,12 +81,12 @@ history = hit.train_with_dataloader(
     val_dataloader=val_dataloader,
     epochs=EPOCHS,
     # grad_clip=1.0,
-    early_stopping_patience=50,
+    early_stopping_patience=80,
     save_every_n_epochs=10,
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_hit_v3_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_hit_v4_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------
