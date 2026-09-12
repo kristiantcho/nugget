@@ -5,14 +5,14 @@ import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_atime_muon_flow_v5_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v5.pt'
+TEST_PARQUET = './flow_models/mc_atime_muon_flow_v1r_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v1r.pt'
 
 EPOCHS = 700
 
 flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
-    device="cuda:3",
-    domain_size=10000,
+    device="cuda:0",
+    domain_size=20000,
     dim=3,
 
     # --- velocity network ---
@@ -43,12 +43,12 @@ flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
 
     # --- context features (identical to the light-yield model) ---
     rich_rel_pos_mode=True,
-    include_vertex_position=True,
+    include_vertex_position=False,
     add_vertex_distance=False,
     add_distance_from_beam=True,
     add_dist_long=True,
     add_pmt_direction=True,
-    add_pmt_cosangle=False,
+    add_pmt_cosangle=True,
     standardize_context=True,
     ly_eps=1e-6,
 )
@@ -96,7 +96,7 @@ history = flow.train_with_dataloader(
 )
 
 pickle.dump(history,
-            open('./flow_models/mc_atime_muon_flow_v5_training_history.pkl', 'wb'))
+            open('./flow_models/mc_atime_muon_flow_v1r_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------

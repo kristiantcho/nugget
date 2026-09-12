@@ -4,14 +4,14 @@ import torch
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_ly_muon_flow_v2_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_ly_muon_flow_model_v2.pt'
+TEST_PARQUET = './flow_models/mc_ly_muon_flow_v1r_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_ly_muon_flow_model_v1r.pt'
 
 EPOCHS = 500
 
 flow = nugget.surrogates.FlowMatchLY.FlowMatchLY(
     device="cuda:1",
-    domain_size=10000,
+    domain_size=20000,
     dim=3,
 
     # --- velocity network ---
@@ -33,13 +33,13 @@ flow = nugget.surrogates.FlowMatchLY.FlowMatchLY(
 
     # --- context features (same conventions as LLRnet) ---
     rich_rel_pos_mode=True,
-    include_vertex_position=True,
+    include_vertex_position=False,
     add_vertex_distance=False,
     add_distance_from_beam=True,
     add_dist_long=True,
     track_dir_is_arrival=True,
     add_pmt_direction=True,
-    add_pmt_cosangle=False,
+    add_pmt_cosangle=True,
     standardize_context=True,
     ly_eps=1e-6,
 )
@@ -82,7 +82,7 @@ history = flow.train_with_dataloader(
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_ly_muon_flow_v2_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_ly_muon_flow_v1r_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------

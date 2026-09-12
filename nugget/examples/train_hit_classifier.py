@@ -5,14 +5,14 @@ import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_hit_v4_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_hit_model_v4.pt'
+TEST_PARQUET = './flow_models/mc_hit_v1r_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_hit_model_v1r.pt'
 
 EPOCHS = 500
 
 hit = nugget.surrogates.HitClassifier.HitClassifier(
     device="cuda:3",
-    domain_size=10000,
+    domain_size=20000,
     dim=3,
 
     # --- network ---
@@ -30,13 +30,13 @@ hit = nugget.surrogates.HitClassifier.HitClassifier(
 
     # --- context features: identical to the light-yield / arrival-time flows ---
     rich_rel_pos_mode=True,
-    include_vertex_position=True,
+    include_vertex_position=False,
     add_vertex_distance=False,
     add_distance_from_beam=True,
     add_dist_long=True,
     track_dir_is_arrival=True,
     add_pmt_direction=True,
-    add_pmt_cosangle=False,
+    add_pmt_cosangle=True,
     standardize_context=True,
     ly_eps=1e-6,
 )
@@ -86,7 +86,7 @@ history = hit.train_with_dataloader(
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_hit_v4_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_hit_v1r_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------

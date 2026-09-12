@@ -344,7 +344,8 @@ class FlowMatchLY(Surrogate):
                  add_vertex_distance=False, add_distance_from_beam=False,
                  add_dist_long=False, track_dir_is_arrival=False,
                  add_pmt_direction=True, add_pmt_cosangle=False,
-                 standardize_context=True, ly_eps=1e-6, **kwargs):
+                 standardize_context=True, ly_eps=1e-6, pure_relative=False,
+                 **kwargs):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
 
         self.width, self.depth = width, depth
@@ -367,6 +368,7 @@ class FlowMatchLY(Surrogate):
         self.add_pmt_direction = add_pmt_direction
         self.add_pmt_cosangle = add_pmt_cosangle
         self.ly_eps = ly_eps
+        self.pure_relative = pure_relative
 
         self.standardize_context = standardize_context
         self.context_mean = None
@@ -451,14 +453,17 @@ class FlowMatchLY(Surrogate):
         cos_angle = (direction * rel).sum(1) / (dir_norm * vert_dist + 1e-8)
 
         cols = []
+       
         if self.rich_rel_pos_mode:
             cols += [rel, direction, log_e.unsqueeze(1)]
             if self.include_vertex_position:
                 cols.append(vert)
         else:
             cols += [det, vert, direction, log_e.unsqueeze(1)]
+
         if self.add_vertex_distance:
             cols.append(vert_dist.unsqueeze(1))
+      
         cols.append(cos_angle.unsqueeze(1))
         if self.add_distance_from_beam or self.add_dist_long:
             track_dir = -direction if self.track_dir_is_arrival else direction
@@ -473,11 +478,12 @@ class FlowMatchLY(Surrogate):
             if pmt_directions is None:
                 raise ValueError("pmt_directions required when add_pmt_direction=True")
             pdv = pmt_directions.reshape(-1, 3).to(pts.dtype)
-            cols.append(pdv)
             if self.add_pmt_cosangle:
                 pn = torch.linalg.norm(pdv, dim=1)
                 cols.append(((direction * pdv).sum(1)
                              / (dir_norm * pn + 1e-8)).unsqueeze(1))
+            else:
+                cols.append(pdv)
         return torch.cat(cols, dim=1)
 
     def _apply_context_norm(self, c):
@@ -781,6 +787,7 @@ class FlowMatchLY(Surrogate):
             'add_pmt_direction': self.add_pmt_direction,
             'add_pmt_cosangle': self.add_pmt_cosangle,
             'standardize_context': self.standardize_context,
+            'pure_relative': self.pure_relative,
             'context_mean': None if self.context_mean is None else self.context_mean.cpu(),
             'context_std': None if self.context_std is None else self.context_std.cpu(),
             'target_mu': self.target_mu, 'target_sigma': self.target_sigma,
@@ -794,9 +801,12 @@ class FlowMatchLY(Surrogate):
                   'include_vertex_position', 'add_vertex_distance',
                   'add_distance_from_beam', 'add_dist_long', 'track_dir_is_arrival',
                   'add_pmt_direction', 'add_pmt_cosangle', 'standardize_context',
-                  'target_mu', 'target_sigma', 'train_losses', 'val_losses']:
+                  'pure_relative', 'target_mu', 'target_sigma', 'train_losses', 'val_losses']:
             if k in ck:
                 setattr(self, k, ck[k])
+            else:
+                print(f"Warning: {k} not found in checkpoint; using default value")
+                setattr(self, k, getattr(self, k))
         self.build_network()
         self.net.load_state_dict(ck['net_state_dict'])
         cm, cs = ck.get('context_mean'), ck.get('context_std')

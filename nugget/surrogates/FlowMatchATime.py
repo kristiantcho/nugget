@@ -595,6 +595,9 @@ class FlowMatchATime(FlowMatchLY):
         for k in ('refractive_index', 'time_scale', 'time_transform'):
             if k in ck:
                 setattr(self, k, ck[k])
+            else:
+                print(f"load_model: {k} not found in checkpoint; using default")
+                setattr(self, k, getattr(self, k))
         return super().load_model(filepath)
 
     # ---------------- dataloaders ----------------
