@@ -410,7 +410,10 @@ class FlowMatchLY(Surrogate):
         d += 1                                          # cos_angle
         d += int(self.add_distance_from_beam) + int(self.add_dist_long)
         if self.add_pmt_direction:
-            d += 3 + int(self.add_pmt_cosangle)
+            # add_pmt_cosangle REPLACES the raw direction vector with the single
+            # cos(track . pmt normal); it does not add to it. Must mirror the
+            # if/else in build_context or the network is built for the wrong width.
+            d += 1 if self.add_pmt_cosangle else 3
         return d
 
     def _norm_divisor(self):
