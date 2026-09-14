@@ -10333,7 +10333,8 @@ def plot_model_nll_landscape(
         n_steps=32, batch_size=262144, d_max=None, max_photons=None,
         use_mollweide=False, plot_opposite_direction_true_params=False,
         figsize=(7, 5), contour_levels=(0, 1, 4, 9), cmap='viridis',
-        nll_cbar_max=None, progress_every=None, verbose=True, seed=0):
+        nll_cbar_max=None, fill_scale='auto',
+        progress_every=None, verbose=True, seed=0):
     """NLL landscape for ONE of the three surrogates, scanned over event parameters.
 
     Unlike ``plot_nll_landscape`` this does not sample detector points: the caller
@@ -10533,52 +10534,103 @@ def plot_model_nll_landscape(
         ax.axvline(best[names[0]], color='C2', ls=':', label='minimum')
         if names[0] == 'energy':
             ax.set_xscale('log')
+        for lv in contour_levels:
+            if lv > 0:
+                ax.axhline(lv, color='gray', ls=':', alpha=.5, lw=1)
         ax.set_xlabel(names[0]); ax.set_ylabel('NLL - min NLL')
         ax.set_title(f'{title}: 1-D scan over {names[0]}')
         ax.legend(fontsize=8); ax.grid(alpha=.3)
-    elif use_mollweide and set(names) == {'zenith', 'azimuth'}:
-        iz, ia = names.index('zenith'), names.index('azimuth')
-        Z = NLL if iz == 0 else NLL.T
-        lat = np.pi / 2 - axes[iz]
-        lon = axes[ia] - np.pi
-        fig = plt.figure(figsize=figsize)
-        ax = fig.add_subplot(111, projection='mollweide')
-        m = ax.pcolormesh(lon, lat, Z, cmap=cmap, shading='auto',
-                          vmax=nll_cbar_max)
-        ax.contour(*np.meshgrid(lon, lat), Z, levels=list(contour_levels),
-                   colors='w', linewidths=.8)
-        ax.scatter([float(tv['azimuth']) - np.pi], [np.pi / 2 - float(tv['zenith'])],
-                   marker='*', s=170, c='red', ec='k', zorder=5, label='true')
-        if plot_opposite_direction_true_params:
-            ax.scatter([(float(tv['azimuth'])) % (2 * np.pi) - np.pi],
-                       [np.pi / 2 - (np.pi - float(tv['zenith']))],
-                       marker='x', s=90, c='orange', zorder=5, label='mirrored')
-        ax.scatter([best['azimuth'] - np.pi], [np.pi / 2 - best['zenith']],
-                   marker='o', s=60, facecolors='none', edgecolors='lime',
-                   zorder=5, label='minimum')
-        fig.colorbar(m, ax=ax, label='NLL - min NLL')
-        ax.set_title(f'{title}: zenith x azimuth', pad=18)
-        ax.legend(fontsize=8, loc='lower right')
-        ax.grid(alpha=.3)
     else:
-        fig, ax = plt.subplots(figsize=figsize)
-        m = ax.pcolormesh(axes[1], axes[0], NLL, cmap=cmap, shading='auto',
-                          vmax=nll_cbar_max)
-        ax.contour(axes[1], axes[0], NLL, levels=list(contour_levels),
-                   colors='w', linewidths=.8)
-        if tv.get(names[0]) is not None and tv.get(names[1]) is not None:
-            ax.scatter([float(tv[names[1]])], [float(tv[names[0]])], marker='*',
-                       s=170, c='red', ec='k', zorder=5, label='true')
-        ax.scatter([best[names[1]]], [best[names[0]]], marker='o', s=60,
-                   facecolors='none', edgecolors='lime', zorder=5, label='minimum')
-        if names[0] == 'energy':
-            ax.set_yscale('log')
-        if names[1] == 'energy':
-            ax.set_xscale('log')
-        fig.colorbar(m, ax=ax, label='NLL - min NLL')
-        ax.set_xlabel(names[1]); ax.set_ylabel(names[0])
-        ax.set_title(f'{title}: {names[0]} x {names[1]}')
-        ax.legend(fontsize=8)
+        # filled contours + labelled white level lines, matching plot_nll_landscape.
+        # These landscapes routinely span 0 -> 1e4+ nats with the well occupying <1%
+        # of the grid, so a linear fill saturates to one colour; 'auto' switches to
+        # log-spaced levels once the range makes that a problem.
+        hi_fill = (float(nll_cbar_max) if nll_cbar_max is not None
+                   else float(np.nanmax(NLL)))
+        scale = fill_scale
+        if scale == 'auto':
+            scale = 'log' if hi_fill > 100.0 else 'linear'
+        cbar_ticks = None
+        if scale == 'log':
+            pos = NLL[NLL > 0]
+            lo_fill = min(float(np.nanmin(pos)) if pos.size else 0.1, 1.0)
+            lo_fill = max(lo_fill, 1e-2)
+            hi_fill = max(hi_fill, lo_fill * 10.0)
+            fill_kw = dict(levels=np.logspace(np.log10(lo_fill), np.log10(hi_fill), 21),
+                           extend='both')
+            cbar_ticks = 10.0 ** np.arange(np.ceil(np.log10(lo_fill)),
+                                           np.floor(np.log10(hi_fill)) + 1)
+        else:
+            fill_kw = dict(levels=np.linspace(0.0, hi_fill, 21), vmin=0.0,
+                           vmax=hi_fill,
+                           extend='max' if nll_cbar_max is not None else 'neither')
+        lines = [lv for lv in contour_levels if np.nanmin(NLL) < lv < np.nanmax(NLL)]
+
+        if use_mollweide and set(names) == {'zenith', 'azimuth'}:
+            iz, ia = names.index('zenith'), names.index('azimuth')
+            Z = NLL if iz == 0 else NLL.T
+            lat = np.pi / 2 - axes[iz]
+            lon = axes[ia] - np.pi
+            fig = plt.figure(figsize=figsize)
+            ax = fig.add_subplot(111, projection='mollweide')
+            cf = ax.contourf(lon, lat, Z, cmap=cmap, alpha=.7, **fill_kw)
+            if lines:
+                cs = ax.contour(lon, lat, Z, levels=lines, colors='white',
+                                linewidths=2, alpha=.8)
+                try:
+                    ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
+                except (IndexError, ValueError):
+                    pass                    # too sparse to label in this projection
+            ax.scatter([float(tv['azimuth']) - np.pi],
+                       [np.pi / 2 - float(tv['zenith'])],
+                       marker='*', s=170, c='red', ec='k', zorder=5, label='true')
+            if plot_opposite_direction_true_params:
+                ax.scatter([(float(tv['azimuth']) + np.pi) % (2 * np.pi) - np.pi],
+                           [np.pi / 2 - (np.pi - float(tv['zenith']))],
+                           marker='x', s=90, c='orange', zorder=5, label='mirrored')
+            ax.scatter([best['azimuth'] - np.pi], [np.pi / 2 - best['zenith']],
+                       marker='o', s=60, facecolors='none', edgecolors='lime',
+                       zorder=5, label='minimum')
+            cbar = fig.colorbar(cf, ax=ax, orientation='horizontal', pad=0.07,
+                                fraction=0.046)
+            if cbar_ticks is not None and len(cbar_ticks):
+                cbar.set_ticks(list(cbar_ticks))
+                cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
+            cbar.set_label('NLL - min NLL' + (' (log fill)' if scale == 'log' else ''),
+                           fontsize=11)
+            ax.set_title(f'{title}: zenith x azimuth', pad=18)
+            ax.legend(fontsize=8, loc='lower right')
+            ax.grid(True, alpha=.3)
+        else:
+            fig, ax = plt.subplots(figsize=figsize)
+            cf = ax.contourf(axes[1], axes[0], NLL, cmap=cmap, alpha=.7, **fill_kw)
+            if lines:
+                cs = ax.contour(axes[1], axes[0], NLL, levels=lines,
+                                colors='white', linewidths=2, alpha=.8)
+                try:
+                    ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
+                except (IndexError, ValueError):
+                    pass
+            if tv.get(names[0]) is not None and tv.get(names[1]) is not None:
+                ax.scatter([float(tv[names[1]])], [float(tv[names[0]])], marker='*',
+                           s=170, c='red', ec='k', zorder=5, label='true')
+            ax.scatter([best[names[1]]], [best[names[0]]], marker='o', s=60,
+                       facecolors='none', edgecolors='lime', zorder=5,
+                       label='minimum')
+            if names[0] == 'energy':
+                ax.set_yscale('log')
+            if names[1] == 'energy':
+                ax.set_xscale('log')
+            cbar = fig.colorbar(cf, ax=ax)
+            if cbar_ticks is not None and len(cbar_ticks):
+                cbar.set_ticks(list(cbar_ticks))
+                cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
+            cbar.set_label('NLL - min NLL' + (' (log fill)' if scale == 'log' else ''),
+                           fontsize=11)
+            ax.set_xlabel(names[1]); ax.set_ylabel(names[0])
+            ax.set_title(f'{title}: {names[0]} x {names[1]}')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=.3)
     plt.tight_layout(); plt.show()
 
     if verbose:
