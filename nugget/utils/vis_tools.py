@@ -10317,3 +10317,274 @@ def animate_flow_transport(model, context, z_range=(-4.5, 4.5), n_z=321,
             print(f'GIF -> {save_path}  ({len(frames)} frames)')
     plt.close(fig)
     return anim
+
+
+def _nll_axis_values(name, rng, n, true_val):
+    """Grid for one scanned parameter; energy is scanned logarithmically."""
+    if name == 'energy':
+        return np.logspace(np.log10(rng[0]), np.log10(rng[1]), n)
+    return np.linspace(rng[0], rng[1], n)
+
+
+def plot_model_nll_landscape(
+        model, kind, true_event, points, pmt_directions,
+        hit_mask=None, counts=None, photon_times=None, photon_point_index=None,
+        param_names=('zenith', 'azimuth'), param_ranges=None, n_points=25,
+        n_steps=32, batch_size=262144, d_max=None, max_photons=None,
+        use_mollweide=False, plot_opposite_direction_true_params=False,
+        figsize=(7, 5), contour_levels=(0, 1, 4, 9), cmap='viridis',
+        nll_cbar_max=None, progress_every=None, verbose=True, seed=0):
+    """NLL landscape for ONE of the three surrogates, scanned over event parameters.
+
+    Unlike ``plot_nll_landscape`` this does not sample detector points: the caller
+    supplies the exact set of PMTs the likelihood runs over, which is what the hit
+    term needs (every PMT in the geometry contributes, the unhit ones through
+    ``log(1 - pi)``).
+
+    Parameters
+    ----------
+    kind : {'hit', 'ly', 'atime'}
+        'hit'   -> sum_j [ y_j log pi_j + (1 - y_j) log(1 - pi_j) ] over ALL of
+                   ``points``; needs ``hit_mask``. The unhit PMTs are what make the
+                   landscape close: a wrong hypothesis lights up PMTs that stayed
+                   dark, and every one of those costs log(1 - pi).
+        'ly'    -> sum_j log p_LY(q_j | theta, x_j) over the hit PMTs; needs ``counts``.
+        'atime' -> sum over photons of log p_T(t | theta, x_j); needs
+                   ``photon_times`` and ``photon_point_index``.
+    points, pmt_directions : (N, 3)
+        For 'hit' pass the whole geometry. For 'ly'/'atime' pass only the hit PMTs.
+    d_max : float or None
+        'hit' only. Skip unhit PMTs further than this from the HYPOTHESIS track and
+        treat their log(1 - pi) as 0. Hit PMTs are always evaluated exactly, at any
+        distance -- they are what penalises a wrong hypothesis. None evaluates
+        everything (exact, but ~10x slower). The neglected term is measured at the
+        true event and printed.
+    param_names : 1 or 2 names from {'energy','zenith','azimuth','x','y','z'}
+
+    Returns
+    -------
+    dict with 'axes', 'nll', 'true', 'best', and the raw log-likelihoods.
+    """
+    dev, dt = model.device, model.param_dtype
+    P = torch.as_tensor(np.asarray(points), device=dev, dtype=dt).reshape(-1, 3)
+    D = torch.as_tensor(np.asarray(pmt_directions), device=dev, dtype=dt).reshape(-1, 3)
+    N = P.shape[0]
+    kind = str(kind).lower()
+    if kind not in ('hit', 'ly', 'atime'):
+        raise ValueError("kind must be 'hit', 'ly' or 'atime'")
+
+    # ---- observed data, as device tensors -----------------------------------
+    y = ph_idx = t_obs = cnt = None
+    if kind == 'hit':
+        if hit_mask is None:
+            raise ValueError("kind='hit' needs hit_mask over `points`")
+        y = torch.as_tensor(np.asarray(hit_mask).reshape(-1).astype(np.float64),
+                            device=dev, dtype=dt)
+        if y.shape[0] != N:
+            raise ValueError(f"hit_mask has {y.shape[0]} entries for {N} points")
+    elif kind == 'ly':
+        if counts is None:
+            raise ValueError("kind='ly' needs counts over `points`")
+        cnt = torch.as_tensor(np.asarray(counts).reshape(-1), device=dev, dtype=dt)
+    else:
+        if photon_times is None or photon_point_index is None:
+            raise ValueError("kind='atime' needs photon_times and photon_point_index")
+        t_np = np.asarray(photon_times).reshape(-1)
+        i_np = np.asarray(photon_point_index).reshape(-1).astype(np.int64)
+        if max_photons is not None and len(t_np) > int(max_photons):
+            k = np.random.default_rng(seed).choice(len(t_np), int(max_photons),
+                                                   replace=False)
+            t_np, i_np = t_np[k], i_np[k]
+        t_obs = torch.as_tensor(t_np, device=dev, dtype=dt)
+        ph_idx = torch.as_tensor(i_np, device=dev)
+
+    # ---- the hypothesis -> event-parameter mapping --------------------------
+    tv = dict(true_event)
+    pos0 = np.asarray(tv['position'], dtype=np.float64).reshape(3)
+
+    def _event(vals):
+        e = dict(energy=float(tv['energy']), zenith=float(tv['zenith']),
+                 azimuth=float(tv['azimuth']), position=pos0.copy())
+        for nm, v in vals.items():
+            if nm in ('x', 'y', 'z'):
+                e['position']['xyz'.index(nm)] = float(v)
+            else:
+                e[nm] = float(v)
+        return e
+
+    def _loglik(e, report_far=False):
+        vert = torch.as_tensor(e['position'], device=dev, dtype=dt).reshape(1, 3)
+        en = torch.tensor(e['energy'], device=dev, dtype=dt).reshape(1)
+        zn = torch.tensor(e['zenith'], device=dev, dtype=dt).reshape(1)
+        az = torch.tensor(e['azimuth'], device=dev, dtype=dt).reshape(1)
+
+        sel = torch.arange(N, device=dev)
+        if kind == 'hit' and d_max is not None:
+            # travel direction, mirroring build_context's own convention
+            st, ct = math.sin(e['zenith']), math.cos(e['zenith'])
+            u = np.array([st * math.cos(e['azimuth']), st * math.sin(e['azimuth']), ct])
+            if getattr(model, 'track_dir_is_arrival', False):
+                u = -u
+            ut = torch.as_tensor(u, device=dev, dtype=dt).reshape(1, 3)
+            rel = P - vert
+            dl = (rel * ut).sum(1)
+            dp = torch.linalg.norm(rel - dl.unsqueeze(1) * ut, dim=1)
+            near = dp < float(d_max)
+            sel = torch.nonzero(near | (y > 0.5), as_tuple=True)[0]
+
+        tot = 0.0
+        far = 0.0
+        for s in range(0, sel.shape[0], batch_size):
+            g = sel[s:s + batch_size]
+            n = g.shape[0]
+            c = model.build_context(P[g], vert.expand(n, 3), en.expand(n),
+                                    zn.expand(n), az.expand(n),
+                                    pmt_directions=D[g])
+            if kind == 'hit':
+                lp1, lp0 = model.log_prob_hit(c, calibrated=True)
+                yy = y[g]
+                tot += float((yy * lp1 + (1.0 - yy) * lp0).sum().item())
+            elif kind == 'ly':
+                tot += float(model.log_prob_light_yield(cnt[g], c,
+                                                        n_steps=n_steps).sum().item())
+        if kind == 'atime':
+            # one context per PHOTON, from its parent PMT
+            for s in range(0, ph_idx.shape[0], batch_size):
+                g = ph_idx[s:s + batch_size]
+                n = g.shape[0]
+                c = model.build_context(P[g], vert.expand(n, 3), en.expand(n),
+                                        zn.expand(n), az.expand(n),
+                                        pmt_directions=D[g])
+                tot += float(model.log_prob_arrival_time(
+                    t_obs[s:s + batch_size], c, P[g], vert.expand(n, 3),
+                    zeniths=zn.expand(n), azimuths=az.expand(n),
+                    n_steps=n_steps).sum().item())
+        if report_far and kind == 'hit' and d_max is not None:
+            rest = torch.nonzero(~(near | (y > 0.5)), as_tuple=True)[0]
+            for s in range(0, rest.shape[0], batch_size):
+                g = rest[s:s + batch_size]
+                n = g.shape[0]
+                c = model.build_context(P[g], vert.expand(n, 3), en.expand(n),
+                                        zn.expand(n), az.expand(n),
+                                        pmt_directions=D[g])
+                _, lp0 = model.log_prob_hit(c, calibrated=True)
+                far += float(lp0.sum().item())
+        return tot, far
+
+    # ---- scan ---------------------------------------------------------------
+    names = list(param_names)
+    if not 1 <= len(names) <= 2:
+        raise ValueError("param_names must hold 1 or 2 entries")
+    pr = dict(param_ranges or {})
+    defaults = {'energy': (1e2, 1e6), 'zenith': (0.0, math.pi),
+                'azimuth': (0.0, 2 * math.pi)}
+    axes = []
+    for nm in names:
+        if nm not in pr:
+            if nm in defaults:
+                pr[nm] = defaults[nm]
+            else:
+                c0 = pos0['xyz'.index(nm)] if nm in 'xyz' else 0.0
+                pr[nm] = (c0 - 500.0, c0 + 500.0)
+        axes.append(_nll_axis_values(nm, pr[nm], int(n_points), tv.get(nm)))
+
+    with torch.no_grad():
+        ll_true, far_true = _loglik(_event({}), report_far=True)
+        if verbose:
+            extra = (f'   neglected far-PMT log(1-pi) = {far_true:+.3f} nats'
+                     if (kind == 'hit' and d_max is not None) else '')
+            print(f'kind={kind}  points={N:,}  logL(true) = {ll_true:.3f}{extra}')
+            if kind == 'hit':
+                nh = int(np.asarray(hit_mask).sum())
+                print(f'  {nh:,} hit / {N - nh:,} unhit PMTs contribute')
+
+        if len(names) == 1:
+            LL = np.empty(len(axes[0]))
+            for i, v in enumerate(axes[0]):
+                LL[i], _ = _loglik(_event({names[0]: v}))
+                if progress_every and (i + 1) % progress_every == 0:
+                    print(f'  {i + 1}/{len(axes[0])}', end='\r')
+        else:
+            LL = np.empty((len(axes[0]), len(axes[1])))
+            tot_pts = LL.size
+            done = 0
+            for i, a in enumerate(axes[0]):
+                for j, b in enumerate(axes[1]):
+                    LL[i, j], _ = _loglik(_event({names[0]: a, names[1]: b}))
+                    done += 1
+                    if progress_every and done % progress_every == 0:
+                        print(f'  {done}/{tot_pts}', end='\r')
+
+    NLL = -LL
+    NLL = NLL - np.nanmin(NLL)
+    flat = int(np.nanargmin(NLL))
+    best = ({names[0]: axes[0][flat]} if len(names) == 1 else
+            {names[0]: axes[0][flat // len(axes[1])],
+             names[1]: axes[1][flat % len(axes[1])]})
+
+    # ---- plot ---------------------------------------------------------------
+    title = {'hit': 'hit probability', 'ly': 'light yield',
+             'atime': 'arrival time'}[kind]
+    if len(names) == 1:
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.plot(axes[0], NLL, 'o-', lw=1.8, ms=4)
+        if tv.get(names[0]) is not None:
+            ax.axvline(float(tv[names[0]]), color='C3', ls='--', label='true')
+        ax.axvline(best[names[0]], color='C2', ls=':', label='minimum')
+        if names[0] == 'energy':
+            ax.set_xscale('log')
+        ax.set_xlabel(names[0]); ax.set_ylabel('NLL - min NLL')
+        ax.set_title(f'{title}: 1-D scan over {names[0]}')
+        ax.legend(fontsize=8); ax.grid(alpha=.3)
+    elif use_mollweide and set(names) == {'zenith', 'azimuth'}:
+        iz, ia = names.index('zenith'), names.index('azimuth')
+        Z = NLL if iz == 0 else NLL.T
+        lat = np.pi / 2 - axes[iz]
+        lon = axes[ia] - np.pi
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111, projection='mollweide')
+        m = ax.pcolormesh(lon, lat, Z, cmap=cmap, shading='auto',
+                          vmax=nll_cbar_max)
+        ax.contour(*np.meshgrid(lon, lat), Z, levels=list(contour_levels),
+                   colors='w', linewidths=.8)
+        ax.scatter([float(tv['azimuth']) - np.pi], [np.pi / 2 - float(tv['zenith'])],
+                   marker='*', s=170, c='red', ec='k', zorder=5, label='true')
+        if plot_opposite_direction_true_params:
+            ax.scatter([(float(tv['azimuth'])) % (2 * np.pi) - np.pi],
+                       [np.pi / 2 - (np.pi - float(tv['zenith']))],
+                       marker='x', s=90, c='orange', zorder=5, label='mirrored')
+        ax.scatter([best['azimuth'] - np.pi], [np.pi / 2 - best['zenith']],
+                   marker='o', s=60, facecolors='none', edgecolors='lime',
+                   zorder=5, label='minimum')
+        fig.colorbar(m, ax=ax, label='NLL - min NLL')
+        ax.set_title(f'{title}: zenith x azimuth', pad=18)
+        ax.legend(fontsize=8, loc='lower right')
+        ax.grid(alpha=.3)
+    else:
+        fig, ax = plt.subplots(figsize=figsize)
+        m = ax.pcolormesh(axes[1], axes[0], NLL, cmap=cmap, shading='auto',
+                          vmax=nll_cbar_max)
+        ax.contour(axes[1], axes[0], NLL, levels=list(contour_levels),
+                   colors='w', linewidths=.8)
+        if tv.get(names[0]) is not None and tv.get(names[1]) is not None:
+            ax.scatter([float(tv[names[1]])], [float(tv[names[0]])], marker='*',
+                       s=170, c='red', ec='k', zorder=5, label='true')
+        ax.scatter([best[names[1]]], [best[names[0]]], marker='o', s=60,
+                   facecolors='none', edgecolors='lime', zorder=5, label='minimum')
+        if names[0] == 'energy':
+            ax.set_yscale('log')
+        if names[1] == 'energy':
+            ax.set_xscale('log')
+        fig.colorbar(m, ax=ax, label='NLL - min NLL')
+        ax.set_xlabel(names[1]); ax.set_ylabel(names[0])
+        ax.set_title(f'{title}: {names[0]} x {names[1]}')
+        ax.legend(fontsize=8)
+    plt.tight_layout(); plt.show()
+
+    if verbose:
+        for nm in names:
+            t = tv.get(nm)
+            print(f'  {nm}: true {float(t):.4g}' if t is not None else f'  {nm}:',
+                  f'  minimum {best[nm]:.4g}')
+    return {'axes': axes, 'param_names': names, 'nll': NLL, 'loglik': LL,
+            'true': tv, 'best': best, 'loglik_true': ll_true}
