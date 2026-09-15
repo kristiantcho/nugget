@@ -10333,7 +10333,7 @@ def plot_model_nll_landscape(
         n_steps=32, batch_size=262144, d_max=None, max_photons=None,
         use_mollweide=False, plot_opposite_direction_true_params=False,
         figsize=(7, 5), contour_levels=(0, 1, 4, 9), cmap='viridis',
-        nll_cbar_max=None, fill_scale='auto', veto='auto',
+        nll_cbar_max=None, fill_scale='auto',
         progress_every=None, verbose=True, seed=0):
     """NLL landscape for ONE of the three surrogates, scanned over event parameters.
 
@@ -10413,42 +10413,32 @@ def plot_model_nll_landscape(
                 e[nm] = float(v)
         return e
 
-    # ---- causality veto -----------------------------------------------------
-    # t_geom is the earliest DIRECT arrival time of Cherenkov light from a muon
-    # that is at the vertex at t = 0. t_geom < 0 means the hypothesis needs the
-    # photon to arrive before the muon existed, and s_emit < 0 means it needs the
-    # light emitted upstream of the vertex. Either way the likelihood is exactly
-    # zero, not merely small -- so the hypothesis is excluded rather than being
-    # given a finite penalty that the heavy asinh tail would make cheap.
-    if veto == 'auto':
-        veto = 't_geom' if kind in ('atime', 'ly') else None
-    if veto not in (None, 't_geom', 's_emit'):
-        raise ValueError("veto must be None, 't_geom' or 's_emit'")
-    n_ref = float(getattr(model, 'refractive_index', 1.33))
-    _cos_c = 1.0 / n_ref
-    _sin_c = math.sqrt(max(1.0 - _cos_c ** 2, 1e-12))
-    # which PMTs must be causally reachable: the ones that actually recorded light
-    if kind == 'hit':
-        veto_pts = np.asarray(points)[np.asarray(hit_mask).reshape(-1).astype(bool)] \
-            if hit_mask is not None else np.asarray(points)
-    else:
-        veto_pts = np.asarray(points)
-    veto_pts = np.asarray(veto_pts, dtype=np.float64).reshape(-1, 3)
-
-    def _causal(e):
-        """True if every lit PMT can be reached by direct light from this track."""
-        if veto is None or len(veto_pts) == 0:
-            return True
-        st, ct = math.sin(e['zenith']), math.cos(e['zenith'])
-        u = np.array([st * math.cos(e['azimuth']), st * math.sin(e['azimuth']), ct])
-        if getattr(model, 'track_dir_is_arrival', False):
-            u = -u
-        rel = veto_pts - np.asarray(e['position'], dtype=np.float64).reshape(1, 3)
-        dl = rel @ u
-        dp = np.sqrt(np.maximum((rel * rel).sum(1) - dl * dl, 0.0))
-        if veto == 's_emit':
-            return bool((dl - dp * (_cos_c / _sin_c) >= 0.0).all())
-        return bool(((dl + dp * (n_ref - _cos_c) / _sin_c) >= 0.0).all())
+    # ---- arrival-time residuals are FIXED at the true event ------------------
+    # t_res = t_hit - t_geom is computed ONCE, from the true parameters, and then
+    # held constant while the hypothesis varies. The hypothesis therefore enters
+    # only through the context c(theta, x) -- the same convention LLRnet uses via
+    # rel_time. Recomputing t_geom(theta) instead makes the scan measure the bulk
+    # time shift a rotation implies, which for a long lever arm swamps everything
+    # else: at d_long = 2 km the residuals move ~100 ns per degree, far narrower
+    # than any practical grid, so the landscape becomes unreadable. Freezing them
+    # asks the question that is actually wanted -- does the conditional density
+    # SHAPE prefer the true parameters?
+    t_res_fixed = None
+    if kind == 'atime':
+        with torch.no_grad():
+            vt_ = torch.as_tensor(pos0, device=dev, dtype=dt).reshape(1, 3)
+            zt_ = torch.tensor(float(tv['zenith']), device=dev, dtype=dt).reshape(1)
+            at_ = torch.tensor(float(tv['azimuth']), device=dev, dtype=dt).reshape(1)
+            m_ = ph_idx.shape[0]
+            t_res_fixed = model.time_residual(
+                t_obs, P[ph_idx], vt_.expand(m_, 3),
+                zeniths=zt_.expand(m_), azimuths=at_.expand(m_)).detach()
+        if verbose:
+            tnp = t_res_fixed.cpu().numpy()
+            q = np.percentile(tnp, [1, 16, 50, 84, 99])
+            print(f'fixed t_res from the true event: p1/p16/p50/p84/p99 = '
+                  f'{q[0]:.1f} {q[1]:.1f} {q[2]:.1f} {q[3]:.1f} {q[4]:.1f} ns   '
+                  f'frac<0 = {np.mean(tnp < 0):.3f}')
 
     def _loglik(e, report_far=False):
         vert = torch.as_tensor(e['position'], device=dev, dtype=dt).reshape(1, 3)
@@ -10493,9 +10483,8 @@ def plot_model_nll_landscape(
                 c = model.build_context(P[g], vert.expand(n, 3), en.expand(n),
                                         zn.expand(n), az.expand(n),
                                         pmt_directions=D[g])
-                tot += float(model.log_prob_arrival_time(
-                    t_obs[s:s + batch_size], c, P[g], vert.expand(n, 3),
-                    zeniths=zn.expand(n), azimuths=az.expand(n),
+                tot += float(model.log_prob_time_residual(
+                    t_res_fixed[s:s + batch_size], c,
                     n_steps=n_steps).sum().item())
         if report_far and kind == 'hit' and d_max is not None:
             rest = torch.nonzero(~(near | (y > 0.5)), as_tuple=True)[0]
@@ -10527,9 +10516,6 @@ def plot_model_nll_landscape(
         axes.append(_nll_axis_values(nm, pr[nm], int(n_points), tv.get(nm)))
 
     with torch.no_grad():
-        if veto is not None and not _causal(_event({})):
-            print('WARNING: the true event violates the causality veto -- check the '
-                  'zenith/azimuth convention against the model\'s track_dir_is_arrival')
         ll_true, far_true = _loglik(_event({}), report_far=True)
         if verbose:
             extra = (f'   neglected far-PMT log(1-pi) = {far_true:+.3f} nats'
@@ -10539,15 +10525,10 @@ def plot_model_nll_landscape(
                 nh = int(np.asarray(hit_mask).sum())
                 print(f'  {nh:,} hit / {N - nh:,} unhit PMTs contribute')
 
-        n_vetoed = 0
         if len(names) == 1:
             LL = np.empty(len(axes[0]))
             for i, v in enumerate(axes[0]):
-                ev_i = _event({names[0]: v})
-                if not _causal(ev_i):
-                    LL[i] = np.nan; n_vetoed += 1
-                else:
-                    LL[i], _ = _loglik(ev_i)
+                LL[i], _ = _loglik(_event({names[0]: v}))
                 if progress_every and (i + 1) % progress_every == 0:
                     print(f'  {i + 1}/{len(axes[0])}', end='\r')
         else:
@@ -10556,20 +10537,26 @@ def plot_model_nll_landscape(
             done = 0
             for i, a in enumerate(axes[0]):
                 for j, b in enumerate(axes[1]):
-                    ev_ij = _event({names[0]: a, names[1]: b})
-                    if not _causal(ev_ij):
-                        LL[i, j] = np.nan; n_vetoed += 1
-                    else:
-                        LL[i, j], _ = _loglik(ev_ij)
+                    LL[i, j], _ = _loglik(_event({names[0]: a, names[1]: b}))
                     done += 1
                     if progress_every and done % progress_every == 0:
                         print(f'  {done}/{tot_pts}', end='\r')
-        if verbose and veto is not None:
-            print(f'  causality veto ({veto} >= 0 at every lit PMT): '
-                  f'{n_vetoed}/{LL.size} grid points excluded '
-                  f'({n_vetoed / LL.size:.1%})'
-                  + ('   WARNING: the TRUE event is itself vetoed'
-                     if not _causal(_event({})) else ''))
+
+    # ---- what the residuals actually look like, at the truth and at the minimum --
+    def _atime_report(e, label):
+        """Mean log-density of the FIXED residuals under this hypothesis' context."""
+        with torch.no_grad():
+            vert = torch.as_tensor(e['position'], device=dev, dtype=dt).reshape(1, 3)
+            zn = torch.tensor(e['zenith'], device=dev, dtype=dt).reshape(1)
+            az = torch.tensor(e['azimuth'], device=dev, dtype=dt).reshape(1)
+            en = torch.tensor(e['energy'], device=dev, dtype=dt).reshape(1)
+            m = min(ph_idx.shape[0], 20000)
+            g = ph_idx[:m]
+            c = model.build_context(P[g], vert.expand(m, 3), en.expand(m),
+                                    zn.expand(m), az.expand(m), pmt_directions=D[g])
+            lp = model.log_prob_time_residual(t_res_fixed[:m], c, n_steps=n_steps)
+        print(f'  {label:<22} mean log p per photon = {float(lp.mean()):8.4f}'
+              f'   total over {m:,} photons = {float(lp.sum()):12.1f}')
 
     NLL = -LL
     NLL = NLL - np.nanmin(NLL)
@@ -10577,6 +10564,11 @@ def plot_model_nll_landscape(
     best = ({names[0]: axes[0][flat]} if len(names) == 1 else
             {names[0]: axes[0][flat // len(axes[1])],
              names[1]: axes[1][flat % len(axes[1])]})
+
+    if verbose and kind == 'atime':
+        print('\nresiduals are held fixed; only the context varies:')
+        _atime_report(_event({}), 'TRUE event')
+        _atime_report(_event(best), 'located minimum')
 
     # ---- plot ---------------------------------------------------------------
     title = {'hit': 'hit probability', 'ly': 'light yield',
@@ -10620,9 +10612,6 @@ def plot_model_nll_landscape(
                            vmax=hi_fill,
                            extend='max' if nll_cbar_max is not None else 'neither')
         lines = [lv for lv in contour_levels if np.nanmin(NLL) < lv < np.nanmax(NLL)]
-        cmap_obj = plt.get_cmap(cmap).copy()
-        cmap_obj.set_bad('0.82')          # causally excluded hypotheses
-        cmap = cmap_obj
 
         if use_mollweide and set(names) == {'zenith', 'azimuth'}:
             iz, ia = names.index('zenith'), names.index('azimuth')
@@ -10631,7 +10620,6 @@ def plot_model_nll_landscape(
             lon = axes[ia] - np.pi
             fig = plt.figure(figsize=figsize)
             ax = fig.add_subplot(111, projection='mollweide')
-            ax.set_facecolor('0.85')      # causally excluded hypotheses (NaN)
             cf = ax.contourf(lon, lat, Z, cmap=cmap, alpha=.7, **fill_kw)
             if lines:
                 cs = ax.contour(lon, lat, Z, levels=lines, colors='white',
@@ -10662,7 +10650,6 @@ def plot_model_nll_landscape(
             ax.grid(True, alpha=.3)
         else:
             fig, ax = plt.subplots(figsize=figsize)
-            ax.set_facecolor('0.85')      # causally excluded hypotheses (NaN)
             cf = ax.contourf(axes[1], axes[0], NLL, cmap=cmap, alpha=.7, **fill_kw)
             if lines:
                 cs = ax.contour(axes[1], axes[0], NLL, levels=lines,
