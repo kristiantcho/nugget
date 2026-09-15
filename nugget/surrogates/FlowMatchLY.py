@@ -344,7 +344,7 @@ class FlowMatchLY(Surrogate):
                  add_vertex_distance=False, add_distance_from_beam=False,
                  add_dist_long=False, track_dir_is_arrival=False,
                  add_pmt_direction=True, add_pmt_cosangle=False,
-                 standardize_context=True, ly_eps=1e-6, pure_relative=False,
+                 standardize_context=True, ly_eps=1e-6,
                  **kwargs):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
 
@@ -368,7 +368,7 @@ class FlowMatchLY(Surrogate):
         self.add_pmt_direction = add_pmt_direction
         self.add_pmt_cosangle = add_pmt_cosangle
         self.ly_eps = ly_eps
-        self.pure_relative = pure_relative
+    
 
         self.standardize_context = standardize_context
         self.context_mean = None
@@ -790,7 +790,6 @@ class FlowMatchLY(Surrogate):
             'add_pmt_direction': self.add_pmt_direction,
             'add_pmt_cosangle': self.add_pmt_cosangle,
             'standardize_context': self.standardize_context,
-            'pure_relative': self.pure_relative,
             'context_mean': None if self.context_mean is None else self.context_mean.cpu(),
             'context_std': None if self.context_std is None else self.context_std.cpu(),
             'target_mu': self.target_mu, 'target_sigma': self.target_sigma,
@@ -803,8 +802,8 @@ class FlowMatchLY(Surrogate):
                   'dim', 'sigma_min', 'ly_eps', 'rich_rel_pos_mode',
                   'include_vertex_position', 'add_vertex_distance',
                   'add_distance_from_beam', 'add_dist_long', 'track_dir_is_arrival',
-                  'add_pmt_direction', 'add_pmt_cosangle', 'standardize_context',
-                  'pure_relative', 'target_mu', 'target_sigma', 'train_losses', 'val_losses']:
+                  'add_pmt_direction', 'add_pmt_cosangle', 'standardize_context', 
+                  'target_mu', 'target_sigma', 'train_losses', 'val_losses']:
             if k in ck:
                 setattr(self, k, ck[k])
             else:
