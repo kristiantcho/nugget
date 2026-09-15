@@ -528,10 +528,12 @@ class FlowMatchATime(FlowMatchLY):
         t_geom = t_geom.reshape(-1).to(device=t_res.device, dtype=t_res.dtype)
         return t_geom + t_res
 
-    def log_prob_time_residual(self, t_res, context, n_steps=64):
+    def log_prob_time_residual(self, t_res, context, n_steps=64,
+                               differentiable=False):
         """log p(t_res | c). Equals log p(t_hit | c): the shift has unit Jacobian."""
         t_res = self._prep(t_res).reshape(-1)
-        return self.log_prob_z(self.to_z(t_res), context, n_steps=n_steps) \
+        return self.log_prob_z(self.to_z(t_res), context, n_steps=n_steps,
+                               differentiable=differentiable) \
             + self.log_det_dz_dq(t_res)
 
     def log_prob_arrival_time(self, t_hit, context, points, vertices, zeniths=None,

@@ -575,13 +575,35 @@ class FlowMatchLY(Surrogate):
             div = torch.autograd.grad(v.sum(), z, create_graph=create_graph)[0]
         return (v.detach(), div.detach()) if not create_graph else (v, div)
 
-    def log_prob_z(self, z1, context, n_steps=64):
-        """log p(z | c) by integrating the flow backwards with the divergence."""
+    def log_prob_z(self, z1, context, n_steps=64, differentiable=False):
+        """log p(z | c) by integrating the flow backwards with the divergence.
+
+        differentiable=False (the default) is the fast path: ``_v_and_div``
+        detaches, so the result has NO grad_fn and any derivative taken through it
+        w.r.t. the context is exactly zero -- fine for evaluation, useless for a
+        Fisher matrix. differentiable=True keeps the graph in both the context and
+        the transported z (the latter matters: z_{i+1} depends on c through every
+        earlier step, so detaching it would silently drop most of the derivative).
+        It holds n_steps forward + double-backward passes in memory, so batch
+        accordingly.
+        """
         c = self._apply_context_norm(self._prep(context))
         z = self._prep(z1).reshape(-1, 1)
         B = z.shape[0]
         div_acc = torch.zeros(B, 1, device=z.device, dtype=z.dtype)
         dt = 1.0 / n_steps
+        if differentiable:
+            with torch.enable_grad():
+                for i in reversed(range(n_steps)):
+                    tm = torch.full((B,), (i + 0.5) * dt, device=z.device,
+                                    dtype=z.dtype)
+                    zz = z if z.requires_grad else z.detach().requires_grad_(True)
+                    v = self._velocity(zz, tm, c)
+                    div = torch.autograd.grad(v.sum(), zz, create_graph=True)[0]
+                    z = zz - dt * v
+                    div_acc = div_acc + dt * div
+                log_p0 = -0.5 * (z ** 2) - 0.5 * math.log(2 * math.pi)
+                return (log_p0 - div_acc).reshape(-1)
         for i in reversed(range(n_steps)):
             tm = torch.full((B,), (i + 0.5) * dt, device=z.device, dtype=z.dtype)
             v, div = self._v_and_div(z, tm, c)
@@ -622,14 +644,15 @@ class FlowMatchLY(Surrogate):
         return torch.floor(q).clamp(min=1.0) if discrete else q
 
     def log_prob_light_yield(self, counts, context, n_steps=64, n_dequant=1,
-                             generator=None):
+                             generator=None, differentiable=False):
         """log p(q~ | c) averaged over dequantisation draws (ELBO on log P(q))."""
         counts = self._prep(counts).reshape(-1)
         out = []
         for _ in range(n_dequant):
             q_deq = self.dequantize(counts, generator=generator)
             z = self.to_z(q_deq)
-            out.append(self.log_prob_z(z, context, n_steps=n_steps)
+            out.append(self.log_prob_z(z, context, n_steps=n_steps,
+                                       differentiable=differentiable)
                        + self.log_det_dz_dq(q_deq))
         return torch.stack(out).mean(0)
 
