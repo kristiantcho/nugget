@@ -10573,20 +10573,28 @@ def plot_model_nll_landscape(
     # ---- plot ---------------------------------------------------------------
     title = {'hit': 'hit probability', 'ly': 'light yield',
              'atime': 'arrival time'}[kind]
+    if kind == 'atime':
+        n_obs_label = f'{ph_idx.shape[0]:,} photons'
+    elif kind == 'hit':
+        n_obs_label = f'{int(np.asarray(hit_mask).sum()):,} hit / {N:,} PMTs'
+    else:
+        n_obs_label = f'{N:,} PMTs'
     if len(names) == 1:
         fig, ax = plt.subplots(figsize=figsize)
         ax.plot(axes[0], NLL, 'o-', lw=1.8, ms=4)
         if tv.get(names[0]) is not None:
-            ax.axvline(float(tv[names[0]]), color='C3', ls='--', label='true')
-        ax.axvline(best[names[0]], color='C2', ls=':', label='minimum')
+            ax.axvline(float(tv[names[0]]), color='red', ls='--', lw=2,
+                       label='True value')
+        ax.axvline(best[names[0]], color='green', ls=':', lw=2, label='Minimum NLL')
         if names[0] == 'energy':
             ax.set_xscale('log')
         for lv in contour_levels:
             if lv > 0:
                 ax.axhline(lv, color='gray', ls=':', alpha=.5, lw=1)
-        ax.set_xlabel(names[0]); ax.set_ylabel('NLL - min NLL')
-        ax.set_title(f'{title}: 1-D scan over {names[0]}')
-        ax.legend(fontsize=8); ax.grid(alpha=.3)
+        ax.set_xlabel(f'{names[0].capitalize()}', fontsize=12)
+        ax.set_ylabel('Negative Log-Likelihood', fontsize=11)
+        ax.set_title(f'NLL Landscape ({title}, {n_obs_label})', fontsize=14)
+        ax.legend(); ax.grid(True, alpha=0.3)
     else:
         # filled contours + labelled white level lines, matching plot_nll_landscape.
         # These landscapes routinely span 0 -> 1e4+ nats with the well occupying <1%
@@ -10628,26 +10636,35 @@ def plot_model_nll_landscape(
                     ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
                 except (IndexError, ValueError):
                     pass                    # too sparse to label in this projection
-            ax.scatter([float(tv['azimuth']) - np.pi],
-                       [np.pi / 2 - float(tv['zenith'])],
-                       marker='*', s=170, c='red', ec='k', zorder=5, label='true')
+            ax.plot(best['azimuth'] - np.pi, np.pi / 2 - best['zenith'], 'g*',
+                    markersize=20, markeredgecolor='black', markeredgewidth=2,
+                    label='Minimum NLL', zorder=5)
+            ax.plot(float(tv['azimuth']) - np.pi, np.pi / 2 - float(tv['zenith']),
+                    'r*', markersize=20, markeredgecolor='white', markeredgewidth=2,
+                    label='True values', zorder=5)
             if plot_opposite_direction_true_params:
-                ax.scatter([(float(tv['azimuth']) + np.pi) % (2 * np.pi) - np.pi],
-                           [np.pi / 2 - (np.pi - float(tv['zenith']))],
-                           marker='x', s=90, c='orange', zorder=5, label='mirrored')
-            ax.scatter([best['azimuth'] - np.pi], [np.pi / 2 - best['zenith']],
-                       marker='o', s=60, facecolors='none', edgecolors='lime',
-                       zorder=5, label='minimum')
-            cbar = fig.colorbar(cf, ax=ax, orientation='horizontal', pad=0.07,
+                ax.plot((float(tv['azimuth']) + np.pi) % (2 * np.pi) - np.pi,
+                        np.pi / 2 - (np.pi - float(tv['zenith'])), 'm*',
+                        markersize=16, markeredgecolor='white', markeredgewidth=1.5,
+                        label='Opposite true direction', zorder=5)
+            # tick labels in degrees, as in plot_nll_landscape
+            ax.set_xlabel('Azimuth (degrees)', fontsize=12)
+            xt = ax.get_xticks()
+            ax.set_xticks(xt)
+            ax.set_xticklabels([f'{int(round((x + np.pi) * 180 / np.pi))}\u00b0' for x in xt])
+            ax.set_ylabel('Zenith (degrees)', fontsize=12)
+            yt = ax.get_yticks()
+            ax.set_yticks(yt)
+            ax.set_yticklabels([f'{int(round((np.pi / 2 - y) * 180 / np.pi))}\u00b0' for y in yt])
+            ax.set_title(f'NLL Landscape ({title}, {n_obs_label})', fontsize=14)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.07,
                                 fraction=0.046)
             if cbar_ticks is not None and len(cbar_ticks):
                 cbar.set_ticks(list(cbar_ticks))
                 cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
-            cbar.set_label('NLL - min NLL' + (' (log fill)' if scale == 'log' else ''),
-                           fontsize=11)
-            ax.set_title(f'{title}: zenith x azimuth', pad=18)
-            ax.legend(fontsize=8, loc='lower right')
-            ax.grid(True, alpha=.3)
+            cbar.set_label('Negative Log-Likelihood', fontsize=11)
         else:
             fig, ax = plt.subplots(figsize=figsize)
             cf = ax.contourf(axes[1], axes[0], NLL, cmap=cmap, alpha=.7, **fill_kw)
@@ -10658,26 +10675,27 @@ def plot_model_nll_landscape(
                     ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
                 except (IndexError, ValueError):
                     pass
+            ax.plot(best[names[1]], best[names[0]], 'g*', markersize=20,
+                    markeredgecolor='black', markeredgewidth=2,
+                    label='Minimum NLL', zorder=5)
             if tv.get(names[0]) is not None and tv.get(names[1]) is not None:
-                ax.scatter([float(tv[names[1]])], [float(tv[names[0]])], marker='*',
-                           s=170, c='red', ec='k', zorder=5, label='true')
-            ax.scatter([best[names[1]]], [best[names[0]]], marker='o', s=60,
-                       facecolors='none', edgecolors='lime', zorder=5,
-                       label='minimum')
+                ax.plot(float(tv[names[1]]), float(tv[names[0]]), 'r*',
+                        markersize=20, markeredgecolor='white', markeredgewidth=2,
+                        label='True values', zorder=5)
             if names[0] == 'energy':
                 ax.set_yscale('log')
             if names[1] == 'energy':
                 ax.set_xscale('log')
-            cbar = fig.colorbar(cf, ax=ax)
+            ax.set_xlabel(f'{names[1].capitalize()}', fontsize=12)
+            ax.set_ylabel(f'{names[0].capitalize()}', fontsize=12)
+            ax.set_title(f'NLL Landscape ({title}, {n_obs_label})', fontsize=14)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            cbar = plt.colorbar(cf, ax=ax)
             if cbar_ticks is not None and len(cbar_ticks):
                 cbar.set_ticks(list(cbar_ticks))
                 cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
-            cbar.set_label('NLL - min NLL' + (' (log fill)' if scale == 'log' else ''),
-                           fontsize=11)
-            ax.set_xlabel(names[1]); ax.set_ylabel(names[0])
-            ax.set_title(f'{title}: {names[0]} x {names[1]}')
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=.3)
+            cbar.set_label('Negative Log-Likelihood', fontsize=11)
     plt.tight_layout(); plt.show()
 
     if verbose:
