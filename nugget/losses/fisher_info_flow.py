@@ -127,8 +127,8 @@ class FlowFisherResolutionLoss(LossFunction):
                  n_quad=48, z_range=(-5.0, 5.0), n_steps=8,
                  pmt_directions=None, geometry_csv_path=None, n_pmt_per_om=None,
                  div_mode='autograd', div_eps=1e-6, use_torch_compile=False,
-                 torch_compile_kwargs=None, sample_hits=False, hit_sample_seed=None,
-                 print_loss=False):
+                 torch_compile_kwargs=None, sample_hits=False, n_hit_samples=1,
+                 hit_sample_seed=None, print_loss=False):
         super().__init__(device=device)
         _MODES = {'all':    (True,  True,  True),
                   'hit_ly': (True,  True,  False),
@@ -162,6 +162,7 @@ class FlowFisherResolutionLoss(LossFunction):
                   "(the autograd divergence uses double backward, which compile "
                   "rejects) -- switching to 'fd'.")
         self.sample_hits = bool(sample_hits)
+        self.n_hit_samples = max(int(n_hit_samples), 1)
         self.hit_sample_seed = hit_sample_seed
         self.div_mode = div_mode
         self.div_eps = float(div_eps) if div_mode == 'fd' else None
@@ -298,10 +299,11 @@ class FlowFisherResolutionLoss(LossFunction):
         sample_hits=False evaluates the exact expectation: every PMT gets the
         closed-form Bernoulli Fisher plus its flow terms weighted by pi.
 
-        sample_hits=True draws the hit once per PMT and evaluates one realisation --
-        fired PMTs get (1-pi)^2 grad l grad l^T plus their full flow terms, dark ones
-        only pi^2 grad l grad l^T. Unbiased, and it skips the ODE work on every dark
-        PMT; the cost is variance, which is worst where pi is small.
+        sample_hits=True draws the hit n_hit_samples times per PMT and averages the
+        realisations -- fired draws give (1-pi)^2 grad l grad l^T plus the full flow
+        terms, dark ones only pi^2 grad l grad l^T. Unbiased for any X, and it skips
+        the ODE work on PMTs that never fired; X dials between one honest realisation
+        (X=1, cheapest and noisiest) and the exact expectation (X -> inf).
         """
         theta = self._theta0(ev)
         vertex = _as_t(ev['position'], self.device, self.dtype).reshape(3)
@@ -321,19 +323,24 @@ class FlowFisherResolutionLoss(LossFunction):
         F = torch.zeros(M, P, P, device=self.device, dtype=self.dtype)
 
         if self.sample_hits:
-            # One Bernoulli draw per PMT. A PMT that fired contributes its full
-            # per-realisation Fisher; one that did not contributes only the no-hit
-            # score, d log(1 - pi)/d theta = -pi grad l, i.e. pi^2 grad l grad l^T.
-            # Averaged over the draw these give back pi (1 - pi) grad l grad l^T and
-            # pi x (flow), so the estimator is unbiased -- it just trades variance
-            # for skipping the ODE work on every PMT that stayed dark.
-            y = torch.rand(M, device=self.device, dtype=self.dtype,
-                           generator=gen) < pi
+            # Draw the hit n_hit_samples times per PMT and average the realisations.
+            # A draw that fired contributes (1-pi)^2 grad l grad l^T plus the full
+            # flow terms; one that did not contributes only the no-hit score,
+            # d log(1-pi)/d theta = -pi grad l, i.e. pi^2 grad l grad l^T.
+            #
+            # X = 1 is a single honest realisation. Larger X averages them: the
+            # weights become fractional, the variance falls as 1/X, and in the limit
+            # coef -> pi(1-pi) and w_fire -> pi, recovering the exact path exactly.
+            # Cost rises with X too, since a PMT is evaluated if it fired at ALL:
+            # P(>=1 fire) = 1 - (1-pi)^X.
+            X = self.n_hit_samples
+            u = torch.rand(X, M, device=self.device, dtype=self.dtype, generator=gen)
+            w_fire = (u < pi.unsqueeze(0)).sum(0).to(self.dtype) / X
             if self.include_hit:
-                coef = torch.where(y, (1.0 - pi) ** 2, pi ** 2)
+                coef = w_fire * (1.0 - pi) ** 2 + (1.0 - w_fire) * pi ** 2
                 F = F + coef.reshape(M, 1, 1) * glgl
-            idx = torch.nonzero(y, as_tuple=True)[0]
-            wf = torch.ones(idx.numel(), device=self.device, dtype=self.dtype)
+            idx = torch.nonzero(w_fire > 0, as_tuple=True)[0]
+            wf = w_fire[idx]
         else:
             # Exact: every PMT carries the closed-form Bernoulli Fisher and its
             # flow terms weighted by pi.
