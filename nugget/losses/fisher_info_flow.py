@@ -1,50 +1,3 @@
-"""Fisher-information resolution loss for the hit / light-yield / arrival-time surrogates.
-
-A light-weight counterpart to ``WeightedResolutionLoss`` in ``fisher_info.py``: same
-``__call__(geom_dict, **kwargs)`` contract and the same return dict, but the
-likelihood is the learned hurdle model rather than LLRnet/LightSabre, and the knob
-count is kept small.
-
-The Fisher matrix
-----------------
-Per PMT j the observation is (hit?, light yield, arrival times) with
-
-    p(y, q, {t} | th) = (1 - pi)                      if y = 0
-                      = pi . p_q(q) . prod_k p_t(t_k) if y = 1
-
-The score is  s = (y - pi) grad l + y [grad log p_q + sum_k grad log p_t],
-l = logit(pi). Every cross term in E[s s^T] vanishes because E[grad log p] = 0 for a
-normalised density -- including the q-t one, where E_q[q E_t[grad log p_t] ...] = 0.
-So the three pieces simply add:
-
-    F_j = pi (1 - pi) grad l grad l^T                       (hit)
-        + pi      E_q[ grad log p_q grad log p_q^T ]        (light yield)
-        + pi qbar E_t[ grad log p_t grad log p_t^T ]        (arrival time)
-
-with qbar = E[q | hit]. The Bernoulli term is closed form; it is written with the
-logit rather than as grad pi grad pi^T / (pi (1 - pi)) because pi ~ 1e-4 makes the
-divided form numerically hopeless. qbar is evaluated at the true parameters and is
-NOT differentiated -- the information carried by q itself is already the second term.
-
-The expectations are done by quadrature on a fixed grid in the flow's own z, with
-weights p_z(z) dz. For the light yield z is a theta-independent transform of q, so
-the change of variables leaves the Fisher untouched; for the arrival time z depends
-on theta through t_geom, but gridding z at th0 and mapping to fixed t_hit leaves the
-Jacobians cancelling inside the integral. qbar falls out of the same grid.
-
-Gradients
----------
-``log_prob_*(differentiable=True)`` is required: the default path detaches inside
-``_v_and_div`` and returns a constant, so a Fisher built on it is identically zero.
-
-Rows of a batch are independent, so ONE backward pass of ``sum_i log p_i`` yields
-d log p_i / d c_i for every row at once; the chain to theta then goes through the
-Jacobian of ``build_context``, which is cheap and pure-torch (``jacfwd``). This
-costs one backward per batch regardless of how many PMTs or quadrature nodes it
-holds. Note that ``jacfwd`` cannot be wrapped around the flow itself -- nesting it
-over the ``jvp``-based divergence gives silently wrong numbers.
-"""
-
 import gc
 import math
 
@@ -99,7 +52,7 @@ def _log_prob_tres(at, t_res, ctx, n_steps, div_eps=None):
 
 
 class FlowFisherResolutionLoss(LossFunction):
-    """Angular / energy resolution from the learned hurdle likelihood.
+    """Angular / energy resolution from the learned combined likelihoods.
 
     Parameters
     ----------
@@ -107,16 +60,12 @@ class FlowFisherResolutionLoss(LossFunction):
     ly_model : FlowMatchLY
     atime_model : FlowMatchATime or None
     mode : {'all', 'atime'}
-        'atime' uses only the arrival-time Fisher term, but still evaluates pi and
-        qbar because they weight it.
     fisher_info_params : sequence of str
-        Scanned parameters, from {'energy', 'zenith', 'azimuth'}. Energy is
-        differentiated w.r.t. log10(E), which is what the resolution is usually
-        quoted in and keeps the matrix well conditioned.
+        Scanned parameters, from {'energy', 'zenith', 'azimuth'}. 
     n_quad, z_range : int, (float, float)
-        Quadrature grid in the flow's z. 48 nodes over [-5, 5] is ample.
+        Quadrature grid in the flow's z. 
     n_steps : int
-        ODE steps per log-prob. The gradient path holds all of them in memory.
+        ODE steps per log-prob. 
     pmt_directions, geometry_csv_path, n_pmt_per_om
         The per-OM PMT template; defaults to the geometry the models were trained on.
     """
@@ -130,6 +79,7 @@ class FlowFisherResolutionLoss(LossFunction):
                  torch_compile_kwargs=None, sample_hits=False, n_hit_samples=1,
                  hit_sample_seed=None, print_loss=False):
         super().__init__(device=device)
+        # The mode controls which terms are included in the Fisher: hit, light-yield, and/or arrival-time.
         _MODES = {'all':    (True,  True,  True),
                   'hit_ly': (True,  True,  False),
                   'atime':  (False, False, True),
