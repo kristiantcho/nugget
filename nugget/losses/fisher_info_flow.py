@@ -127,10 +127,16 @@ class FlowFisherResolutionLoss(LossFunction):
                  n_quad=48, z_range=(-5.0, 5.0), n_steps=8,
                  pmt_directions=None, geometry_csv_path=None, n_pmt_per_om=None,
                  div_mode='autograd', div_eps=1e-6, use_torch_compile=False,
-                 torch_compile_kwargs=None, print_loss=False):
+                 torch_compile_kwargs=None, sample_hits=False, hit_sample_seed=None,
+                 print_loss=False):
         super().__init__(device=device)
-        if mode not in ('all', 'atime'):
-            raise ValueError("mode must be 'all' or 'atime'")
+        _MODES = {'all':    (True,  True,  True),
+                  'hit_ly': (True,  True,  False),
+                  'atime':  (False, False, True),
+                  'hit':    (True,  False, False)}
+        if mode not in _MODES:
+            raise ValueError(f"mode must be one of {sorted(_MODES)}")
+        self.include_hit, self.include_ly, self.include_atime = _MODES[mode]
         if resolution_type not in ('angular', 'energy'):
             raise ValueError("resolution_type must be 'angular' or 'energy'")
         bad = [p for p in fisher_info_params
@@ -155,6 +161,8 @@ class FlowFisherResolutionLoss(LossFunction):
             print("FlowFisherResolutionLoss: torch.compile needs div_mode='fd' "
                   "(the autograd divergence uses double backward, which compile "
                   "rejects) -- switching to 'fd'.")
+        self.sample_hits = bool(sample_hits)
+        self.hit_sample_seed = hit_sample_seed
         self.div_mode = div_mode
         self.div_eps = float(div_eps) if div_mode == 'fd' else None
         self.use_torch_compile = bool(use_torch_compile)
@@ -162,8 +170,8 @@ class FlowFisherResolutionLoss(LossFunction):
         if hit_model is None or ly_model is None:
             raise ValueError("a hit model and a light-yield model are both required "
                              "(pi and qbar weight every term)")
-        if mode == 'atime' and atime_model is None:
-            raise ValueError("mode='atime' needs an arrival-time model")
+        if self.include_atime and atime_model is None:
+            raise ValueError(f"mode='{mode}' needs an arrival-time model")
 
         self.dtype = hit_model.param_dtype
         self._pmt_dirs = self._resolve_pmt_template(
@@ -257,6 +265,21 @@ class FlowFisherResolutionLoss(LossFunction):
             del c, lp, G
         return logw, g
 
+    def _logw_only(self, model, ctx, z_nodes, chunk):
+        """log p_z at the nodes, no gradients -- all qbar needs."""
+        M, K = ctx.shape[0], z_nodes.shape[0]
+        out = torch.empty(M, K, device=self.device, dtype=self.dtype)
+        rep = max(int(chunk) // max(K, 1), 1)
+        with torch.no_grad():
+            for s in range(0, M, rep):
+                e = min(s + rep, M)
+                n = e - s
+                lp = model.log_prob_z(z_nodes.repeat(n),
+                                      ctx[s:e].repeat_interleave(K, 0),
+                                      n_steps=self.n_steps)
+                out[s:e] = lp.reshape(n, K)
+        return out
+
     @staticmethod
     def _weights(logw):
         """p_z(z_k) dz normalised over the grid -- robust to an imperfect flow norm."""
@@ -269,14 +292,23 @@ class FlowFisherResolutionLoss(LossFunction):
 
     # ---------------------------------------------------------- per-event core
 
-    def _fisher_per_pmt(self, pts, dirs, ev, chunk):
-        """(M, P, P) Fisher contribution of each PMT for one event."""
+    def _fisher_per_pmt(self, pts, dirs, ev, chunk, gen=None):
+        """(M, P, P) Fisher contribution of each PMT for one event.
+
+        sample_hits=False evaluates the exact expectation: every PMT gets the
+        closed-form Bernoulli Fisher plus its flow terms weighted by pi.
+
+        sample_hits=True draws the hit once per PMT and evaluates one realisation --
+        fired PMTs get (1-pi)^2 grad l grad l^T plus their full flow terms, dark ones
+        only pi^2 grad l grad l^T. Unbiased, and it skips the ODE work on every dark
+        PMT; the cost is variance, which is worst where pi is small.
+        """
         theta = self._theta0(ev)
         vertex = _as_t(ev['position'], self.device, self.dtype).reshape(3)
         P = theta.shape[0]
         M = pts.shape[0]
 
-        # ---- hit term: closed form, pi (1-pi) grad l grad l^T ----
+        # ---- pi and grad logit: needed either way (pi weights every term) ----
         build_h = self._ctx_builder(self.hit_model, pts, dirs, vertex, ev)
         Jh = torch.func.jacfwd(build_h)(theta)                     # (M, C, P)
         ch = build_h(theta).detach().requires_grad_(True)
@@ -284,37 +316,71 @@ class FlowFisherResolutionLoss(LossFunction):
         gl_c = torch.autograd.grad(ell.sum(), ch)[0]               # (M, C)
         gl = torch.einsum('mc,mcp->mp', gl_c, Jh)                  # (M, P)
         pi = torch.sigmoid(ell.detach()).clamp(1e-12, 1 - 1e-12)   # (M,)
-        F = (pi * (1.0 - pi)).reshape(M, 1, 1) * gl.unsqueeze(2) * gl.unsqueeze(1)
 
-        # ---- light yield: weights, qbar, and (unless mode='atime') its Fisher ----
-        build_l = self._ctx_builder(self.ly_model, pts, dirs, vertex, ev)
-        logw_q, g_q = self._scores(self.ly_model, build_l, theta, self._zq, chunk)
-        w_q = self._weights(logw_q)                                # (M, K)
-        qvals = self.ly_model.from_z(self._zq).reshape(1, -1)      # (1, K)
-        qbar = (w_q * qvals).sum(1).clamp_min(1.0)                 # (M,)
-        if self.mode == 'all':
-            F = F + pi.reshape(M, 1, 1) * self._outer(w_q, g_q)
-        del logw_q, g_q
+        glgl = gl.unsqueeze(2) * gl.unsqueeze(1)                   # (M, P, P)
+        F = torch.zeros(M, P, P, device=self.device, dtype=self.dtype)
+
+        if self.sample_hits:
+            # One Bernoulli draw per PMT. A PMT that fired contributes its full
+            # per-realisation Fisher; one that did not contributes only the no-hit
+            # score, d log(1 - pi)/d theta = -pi grad l, i.e. pi^2 grad l grad l^T.
+            # Averaged over the draw these give back pi (1 - pi) grad l grad l^T and
+            # pi x (flow), so the estimator is unbiased -- it just trades variance
+            # for skipping the ODE work on every PMT that stayed dark.
+            y = torch.rand(M, device=self.device, dtype=self.dtype,
+                           generator=gen) < pi
+            if self.include_hit:
+                coef = torch.where(y, (1.0 - pi) ** 2, pi ** 2)
+                F = F + coef.reshape(M, 1, 1) * glgl
+            idx = torch.nonzero(y, as_tuple=True)[0]
+            wf = torch.ones(idx.numel(), device=self.device, dtype=self.dtype)
+        else:
+            # Exact: every PMT carries the closed-form Bernoulli Fisher and its
+            # flow terms weighted by pi.
+            if self.include_hit:
+                F = F + (pi * (1.0 - pi)).reshape(M, 1, 1) * glgl
+            idx = torch.arange(M, device=self.device)
+            wf = pi
+
+        if not (self.include_ly or self.include_atime) or idx.numel() == 0:
+            return F
+        sub_pts, sub_dirs = pts[idx], dirs[idx]
+        m = idx.numel()
+
+        # ---- light yield: qbar always (it weights the time term), Fisher on demand
+        build_l = self._ctx_builder(self.ly_model, sub_pts, sub_dirs, vertex, ev)
+        if self.include_ly:
+            logw_q, g_q = self._scores(self.ly_model, build_l, theta, self._zq, chunk)
+            w_q = self._weights(logw_q)
+            contrib = wf.reshape(m, 1, 1) * self._outer(w_q, g_q)
+            F = F + torch.zeros_like(F).index_add(0, idx, contrib)
+            del logw_q, g_q, contrib
+        else:
+            w_q = self._weights(
+                self._logw_only(self.ly_model, build_l(theta).detach(), self._zq, chunk))
+        qvals = self.ly_model.from_z(self._zq).reshape(1, -1)
+        qbar = (w_q * qvals).sum(1).clamp_min(1.0)                 # (m,)
 
         # ---- arrival time ----
-        if self.atime_model is not None:
+        if self.include_atime:
             at = self.atime_model
-            build_t = self._ctx_builder(at, pts, dirs, vertex, ev)
+            build_t = self._ctx_builder(at, sub_pts, sub_dirs, vertex, ev)
             # grid z at the true theta, map to fixed t_hit, then let t_res move with
             # theta through t_geom -- that dependence is where the timing information
             # on direction actually lives.
             with torch.no_grad():
                 tg0 = at.geometric_time(
-                    pts, vertex.reshape(1, 3).expand(M, 3),
-                    zeniths=_as_t(ev['zenith'], self.device, self.dtype).reshape(1).expand(M),
-                    azimuths=_as_t(ev['azimuth'], self.device, self.dtype).reshape(1).expand(M),
-                ).reshape(M, 1)
-                t_hit = at.from_z(self._zq).reshape(1, -1) + tg0   # (M, K)
-            logw_t, g_t = self._scores_time(at, build_t, theta, t_hit, pts, vertex,
-                                            ev, chunk)
+                    sub_pts, vertex.reshape(1, 3).expand(m, 3),
+                    zeniths=_as_t(ev['zenith'], self.device, self.dtype).reshape(1).expand(m),
+                    azimuths=_as_t(ev['azimuth'], self.device, self.dtype).reshape(1).expand(m),
+                ).reshape(m, 1)
+                t_hit = at.from_z(self._zq).reshape(1, -1) + tg0   # (m, K)
+            logw_t, g_t = self._scores_time(at, build_t, theta, t_hit, sub_pts,
+                                            vertex, ev, chunk)
             w_t = self._weights(logw_t)
-            F = F + (pi * qbar).reshape(M, 1, 1) * self._outer(w_t, g_t)
-            del logw_t, g_t
+            contrib = (wf * qbar).reshape(m, 1, 1) * self._outer(w_t, g_t)
+            F = F + torch.zeros_like(F).index_add(0, idx, contrib)
+            del logw_t, g_t, contrib
         return F
 
     def _scores_time(self, at, build, theta, t_hit, pts, vertex, ev, chunk):
@@ -386,9 +452,14 @@ class FlowFisherResolutionLoss(LossFunction):
             sel = [h.nonzero(as_tuple=True)[0] for h in hit]
         n_str = len(sel)
 
+        gen = None
+        if self.sample_hits and self.hit_sample_seed is not None:
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(int(self.hit_sample_seed))
+
         out = torch.zeros(n_ev, n_str, P, P, device=self.device, dtype=self.dtype)
         for i, ev in enumerate(signal_event_params):
-            F_pmt = self._fisher_per_pmt(pts, dirs, ev, chunk)     # (n_pts*K, P, P)
+            F_pmt = self._fisher_per_pmt(pts, dirs, ev, chunk, gen)  # (n_pts*K, P, P)
             F_om = F_pmt.reshape(n_pts, K_pmt, P, P).sum(1)        # (n_pts, P, P)
             for s, ids in enumerate(sel):
                 if ids.numel():
