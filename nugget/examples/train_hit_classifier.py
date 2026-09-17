@@ -5,19 +5,19 @@ import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_hit_v1r_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_hit_model_v1r.pt'
+TEST_PARQUET = './flow_models/mc_hit_v1rs_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_hit_model_v1rs.pt'
 
 EPOCHS = 500
 
 hit = nugget.surrogates.HitClassifier.HitClassifier(
-    device="cuda:3",
+    device="cuda:1",
     domain_size=20000,
     dim=3,
 
     # --- network ---
-    width=256,
-    depth=8,
+    width=128,
+    depth=6,
     dropout=0.0,
 
     # --- optimisation ---
@@ -86,7 +86,7 @@ history = hit.train_with_dataloader(
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_hit_v1r_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_hit_v1rs_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------
