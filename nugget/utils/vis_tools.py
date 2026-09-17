@@ -10705,3 +10705,157 @@ def plot_model_nll_landscape(
                   f'  minimum {best[nm]:.4g}')
     return {'axes': axes, 'param_names': names, 'nll': NLL, 'loglik': LL,
             'true': tv, 'best': best, 'loglik_true': ll_true}
+
+
+def _ts_prep(Xa, Xb, standardize=True, max_n=None, seed=0):
+    """Stack two sample sets, drop non-finite rows, optionally standardise/subsample."""
+    A = np.asarray(Xa, dtype=np.float64).reshape(len(Xa), -1)
+    B = np.asarray(Xb, dtype=np.float64).reshape(len(Xb), -1)
+    if A.shape[1] != B.shape[1]:
+        raise ValueError(f"feature mismatch: {A.shape[1]} vs {B.shape[1]}")
+    A = A[np.isfinite(A).all(1)]
+    B = B[np.isfinite(B).all(1)]
+    rng = np.random.default_rng(seed)
+    if max_n is not None:
+        if len(A) > max_n:
+            A = A[rng.choice(len(A), max_n, replace=False)]
+        if len(B) > max_n:
+            B = B[rng.choice(len(B), max_n, replace=False)]
+    if standardize:
+        pool = np.vstack([A, B])
+        mu, sd = pool.mean(0), pool.std(0)
+        sd[sd < 1e-12] = 1.0
+        A, B = (A - mu) / sd, (B - mu) / sd
+    return A, B
+
+
+def classifier_two_sample_test(X_data, X_model, test_frac=0.3, seed=0,
+                               max_n=20000, standardize=True, clf=None,
+                               n_perm=1000):
+    """C2ST: can a classifier tell the model's samples from the data's?
+
+    Under the null (model == data) the held-out AUC is 0.5. Because the feature
+    vector carries the CONTEXT alongside the observable, this tests the conditional
+    p(x | c), not just the marginal -- a model can match every marginal and still be
+    caught here.
+
+    The default classifier is deliberately REGULARISED. An unconstrained booster
+    reaches ~0.95 train AUC on pure noise and its test AUC then sits at chance even
+    when a real difference exists (measured: a genuine 0.11-sigma shift gave test
+    AUC 0.518 unregularised versus 0.544 regularised, against a Bayes limit of
+    0.531). Overfitting costs power, it does not create false positives.
+
+    The p-value permutes the TEST labels against the fitted scores, which is exact
+    under the null (the scores carry no label information there) and needs no
+    normal approximation.
+    """
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import train_test_split
+
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+    X = np.vstack([A, B])
+    y = np.concatenate([np.zeros(len(A)), np.ones(len(B))])
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_frac,
+                                          random_state=seed, stratify=y)
+    if clf is None:
+        clf = HistGradientBoostingClassifier(
+            max_iter=200, max_leaf_nodes=8, l2_regularization=1.0,
+            early_stopping=True, validation_fraction=0.2, random_state=seed)
+    clf.fit(Xtr, ytr)
+    p = clf.predict_proba(Xte)[:, 1]
+    auc = float(roc_auc_score(yte, p))
+    acc = float(((p > 0.5) == (yte > 0.5)).mean())
+    try:
+        tr_auc = float(roc_auc_score(ytr, clf.predict_proba(Xtr)[:, 1]))
+    except Exception:
+        tr_auc = float('nan')
+
+    rng = np.random.default_rng(seed)
+    null = np.array([roc_auc_score(rng.permutation(yte), p) for _ in range(n_perm)])
+    pval = float((1 + (null >= auc).sum()) / (1 + n_perm))
+    return {'auc': auc, 'train_auc': tr_auc, 'accuracy': acc, 'p_value': pval,
+            'z': float((auc - null.mean()) / max(null.std(), 1e-300)),
+            'n_test': len(yte), 'null_auc': null,
+            'proba_data': p[yte == 0], 'proba_model': p[yte == 1]}
+
+
+def mmd_two_sample_test(X_data, X_model, n_perm=200, seed=0, max_n=1500,
+                        standardize=True, bandwidth=None):
+    """Unbiased MMD^2 with an RBF kernel and a permutation p-value.
+
+    Bandwidth defaults to the median pairwise distance of the pooled sample. The
+    estimator is O(n^2) in memory, hence max_n.
+    """
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+    n, m = len(A), len(B)
+    Z = np.vstack([A, B])
+    d2 = np.maximum(((Z[:, None, :] - Z[None, :, :]) ** 2).sum(-1), 0.0)
+    if bandwidth is None:                       # median heuristic
+        iu = np.triu_indices(len(Z), 1)
+        med = np.median(d2[iu])
+        bandwidth = math.sqrt(max(med, 1e-12) / 2.0)
+    K = np.exp(-d2 / (2.0 * bandwidth ** 2))
+
+    def _mmd2(idx_a, idx_b):
+        Kaa = K[np.ix_(idx_a, idx_a)]
+        Kbb = K[np.ix_(idx_b, idx_b)]
+        Kab = K[np.ix_(idx_a, idx_b)]
+        na, nb = len(idx_a), len(idx_b)
+        return ((Kaa.sum() - np.trace(Kaa)) / (na * (na - 1))
+                + (Kbb.sum() - np.trace(Kbb)) / (nb * (nb - 1))
+                - 2.0 * Kab.mean())
+
+    ia, ib = np.arange(n), np.arange(n, n + m)
+    obs = _mmd2(ia, ib)
+    rng = np.random.default_rng(seed)
+    null = np.empty(n_perm)
+    allidx = np.arange(n + m)
+    for k in range(n_perm):
+        perm = rng.permutation(allidx)
+        null[k] = _mmd2(perm[:n], perm[n:])
+    p = float((1 + (null >= obs).sum()) / (1 + n_perm))
+    return {'mmd2': float(obs), 'null': null, 'p_value': p,
+            'bandwidth': float(bandwidth), 'n': n, 'm': m,
+            'z': float((obs - null.mean()) / max(null.std(), 1e-300))}
+
+
+def two_sample_report(X_data, X_model, title='', feature_names=None,
+                      seed=0, c2st_max_n=20000, mmd_max_n=1500, n_perm=200,
+                      figsize=(11, 3.8), show=True):
+    """Run the C2ST and the MMD test, print a summary and plot both diagnostics."""
+    c = classifier_two_sample_test(X_data, X_model, seed=seed, max_n=c2st_max_n)
+    m = mmd_two_sample_test(X_data, X_model, seed=seed, max_n=mmd_max_n,
+                            n_perm=n_perm)
+    print(f'{title}')
+    print(f'  C2ST : AUC = {c["auc"]:.4f} (chance 0.5, train {c["train_auc"]:.4f}, '
+          f'n_test {c["n_test"]:,})   z = {c["z"]:+.1f}   p = {c["p_value"]:.4f}')
+    print(f'  MMD  : MMD^2 = {m["mmd2"]:.3e}   permutation p = {m["p_value"]:.4f} '
+          f'({n_perm} perms)   z = {m["z"]:+.1f}   bandwidth = {m["bandwidth"]:.3f}')
+    if feature_names:
+        print(f'  features ({len(feature_names)}): {", ".join(feature_names)}')
+
+    if show:
+        fig, ax = plt.subplots(1, 2, figsize=figsize)
+        b = np.linspace(0, 1, 41)
+        ax[0].hist(c['proba_data'], bins=b, histtype='step', lw=2, density=True,
+                   label='data')
+        ax[0].hist(c['proba_model'], bins=b, histtype='step', lw=2, density=True,
+                   label='model')
+        ax[0].axvline(0.5, color='k', ls=':', lw=1)
+        ax[0].set_xlabel('classifier P(sample is from the model)')
+        ax[0].set_ylabel('density')
+        ax[0].set_title(f'C2ST: AUC = {c["auc"]:.3f} (0.5 = indistinguishable)',
+                        fontsize=10)
+        ax[0].legend(fontsize=8); ax[0].grid(alpha=.3)
+
+        ax[1].hist(m['null'], bins=30, color='C0', alpha=.7,
+                   label='permutation null')
+        ax[1].axvline(m['mmd2'], color='C3', lw=2.5, label='observed')
+        ax[1].set_xlabel('MMD$^2$'); ax[1].set_ylabel('permutations')
+        ax[1].set_title(f'MMD: p = {m["p_value"]:.4f}', fontsize=10)
+        ax[1].legend(fontsize=8); ax[1].grid(alpha=.3)
+        if title:
+            fig.suptitle(title, y=1.02, fontsize=11)
+        plt.tight_layout(); plt.show()
+    return {'c2st': c, 'mmd': m}

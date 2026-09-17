@@ -161,7 +161,7 @@ class FlowFisherResolutionLoss(LossFunction):
         vals = []
         for p in self.fisher_info_params:
             v = float(_as_t(ev[p], self.device, self.dtype).reshape(-1)[0])
-            vals.append(math.log10(max(v, 1e-30)) if p == 'energy' else v)
+            vals.append(v)
         return torch.tensor(vals, device=self.device, dtype=self.dtype)
 
     def _ctx_builder(self, model, pts, dirs, vertex, ev):
@@ -172,7 +172,7 @@ class FlowFisherResolutionLoss(LossFunction):
         idx = {p: i for i, p in enumerate(self.fisher_info_params)}
 
         def build(theta):
-            e = (10.0 ** theta[idx['energy']] if 'energy' in idx
+            e = (theta[idx['energy']] if 'energy' in idx
                  else torch.tensor(fixed['energy'], device=self.device, dtype=self.dtype))
             z = (theta[idx['zenith']] if 'zenith' in idx
                  else torch.tensor(fixed['zenith'], device=self.device, dtype=self.dtype))
@@ -221,14 +221,14 @@ class FlowFisherResolutionLoss(LossFunction):
         M, K = ctx.shape[0], z_nodes.shape[0]
         out = torch.empty(M, K, device=self.device, dtype=self.dtype)
         rep = max(int(chunk) // max(K, 1), 1)
-        with torch.no_grad():
-            for s in range(0, M, rep):
-                e = min(s + rep, M)
-                n = e - s
-                lp = model.log_prob_z(z_nodes.repeat(n),
-                                      ctx[s:e].repeat_interleave(K, 0),
-                                      n_steps=self.n_steps)
-                out[s:e] = lp.reshape(n, K)
+        # with torch.no_grad(): #keep grad for now
+        for s in range(0, M, rep):
+            e = min(s + rep, M)
+            n = e - s
+            lp = model.log_prob_z(z_nodes.repeat(n),
+                                    ctx[s:e].repeat_interleave(K, 0),
+                                    n_steps=self.n_steps)
+            out[s:e] = lp.reshape(n, K)
         return out
 
     @staticmethod
@@ -432,12 +432,29 @@ class FlowFisherResolutionLoss(LossFunction):
 
     def _resolution(self, F, signal_event_params, use_relative_energy):
         names = self.fisher_info_params
-        n = F.shape[0]
-        eye = torch.eye(F.shape[-1], device=self.device, dtype=F.dtype)
+        n, P = F.shape[0], F.shape[-1]
+
+        # Invert in scaled units: energy measured in E_true, angles in radians.
+        # theta carries E in GeV, and d log p/dE is ~1/(E ln10) times d log p/dlog10 E,
+        # so the energy entry sits ~1e-11 below the angular ones and the condition
+        # number reaches ~1e15 -- the edge of float64, and enough that the 1e-20
+        # regulariser stops being negligible against it. A diagonal similarity
+        # F' = D F D with D = diag(E_true, 1, 1) is an exact change of units:
+        #     cov = D cov' D,  so  sigma_i = d_i sqrt(cov'_ii)
+        # leaving every resolution unchanged while conditioning the inverse.
+        d = torch.ones(n, P, device=self.device, dtype=self.dtype)
+        if 'energy' in names:
+            E = torch.stack([_as_t(p['energy'], self.device, self.dtype).reshape(())
+                             for p in signal_event_params]).clamp_min(1e-30)
+            d[:, names.index('energy')] = E
+        dd = d.unsqueeze(2) * d.unsqueeze(1)                    # (n, P, P), d_i d_j
+
+        eye = torch.eye(P, device=self.device, dtype=F.dtype)
+        Fs = dd * F
         try:
-            cov = torch.linalg.inv(F + 1e-20 * eye)
+            cov = dd * torch.linalg.inv(Fs + 1e-20 * eye)
         except Exception:
-            cov = torch.linalg.pinv(F + 1e-20 * eye)
+            cov = dd * torch.linalg.pinv(Fs + 1e-20 * eye)
         if self.resolution_type == 'angular':
             iz, ia = names.index('zenith'), names.index('azimuth')
             zen = torch.stack([_as_t(p['zenith'], self.device, self.dtype).reshape(())
@@ -447,9 +464,14 @@ class FlowFisherResolutionLoss(LossFunction):
                    + 2.0 * torch.sin(zen) * cov[:, iz, ia])
             return torch.sqrt(var.clamp_min(0.0))
         ie = names.index('energy')
-        # theta uses log10 E, so sqrt(var) is already a relative (dex) resolution
+        # theta carries E in GeV, so sqrt(var) is sigma_E in GeV directly
         res = torch.sqrt(cov[:, ie, ie].clamp_min(0.0))
-        return res if use_relative_energy else res * math.log(10.0)
+        if use_relative_energy:
+            energies = torch.stack([
+                _as_t(p['energy'], self.device, self.dtype).reshape(())
+                for p in signal_event_params])
+            return res / energies.clamp_min(1e-30)
+        return res
 
     def __call__(self, geom_dict, **kwargs):
         """Same contract as ``WeightedResolutionLoss.__call__``.
