@@ -10729,6 +10729,205 @@ def _ts_prep(Xa, Xb, standardize=True, max_n=None, seed=0):
     return A, B
 
 
+class _C2STNet(torch.nn.Module):
+    """Plain MLP discriminator for the classifier two-sample test."""
+
+    def __init__(self, in_dim, hidden=(256, 256, 128), dropout=0.1):
+        super().__init__()
+        layers, d = [], in_dim
+        for h in hidden:
+            layers += [torch.nn.Linear(d, h), torch.nn.LayerNorm(h),
+                       torch.nn.GELU(), torch.nn.Dropout(dropout)]
+            d = h
+        layers += [torch.nn.Linear(d, 1)]
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def _fit_mlp_c2st(Xtr, ytr, Xte, hidden=(256, 256, 128), dropout=0.1, lr=1e-3,
+                  weight_decay=1e-4, batch_size=256, max_epochs=300, patience=25,
+                  val_frac=0.2, seed=0, device=None):
+    """Train the MLP discriminator on (Xtr, ytr), return its scores on Xte.
+
+    Early stopping on a held-out slice of the TRAINING fold (never the test fold),
+    restoring the best weights.  Without it the net memorises small event-level
+    samples and the out-of-fold AUC collapses to chance even when a real
+    difference exists.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    g = torch.Generator().manual_seed(seed)
+    torch.manual_seed(seed)
+
+    n = len(Xtr)
+    perm = torch.randperm(n, generator=g).numpy()
+    n_val = max(int(val_frac * n), 1)
+    vi, ti = perm[:n_val], perm[n_val:]
+
+    Xt = torch.as_tensor(Xtr[ti], dtype=torch.float32, device=device)
+    yt = torch.as_tensor(ytr[ti], dtype=torch.float32, device=device)
+    Xv = torch.as_tensor(Xtr[vi], dtype=torch.float32, device=device)
+    yv = ytr[vi]
+
+    # nugget sets torch's default dtype to float64; the discriminator does not
+    # need it and float32 is ~2x faster, so pin it explicitly.
+    net = _C2STNet(Xtr.shape[1], hidden, dropout).to(device=device,
+                                                     dtype=torch.float32)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    lossf = torch.nn.BCEWithLogitsLoss()
+
+    best, best_state, bad = -np.inf, None, 0
+    for _ in range(max_epochs):
+        net.train()
+        order = torch.randperm(len(Xt), generator=g).to(device)
+        for s in range(0, len(Xt), batch_size):
+            idx = order[s:s + batch_size]
+            opt.zero_grad(set_to_none=True)
+            lossf(net(Xt[idx]), yt[idx]).backward()
+            opt.step()
+        net.eval()
+        with torch.no_grad():
+            sv = net(Xv).cpu().numpy()
+        try:
+            auc_v = roc_auc_score(yv, sv)
+        except ValueError:                       # one class only in the val slice
+            auc_v = 0.5
+        if auc_v > best + 1e-4:
+            best, bad = auc_v, 0
+            best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    if best_state is not None:
+        net.load_state_dict(best_state)
+    net.eval()
+    with torch.no_grad():
+        out = net(torch.as_tensor(Xte, dtype=torch.float32,
+                                  device=device)).cpu().numpy()
+    return out
+
+
+def c2st_auc(X_data, X_model, n_folds=5, seed=0, clf=None, standardize=True,
+             max_n=None, return_proba=False, device=None, **net_kw):
+    """Classifier two-sample test reduced to a SINGLE number: the K-fold AUC.
+
+    One row of X is one sample.  For a detector surrogate that means one EVENT:
+    the row summarises the whole detector response, so the test sees the joint
+    event rather than one PMT at a time.
+
+    The discriminator is an MLP (LayerNorm + GELU + dropout, AdamW, early stopping
+    on a slice of the training fold).  Every sample is scored by a net that never
+    saw it -- K-fold out-of-fold predictions -- and one AUC is computed over all of
+    them.  That uses the whole sample and avoids the noise of a single held-out
+    split, which matters because event-level tests have far fewer samples than
+    row-level ones.
+
+        0.5 -> the discriminator cannot tell model events from data events
+        1.0 -> trivially separable
+
+    Under the null the AUC has standard error sqrt((n0 + n1 + 1) / (12 n0 n1));
+    at n0 = n1 = 1000 that is 0.013, so 0.55 is already a 4-sigma failure.
+    Out-of-fold scores are mildly correlated across folds, so treat that as a
+    yardstick and calibrate with a data-vs-data baseline (two_sample_numbers).
+
+    Pass `clf` (any sklearn estimator with predict_proba) to swap the MLP out;
+    extra keywords (hidden, dropout, lr, max_epochs, patience, ...) go to the net.
+    """
+    import sklearn.base
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import StratifiedKFold
+
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+    X = np.vstack([A, B])
+    y = np.concatenate([np.zeros(len(A)), np.ones(len(B))])
+
+    oof = np.zeros(len(y))
+    splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    for k, (tr, te) in enumerate(splitter.split(X, y)):
+        if clf is None:
+            oof[te] = _fit_mlp_c2st(X[tr], y[tr], X[te], seed=seed + k,
+                                    device=device, **net_kw)
+        else:
+            c = sklearn.base.clone(clf)
+            c.fit(X[tr], y[tr])
+            oof[te] = c.predict_proba(X[te])[:, 1]
+    auc = float(roc_auc_score(y, oof))
+    if return_proba:
+        return auc, oof, y
+    return auc
+
+
+def c2st_null_sigma(n0, n1):
+    """Standard error of the AUC under the null (Mann-Whitney U variance)."""
+    return math.sqrt((n0 + n1 + 1.0) / (12.0 * float(n0) * float(n1)))
+
+
+def mmd2(X_data, X_model, bandwidth=None, standardize=True, max_n=2000, seed=0):
+    """Unbiased MMD^2 with an RBF kernel, as a SINGLE number.
+
+    Bandwidth defaults to the median pairwise distance of the pooled sample.  The
+    value is scale dependent and near zero under the null (it is unbiased, so it
+    goes NEGATIVE about half the time there); it only means something next to a
+    reference, so compare it with a data-vs-data split of the same size --
+    two_sample_numbers does that for you.
+
+    Memory is O((n+m)^2), hence max_n.
+    """
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+    n, m = len(A), len(B)
+    Z = np.vstack([A, B])
+    sq = (Z ** 2).sum(1)
+    d2 = np.maximum(sq[:, None] + sq[None, :] - 2.0 * (Z @ Z.T), 0.0)
+    if bandwidth is None:                                   # median heuristic
+        med = np.median(d2[np.triu_indices(len(Z), 1)])
+        bandwidth = math.sqrt(max(med, 1e-12) / 2.0)
+    K = np.exp(-d2 / (2.0 * bandwidth ** 2))
+    Kaa, Kbb, Kab = K[:n, :n], K[n:, n:], K[:n, n:]
+    return float((Kaa.sum() - np.trace(Kaa)) / (n * (n - 1.0))
+                 + (Kbb.sum() - np.trace(Kbb)) / (m * (m - 1.0))
+                 - 2.0 * Kab.mean())
+
+
+def two_sample_numbers(X_data, X_model, label='', seed=0, n_folds=5, clf=None,
+                       c2st_max_n=None, mmd_max_n=2000, baseline=True,
+                       verbose=True, device=None, **net_kw):
+    """C2ST AUC and MMD^2 for one batch of events -- two numbers, no plots.
+
+    The baseline splits the DATA sample in half and runs both tests on the two
+    halves.  That is the null by construction, so it calibrates both numbers for
+    the sample size and feature set actually in use: AUC_base should sit at 0.5,
+    and MMD2_base sets the scale below which MMD2 is noise.  The halves are half
+    the size, so the baseline AUC is the noisier of the two -- it bounds the
+    resolution rather than matching it exactly.
+    """
+    out = {'auc': c2st_auc(X_data, X_model, n_folds=n_folds, seed=seed, clf=clf,
+                           max_n=c2st_max_n, device=device, **net_kw),
+           'mmd2': mmd2(X_data, X_model, max_n=mmd_max_n, seed=seed)}
+    n0 = min(len(X_data), c2st_max_n or len(X_data))
+    n1 = min(len(X_model), c2st_max_n or len(X_model))
+    out['auc_sigma'] = c2st_null_sigma(n0, n1)
+    out['n_sigma'] = (out['auc'] - 0.5) / out['auc_sigma']
+    if baseline:
+        A = np.asarray(X_data, dtype=np.float64).reshape(len(X_data), -1)
+        idx = np.random.default_rng(seed + 1).permutation(len(A))
+        h = len(A) // 2
+        A1, A2 = A[idx[:h]], A[idx[h:2 * h]]
+        out['auc_base'] = c2st_auc(A1, A2, n_folds=n_folds, seed=seed, clf=clf,
+                                   max_n=c2st_max_n, device=device, **net_kw)
+        out['mmd2_base'] = mmd2(A1, A2, max_n=mmd_max_n, seed=seed)
+    if verbose:
+        tail = (f"   |   data-vs-data: AUC {out['auc_base']:.4f}  "
+                f"MMD2 {out['mmd2_base']:+.2e}") if baseline else ''
+        print(f"{label:<26s} AUC {out['auc']:.4f} ({out['n_sigma']:+5.1f} sigma)   "
+              f"MMD2 {out['mmd2']:+.3e}{tail}")
+    return out
+
+
 def classifier_two_sample_test(X_data, X_model, test_frac=0.3, seed=0,
                                max_n=20000, standardize=True, clf=None,
                                n_perm=1000):
