@@ -10893,21 +10893,55 @@ def mmd2(X_data, X_model, bandwidth=None, standardize=True, max_n=2000, seed=0):
                  - 2.0 * Kab.mean())
 
 
-def two_sample_numbers(X_data, X_model, label='', seed=0, n_folds=5, clf=None,
-                       c2st_max_n=None, mmd_max_n=2000, baseline=True,
-                       verbose=True, device=None, **net_kw):
-    """C2ST AUC and MMD^2 for one batch of events -- two numbers, no plots.
+def energy_distance(X_data, X_model, standardize=True, max_n=3000, seed=0):
+    """Szekely-Rizzo energy distance as a SINGLE number.
 
-    The baseline splits the DATA sample in half and runs both tests on the two
-    halves.  That is the null by construction, so it calibrates both numbers for
+        E = 2 E|X - Y| - E|X - X'| - E|Y - Y'|
+
+    Zero iff the two distributions are equal, strictly positive otherwise.  It is
+    MMD with the distance kernel, so there is no bandwidth to choose -- which makes
+    it the steadier of the two when the feature columns have very different scales
+    or heavy tails.  Still scale dependent, so read it against a data-vs-data
+    baseline.
+
+    The within-sample terms exclude their zero diagonals, which makes this the
+    U-statistic form: unbiased, and therefore negative about half the time under
+    the null, exactly like MMD^2.  Memory is O(n m), hence max_n.
+    """
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+
+    def _md(P, Q, same=False):
+        sp, sq = (P ** 2).sum(1), (Q ** 2).sum(1)
+        d = np.sqrt(np.maximum(sp[:, None] + sq[None, :] - 2.0 * (P @ Q.T), 0.0))
+        if same:                                  # drop the zero diagonal
+            n = len(P)
+            return d.sum() / (n * (n - 1.0))
+        return d.mean()
+
+    return float(2.0 * _md(A, B) - _md(A, A, True) - _md(B, B, True))
+
+
+def two_sample_numbers(X_data, X_model, label='', seed=0, n_folds=5, clf=None,
+                       c2st_max_n=None, mmd_max_n=3000, baseline=True,
+                       verbose=True, device=None, **net_kw):
+    """C2ST AUC, MMD^2 and energy distance for one batch -- numbers, no plots.
+
+    One row of X is one sample: for these surrogates, one PMT, with the model's own
+    context vector alongside the observable.  The context columns are identical on
+    both sides by construction, so they carry no marginal signal -- they force the
+    tests to judge the conditional p(x | c) rather than the marginal p(x).
+
+    The baseline splits the DATA sample in half and runs all three tests on the two
+    halves.  That is the null by construction, so it calibrates every number for
     the sample size and feature set actually in use: AUC_base should sit at 0.5,
-    and MMD2_base sets the scale below which MMD2 is noise.  The halves are half
-    the size, so the baseline AUC is the noisier of the two -- it bounds the
-    resolution rather than matching it exactly.
+    and the MMD2/energy baselines set the scale below which those two mean nothing.
+    The halves are half the size, so the baseline is the noisier of the pair -- it
+    bounds the resolution rather than matching it exactly.
     """
     out = {'auc': c2st_auc(X_data, X_model, n_folds=n_folds, seed=seed, clf=clf,
                            max_n=c2st_max_n, device=device, **net_kw),
-           'mmd2': mmd2(X_data, X_model, max_n=mmd_max_n, seed=seed)}
+           'mmd2': mmd2(X_data, X_model, max_n=mmd_max_n, seed=seed),
+           'edist': energy_distance(X_data, X_model, max_n=mmd_max_n, seed=seed)}
     n0 = min(len(X_data), c2st_max_n or len(X_data))
     n1 = min(len(X_model), c2st_max_n or len(X_model))
     out['auc_sigma'] = c2st_null_sigma(n0, n1)
@@ -10920,11 +10954,16 @@ def two_sample_numbers(X_data, X_model, label='', seed=0, n_folds=5, clf=None,
         out['auc_base'] = c2st_auc(A1, A2, n_folds=n_folds, seed=seed, clf=clf,
                                    max_n=c2st_max_n, device=device, **net_kw)
         out['mmd2_base'] = mmd2(A1, A2, max_n=mmd_max_n, seed=seed)
+        out['edist_base'] = energy_distance(A1, A2, max_n=mmd_max_n, seed=seed)
     if verbose:
-        tail = (f"   |   data-vs-data: AUC {out['auc_base']:.4f}  "
-                f"MMD2 {out['mmd2_base']:+.2e}") if baseline else ''
-        print(f"{label:<26s} AUC {out['auc']:.4f} ({out['n_sigma']:+5.1f} sigma)   "
-              f"MMD2 {out['mmd2']:+.3e}{tail}")
+        print(f"{label}")
+        b = (f"  (data-vs-data {out['auc_base']:.4f})") if baseline else ''
+        print(f"  C2ST AUC   {out['auc']:.4f}   {out['n_sigma']:+6.1f} sigma "
+              f"[null 0.5 +- {out['auc_sigma']:.4f}]{b}")
+        b = (f"  (data-vs-data {out['mmd2_base']:+.3e})") if baseline else ''
+        print(f"  MMD^2      {out['mmd2']:+.4e}{b}")
+        b = (f"  (data-vs-data {out['edist_base']:+.3e})") if baseline else ''
+        print(f"  energy d.  {out['edist']:+.4e}{b}")
     return out
 
 
