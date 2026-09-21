@@ -10707,20 +10707,33 @@ def plot_model_nll_landscape(
             'true': tv, 'best': best, 'loglik_true': ll_true}
 
 
-def _ts_prep(Xa, Xb, standardize=True, max_n=None, seed=0):
-    """Stack two sample sets, drop non-finite rows, optionally standardise/subsample."""
+def _ts_prep(Xa, Xb, standardize=True, max_n=None, seed=0, paired=False):
+    """Stack two sample sets, drop non-finite rows, optionally standardise/subsample.
+
+    paired=True keeps row i of A and row i of B together: they are the same PMT,
+    so filtering and subsampling must hit both or the matching is lost.
+    """
     A = np.asarray(Xa, dtype=np.float64).reshape(len(Xa), -1)
     B = np.asarray(Xb, dtype=np.float64).reshape(len(Xb), -1)
     if A.shape[1] != B.shape[1]:
         raise ValueError(f"feature mismatch: {A.shape[1]} vs {B.shape[1]}")
-    A = A[np.isfinite(A).all(1)]
-    B = B[np.isfinite(B).all(1)]
     rng = np.random.default_rng(seed)
-    if max_n is not None:
-        if len(A) > max_n:
-            A = A[rng.choice(len(A), max_n, replace=False)]
-        if len(B) > max_n:
-            B = B[rng.choice(len(B), max_n, replace=False)]
+    if paired:
+        if len(A) != len(B):
+            raise ValueError(f"paired needs equal lengths: {len(A)} vs {len(B)}")
+        ok = np.isfinite(A).all(1) & np.isfinite(B).all(1)
+        A, B = A[ok], B[ok]
+        if max_n is not None and len(A) > max_n:
+            k = rng.choice(len(A), max_n, replace=False)
+            A, B = A[k], B[k]
+    else:
+        A = A[np.isfinite(A).all(1)]
+        B = B[np.isfinite(B).all(1)]
+        if max_n is not None:
+            if len(A) > max_n:
+                A = A[rng.choice(len(A), max_n, replace=False)]
+            if len(B) > max_n:
+                B = B[rng.choice(len(B), max_n, replace=False)]
     if standardize:
         pool = np.vstack([A, B])
         mu, sd = pool.mean(0), pool.std(0)
@@ -10751,10 +10764,8 @@ def _fit_mlp_c2st(Xtr, ytr, Xte, hidden=(256, 256, 128), dropout=0.1, lr=1e-3,
                   val_frac=0.2, seed=0, device=None):
     """Train the MLP discriminator on (Xtr, ytr), return its scores on Xte.
 
-    Early stopping on a held-out slice of the TRAINING fold (never the test fold),
-    restoring the best weights.  Without it the net memorises small event-level
-    samples and the out-of-fold AUC collapses to chance even when a real
-    difference exists.
+    Early stops on a slice of the TRAINING fold (never the test fold) and restores
+    the best weights; without it the net memorises and loses power.
     """
     from sklearn.metrics import roc_auc_score
 
@@ -10813,42 +10824,42 @@ def _fit_mlp_c2st(Xtr, ytr, Xte, hidden=(256, 256, 128), dropout=0.1, lr=1e-3,
 
 
 def c2st_auc(X_data, X_model, n_folds=5, seed=0, clf=None, standardize=True,
-             max_n=None, return_proba=False, device=None, **net_kw):
-    """Classifier two-sample test reduced to a SINGLE number: the K-fold AUC.
+             max_n=None, return_proba=False, device=None, paired=True, **net_kw):
+    """Classifier two-sample test as one number: the K-fold out-of-fold AUC.
 
-    One row of X is one sample.  For a detector surrogate that means one EVENT:
-    the row summarises the whole detector response, so the test sees the joint
-    event rather than one PMT at a time.
+    0.5 = indistinguishable. Null sigma is c2st_null_sigma(n0, n1).
 
-    The discriminator is an MLP (LayerNorm + GELU + dropout, AdamW, early stopping
-    on a slice of the training fold).  Every sample is scored by a net that never
-    saw it -- K-fold out-of-fold predictions -- and one AUC is computed over all of
-    them.  That uses the whole sample and avoids the noise of a single held-out
-    split, which matters because event-level tests have far fewer samples than
-    row-level ones.
+    paired=True (the default) means row i of X_data and row i of X_model are the
+    SAME PMT: identical context, observed value versus modelled value. That is the
+    comparison you want -- it removes context sampling noise entirely, so the only
+    thing left to separate the classes is p(x | c). The two rows are then folded
+    TOGETHER, because splitting a matched pair across folds lets the net memorise
+    one twin's label and predict it for the other, where it is the wrong label; the
+    null drifts to 0.4926 (-2.6 sigma at 20k pairs) if you don't.
 
-        0.5 -> the discriminator cannot tell model events from data events
-        1.0 -> trivially separable
+    paired=False for two independent sets of rows.
 
-    Under the null the AUC has standard error sqrt((n0 + n1 + 1) / (12 n0 n1));
-    at n0 = n1 = 1000 that is 0.013, so 0.55 is already a 4-sigma failure.
-    Out-of-fold scores are mildly correlated across folds, so treat that as a
-    yardstick and calibrate with a data-vs-data baseline (two_sample_numbers).
-
-    Pass `clf` (any sklearn estimator with predict_proba) to swap the MLP out;
-    extra keywords (hidden, dropout, lr, max_epochs, patience, ...) go to the net.
+    Discriminator is an MLP; pass `clf` for any sklearn estimator instead, and
+    hidden/dropout/lr/max_epochs/patience through to the net.
     """
     import sklearn.base
     from sklearn.metrics import roc_auc_score
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
 
-    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed, paired=paired)
     X = np.vstack([A, B])
     y = np.concatenate([np.zeros(len(A)), np.ones(len(B))])
 
     oof = np.zeros(len(y))
-    splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    for k, (tr, te) in enumerate(splitter.split(X, y)):
+    if paired:
+        grp = np.tile(np.arange(len(A)), 2)
+        splitter = StratifiedGroupKFold(n_splits=n_folds, shuffle=True,
+                                        random_state=seed)
+        folds = splitter.split(X, y, groups=grp)
+    else:
+        splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        folds = splitter.split(X, y)
+    for k, (tr, te) in enumerate(folds):
         if clf is None:
             oof[te] = _fit_mlp_c2st(X[tr], y[tr], X[te], seed=seed + k,
                                     device=device, **net_kw)
@@ -10867,18 +10878,16 @@ def c2st_null_sigma(n0, n1):
     return math.sqrt((n0 + n1 + 1.0) / (12.0 * float(n0) * float(n1)))
 
 
-def mmd2(X_data, X_model, bandwidth=None, standardize=True, max_n=2000, seed=0):
-    """Unbiased MMD^2 with an RBF kernel, as a SINGLE number.
+def mmd2(X_data, X_model, bandwidth=None, standardize=True, max_n=2000, seed=0,
+         paired=True):
+    """Unbiased MMD^2 with an RBF kernel (median-heuristic bandwidth), one number.
 
-    Bandwidth defaults to the median pairwise distance of the pooled sample.  The
-    value is scale dependent and near zero under the null (it is unbiased, so it
-    goes NEGATIVE about half the time there); it only means something next to a
-    reference, so compare it with a data-vs-data split of the same size --
-    two_sample_numbers does that for you.
-
+    Unbiased, so it goes negative about half the time under the null. With paired
+    rows the cross term drops its diagonal too: k(x_i, y_i) shares a context and so
+    runs systematically high, which would bias MMD^2 negative by O(1/n).
     Memory is O((n+m)^2), hence max_n.
     """
-    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed, paired=paired)
     n, m = len(A), len(B)
     Z = np.vstack([A, B])
     sq = (Z ** 2).sum(1)
@@ -10888,81 +10897,72 @@ def mmd2(X_data, X_model, bandwidth=None, standardize=True, max_n=2000, seed=0):
         bandwidth = math.sqrt(max(med, 1e-12) / 2.0)
     K = np.exp(-d2 / (2.0 * bandwidth ** 2))
     Kaa, Kbb, Kab = K[:n, :n], K[n:, n:], K[:n, n:]
+    cross = ((Kab.sum() - np.trace(Kab)) / (n * (m - 1.0)) if paired
+             else Kab.mean())
     return float((Kaa.sum() - np.trace(Kaa)) / (n * (n - 1.0))
                  + (Kbb.sum() - np.trace(Kbb)) / (m * (m - 1.0))
-                 - 2.0 * Kab.mean())
+                 - 2.0 * cross)
 
 
-def energy_distance(X_data, X_model, standardize=True, max_n=3000, seed=0):
-    """Szekely-Rizzo energy distance as a SINGLE number.
+def energy_distance(X_data, X_model, standardize=True, max_n=3000, seed=0,
+                    paired=True):
+    """Szekely-Rizzo energy distance 2 E|X-Y| - E|X-X'| - E|Y-Y'|, one number.
 
-        E = 2 E|X - Y| - E|X - X'| - E|Y - Y'|
-
-    Zero iff the two distributions are equal, strictly positive otherwise.  It is
-    MMD with the distance kernel, so there is no bandwidth to choose -- which makes
-    it the steadier of the two when the feature columns have very different scales
-    or heavy tails.  Still scale dependent, so read it against a data-vs-data
-    baseline.
-
-    The within-sample terms exclude their zero diagonals, which makes this the
-    U-statistic form: unbiased, and therefore negative about half the time under
-    the null, exactly like MMD^2.  Memory is O(n m), hence max_n.
+    MMD with the distance kernel, so no bandwidth to choose. U-statistic form, so
+    unbiased and negative about half the time under the null, like mmd2. With
+    paired rows the cross term drops its diagonal for the same reason.
     """
-    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed, paired=paired)
 
-    def _md(P, Q, same=False):
+    def _md(P, Q, drop_diag=False):
         sp, sq = (P ** 2).sum(1), (Q ** 2).sum(1)
         d = np.sqrt(np.maximum(sp[:, None] + sq[None, :] - 2.0 * (P @ Q.T), 0.0))
-        if same:                                  # drop the zero diagonal
-            n = len(P)
-            return d.sum() / (n * (n - 1.0))
+        if drop_diag:
+            n, m = len(P), len(Q)
+            return (d.sum() - np.trace(d)) / (n * (m - 1.0))
         return d.mean()
 
-    return float(2.0 * _md(A, B) - _md(A, A, True) - _md(B, B, True))
+    return float(2.0 * _md(A, B, paired) - _md(A, A, True) - _md(B, B, True))
 
 
-def two_sample_numbers(X_data, X_model, label='', seed=0, n_folds=5, clf=None,
-                       c2st_max_n=None, mmd_max_n=3000, baseline=True,
+def two_sample_numbers(X_data, X_model, X_model2=None, label='', seed=0, n_folds=5,
+                       clf=None, c2st_max_n=None, mmd_max_n=3000, paired=True,
                        verbose=True, device=None, **net_kw):
     """C2ST AUC, MMD^2 and energy distance for one batch -- numbers, no plots.
 
-    One row of X is one sample: for these surrogates, one PMT, with the model's own
-    context vector alongside the observable.  The context columns are identical on
-    both sides by construction, so they carry no marginal signal -- they force the
-    tests to judge the conditional p(x | c) rather than the marginal p(x).
+    One row is one PMT: context features plus the observable, with row i the same
+    PMT in every array. See c2st_auc for why the folds are grouped.
 
-    The baseline splits the DATA sample in half and runs all three tests on the two
-    halves.  That is the null by construction, so it calibrates every number for
-    the sample size and feature set actually in use: AUC_base should sit at 0.5,
-    and the MMD2/energy baselines set the scale below which those two mean nothing.
-    The halves are half the size, so the baseline is the noisier of the pair -- it
-    bounds the resolution rather than matching it exactly.
+    X_model2 is a SECOND independent draw from the model at the same contexts. It
+    gives a null with exactly the structure of the real test -- the data side
+    cannot supply one, since each PMT is measured only once -- so it says what "no
+    difference" looks like here. Strongly recommended; cheap to produce.
     """
-    out = {'auc': c2st_auc(X_data, X_model, n_folds=n_folds, seed=seed, clf=clf,
-                           max_n=c2st_max_n, device=device, **net_kw),
-           'mmd2': mmd2(X_data, X_model, max_n=mmd_max_n, seed=seed),
-           'edist': energy_distance(X_data, X_model, max_n=mmd_max_n, seed=seed)}
+    kw = dict(n_folds=n_folds, seed=seed, clf=clf, max_n=c2st_max_n,
+              paired=paired, device=device, **net_kw)
+    out = {'auc': c2st_auc(X_data, X_model, **kw),
+           'mmd2': mmd2(X_data, X_model, max_n=mmd_max_n, seed=seed, paired=paired),
+           'edist': energy_distance(X_data, X_model, max_n=mmd_max_n, seed=seed,
+                                    paired=paired)}
     n0 = min(len(X_data), c2st_max_n or len(X_data))
     n1 = min(len(X_model), c2st_max_n or len(X_model))
     out['auc_sigma'] = c2st_null_sigma(n0, n1)
     out['n_sigma'] = (out['auc'] - 0.5) / out['auc_sigma']
-    if baseline:
-        A = np.asarray(X_data, dtype=np.float64).reshape(len(X_data), -1)
-        idx = np.random.default_rng(seed + 1).permutation(len(A))
-        h = len(A) // 2
-        A1, A2 = A[idx[:h]], A[idx[h:2 * h]]
-        out['auc_base'] = c2st_auc(A1, A2, n_folds=n_folds, seed=seed, clf=clf,
-                                   max_n=c2st_max_n, device=device, **net_kw)
-        out['mmd2_base'] = mmd2(A1, A2, max_n=mmd_max_n, seed=seed)
-        out['edist_base'] = energy_distance(A1, A2, max_n=mmd_max_n, seed=seed)
+    if X_model2 is not None:
+        out['auc_base'] = c2st_auc(X_model, X_model2, **kw)
+        out['mmd2_base'] = mmd2(X_model, X_model2, max_n=mmd_max_n, seed=seed,
+                                paired=paired)
+        out['edist_base'] = energy_distance(X_model, X_model2, max_n=mmd_max_n,
+                                            seed=seed, paired=paired)
+    has = 'auc_base' in out
     if verbose:
         print(f"{label}")
-        b = (f"  (data-vs-data {out['auc_base']:.4f})") if baseline else ''
+        b = f"  (null draw {out['auc_base']:.4f})" if has else ''
         print(f"  C2ST AUC   {out['auc']:.4f}   {out['n_sigma']:+6.1f} sigma "
               f"[null 0.5 +- {out['auc_sigma']:.4f}]{b}")
-        b = (f"  (data-vs-data {out['mmd2_base']:+.3e})") if baseline else ''
+        b = f"  (null draw {out['mmd2_base']:+.3e})" if has else ''
         print(f"  MMD^2      {out['mmd2']:+.4e}{b}")
-        b = (f"  (data-vs-data {out['edist_base']:+.3e})") if baseline else ''
+        b = f"  (null draw {out['edist_base']:+.3e})" if has else ''
         print(f"  energy d.  {out['edist']:+.4e}{b}")
     return out
 

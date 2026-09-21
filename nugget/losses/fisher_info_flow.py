@@ -68,6 +68,13 @@ class FlowFisherResolutionLoss(LossFunction):
         ODE steps per log-prob. 
     pmt_directions, geometry_csv_path, n_pmt_per_om
         The per-OM PMT template; defaults to the geometry the models were trained on.
+    geometry_grads : bool
+        Keep the Fisher tensor attached to ``points_3d``, so the loss is
+        differentiable with respect to detector positions and not only to
+        ``string_weights``. Needs create_graph through every ODE solve (the
+        scores are already first derivatives), so it is markedly slower and
+        heavier, and is incompatible with ``use_torch_compile`` and with a
+        precomputed Fisher tensor.
     """
 
     def __init__(self, hit_model=None, ly_model=None, atime_model=None,
@@ -77,7 +84,7 @@ class FlowFisherResolutionLoss(LossFunction):
                  pmt_directions=None, geometry_csv_path=None, n_pmt_per_om=None,
                  div_mode='autograd', div_eps=1e-6, use_torch_compile=False,
                  torch_compile_kwargs=None, sample_hits=False, n_hit_samples=1,
-                 hit_sample_seed=None, print_loss=False):
+                 hit_sample_seed=None, geometry_grads=False, print_loss=False):
         super().__init__(device=device)
         # The mode controls which terms are included in the Fisher: hit, light-yield, and/or arrival-time.
         _MODES = {'all':    (True,  True,  True),
@@ -117,6 +124,25 @@ class FlowFisherResolutionLoss(LossFunction):
         self.div_mode = div_mode
         self.div_eps = float(div_eps) if div_mode == 'fd' else None
         self.use_torch_compile = bool(use_torch_compile)
+
+        # Keep the detector positions attached all the way through the Fisher
+        # build, so d(loss)/d(points_3d) -- and through the geometry's own graph
+        # d/d(string_xy), d/d(slice_radius), ... -- is a real derivative rather
+        # than zero. Off by default: the scores are themselves first derivatives,
+        # so this needs create_graph through every ODE solve, and both the memory
+        # and the step time go up substantially.
+        self.geometry_grads = bool(geometry_grads)
+        if self.geometry_grads and use_torch_compile:
+            raise ValueError(
+                "geometry_grads=True needs create_graph through the score "
+                "computation, which is double backward -- exactly what "
+                "torch.compile rejects. Use one or the other."
+            )
+        if self.geometry_grads and self.sample_hits:
+            print("FlowFisherResolutionLoss: sample_hits=True draws the hit count "
+                  "through a comparison (u < pi), which has no derivative, so the "
+                  "geometry gradient picks it up only via pi in `coef`. Prefer "
+                  "sample_hits=False when optimizing positions.")
 
         if hit_model is None or ly_model is None:
             raise ValueError("a hit model and a light-yield model are both required "
@@ -186,6 +212,20 @@ class FlowFisherResolutionLoss(LossFunction):
 
     # ------------------------------------------------------------- score terms
 
+    def _keep(self, t):
+        """Drop the geometry path unless geometry gradients were asked for."""
+        return t if self.geometry_grads else t.detach()
+
+    def _diff_wrt(self, t):
+        """A tensor ``autograd.grad`` can differentiate with respect to.
+
+        With geometry_grads the tensor keeps its history -- ``autograd.grad``
+        accepts non-leaf inputs, and that history is precisely the route back to
+        points_3d. Without it, cutting the history and making a fresh leaf is
+        cheaper and is the original behaviour.
+        """
+        return t if self.geometry_grads else t.detach().requires_grad_(True)
+
     def _scores(self, model, build, theta, z_nodes, chunk):
         """d log p_z(z_k | c_j) / d theta for every (PMT j, node k).
 
@@ -198,8 +238,9 @@ class FlowFisherResolutionLoss(LossFunction):
         M = int(build(theta).shape[0])
         K = z_nodes.shape[0]
         P = theta.shape[0]
+        keep = self.geometry_grads
         Jc = torch.func.jacfwd(build)(theta)                       # (M, C, P)
-        ctx0 = build(theta).detach()
+        ctx0 = self._keep(build(theta))
 
         logw = torch.empty(M, K, device=self.device, dtype=self.dtype)
         g = torch.empty(M, K, P, device=self.device, dtype=self.dtype)
@@ -207,27 +248,36 @@ class FlowFisherResolutionLoss(LossFunction):
         for s in range(0, M, rep):
             e = min(s + rep, M)
             n = e - s
-            c = ctx0[s:e].repeat_interleave(K, 0).detach().requires_grad_(True)
+            c = self._diff_wrt(ctx0[s:e].repeat_interleave(K, 0))
             zz = z_nodes.repeat(n)
             lp = _log_prob_z(model, zz, c, self.n_steps, self.div_eps)
-            G = torch.autograd.grad(lp.sum(), c)[0].reshape(n, K, -1)
-            logw[s:e] = lp.detach().reshape(n, K)
+            # create_graph keeps d log p / d c differentiable in its own right, so
+            # the score stays a function of the detector position through both
+            # factors -- the context the flow was evaluated at, and Jc.
+            G = torch.autograd.grad(lp.sum(), c, create_graph=keep)[0].reshape(n, K, -1)
+            logw[s:e] = self._keep(lp).reshape(n, K)
             g[s:e] = torch.einsum('mkc,mcp->mkp', G, Jc[s:e])
             del c, lp, G
         return logw, g
 
     def _logw_only(self, model, ctx, z_nodes, chunk):
-        """log p_z at the nodes, no gradients -- all qbar needs."""
+        """log p_z at the nodes -- all qbar needs.
+
+        ``differentiable`` has to track geometry_grads. log_prob_z's fast path
+        detaches inside ``_v_and_div``, returning a value with no grad_fn at all,
+        so leaving it off would silently zero the position dependence of qbar --
+        and qbar scales the whole arrival-time term whenever include_ly is False.
+        """
         M, K = ctx.shape[0], z_nodes.shape[0]
         out = torch.empty(M, K, device=self.device, dtype=self.dtype)
         rep = max(int(chunk) // max(K, 1), 1)
-        # with torch.no_grad(): #keep grad for now
         for s in range(0, M, rep):
             e = min(s + rep, M)
             n = e - s
             lp = model.log_prob_z(z_nodes.repeat(n),
                                     ctx[s:e].repeat_interleave(K, 0),
-                                    n_steps=self.n_steps)
+                                    n_steps=self.n_steps,
+                                    differentiable=self.geometry_grads)
             out[s:e] = lp.reshape(n, K)
         return out
 
@@ -263,11 +313,12 @@ class FlowFisherResolutionLoss(LossFunction):
         # ---- pi and grad logit: needed either way (pi weights every term) ----
         build_h = self._ctx_builder(self.hit_model, pts, dirs, vertex, ev)
         Jh = torch.func.jacfwd(build_h)(theta)                     # (M, C, P)
-        ch = build_h(theta).detach().requires_grad_(True)
+        ch = self._diff_wrt(build_h(theta))
         ell = self.hit_model.predict_hit_logit(ch, calibrated=True).reshape(-1)
-        gl_c = torch.autograd.grad(ell.sum(), ch)[0]               # (M, C)
+        gl_c = torch.autograd.grad(ell.sum(), ch,
+                                   create_graph=self.geometry_grads)[0]  # (M, C)
         gl = torch.einsum('mc,mcp->mp', gl_c, Jh)                  # (M, P)
-        pi = torch.sigmoid(ell.detach()).clamp(1e-12, 1 - 1e-12)   # (M,)
+        pi = torch.sigmoid(self._keep(ell)).clamp(1e-12, 1 - 1e-12)  # (M,)
 
         glgl = gl.unsqueeze(2) * gl.unsqueeze(1)                   # (M, P, P)
         F = torch.zeros(M, P, P, device=self.device, dtype=self.dtype)
@@ -314,7 +365,8 @@ class FlowFisherResolutionLoss(LossFunction):
             del logw_q, g_q, contrib
         else:
             w_q = self._weights(
-                self._logw_only(self.ly_model, build_l(theta).detach(), self._zq, chunk))
+                self._logw_only(self.ly_model, self._keep(build_l(theta)),
+                                self._zq, chunk))
         qvals = self.ly_model.from_z(self._zq).reshape(1, -1)
         qbar = (w_q * qvals).sum(1).clamp_min(1.0)                 # (m,)
 
@@ -325,7 +377,13 @@ class FlowFisherResolutionLoss(LossFunction):
             # grid z at the true theta, map to fixed t_hit, then let t_res move with
             # theta through t_geom -- that dependence is where the timing information
             # on direction actually lives.
-            with torch.no_grad():
+            # t_hit must carry the same position dependence as the t_geom that
+            # _scores_time subtracts from it. Then at theta = theta_0 the two
+            # cancel exactly, t_res is the fixed z-grid, and d(t_res)/d(pts) is 0
+            # there -- the quadrature nodes stay a numerical device rather than
+            # becoming geometry-dependent. Detaching only tg0 would leave a
+            # spurious one-sided -d(t_geom)/d(pts) in every node.
+            with torch.set_grad_enabled(self.geometry_grads):
                 tg0 = at.geometric_time(
                     sub_pts, vertex.reshape(1, 3).expand(m, 3),
                     zeniths=_as_t(ev['zenith'], self.device, self.dtype).reshape(1).expand(m),
@@ -359,8 +417,9 @@ class FlowFisherResolutionLoss(LossFunction):
                                    azimuths=a.reshape(1).expand(n)).reshape(n, 1)
             return (t_hit[sl] - tg).reshape(-1)
 
+        keep = self.geometry_grads
         Jc = torch.func.jacfwd(build)(theta)                       # (M, C, P)
-        ctx0 = build(theta).detach()
+        ctx0 = self._keep(build(theta))
         logw = torch.empty(M, K, device=self.device, dtype=self.dtype)
         g = torch.empty(M, K, P, device=self.device, dtype=self.dtype)
         rep = max(int(chunk) // max(K, 1), 1)
@@ -369,11 +428,11 @@ class FlowFisherResolutionLoss(LossFunction):
             n = e - s
             sl = slice(s, e)
             Jt = torch.func.jacfwd(lambda th: t_res_of(th, sl))(theta)  # (n*K, P)
-            tr = t_res_of(theta, sl).detach().requires_grad_(True)
-            c = ctx0[sl].repeat_interleave(K, 0).detach().requires_grad_(True)
+            tr = self._diff_wrt(t_res_of(theta, sl))
+            c = self._diff_wrt(ctx0[sl].repeat_interleave(K, 0))
             lp = _log_prob_tres(at, tr, c, self.n_steps, self.div_eps)
-            gc_, gt_ = torch.autograd.grad(lp.sum(), (c, tr))
-            logw[sl] = lp.detach().reshape(n, K)
+            gc_, gt_ = torch.autograd.grad(lp.sum(), (c, tr), create_graph=keep)
+            logw[sl] = self._keep(lp).reshape(n, K)
             g[sl] = (torch.einsum('mkc,mcp->mkp', gc_.reshape(n, K, -1), Jc[sl])
                      + (gt_.reshape(n, K, 1) * Jt.reshape(n, K, P)))
             del c, tr, lp, gc_, gt_, Jt
@@ -389,6 +448,12 @@ class FlowFisherResolutionLoss(LossFunction):
 
         Every OM in ``points_3d`` is expanded into the PMT template; a point belongs
         to the string whose (x, y) it matches exactly, as in ``fisher_info.py``.
+
+        With ``geometry_grads`` the result stays attached to ``points_3d``. The
+        string matching below is still detached, and has to be: it is an exact
+        equality test, so it has no derivative to offer. That costs nothing --
+        the gradient reaches ``string_xy`` (or ``slice_radius``, ...) through
+        ``points_3d`` and the geometry's own graph, not through the lookup.
         """
         pts3 = _as_t(points_3d, self.device, self.dtype).reshape(-1, 3)
         n_pts = pts3.shape[0]
@@ -507,6 +572,12 @@ class FlowFisherResolutionLoss(LossFunction):
                 string_xy, points_3d, params, chunk=chunk,
                 empty_cache_after_event=empty_cache, verbose=verbose)
         else:
+            if self.geometry_grads:
+                print("FlowFisherResolutionLoss: geometry_grads=True but a "
+                      "precomputed Fisher tensor was supplied, so it is a "
+                      "constant and no position gradient exists. Drop "
+                      "'precomputed_fisher_info_per_string_per_event' to have it "
+                      "rebuilt from the current geometry each step.")
             F_str = precomp.to(device=self.device, dtype=self.dtype)
 
         if string_weights is None:

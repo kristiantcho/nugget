@@ -24,6 +24,10 @@ ENV/
 *.json
 *.parquet
 
+# Agent / assistant context files
+CLAUDE.md
+.claude/
+
 # OS specific files
 .DS_Store
 Thumbs.db
