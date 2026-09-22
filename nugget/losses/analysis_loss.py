@@ -13,8 +13,9 @@ from nugget.samplers.cyl_sampler import CylinderSampler
 from torch.special import ndtr
 from typing import Union, List
 from numpy.typing import ArrayLike as Array
-from friEnd.api import extend_dataframe, load_config
-from friEnd.pyff_friend import PyFF_Friend
+
+# friEnd / pyForwardFolding are imported at the call site: they pull in JAX,
+# which preallocates most of every visible GPU on first use.
 
 # ---------------------------------------------------------------------------
 # Flux weighting via friEnd + pyForwardFolding
@@ -280,6 +281,9 @@ def add_weights_to_signal_events(
     list of dict
         The events, with ``weights`` and ``grad_weights_<param>`` added.
     """
+
+    from friEnd.api import extend_dataframe, load_config
+    from friEnd.pyff_friend import PyFF_Friend
 
     if gen is None:
         if signal_sampler is None:
