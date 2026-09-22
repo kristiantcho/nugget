@@ -10,6 +10,11 @@ and adds two things:
 * **Per-loss devices** -- a loss can run on its own GPU, with torch and JAX
   losses (via :mod:`nugget.utils.jax_bridge`) landing in the same ``.grad``.
 
+:class:`JaxLossAdapter` turns a pure-JAX loss into a torch one, and
+``HybridOptimizer`` applies it automatically to any entry of ``loss_func_dict``
+implementing that protocol -- so a JAX loss can be registered directly and can
+also be repeated or pinned to a device like any other.
+
 Configuration lives in ``loss_params_dict``::
 
     loss_params = {
@@ -33,9 +38,97 @@ one.
 import torch
 
 from nugget.utils.basic_optimizer import Optimizer
-from nugget.utils.jax_bridge import inject_gradient
+from nugget.utils.jax_bridge import inject_gradient, to_jax, to_torch
 
-__all__ = ["AccumulatingLoss", "HybridOptimizer"]
+__all__ = ["AccumulatingLoss", "JaxLossAdapter", "HybridOptimizer"]
+
+
+class JaxLossAdapter:
+    """Present a pure-JAX loss as a nugget loss, in torch.
+
+    All torch interop lives here: the JAX side never imports torch and never
+    sees a tensor. This converts the differentiated geometry tensors to JAX,
+    calls the loss's own jitted ``value_and_grad``, and splices the resulting
+    gradients back onto the torch tensors so the optimizer's usual machinery --
+    weighting, the sigmoid wrapper, ALM, ConFIG, ``backward()`` -- applies
+    unchanged.
+
+    Gradients are injected at the geometry tensors rather than at the optimized
+    leaves, so torch carries them the rest of the way through ``update_points``.
+    They are true partials (each is a separate argument to the JAX function), so
+    summing ``partial_i * d(x_i)/d(leaf)`` is the total derivative and injecting
+    several at once does not double count.
+
+    The wrapped object must provide:
+
+    ``diff_keys``
+        Tuple of geom_dict keys to differentiate with respect to, in the order
+        the core takes them.
+    ``aux_keys``
+        Names for the aux arrays the core returns, in order. Each is converted
+        to a torch tensor and placed in the returned dict, where the visualizer
+        picks it up.
+    ``default_input(key, geom_dict)``
+        JAX array to use when geom_dict has no entry for a diff key.
+    ``prepare(geom_dict, **loss_params) -> (static, extras)``
+        ``static`` is passed to the core as keyword JAX arrays; ``extras`` is
+        merged into the returned dict untouched (event lists and the like).
+    ``value_and_grad(*diff_arrays, **static) -> ((value, aux), grads)``
+        Jitted, with ``grads`` parallel to ``diff_keys``.
+    """
+
+    def __init__(self, jax_loss, loss_name, device=None):
+        self.jax_loss = jax_loss
+        self.loss_name = loss_name
+        self.device = device
+
+    def __call__(self, geom_dict, **loss_params):
+        static, extras = self.jax_loss.prepare(geom_dict, **loss_params)
+
+        targets, arrays = [], []
+        for key in self.jax_loss.diff_keys:
+            tensor = geom_dict.get(key, None)
+            if tensor is None:
+                targets.append(None)
+                arrays.append(self.jax_loss.default_input(key, geom_dict))
+            else:
+                targets.append(tensor)
+                arrays.append(to_jax(tensor))
+
+        (value, aux), grads = self.jax_loss.value_and_grad(*arrays, **static)
+
+        reference = next((t for t in targets if t is not None), None)
+        if reference is None:
+            raise ValueError(
+                f"JaxLossAdapter('{self.loss_name}'): geom_dict provided none of "
+                f"{self.jax_loss.diff_keys}"
+            )
+        device = self.device if self.device is not None else reference.device
+        dtype = reference.dtype
+
+        # Inject only where there is something to differentiate; a key the
+        # geometry does not carry, or one that is not being optimized, just
+        # drops its gradient.
+        live_targets, live_grads = [], []
+        for tensor, grad in zip(targets, grads):
+            if tensor is None or not tensor.requires_grad:
+                continue
+            live_targets.append(tensor)
+            live_grads.append(to_torch(grad, device=tensor.device,
+                                       dtype=tensor.dtype))
+
+        if live_targets:
+            total = inject_gradient(float(value), live_grads, live_targets,
+                                    device=device, dtype=dtype)
+        else:
+            total = torch.as_tensor(float(value), device=device, dtype=dtype)
+
+        out = {self.loss_name: total}
+        aux = aux if isinstance(aux, (tuple, list)) else (aux,)
+        for name, array in zip(self.jax_loss.aux_keys, aux):
+            out[name] = to_torch(array, device=device, dtype=dtype)
+        out.update(extras)
+        return out
 
 
 class AccumulatingLoss:
@@ -291,8 +384,14 @@ class HybridOptimizer(Optimizer):
             from nugget.utils.jax_bridge import configure_jax as _configure
             _configure()
 
+    @staticmethod
+    def _is_jax_loss(obj):
+        """True for anything implementing the JaxLossAdapter protocol."""
+        return all(hasattr(obj, attr)
+                   for attr in ("diff_keys", "prepare", "value_and_grad"))
+
     def _wrap_losses(self, loss_func_dict, loss_params_dict):
-        """Wrap losses that asked for repeats and/or their own device."""
+        """Adapt pure-JAX losses, then wrap whatever asked for repeats/a device."""
         repeats_map = loss_params_dict.get("loss_repeats", {}) or {}
         devices_map = loss_params_dict.get("loss_devices", {}) or {}
         reduction_map = loss_params_dict.get("loss_reduction", {}) or {}
@@ -309,6 +408,11 @@ class HybridOptimizer(Optimizer):
         wrapped = {}
         self._wrapped_losses = {}
         for loss_name, loss_func in loss_func_dict.items():
+            # A pure-JAX loss is adapted first, so everything downstream --
+            # including AccumulatingLoss -- sees an ordinary torch loss.
+            if self._is_jax_loss(loss_func):
+                loss_func = JaxLossAdapter(loss_func, loss_name, device=self.device)
+
             repeats = int(repeats_map.get(loss_name, 1))
             device = devices_map.get(loss_name, None)
             if repeats <= 1 and device is None:
