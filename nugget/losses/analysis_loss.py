@@ -1,10 +1,11 @@
-from nugget.losses.base_loss import LossFunction
 import torch
 import numpy as np
 import math
 import random
 import pandas as pd
 import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+from nugget.losses.base_loss import LossFunction
 from nugget.losses.trigger import TriggerLoss, ResolutionSelectionLoss
 from nugget.losses.fisher_info import WeightedResolutionLoss
 from nugget.losses.effective_area import get_weighted_min_enclosing_circle
