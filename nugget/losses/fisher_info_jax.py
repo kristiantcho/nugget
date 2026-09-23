@@ -175,9 +175,8 @@ def build_value_and_grad(fisher_info_params, cfg, n_strings, resolution_type,
 class JaxResolutionLoss:
     """Angular / energy resolution from the LightSabre Poisson Fisher, in JAX.
 
-    Implements the adapter protocol documented on
-    :class:`nugget.utils.hybrid_optimizer.JaxLossAdapter`; wrap it in that to use
-    it as a nugget loss.
+    Called like any other nugget loss, but returns JAX arrays plus
+    ``'_jax_grads'``. `HybridOptimizer` converts and splices those gradients in.
 
     Parameters
     ----------
@@ -190,6 +189,7 @@ class JaxResolutionLoss:
         `LightSabreConfig.from_torch`, which is what makes the two comparable.
     """
 
+    backend = "jax"
     diff_keys = ("points_3d", "string_weights")
 
     def __init__(self, fisher_info_params=("direction", "position"),
@@ -224,30 +224,42 @@ class JaxResolutionLoss:
         self._metric = "fom"
         self._use_rel_e = False
 
-    # -- adapter protocol ----------------------------------------------
-
     @property
     def loss_key(self):
         return ("angular_resolution" if self.resolution_type == "angular"
                 else "energy_resolution")
 
-    @property
-    def aux_keys(self):
-        return (f"{self.loss_key}_per_event", "fisher_info_per_string_per_event")
-
-    def default_input(self, key, geom_dict):
-        """Value for a diff key the geometry does not provide.
-
-        Only ``string_weights``: a geometry without weights contributes every
-        string fully, and the core applies sigmoid, so feed it a large logit.
-        """
+    def __call__(self, geom_dict, **loss_params):
+        """Standard nugget loss signature; values are JAX arrays."""
         import jax.numpy as jnp
-        if key == "string_weights":
-            return jnp.full(len(geom_dict["string_xy"]), 30.0)
-        raise KeyError(f"geom_dict has no '{key}' and no default is defined")
 
-    def prepare(self, geom_dict, **loss_params):
-        """-> (static jax kwargs for the core, plain extras to pass through)."""
+        static, params = self._prepare(geom_dict, **loss_params)
+
+        arrays = []
+        for key in self.diff_keys:
+            value = geom_dict.get(key, None)
+            if value is not None:
+                arrays.append(jnp.asarray(_as_np(value)))
+            elif key == "string_weights":
+                # No weights to optimize: every string contributes fully, and
+                # the core applies sigmoid, so feed it a large logit.
+                arrays.append(jnp.full(len(geom_dict["string_xy"]), 30.0))
+            else:
+                raise ValueError(f"geom_dict needs '{key}'")
+
+        (value, (res, F_str)), grads = self._value_and_grad(*arrays, **static)
+
+        return {
+            f"{self.loss_key}_loss": value,
+            f"{self.loss_key}_per_event": res,
+            "fisher_info_per_string_per_event": F_str,
+            "resolution_params": params,
+            "_jax_grads": {k: g for k, g in zip(self.diff_keys, grads)
+                           if geom_dict.get(k, None) is not None},
+        }
+
+    def _prepare(self, geom_dict, **loss_params):
+        """-> (static jax kwargs for the core, the event list)."""
         import jax.numpy as jnp
 
         string_xy = geom_dict.get("string_xy", None)
@@ -278,10 +290,10 @@ class JaxResolutionLoss:
         # the compiled core can never disagree.
         self._metric = loss_params.get("fisher_res_metric", "fom")
         self._use_rel_e = bool(loss_params.get("use_relative_energy", False))
-        return static, {"resolution_params": params}
+        return static, params
 
-    def value_and_grad(self, points, string_weights, **static):
-        """((value, aux), grads) -- all JAX, grads parallel to `diff_keys`."""
+    def _value_and_grad(self, points, string_weights, **static):
+        """((value, aux), grads) -- grads parallel to `diff_keys`."""
         n_strings = int(string_weights.shape[0])
         key = (n_strings, self._metric, self._use_rel_e)
         if key not in self._fns:

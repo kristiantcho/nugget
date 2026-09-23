@@ -37,45 +37,25 @@ one.
 
 import torch
 
-from nugget.utils.basic_optimizer import Optimizer
-from nugget.utils.jax_bridge import inject_gradient, to_jax, to_torch
+# Aliased: a bare `Optimizer` here would make `hybrid_optimizer.Optimizer`
+# resolve to the base class, which silently skips the JAX/accumulation wrapping.
+from nugget.utils.basic_optimizer import Optimizer as _BaseOptimizer
+from nugget.utils.jax_bridge import inject_gradient, to_torch
 
 __all__ = ["AccumulatingLoss", "JaxLossAdapter", "HybridOptimizer"]
 
 
 class JaxLossAdapter:
-    """Present a pure-JAX loss as a nugget loss, in torch.
+    """Convert a JAX loss's output to torch and splice its gradients in.
 
-    All torch interop lives here: the JAX side never imports torch and never
-    sees a tensor. This converts the differentiated geometry tensors to JAX,
-    calls the loss's own jitted ``value_and_grad``, and splices the resulting
-    gradients back onto the torch tensors so the optimizer's usual machinery --
-    weighting, the sigmoid wrapper, ALM, ConFIG, ``backward()`` -- applies
-    unchanged.
-
-    Gradients are injected at the geometry tensors rather than at the optimized
-    leaves, so torch carries them the rest of the way through ``update_points``.
-    They are true partials (each is a separate argument to the JAX function), so
-    summing ``partial_i * d(x_i)/d(leaf)`` is the total derivative and injecting
-    several at once does not double count.
-
-    The wrapped object must provide:
-
-    ``diff_keys``
-        Tuple of geom_dict keys to differentiate with respect to, in the order
-        the core takes them.
-    ``aux_keys``
-        Names for the aux arrays the core returns, in order. Each is converted
-        to a torch tensor and placed in the returned dict, where the visualizer
-        picks it up.
-    ``default_input(key, geom_dict)``
-        JAX array to use when geom_dict has no entry for a diff key.
-    ``prepare(geom_dict, **loss_params) -> (static, extras)``
-        ``static`` is passed to the core as keyword JAX arrays; ``extras`` is
-        merged into the returned dict untouched (event lists and the like).
-    ``value_and_grad(*diff_arrays, **static) -> ((value, aux), grads)``
-        Jitted, with ``grads`` parallel to ``diff_keys``.
+    The wrapped loss has the ordinary nugget signature, but returns JAX arrays
+    and a ``'_jax_grads'`` entry mapping geom_dict keys to d(loss)/d(that key).
+    Gradients land on the geometry tensors, not the optimized leaves, so torch
+    carries them the rest of the way through ``update_points``. Each is a true
+    partial, so injecting several at once sums rather than double counts.
     """
+
+    GRADS_KEY = "_jax_grads"
 
     def __init__(self, jax_loss, loss_name, device=None):
         self.jax_loss = jax_loss
@@ -83,52 +63,45 @@ class JaxLossAdapter:
         self.device = device
 
     def __call__(self, geom_dict, **loss_params):
-        static, extras = self.jax_loss.prepare(geom_dict, **loss_params)
+        import jax
 
-        targets, arrays = [], []
-        for key in self.jax_loss.diff_keys:
-            tensor = geom_dict.get(key, None)
-            if tensor is None:
-                targets.append(None)
-                arrays.append(self.jax_loss.default_input(key, geom_dict))
-            else:
-                targets.append(tensor)
-                arrays.append(to_jax(tensor))
+        out = dict(self.jax_loss(geom_dict, **loss_params))
+        grads = out.pop(self.GRADS_KEY, None) or {}
 
-        (value, aux), grads = self.jax_loss.value_and_grad(*arrays, **static)
-
-        reference = next((t for t in targets if t is not None), None)
+        reference = geom_dict.get("points_3d", None)
         if reference is None:
-            raise ValueError(
-                f"JaxLossAdapter('{self.loss_name}'): geom_dict provided none of "
-                f"{self.jax_loss.diff_keys}"
-            )
+            reference = next((v for v in geom_dict.values() if torch.is_tensor(v)), None)
+        if reference is None:
+            raise ValueError(f"JaxLossAdapter('{self.loss_name}'): geom_dict has no tensors")
         device = self.device if self.device is not None else reference.device
         dtype = reference.dtype
 
-        # Inject only where there is something to differentiate; a key the
-        # geometry does not carry, or one that is not being optimized, just
-        # drops its gradient.
-        live_targets, live_grads = [], []
-        for tensor, grad in zip(targets, grads):
+        # Only inject where there is something to differentiate.
+        targets, live_grads = [], []
+        for key, grad in grads.items():
+            tensor = geom_dict.get(key, None)
             if tensor is None or not tensor.requires_grad:
                 continue
-            live_targets.append(tensor)
-            live_grads.append(to_torch(grad, device=tensor.device,
-                                       dtype=tensor.dtype))
+            targets.append(tensor)
+            live_grads.append(to_torch(grad, device=tensor.device, dtype=tensor.dtype))
 
-        if live_targets:
-            total = inject_gradient(float(value), live_grads, live_targets,
-                                    device=device, dtype=dtype)
-        else:
-            total = torch.as_tensor(float(value), device=device, dtype=dtype)
+        result = {}
+        for key, value in out.items():
+            result[key] = (to_torch(value, device=device, dtype=dtype)
+                           if isinstance(value, jax.Array) else value)
 
-        out = {self.loss_name: total}
-        aux = aux if isinstance(aux, (tuple, list)) else (aux,)
-        for name, array in zip(self.jax_loss.aux_keys, aux):
-            out[name] = to_torch(array, device=device, dtype=dtype)
-        out.update(extras)
-        return out
+        if self.loss_name not in out:
+            raise KeyError(
+                f"JaxLossAdapter('{self.loss_name}'): the loss returned "
+                f"{sorted(out)} but not '{self.loss_name}'; the key must match "
+                "its name in loss_func_dict"
+            )
+        value = float(out[self.loss_name])
+        result[self.loss_name] = (
+            inject_gradient(value, live_grads, targets, device=device, dtype=dtype)
+            if targets else torch.as_tensor(value, device=device, dtype=dtype)
+        )
+        return result
 
 
 class AccumulatingLoss:
@@ -363,7 +336,7 @@ def geom_dict_device(geom_dict):
     return torch.device("cpu")
 
 
-class HybridOptimizer(Optimizer):
+class HybridOptimizer(_BaseOptimizer):
     """`Optimizer` with per-loss gradient accumulation and per-loss devices.
 
     Reads `loss_repeats` / `loss_devices` / `loss_reduction` from
@@ -386,9 +359,8 @@ class HybridOptimizer(Optimizer):
 
     @staticmethod
     def _is_jax_loss(obj):
-        """True for anything implementing the JaxLossAdapter protocol."""
-        return all(hasattr(obj, attr)
-                   for attr in ("diff_keys", "prepare", "value_and_grad"))
+        """True for a loss that returns JAX arrays (marked by `backend`)."""
+        return getattr(obj, "backend", None) == "jax"
 
     def _wrap_losses(self, loss_func_dict, loss_params_dict):
         """Adapt pure-JAX losses, then wrap whatever asked for repeats/a device."""
