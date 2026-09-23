@@ -26,15 +26,33 @@ __all__ = [
 # setup
 # ----------------------------------------------------------------------
 
-def configure_jax(preallocate=False, mem_fraction=None, x64=True, platform=None):
+def configure_jax(preallocate=False, mem_fraction=None, x64=True, platform=None,
+                  device=None, verbose=True):
     """Make JAX safe to run alongside torch in one process.
 
     JAX preallocates ~75% of each visible GPU on first use, which OOMs a process
     that is also running torch; ``preallocate=False`` disables that. ``x64=True``
     matches nugget's global float64 default. The environment variables only take
     effect if set before JAX is first imported.
+
+    Parameters
+    ----------
+    platform : {'cuda', 'cpu', 'tpu'} or None
+        Backend, not a device. Use `device` to pick which GPU.
+    device : int, str or None
+        Pin JAX's default device, e.g. ``2`` or ``'cuda:2'``. Does not change
+        what torch sees. To keep JAX off the other GPUs entirely -- it still
+        opens a context on each visible one -- set ``CUDA_VISIBLE_DEVICES``
+        before the process starts instead.
     """
     import sys
+
+    if platform is not None and any(c.isdigit() or c == ":" for c in str(platform)):
+        raise ValueError(
+            f"platform={platform!r} is a device, not a backend. Use "
+            f"platform='cuda' to pick the backend and device={str(platform).split(':')[-1]} "
+            "to pick the GPU."
+        )
 
     already = "jax" in sys.modules
     if not preallocate:
@@ -52,7 +70,37 @@ def configure_jax(preallocate=False, mem_fraction=None, x64=True, platform=None)
     import jax
     if x64:
         jax.config.update("jax_enable_x64", True)
+
+    if device is not None:
+        target = _select_device(jax, device)
+        jax.config.update("jax_default_device", target)
+        if verbose:
+            print(f"jax_bridge: JAX default device is {target}")
+    elif verbose:
+        print(f"jax_bridge: JAX devices {jax.devices()}")
     return jax
+
+
+def _select_device(jax, device):
+    """int | 'cuda:N' | jax.Device -> jax.Device."""
+    if hasattr(device, "platform"):
+        return device
+    text = str(device)
+    kind, _, index = text.rpartition(":")
+    kind = kind or ("cpu" if text == "cpu" else "cuda")
+    if text == "cpu":
+        index = "0"
+    if not index.isdigit():
+        raise ValueError(f"device={device!r} should be an int or 'cuda:N'")
+
+    devices = jax.devices(kind)
+    if int(index) >= len(devices):
+        raise ValueError(
+            f"device={device!r} but JAX sees only {len(devices)} {kind} device(s): "
+            f"{devices}. If you set CUDA_VISIBLE_DEVICES, the index is into the "
+            "visible list, not the physical one."
+        )
+    return devices[int(index)]
 
 
 def _jax():
