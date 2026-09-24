@@ -4,7 +4,6 @@ import math
 import random
 import pandas as pd
 import os
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 from nugget.losses.base_loss import LossFunction
 from nugget.losses.trigger import TriggerLoss, ResolutionSelectionLoss
 from nugget.losses.fisher_info import WeightedResolutionLoss
