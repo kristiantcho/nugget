@@ -976,137 +976,6 @@ class ROVPenalty(LossFunction):
 
         return blockage_per_angle
 
-    def _compute_away_theta(self, all_relative, num_neighbours, soft=True, nn_tau=1.0):
-        """Per-string heading pointing away from its `num_neighbours` nearest strings.
-
-        For each string i, take the (soft or hard) nearest-neighbour set among the
-        other strings, sum the unit vectors pointing *to* those neighbours, and
-        negate: the result points away from the local cluster.
-
-        Parameters
-        ----------
-        all_relative : (N, N-1, 2) tensor
-            all_relative[i, j] = (position of other string j) - (position of string i),
-            i.e. the vector from string i toward other string j.
-        num_neighbours : int
-            Number of nearest neighbours (k). Clamped to available count.
-        soft : bool
-            If True, neighbour membership is a softmax over -distance/nn_tau (fully
-            differentiable). If False, a hard top-k membership mask (0/1) is used.
-        nn_tau : float or None
-            Softmax temperature for the soft neighbour selection, as a *multiple of the
-            geometry's own distance scale* (the median k-th nearest-neighbour distance),
-            so it is robust to the absolute units of `points`. Smaller -> sharper top-k.
-            If None, defaults to 0.5 * that scale.
-
-        Returns
-        -------
-        theta_away : (N,) tensor of headings in radians (gradients flow w.r.t. positions).
-        away_valid : (N,) bool tensor, False where the away vector is ~0 (undefined).
-        """
-        n_other = all_relative.shape[1]
-        k = int(max(1, min(int(num_neighbours), n_other)))
-
-        dist = torch.sqrt((all_relative ** 2).sum(dim=-1) + 1e-12)  # (N, N-1)
-        # Unit vectors from string i toward each other string j.
-        unit = all_relative / dist.unsqueeze(-1)  # (N, N-1, 2)
-
-        if soft:
-            # Scale the softmax temperature by the geometry's own distance scale (median
-            # k-th nearest distance) so the soft top-k spreads over ~k neighbours
-            # regardless of the absolute coordinate units.
-            kth_dist = torch.topk(dist, k=k, dim=1, largest=False).values[:, -1]  # (N,)
-            dist_scale = torch.median(kth_dist).clamp_min(1e-12)
-            tau_mult = 0.5 if nn_tau is None else float(nn_tau)
-            tau = (tau_mult * dist_scale).clamp_min(1e-12)
-            # Soft top-k emphasis: softmax over -distance puts weight on the nearest
-            # strings. Scaled by k so the effective membership mass ~ k neighbours.
-            nn_weights = torch.softmax(-dist / tau, dim=1) * k  # (N, N-1)
-        else:
-            # Hard top-k membership mask (1 for the k nearest, else 0).
-            nn_weights = torch.zeros_like(dist)
-            topk_idx = torch.topk(dist, k=k, dim=1, largest=False).indices  # (N, k)
-            nn_weights.scatter_(1, topk_idx, 1.0)
-
-        # Sum unit vectors to neighbours, then negate to point away from them.
-        toward_vec = (unit * nn_weights.unsqueeze(-1)).sum(dim=1)  # (N, 2)
-        away_vec = -toward_vec  # (N, 2)
-
-        away_norm = torch.linalg.norm(away_vec, dim=1)  # (N,)
-        away_valid = away_norm > 1e-8
-        # Offset degenerate (~0) rows so atan2 stays finite in fwd/bwd; away_valid
-        # zeroes their contribution downstream.
-        safe_away_vec = torch.where(
-            away_valid.unsqueeze(1),
-            away_vec,
-            away_vec + torch.tensor([1.0, 0.0], device=all_relative.device, dtype=away_vec.dtype),
-        )
-        # NOTE: `angles` (and blockage_per_angle's heading grid) use ROVPenalty's own
-        # corridor-rotation convention, under which a heading `theta` maps to the WORLD
-        # direction (cos(theta), -sin(theta)) -- i.e. angles increase clockwise, not the
-        # standard (counter-clockwise) atan2 convention. `away_vec` is an ordinary
-        # world-space Cartesian vector, so we must negate its y-component before
-        # atan2 to express it in that same clockwise convention; otherwise theta_away
-        # would be the mirror image (about the x-axis) of the true away direction,
-        # visibly pointing the wrong way once compared against `angles`.
-        theta_away = torch.atan2(-safe_away_vec[:, 1], safe_away_vec[:, 0])  # (N,)
-        return theta_away, away_valid
-
-    def _select_away_best_angle(
-        self,
-        blockage_per_angle,
-        angles,
-        theta_away,
-        away_valid,
-        *,
-        away_weight=0.0,
-        soft=True,
-        angle_softmin_tau=0.0,
-    ):
-        """Choose the "best" (least-blocked) ROV heading, then add an away-pointing
-        penalty term evaluated AT that heading.
-
-        The heading is selected STRICTLY by blockage -- exactly like the plain
-        (non-away) path: a hard argmin over bins (or a softmin aggregate value, with
-        the reported heading still the hard argmin bin), never by a combined
-        score. This guarantees the reported angle is always a real, actually-clear
-        location -- selecting by a blockage+misalignment combined score (or worse,
-        averaging angles under such a score) can otherwise land on a heading that is
-        NOT actually clear (e.g. the circular mean of two separate clear lobes can
-        fall in a fully-blocked gap between them).
-
-        The returned penalty is
-
-            penalty = blockage_at_best_angle + away_weight * misalign_at_best_angle
-
-        where misalign in [0, 1] measures how much the chosen (least-blocked) heading
-        points *toward* the nearest neighbours (0 = points straight away). For strings
-        with an undefined outward direction (`away_valid` False), the away term is
-        zeroed (penalty reduces to plain blockage).
-
-        Returns
-        -------
-        penalty_per_string : (N,) blockage-at-best-angle plus the away penalty term.
-        best_angle : (N,) chosen (least-blocked) heading in radians.
-        """
-        if soft and angle_softmin_tau > 0.0:
-            blockage_at_best = -angle_softmin_tau * torch.logsumexp(
-                -blockage_per_angle / angle_softmin_tau, dim=1
-            )
-            blockage_at_best = blockage_at_best.clamp(min=0.0)
-        else:
-            blockage_at_best = blockage_per_angle.min(dim=1)[0]  # (N,)
-
-        best_idx = blockage_per_angle.argmin(dim=1)  # (N,)
-        best_angle = angles[best_idx]  # (N,)
-
-        misalign_at_best = (1.0 - torch.cos(best_angle - theta_away)) / 2.0  # (N,)
-        if away_valid is not None:
-            misalign_at_best = misalign_at_best * away_valid.to(misalign_at_best.dtype)
-
-        penalty_per_string = blockage_at_best + away_weight * misalign_at_best
-
-        return penalty_per_string, best_angle
 
     def __call__(self, geom_dict, **kwargs):
         """
@@ -1114,31 +983,12 @@ class ROVPenalty(LossFunction):
         Returns: dict with 'rov_penalty' (scalar), 'rov_penalty_per_string' (N,), and
                  'rov_least_blocked_angle_per_string' (N,).
 
-        "Point away from the nearest neighbours" options (opt-in; defaults off):
-        - rov_away_weight: float, default 0.0. If > 0, the reported/selected heading is
-            still chosen STRICTLY by blockage (least-blocked; the away term never
-            changes which angle is picked, so a uniquely-clear corridor is always
-            selected and never gets a worse angle substituted in). The away term is
-            added on top, evaluated at that same heading:
-                penalty = blockage_at_best_angle + rov_away_weight * misalign_at_best_angle
-            with misalign in [0, 1] (0 = the chosen heading points straight away from
-            the nearest neighbours, 1 = straight toward them).
-        - rov_away_soft: bool, default = rov_soft_inside. Soft variant (soft top-k
-            neighbours via softmax over -distance for theta_away, and blockage
-            aggregated via rov_angle_softmin_tau if set) vs hard variant (hard top-k
-            neighbours, hard argmin blockage).
-        - rov_away_num_neighbours: int, default 5. Number of nearest neighbours defining
-            the outward direction.
-        - rov_away_nn_tau: float or None, default None. Softmax temperature for the soft
-            neighbour selection, as a multiple of the geometry's own distance scale
-            (median k-th nearest distance), so it is unit-robust. None -> 0.5.
         """
         points = geom_dict.get('string_xy', None)
         num_angles = kwargs.get('num_angles', 6)
         string_weights = geom_dict.get('string_weights', None)
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
 
-        # Backward-compatible options (defaults preserve old behavior):
         # - soft_inside=False: use hard boolean masks for corridor membership (non-differentiable w.r.t. positions)
         # - angle_softmin_tau=0.0: use hard min over angles (non-differentiable at argmin switches)
         # - detach_other_probs=True: do not backprop into blocking strings' weights
@@ -1150,27 +1000,6 @@ class ROVPenalty(LossFunction):
         # soft_inside gate: default bounded sigmoid; if True, use the unbounded
         # softplus(k*m)/k one-sided hinge instead (only affects the soft_inside path).
         inside_use_softplus = bool(kwargs.get('rov_inside_use_softplus', False))
-
-        # "Point away from the nearest neighbours" options (opt-in; default off).
-        # When rov_away_weight > 0, the "best" ROV heading is chosen by trading off
-        # blockage (primary) against pointing away from the string's nearest neighbours
-        # (secondary): score[a] = blockage[a] + rov_away_weight * misalign[a]. The
-        # reported least-blocked angle becomes this chosen heading, and the penalty is
-        # the blockage at that heading. Because blockage dominates, a string with a
-        # single narrow clear corridor (no alternative) still selects it and is not
-        # punished; the away term only tips the choice among comparably-clear headings.
-        # Two variants:
-        #   - soft (rov_away_soft=True): soft top-k neighbours (softmax over -distance)
-        #     + softmin heading selection, matching the other soft tricks; differentiable.
-        #   - hard (rov_away_soft=False): hard top-k neighbours + hard argmin selection.
-        rov_away_weight = float(kwargs.get('rov_away_weight', 0.0))
-        rov_away_enabled = rov_away_weight > 0.0
-        rov_away_soft = bool(kwargs.get('rov_away_soft', soft_inside))
-        rov_away_num_neighbours = int(kwargs.get('rov_away_num_neighbours', 5))
-        # None -> scale-aware default (0.5 * median k-th nearest distance).
-        _nn_tau = kwargs.get('rov_away_nn_tau', None)
-        rov_away_nn_tau = None if _nn_tau is None else float(_nn_tau)
-
         N = points.shape[0]
         
         # Vectorized computation
@@ -1186,17 +1015,6 @@ class ROVPenalty(LossFunction):
             num_angles,
             device=points.device,
         )
-
-        # Outward "away from nearest neighbours" heading per string (opt-in).
-        theta_away = None
-        away_valid = None
-        if rov_away_enabled:
-            theta_away, away_valid = self._compute_away_theta(
-                all_relative,
-                num_neighbours=rov_away_num_neighbours,
-                soft=rov_away_soft,
-                nn_tau=rov_away_nn_tau,
-            )
 
         # Geometry checks
         # Intended shape: a triangular "nose" starting at the string that widens
@@ -1258,37 +1076,23 @@ class ROVPenalty(LossFunction):
         angle_scores_per_angle = blockage_per_angle
 
         # --- Per-string penalty and reported least-blocked heading ---
-        if rov_away_enabled and theta_away is not None:
-            # Heading is selected STRICTLY by blockage (least-blocked), exactly like the
-            # plain path below. The away term is added to the penalty afterward,
-            # evaluated at that same (strictly least-blocked) heading.
-            penalty_per_string, least_blocked_angle_per_string = self._select_away_best_angle(
-                blockage_per_angle,
-                angles,
-                theta_away,
-                away_valid,
-                away_weight=rov_away_weight,
-                soft=rov_away_soft,
-                angle_softmin_tau=angle_softmin_tau,
+        
+        if angle_softmin_tau > 0.0:
+            penalty_per_string = -angle_softmin_tau * torch.logsumexp(
+                -blockage_per_angle / angle_softmin_tau, dim=1
             )
+            penalty_per_string = penalty_per_string.clamp(min=0.0)
         else:
-            # Default behavior: least-blocked path only.
-            if angle_softmin_tau > 0.0:
-                penalty_per_string = -angle_softmin_tau * torch.logsumexp(
-                    -blockage_per_angle / angle_softmin_tau, dim=1
-                )
-                penalty_per_string = penalty_per_string.clamp(min=0.0)
-            else:
-                penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
+            penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
 
-            # Reported least-blocked angle (hard argmin over near-min bins). A small
-            # tolerance resolves numerically-equivalent boundary bins to the first bin
-            # consistently across the alt and non-alt implementations.
-            min_scores = angle_scores_per_angle.min(dim=1, keepdim=True)[0]
-            tie_tol = 1e-6
-            near_min_mask = angle_scores_per_angle <= (min_scores + tie_tol)
-            least_blocked_angle_idx_per_string = near_min_mask.to(torch.int64).argmax(dim=1)  # (N,)
-            least_blocked_angle_per_string = angles[least_blocked_angle_idx_per_string]  # (N,)
+        # Reported least-blocked angle (hard argmin over near-min bins). A small
+        # tolerance resolves numerically-equivalent boundary bins to the first bin
+        # consistently across the alt and non-alt implementations.
+        min_scores = angle_scores_per_angle.min(dim=1, keepdim=True)[0]
+        tie_tol = 1e-6
+        near_min_mask = angle_scores_per_angle <= (min_scores + tie_tol)
+        least_blocked_angle_idx_per_string = near_min_mask.to(torch.int64).argmax(dim=1)  # (N,)
+        least_blocked_angle_per_string = angles[least_blocked_angle_idx_per_string]  # (N,)
 
         # Aggregate into the scalar loss, weighting by string probability if available.
         if string_probs is not None:
