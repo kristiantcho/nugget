@@ -68,13 +68,10 @@ class FlowFisherResolutionLoss(LossFunction):
         ODE steps per log-prob. 
     pmt_directions, geometry_csv_path, n_pmt_per_om
         The per-OM PMT template; defaults to the geometry the models were trained on.
-    geometry_grads : bool
-        Keep the Fisher tensor attached to ``points_3d``, so the loss is
-        differentiable with respect to detector positions and not only to
-        ``string_weights``. Needs create_graph through every ODE solve (the
-        scores are already first derivatives), so it is markedly slower and
-        heavier, and is incompatible with ``use_torch_compile`` and with a
-        precomputed Fisher tensor.
+    geometry_grads : bool or 'auto'
+        Keep the Fisher attached to ``points_3d`` (slow: create_graph through every
+        ODE solve). Only happens when ``points_3d`` requires grad; True also warns
+        when it does not, 'auto' switches silently per call.
     """
 
     def __init__(self, hit_model=None, ly_model=None, atime_model=None,
@@ -124,8 +121,11 @@ class FlowFisherResolutionLoss(LossFunction):
         self.div_mode = div_mode
         self.div_eps = float(div_eps) if div_mode == 'fd' else None
         self.use_torch_compile = bool(use_torch_compile)
-        self.geometry_grads = bool(geometry_grads)
-        if self.geometry_grads and use_torch_compile:
+        if geometry_grads not in (True, False, 'auto'):
+            raise ValueError("geometry_grads must be True, False or 'auto'")
+        self.geometry_grads = geometry_grads
+        self._track = False           # set per call: are we following points_3d?
+        if self.geometry_grads is True and use_torch_compile:
             raise ValueError(
                 "geometry_grads=True needs create_graph through the score "
                 "computation, which is double backward -- exactly what "
@@ -202,15 +202,14 @@ class FlowFisherResolutionLoss(LossFunction):
 
     def _keep(self, t):
         """Drop the geometry path unless geometry gradients were asked for."""
-        return t if self.geometry_grads else t.detach()
+        return t if self._track else t.detach()
 
     def _diff_wrt(self, t):
         """A tensor ``autograd.grad`` can differentiate with respect to.
 
-        Keeps the history back to points_3d when geometry_grads is on and there is
-        one; otherwise a fresh leaf (points_3d not requiring grad has no history).
+        Keeps the history back to points_3d when tracking it and there is one; otherwise a fresh leaf (points_3d not requiring grad has no history).
         """
-        if self.geometry_grads and t.requires_grad:
+        if self._track and t.requires_grad:
             return t
         return t.detach().requires_grad_(True)
 
@@ -226,7 +225,7 @@ class FlowFisherResolutionLoss(LossFunction):
         M = int(build(theta).shape[0])
         K = z_nodes.shape[0]
         P = theta.shape[0]
-        keep = self.geometry_grads
+        keep = self._track
         Jc = torch.func.jacfwd(build)(theta)                       # (M, C, P)
         ctx0 = self._keep(build(theta))
 
@@ -251,7 +250,7 @@ class FlowFisherResolutionLoss(LossFunction):
     def _logw_only(self, model, ctx, z_nodes, chunk):
         """log p_z at the nodes -- all qbar needs.
 
-        ``differentiable`` has to track geometry_grads. log_prob_z's fast path
+        ``differentiable`` has to follow self._track. log_prob_z's fast path
         detaches inside ``_v_and_div``, returning a value with no grad_fn at all,
         so leaving it off would silently zero the position dependence of qbar --
         and qbar scales the whole arrival-time term whenever include_ly is False.
@@ -265,7 +264,7 @@ class FlowFisherResolutionLoss(LossFunction):
             lp = model.log_prob_z(z_nodes.repeat(n),
                                     ctx[s:e].repeat_interleave(K, 0),
                                     n_steps=self.n_steps,
-                                    differentiable=self.geometry_grads)
+                                    differentiable=self._track)
             out[s:e] = lp.reshape(n, K)
         return out
 
@@ -299,7 +298,7 @@ class FlowFisherResolutionLoss(LossFunction):
         ch = self._diff_wrt(build_h(theta))
         ell = self.hit_model.predict_hit_logit(ch, calibrated=True).reshape(-1)
         gl_c = torch.autograd.grad(ell.sum(), ch,
-                                   create_graph=self.geometry_grads)[0]  # (M, C)
+                                   create_graph=self._track)[0]  # (M, C)
         gl = torch.einsum('mc,mcp->mp', gl_c, Jh)                  # (M, P)
         pi = torch.sigmoid(self._keep(ell)).clamp(1e-12, 1 - 1e-12)  # (M,)
 
@@ -358,7 +357,7 @@ class FlowFisherResolutionLoss(LossFunction):
             # there -- the quadrature nodes stay a numerical device rather than
             # becoming geometry-dependent. Detaching only tg0 would leave a
             # spurious one-sided -d(t_geom)/d(pts) in every node.
-            with torch.set_grad_enabled(self.geometry_grads):
+            with torch.set_grad_enabled(self._track):
                 tg0 = at.geometric_time(
                     sub_pts, vertex.reshape(1, 3).expand(m, 3),
                     zeniths=_as_t(ev['zenith'], self.device, self.dtype).reshape(1).expand(m),
@@ -392,7 +391,7 @@ class FlowFisherResolutionLoss(LossFunction):
                                    azimuths=a.reshape(1).expand(n)).reshape(n, 1)
             return (t_hit[sl] - tg).reshape(-1)
 
-        keep = self.geometry_grads
+        keep = self._track
         Jc = torch.func.jacfwd(build)(theta)                       # (M, C, P)
         ctx0 = self._keep(build(theta))
         logw = torch.empty(M, K, device=self.device, dtype=self.dtype)
@@ -431,7 +430,13 @@ class FlowFisherResolutionLoss(LossFunction):
         ``points_3d`` and the geometry's own graph, not through the lookup.
         """
         pts3 = _as_t(points_3d, self.device, self.dtype).reshape(-1, 3)
-        if self.geometry_grads and not pts3.requires_grad \
+        # Follow points_3d only if something upstream (string_xy, z_values, ...)
+        # actually needs it; otherwise the create_graph cost buys nothing.
+        self._track = bool(self.geometry_grads) and pts3.requires_grad
+        if self._track and self.use_torch_compile:
+            raise ValueError("points_3d requires grad, but position gradients need "
+                             "double backward, which torch.compile rejects.")
+        if self.geometry_grads is True and not pts3.requires_grad \
                 and not getattr(self, '_warned_no_grad', False):
             print("FlowFisherResolutionLoss: geometry_grads=True but points_3d does "
                   "not require grad -- no position gradient will exist.")
@@ -552,8 +557,8 @@ class FlowFisherResolutionLoss(LossFunction):
                 string_xy, points_3d, params, chunk=chunk,
                 empty_cache_after_event=empty_cache, verbose=verbose)
         else:
-            if self.geometry_grads:
-                print("FlowFisherResolutionLoss: geometry_grads=True but a "
+            if self.geometry_grads and getattr(points_3d, 'requires_grad', False):
+                print("FlowFisherResolutionLoss: points_3d requires grad but a "
                       "precomputed Fisher tensor was supplied, so it is a "
                       "constant and no position gradient exists. Drop "
                       "'precomputed_fisher_info_per_string_per_event' to have it "
