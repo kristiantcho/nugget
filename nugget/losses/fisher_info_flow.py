@@ -207,12 +207,12 @@ class FlowFisherResolutionLoss(LossFunction):
     def _diff_wrt(self, t):
         """A tensor ``autograd.grad`` can differentiate with respect to.
 
-        With geometry_grads the tensor keeps its history -- ``autograd.grad``
-        accepts non-leaf inputs, and that history is precisely the route back to
-        points_3d. Without it, cutting the history and making a fresh leaf is
-        cheaper and is the original behaviour.
+        Keeps the history back to points_3d when geometry_grads is on and there is
+        one; otherwise a fresh leaf (points_3d not requiring grad has no history).
         """
-        return t if self.geometry_grads else t.detach().requires_grad_(True)
+        if self.geometry_grads and t.requires_grad:
+            return t
+        return t.detach().requires_grad_(True)
 
     def _scores(self, model, build, theta, z_nodes, chunk):
         """d log p_z(z_k | c_j) / d theta for every (PMT j, node k).
@@ -431,6 +431,11 @@ class FlowFisherResolutionLoss(LossFunction):
         ``points_3d`` and the geometry's own graph, not through the lookup.
         """
         pts3 = _as_t(points_3d, self.device, self.dtype).reshape(-1, 3)
+        if self.geometry_grads and not pts3.requires_grad \
+                and not getattr(self, '_warned_no_grad', False):
+            print("FlowFisherResolutionLoss: geometry_grads=True but points_3d does "
+                  "not require grad -- no position gradient will exist.")
+            self._warned_no_grad = True
         n_pts = pts3.shape[0]
         K_pmt = self._pmt_dirs.shape[0]
         pts = pts3.repeat_interleave(K_pmt, 0)                     # (n_pts*K, 3)
