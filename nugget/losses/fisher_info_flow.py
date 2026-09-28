@@ -93,11 +93,6 @@ class FlowFisherResolutionLoss(LossFunction):
         self.include_hit, self.include_ly, self.include_atime = _MODES[mode]
         if resolution_type not in ('angular', 'energy'):
             raise ValueError("resolution_type must be 'angular' or 'energy'")
-        bad = [p for p in fisher_info_params
-               if p not in ('energy', 'zenith', 'azimuth')]
-        if bad:
-            raise ValueError(f"unsupported fisher_info_params: {bad}")
-
         self.hit_model = hit_model
         self.ly_model = ly_model
         self.atime_model = atime_model
