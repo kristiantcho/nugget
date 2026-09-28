@@ -89,7 +89,7 @@ class FlowFisherResolutionLoss(LossFunction):
         # The mode controls which terms are included in the Fisher: hit, light-yield, and/or arrival-time.
         _MODES = {'all':    (True,  True,  True),
                   'hit_ly': (True,  True,  False),
-                  'atime':  (False, False, True),
+                  'atime':  (True, False, True),
                   'hit':    (True,  False, False)}
         if mode not in _MODES:
             raise ValueError(f"mode must be one of {sorted(_MODES)}")
@@ -124,13 +124,6 @@ class FlowFisherResolutionLoss(LossFunction):
         self.div_mode = div_mode
         self.div_eps = float(div_eps) if div_mode == 'fd' else None
         self.use_torch_compile = bool(use_torch_compile)
-
-        # Keep the detector positions attached all the way through the Fisher
-        # build, so d(loss)/d(points_3d) -- and through the geometry's own graph
-        # d/d(string_xy), d/d(slice_radius), ... -- is a real derivative rather
-        # than zero. Off by default: the scores are themselves first derivatives,
-        # so this needs create_graph through every ODE solve, and both the memory
-        # and the step time go up substantially.
         self.geometry_grads = bool(geometry_grads)
         if self.geometry_grads and use_torch_compile:
             raise ValueError(
@@ -138,11 +131,6 @@ class FlowFisherResolutionLoss(LossFunction):
                 "computation, which is double backward -- exactly what "
                 "torch.compile rejects. Use one or the other."
             )
-        if self.geometry_grads and self.sample_hits:
-            print("FlowFisherResolutionLoss: sample_hits=True draws the hit count "
-                  "through a comparison (u < pi), which has no derivative, so the "
-                  "geometry gradient picks it up only via pi in `coef`. Prefer "
-                  "sample_hits=False when optimizing positions.")
 
         if hit_model is None or ly_model is None:
             raise ValueError("a hit model and a light-yield model are both required "
@@ -296,14 +284,9 @@ class FlowFisherResolutionLoss(LossFunction):
     def _fisher_per_pmt(self, pts, dirs, ev, chunk, gen=None):
         """(M, P, P) Fisher contribution of each PMT for one event.
 
-        sample_hits=False evaluates the exact expectation: every PMT gets the
-        closed-form Bernoulli Fisher plus its flow terms weighted by pi.
-
-        sample_hits=True draws the hit n_hit_samples times per PMT and averages the
-        realisations -- fired draws give (1-pi)^2 grad l grad l^T plus the full flow
-        terms, dark ones only pi^2 grad l grad l^T. Unbiased for any X, and it skips
-        the ODE work on PMTs that never fired; X dials between one honest realisation
-        (X=1, cheapest and noisiest) and the exact expectation (X -> inf).
+        The hit term is always the exact pi(1-pi) grad l grad l^T. sample_hits=True
+        only decides which PMTs get the flow terms: those that fire in at least one
+        of n_hit_samples draws, weighted by pi / P(selected) so the sum stays unbiased.
         """
         theta = self._theta0(ev)
         vertex = _as_t(ev['position'], self.device, self.dtype).reshape(3)
@@ -323,30 +306,22 @@ class FlowFisherResolutionLoss(LossFunction):
         glgl = gl.unsqueeze(2) * gl.unsqueeze(1)                   # (M, P, P)
         F = torch.zeros(M, P, P, device=self.device, dtype=self.dtype)
 
+        # Exact for every PMT: it is computed for all of them anyway, so sampling
+        # it would add noise and save nothing.
+        if self.include_hit:
+            F = F + (pi * (1.0 - pi)).reshape(M, 1, 1) * glgl
+
         if self.sample_hits:
-            # Draw the hit n_hit_samples times per PMT and average the realisations.
-            # A draw that fired contributes (1-pi)^2 grad l grad l^T plus the full
-            # flow terms; one that did not contributes only the no-hit score,
-            # d log(1-pi)/d theta = -pi grad l, i.e. pi^2 grad l grad l^T.
-            #
-            # X = 1 is a single honest realisation. Larger X averages them: the
-            # weights become fractional, the variance falls as 1/X, and in the limit
-            # coef -> pi(1-pi) and w_fire -> pi, recovering the exact path exactly.
-            # Cost rises with X too, since a PMT is evaluated if it fired at ALL:
-            # P(>=1 fire) = 1 - (1-pi)^X.
+            # Flow terms only for PMTs that fire in >= 1 of X draws. Horvitz-Thompson
+            # weight pi / p_sel = E[K/X | K>=1]: unbiased, never noisier than K/X.
+            # p_sel is detached so the pathwise geometry gradient is unbiased as well.
             X = self.n_hit_samples
             u = torch.rand(X, M, device=self.device, dtype=self.dtype, generator=gen)
-            w_fire = (u < pi.unsqueeze(0)).sum(0).to(self.dtype) / X
-            if self.include_hit:
-                coef = w_fire * (1.0 - pi) ** 2 + (1.0 - w_fire) * pi ** 2
-                F = F + coef.reshape(M, 1, 1) * glgl
-            idx = torch.nonzero(w_fire > 0, as_tuple=True)[0]
-            wf = w_fire[idx]
+            fired = (u < pi.detach().unsqueeze(0)).any(0)
+            idx = torch.nonzero(fired, as_tuple=True)[0]
+            p_sel = -torch.expm1(X * torch.log1p(-pi[idx].detach()))
+            wf = pi[idx] / p_sel
         else:
-            # Exact: every PMT carries the closed-form Bernoulli Fisher and its
-            # flow terms weighted by pi.
-            if self.include_hit:
-                F = F + (pi * (1.0 - pi)).reshape(M, 1, 1) * glgl
             idx = torch.arange(M, device=self.device)
             wf = pi
 
