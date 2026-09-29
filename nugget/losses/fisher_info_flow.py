@@ -19,6 +19,18 @@ def _free(device):
         torch.cuda.empty_cache()
 
 
+def _model_dir(model, zen, azi):
+    """Travel angles -> the unit vector ``model`` expects.
+
+    build_context and geometric_time use the direction in the model's TRAINING
+    convention and flip it internally when track_dir_is_arrival is set, so an
+    arrival-trained model must be handed -travel (see NuSmoothie._dir_for).
+    """
+    st = torch.sin(zen)
+    u = torch.stack([st * torch.cos(azi), st * torch.sin(azi), torch.cos(zen)], dim=-1)
+    return -u if getattr(model, 'track_dir_is_arrival', False) else u
+
+
 def _log_prob_z(model, z, ctx, n_steps, div_eps=None):
     """log p(z | c), differentiable in ctx.
 
@@ -200,7 +212,8 @@ class FlowFisherResolutionLoss(LossFunction):
             t = th + delta
             e, z, a = (t[:, idx[p]] if p in idx else fixed[p]
                        for p in ('energy', 'zenith', 'azimuth'))
-            return model.build_context(pts, vert, e, z, a, pmt_directions=dirs)
+            return model.build_context(pts, vert, e, pmt_directions=dirs,
+                                       directions=_model_dir(model, z, a))
 
         return build
 
@@ -381,7 +394,7 @@ class FlowFisherResolutionLoss(LossFunction):
             with torch.set_grad_enabled(self._track):
                 tg0 = at.geometric_time(
                     sub_pts, eb['vertex'][rev],
-                    zeniths=eb['zenith'][rev], azimuths=eb['azimuth'][rev],
+                    directions=_model_dir(at, eb['zenith'][rev], eb['azimuth'][rev]),
                 ).reshape(m, 1)
                 t_hit = at.from_z(self._zq).reshape(1, -1) + tg0   # (m, K)
             logw_t, g_t = self._scores_time(at, build_t, d0, t_hit, sub_pts,
@@ -410,8 +423,8 @@ class FlowFisherResolutionLoss(LossFunction):
         def t_res_of(delta, sl):
             z = th[sl, iz] + delta[iz] if iz is not None else zf[sl]
             a = th[sl, ia] + delta[ia] if ia is not None else af[sl]
-            tg = at.geometric_time(pts[sl], vert[sl], zeniths=z,
-                                   azimuths=a).reshape(-1, 1)
+            tg = at.geometric_time(pts[sl], vert[sl],
+                                   directions=_model_dir(at, z, a)).reshape(-1, 1)
             return (t_hit[sl] - tg).reshape(-1)
 
         keep = self._track
