@@ -11,6 +11,9 @@ PARAMS = ('x', 'y', 'z', 'dir_a', 'dir_b', 'log10_energy', 't0')
 
 F64 = torch.float64
 
+# Default spread of a random fit start: m, degrees, decades, ns.
+START_SIGMA = {'vertex': 20.0, 'direction_deg': 5.0, 'log10_energy': 0.3, 't0': 20.0}
+
 
 def _as_t(x, device, dtype=F64):
     if isinstance(x, torch.Tensor):
@@ -127,8 +130,12 @@ class FlowEventLikelihood:
         K = self.pmt_dirs.shape[0]
         return pts3.repeat_interleave(K, 0), self.pmt_dirs.repeat(pts3.shape[0], 1)
 
-    def frame(self, event):
-        """Seed theta (the true event) and the tangent basis at its travel direction."""
+    def frame(self, event, t_offset=0.0):
+        """Seed theta (the true event) and the tangent basis at its travel direction.
+
+        t_offset is subtracted from the true event time, matching a response whose
+        clock was re-zeroed (sample(time_origin='first_hit')).
+        """
         dev = self.device
         vert = _as_t(event['position'], dev).reshape(3)
         if event.get('direction') is not None:
@@ -145,7 +152,7 @@ class FlowEventLikelihood:
         e1 = e1 / e1.norm()
         e2 = torch.linalg.cross(d, e1)
         E = float(_as_t(event['energy'], dev).reshape(-1)[0])
-        t0 = float(_as_t(event.get('time', 0.0), dev).reshape(-1)[0])
+        t0 = float(_as_t(event.get('time', 0.0), dev).reshape(-1)[0]) - float(t_offset)
         theta0 = torch.tensor([float(vert[0]), float(vert[1]), float(vert[2]),
                                0.0, 0.0, math.log10(E), t0], dtype=F64, device=dev)
         return {'theta0': theta0, 'd0': d, 'e1': e1, 'e2': e2}
@@ -170,12 +177,19 @@ class FlowEventLikelihood:
     # ----------------------------------------------------------------- sampling
 
     @torch.no_grad()
-    def sample(self, points_3d, event, generator=None, max_photons_per_pmt=None):
+    def sample(self, points_3d, event, generator=None, max_photons_per_pmt=None,
+               time_origin='vertex'):
         """One detector response: hit flags, counts, photon times (+ their base noise).
 
+        time_origin : 'vertex' keeps times relative to the muon at its vertex;
+            'first_hit' re-zeros them to the earliest photon, as real data would be.
+            The fit seeds t0 consistently either way, and with t0 free the result is
+            identical. The shift is stored as resp['t_offset'].
         max_photons_per_pmt keeps a random subset per PMT with weight q / n_kept.
         That is an approximation of the full likelihood and inflates the fitted spread.
         """
+        if time_origin not in ('vertex', 'first_hit'):
+            raise ValueError("time_origin must be 'vertex' or 'first_hit'")
         pts, dirs = self.expand(points_3d)
         pts, dirs = pts.detach(), dirs.detach()
         fr = self.frame(event)
@@ -216,9 +230,15 @@ class FlowEventLikelihood:
                                        directions=_dir_for(at, d).reshape(1, 3).expand(n, 3))
                 t_hit[s:s + ck] = t_res.reshape(-1) + tg.reshape(-1).to(F64) + t0
 
+        # A constant shift of every hit time, absorbed exactly by t0 when it is free.
+        t_offset = 0.0
+        if time_origin == 'first_hit' and at is not None and N > 0:
+            t_offset = float(t_hit.min())
+            t_hit = t_hit - t_offset
+
         active = hit | (pi > self.prune_pi)
-        return {'points_3d': points_3d, 'event': event, 'hit': hit, 'counts': counts,
-                'active': active, 'pi_true': pi,
+        return {'points_3d': points_3d, 'event': event, 't_offset': t_offset,
+                'hit': hit, 'counts': counts, 'active': active, 'pi_true': pi,
                 'pruned_expected_hits': float(pi[~active].sum()),
                 'ph_owner': owner, 'ph_t': t_hit, 'ph_w': w, 'ph_z0': z0,
                 'n_hits': int(hid.numel()), 'n_photons': float(q.sum())}
@@ -270,7 +290,7 @@ class FlowEventLikelihood:
 
     def loglik(self, theta, resp, fr=None):
         """log L at a full theta (7,), no graph. Useful for scans."""
-        fr = fr or self.frame(resp['event'])
+        fr = fr or self.frame(resp['event'], resp.get('t_offset', 0.0))
         pts, dirs = self.expand(resp['points_3d'])
         with torch.no_grad():
             return sum(self._unit_loglik(k, i, theta, fr, resp, pts.detach(), dirs, False)
@@ -308,21 +328,78 @@ class FlowEventLikelihood:
 
     # ---------------------------------------------------------------------- fit
 
-    def fit(self, resp, free=PARAMS, max_iter=20, tol=1e-6, lam0=1e-3, verbose=False):
-        """Levenberg-Marquardt / damped Newton from the true event, exact Hessian."""
+    def _start_event(self, fr_true, free, start, start_sigma, gen):
+        """Event to start the fit from, or None for the truth.
+
+        'random' moves only the FREE parameters off the truth (fixed ones stay known):
+        vertex coordinates by N(0, vertex^2) m, the direction by a Rayleigh-distributed
+        angle in a uniform random azimuth about the truth, log10 E and t0 by Gaussians.
+        A dict is used as the start event as given (travel direction convention).
+        """
+        if isinstance(start, dict):
+            return start
+        if start == 'truth':
+            return None
+        if start != 'random':
+            raise ValueError("start must be 'truth', 'random' or an event dict")
+        sg = dict(START_SIGMA)
+        sg.update(start_sigma or {})
+
+        def rn(n=1):
+            return torch.randn(n, generator=gen, dtype=F64).to(self.device)
+
+        vert, d, E, t0 = self.unpack(fr_true['theta0'], fr_true)
+        v = vert.clone()
+        for c, k in enumerate(('x', 'y', 'z')):
+            if k in free:
+                v[c] = v[c] + sg['vertex'] * rn()[0]
+        s_dir = math.radians(sg['direction_deg'])
+        if 'dir_a' in free and 'dir_b' in free:
+            alpha = s_dir * float(rn(2).norm())
+            phi = 2.0 * math.pi * float(torch.rand(1, generator=gen, dtype=F64))
+            d = (math.cos(alpha) * d + math.sin(alpha)
+                 * (math.cos(phi) * fr_true['e1'] + math.sin(phi) * fr_true['e2']))
+        elif 'dir_a' in free or 'dir_b' in free:
+            e = fr_true['e1'] if 'dir_a' in free else fr_true['e2']
+            d = d + s_dir * rn()[0] * e
+        log_e = math.log10(float(E))
+        if 'log10_energy' in free:
+            log_e += sg['log10_energy'] * float(rn()[0])
+        t = float(t0) + (sg['t0'] * float(rn()[0]) if 't0' in free else 0.0)
+        return {'position': v, 'direction': d / d.norm(), 'energy': 10.0 ** log_e,
+                'time': t}
+
+    def fit(self, resp, free=PARAMS, start='truth', start_sigma=None, start_seed=None,
+            max_iter=20, tol=1e-6, lam0=1e-3, verbose=False):
+        """Levenberg-Marquardt / damped Newton with the exact Hessian.
+
+        start : 'truth', 'random' (perturb the free parameters, scales START_SIGMA,
+            overridden by start_sigma) or an event dict. The fit's tangent frame is
+            centred on the start; errors are always measured against the truth.
+        start_seed : int or torch.Generator for reproducible random starts.
+        """
         bad = [p for p in free if p not in PARAMS]
         if bad:
             raise ValueError(f"unknown fit parameters {bad}; choose from {PARAMS}")
         free = tuple(free)
-        fr = self.frame(resp['event'])
         free_idx = torch.tensor([PARAMS.index(p) for p in free], device=self.device)
         pts, dirs = self.expand(resp['points_3d'])
         pts = pts.detach()
         units = self._units(resp)
 
+        gen = start_seed
+        if start_seed is not None and not isinstance(start_seed, torch.Generator):
+            gen = torch.Generator().manual_seed(int(start_seed))
+        # truth on the response's clock; a random start derives from it and inherits it
+        fr_true = self.frame(resp['event'], resp.get('t_offset', 0.0))
+        ev0 = self._start_event(fr_true, free, start, start_sigma, gen)
+        fr = fr_true if ev0 is None else self.frame(ev0)
+        val_true = float(self._value(fr_true['theta0'][free_idx], fr_true, free_idx,
+                                     resp, pts, dirs, units))
+
         th = fr['theta0'][free_idx].clone()
         val, g, H = self._vgh(th, fr, free_idx, resp, pts, dirs, units)
-        val_true = float(val)
+        val_start = float(val)
         lam, converged, it = float(lam0), False, 0
         for it in range(1, max_iter + 1):
             A = -H
@@ -346,7 +423,7 @@ class FlowEventLikelihood:
             lam = max(lam / 10.0, 1e-9)
             val, g, H = self._vgh(th, fr, free_idx, resp, pts, dirs, units)
             if verbose:
-                print(f'    it {it}: logL {float(val):.6f}  (+{float(val) - val_true:.4g})'
+                print(f'    it {it}: logL {float(val):.6f}  (truth {val_true:.6f})'
                       f'  step.g {gain:.3g}  lam {lam:.1e}')
             if abs(gain) < tol:
                 converged = True
@@ -362,29 +439,44 @@ class FlowEventLikelihood:
         if 'dir_a' in free and 'dir_b' in free:
             ia = [free.index('dir_a'), free.index('dir_b')]
             sig_ang = float(torch.sqrt(cov[ia][:, ia].diagonal().sum().clamp_min(0.0)))
-        cos_a = (d @ fr['d0']).clamp(-1.0, 1.0)
-        angle = float(torch.atan2(torch.linalg.cross(d, fr['d0']).norm(), cos_a))
+
+        def ang(u):
+            c = (u @ fr_true['d0']).clamp(-1.0, 1.0)
+            return float(torch.atan2(torch.linalg.cross(u, fr_true['d0']).norm(), c)), c
+
+        angle, cos_a = ang(d)
         return {'theta': full, 'free': free, 'vertex': vertex, 'direction': d,
                 'energy': float(E), 't0': float(t0), 'angle': angle,
                 'chord2': float(2.0 * (1.0 - cos_a)),
-                'dlog10E': float(full[5] - fr['theta0'][5]),
-                'loglik': float(val), 'loglik_true': val_true, 'n_iter': it,
-                'converged': converged, 'hessian': H, 'cov': cov,
+                'dlog10E': float(full[5] - fr_true['theta0'][5]),
+                'dt0': float(full[6] - fr_true['theta0'][6]),
+                'start_angle': ang(fr['d0'])[0],
+                'loglik': float(val), 'loglik_true': val_true,
+                'loglik_start': val_start,
+                'fit_ge_truth': float(val) >= val_true - 1e-6 * max(1.0, abs(val_true)),
+                'n_iter': it, 'converged': converged, 'hessian': H, 'cov': cov,
                 'sigma_angle_obs': sig_ang}
 
     # --------------------------------------------------------------- resolution
 
     def resolution(self, points_3d, events, generator=None, free=PARAMS, min_hits=1,
-                   max_photons_per_pmt=None, verbose=False, **fit_kw):
+                   max_photons_per_pmt=None, time_origin='vertex', verbose=False,
+                   **fit_kw):
         """Sample one response per event, fit each, and summarise the errors.
 
         angular_rms_deg = sqrt(mean 2(1 - cos dpsi)), the MLE counterpart of the
         Fisher sqrt(tr cov); sigma_obs_rms_deg is the same from the observed
         information at each fit. Events with fewer than min_hits hit PMTs are skipped.
+        fit_kw go to fit (e.g. start='random', start_sigma, start_seed); an int
+        start_seed seeds one generator for all events, so each gets its own start.
         """
+        ss = fit_kw.get('start_seed')
+        if ss is not None and not isinstance(ss, torch.Generator):
+            fit_kw['start_seed'] = torch.Generator().manual_seed(int(ss))
         rows, skipped = [], 0
         for i, ev in enumerate(events):
-            resp = self.sample(points_3d, ev, generator, max_photons_per_pmt)
+            resp = self.sample(points_3d, ev, generator, max_photons_per_pmt,
+                               time_origin=time_origin)
             if resp['n_hits'] < min_hits:
                 skipped += 1
                 continue
@@ -394,10 +486,12 @@ class FlowEventLikelihood:
             rows.append(r)
             if verbose:
                 print(f'  event {i + 1}/{len(events)}: {resp["n_hits"]} hits, '
-                      f'{resp["n_photons"]:.0f} photons, dpsi = '
+                      f'{resp["n_photons"]:.0f} photons, start '
+                      f'{math.degrees(r["start_angle"]):.2f} deg -> dpsi = '
                       f'{math.degrees(r["angle"]):.3f} deg, sigma_obs = '
                       f'{math.degrees(r["sigma_angle_obs"]):.3f} deg, '
-                      f'{r["n_iter"]} it{"" if r["converged"] else " (not converged)"}',
+                      f'{r["n_iter"]} it{"" if r["converged"] else " (not converged)"}'
+                      f'{"" if r["fit_ge_truth"] else ", BELOW truth logL"}',
                       flush=True)
         if not rows:
             return {'per_event': [], 'n_skipped': skipped}
@@ -407,6 +501,7 @@ class FlowEventLikelihood:
         de = np.array([r['dlog10E'] for r in rows])
         return {'per_event': rows, 'n_skipped': skipped,
                 'n_converged': int(sum(r['converged'] for r in rows)),
+                'n_fit_ge_truth': int(sum(r['fit_ge_truth'] for r in rows)),
                 'angular_rms_deg': math.degrees(math.sqrt(ch.mean())),
                 'angular_median_deg': math.degrees(float(np.median(ang))),
                 'sigma_obs_rms_deg': math.degrees(math.sqrt(np.nanmean(so ** 2))),
