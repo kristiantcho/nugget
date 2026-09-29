@@ -299,16 +299,18 @@ class FlowFisherResolutionLoss(LossFunction):
 
     # ---------------------------------------------------------- per-event core
 
-    def _fisher_per_pmt(self, pts, dirs, rows_ev, eb, chunk, gen=None, fired=None,
-                        fired_out=None):
+    def _fisher_per_pmt(self, pts, dirs, rows_ev, eb, chunk, gen=None, state=None,
+                        state_out=None):
         """(M, P, P) Fisher contribution of each row, a (PMT, event) pair.
 
         rows_ev maps rows to events of the batch ``eb`` (see _event_batch). The hit
         term is always the exact pi(1-pi) grad l grad l^T. sample_hits=True only
         decides which rows get the flow terms: those that fire in at least one of
         n_hit_samples draws, weighted by pi / P(selected) so the sum stays unbiased.
-        ``fired`` reuses a previous selection instead of drawing; ``fired_out`` (a
-        list) receives the one drawn here.
+
+        ``state`` (dict of per-row tensors) reuses random draws from an earlier call
+        -- the hit selection 'fired', plus whatever _flow_terms draws -- so a
+        recomputation sees the same F; ``state_out`` (a list) receives this call's.
         """
         P = eb['theta'].shape[1]
         M = pts.shape[0]
@@ -334,6 +336,7 @@ class FlowFisherResolutionLoss(LossFunction):
 
         glgl = gl.unsqueeze(2) * gl.unsqueeze(1)                   # (M, P, P)
         F = torch.zeros(M, P, P, device=self.device, dtype=self.dtype)
+        new_state = {}                                             # this call's draws
 
         # Exact for every PMT: it is computed for all of them anyway, so sampling
         # it would add noise and save nothing.
@@ -347,19 +350,35 @@ class FlowFisherResolutionLoss(LossFunction):
             # p_sel is detached so the pathwise geometry gradient is unbiased too.
             X = self.n_hit_samples
             p_all = -torch.expm1(X * torch.log1p(-pi.detach()))
+            fired = None if state is None else state.get('fired')
             if fired is None:
                 u = torch.rand(M, device=self.device, dtype=self.dtype, generator=gen)
                 fired = u < p_all
-            if fired_out is not None:
-                fired_out.append(fired)
+            new_state['fired'] = fired
             idx = torch.nonzero(fired, as_tuple=True)[0]
             wf = pi[idx] / p_all[idx]
         else:
             idx = torch.arange(M, device=self.device)
             wf = pi
 
-        if not (self.include_ly or self.include_atime) or idx.numel() == 0:
-            return F
+        if (self.include_ly or self.include_atime) and idx.numel() > 0:
+            F = self._flow_terms(F, idx, wf, pts, dirs, rows_ev, eb, chunk, d0, gen,
+                                 state, new_state)
+        if state_out is not None:
+            state_out.append(new_state)
+        return F
+
+    def _nodes_per_pmt(self):
+        """Flow evaluations per PMT per likelihood; sizes the chunked pass-2 slices."""
+        return self.n_quad
+
+    def _flow_terms(self, F, idx, wf, pts, dirs, rows_ev, eb, chunk, d0, gen, state,
+                    new_state):
+        """Add the light-yield and arrival-time Fisher of the selected rows ``idx``.
+
+        Quadrature over the fixed z-grid. Subclasses replace this (and may use gen /
+        state / new_state for random draws that a recomputation must reproduce).
+        """
         sub_pts, sub_dirs, rev = pts[idx], dirs[idx], rows_ev[idx]
         m = idx.numel()
 
@@ -473,7 +492,7 @@ class FlowFisherResolutionLoss(LossFunction):
                                             signal_event_params, chunk=8192,
                                             empty_cache_after_event=False,
                                             verbose=False, events_per_batch=1,
-                                            _fired_out=None):
+                                            _state_out=None):
         """(n_events, n_strings, P, P).
 
         Every OM in ``points_3d`` is expanded into the PMT template; a point belongs
@@ -511,7 +530,7 @@ class FlowFisherResolutionLoss(LossFunction):
         pmt_str = om_str.repeat_interleave(K_pmt)                  # (M,)
 
         gen = None
-        if self.sample_hits and self.hit_sample_seed is not None:
+        if self.hit_sample_seed is not None:        # also seeds subclasses' MC draws
             gen = torch.Generator(device=self.device)
             gen.manual_seed(int(self.hit_sample_seed))
 
@@ -522,13 +541,18 @@ class FlowFisherResolutionLoss(LossFunction):
             B = len(evs)
             eb = self._event_batch(evs)
             rows_ev = torch.arange(B, device=self.device).repeat_interleave(M)
-            fo = [] if _fired_out is not None else None
+            so = [] if _state_out is not None else None
             F_rows = self._fisher_per_pmt(pts.repeat(B, 1), dirs.repeat(B, 1), rows_ev,
-                                          eb, chunk, gen, fired_out=fo)  # (B*M, P, P)
+                                          eb, chunk, gen, state_out=so)  # (B*M, P, P)
             key = (b0 + rows_ev) * (n_str + 1) + pmt_str.repeat(B)
             out = out.index_add(0, key, F_rows)
-            if fo is not None:
-                _fired_out.extend(fo[0].reshape(B, M).unbind(0))
+            if so is not None:
+                # one dict per event: every per-row draw split back into its event
+                per_ev = [{} for _ in range(B)]
+                for k, v in so[0].items():
+                    for b, vb in enumerate(v.reshape(B, M, *v.shape[1:]).unbind(0)):
+                        per_ev[b][k] = vb
+                _state_out.extend(per_ev)
             del F_rows
             if empty_cache_after_event:
                 _free(self.device)
@@ -537,13 +561,15 @@ class FlowFisherResolutionLoss(LossFunction):
         return out.reshape(n_ev, n_str + 1, P, P)[:, :n_str]
 
     def _position_grad(self, points_3d, string_xy, signal_event_params, A,
-                       fired_masks, chunk, events_per_batch=1,
+                       row_states, chunk, events_per_batch=1,
                        empty_cache_after_event=False, verbose=False):
         """dL/d(points_3d), given A = dL/dF_str (n_events, n_strings, P, P).
 
         L depends on the geometry only through F, so dL/dx = sum <A, dF_row/dx>
         over (event, PMT) rows. With A fixed that is a plain sum: each slice is
         rebuilt with a graph, backpropagated into a detached leaf, and freed.
+        row_states holds pass 1's per-row random draws, one dict per event, so every
+        slice is rebuilt from the same draws A was computed at.
         """
         pts_leaf = (_as_t(points_3d, self.device, self.dtype).reshape(-1, 3)
                     .detach().requires_grad_(True))
@@ -553,9 +579,9 @@ class FlowFisherResolutionLoss(LossFunction):
         P = A.shape[-1]
         om_str, n_str = self._om_to_string(pts_leaf, string_xy)
         pmt_str = om_str.repeat_interleave(K_pmt)
-        # retained graph per slice ~ chunk rows: n_quad nodes per PMT per likelihood
+        # retained graph per slice ~ chunk rows: nodes per PMT per likelihood
         n_lik = max(int(self.include_ly) + int(self.include_atime), 1)
-        pm = max(int(chunk) // (self.n_quad * n_lik), 1)
+        pm = max(int(chunk) // (self._nodes_per_pmt() * n_lik), 1)
         zero = torch.zeros(1, P, P, device=self.device, dtype=self.dtype)
         active = [i for i in range(len(signal_event_params)) if bool((A[i] != 0).any())]
         epb = max(int(events_per_batch), 1)
@@ -571,9 +597,12 @@ class FlowFisherResolutionLoss(LossFunction):
                 rows = torch.arange(B * M, device=self.device)
                 rows_ev, pmt = rows // M, rows % M
                 key = rows_ev * (n_str + 1) + pmt_str[pmt]
+                # pass 1's draws for these rows, in row order
+                st = {k: torch.cat([row_states[i][k] for i in evi])
+                      for k in row_states[evi[0]]}
                 if self.sample_hits:
                     # same selection as pass 1, or A was taken at a different F
-                    f = torch.cat([fired_masks[i] for i in evi])
+                    f = st['fired']
                     ids_f = torch.nonzero(f, as_tuple=True)[0]
                     jobs = [(ids_f[s:s + pm], True) for s in range(0, ids_f.numel(), pm)]
                     if self.include_hit:        # dark rows: cheap hit term only
@@ -585,12 +614,13 @@ class FlowFisherResolutionLoss(LossFunction):
 
                 for ids, flag in jobs:
                     p_ = pmt[ids]
-                    fired = (None if flag is None else
-                             torch.full((ids.numel(),), flag, dtype=torch.bool,
-                                        device=self.device))
+                    state = {k: v[ids] for k, v in st.items()}
+                    if flag is not None:
+                        state['fired'] = torch.full((ids.numel(),), flag,
+                                                    dtype=torch.bool, device=self.device)
                     F_sl = self._fisher_per_pmt(pts_leaf[p_ // K_pmt],
                                                 self._pmt_dirs[p_ % K_pmt],
-                                                rows_ev[ids], eb, chunk, fired=fired)
+                                                rows_ev[ids], eb, chunk, state=state)
                     s_val = (A_flat[key[ids]] * F_sl).sum()
                     g, = torch.autograd.grad(s_val, pts_leaf, allow_unused=True)
                     if g is not None:
@@ -686,13 +716,13 @@ class FlowFisherResolutionLoss(LossFunction):
         if chunked and self.use_torch_compile:
             raise ValueError("points_3d requires grad, but position gradients need "
                              "double backward, which torch.compile rejects.")
-        fired_masks = [] if (chunked and self.sample_hits) else None
+        row_states = [] if chunked else None                       # pass 1's draws
 
         if precomp is None:
             F_str = self.compute_fisher_per_string_per_event(
                 string_xy, points_3d, params, chunk=chunk,
                 empty_cache_after_event=empty_cache, verbose=verbose,
-                events_per_batch=epb, _fired_out=fired_masks)
+                events_per_batch=epb, _state_out=row_states)
         else:
             if self.geometry_grads and getattr(points_3d, 'requires_grad', False):
                 print("FlowFisherResolutionLoss: points_3d requires grad but a "
@@ -734,7 +764,7 @@ class FlowFisherResolutionLoss(LossFunction):
         if chunked:
             A, = torch.autograd.grad(total, F_in, retain_graph=True, allow_unused=True)
             if A is not None:
-                G = self._position_grad(points_3d, string_xy, params, A, fired_masks,
+                G = self._position_grad(points_3d, string_xy, params, A, row_states,
                                         chunk, epb, empty_cache, verbose)
                 # value unchanged, gradient w.r.t. points_3d is G; the geometry's
                 # own graph then carries it on to string_xy / z_values / ...
