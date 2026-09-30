@@ -6,6 +6,7 @@ import torch
 import nugget
 from nugget.surrogates.NuSmoothie import NuSmoothie
 from nugget.losses.fisher_info_flow import FlowFisherResolutionLoss
+from nugget.losses.fisher_info_flow_mc import FlowFisherMCResolutionLoss
 from nugget.losses.fisher_info_om_net import (OMFisherNetLoss, OMFisherTargets,
                                               resolution_from_fisher)
 
@@ -20,13 +21,21 @@ HISTORY = './fisher_models/om_muon_fisher_net_v1_training_history.pkl'
 # Parameters of the Fisher matrix. Any set FlowFisherResolutionLoss can scan works.
 FISHER_PARAMS = ('energy', 'zenith', 'azimuth')
 
+# 'exact': train on quadrature Fishers.  'mc': train on single-draw MC Fishers
+# (unbiased, noisy, far cheaper); the net learns their expectation. Validation and
+# the checks below always use exact targets.
+TARGET_MODE = 'mc'
+
 # Exact targets: all three terms, every PMT (no hit sampling), generous quadrature.
 FISHER_N_QUAD = 48
 FISHER_N_STEPS = 16
 FISHER_CHUNK = 8192
 
+# MC targets: one draw per PMT for the light yield and one for the arrival time.
+MC_SAMPLES = 1
+
 N_STEPS = 20_000            # each step draws EVENTS_PER_STEP fresh events
-EVENTS_PER_STEP = 16
+EVENTS_PER_STEP = 16 if TARGET_MODE == 'exact' else 128   # MC draws are ~20-40x cheaper
 OMS_PER_EVENT = 64          # 90% around the track, 10% uniform in a cube
 
 sampler = nugget.samplers.cyl_sampler.CylinderSampler(
@@ -49,17 +58,24 @@ exact = FlowFisherResolutionLoss(
     hit_model=ns.hit_model, ly_model=ns.ly_model, atime_model=ns.atime_model,
     device=DEVICE, fisher_info_params=FISHER_PARAMS, mode='all',
     n_quad=FISHER_N_QUAD, n_steps=FISHER_N_STEPS, sample_hits=False)
+# hit_sample_seed stays None: every call must draw fresh MC noise
+mc = FlowFisherMCResolutionLoss(
+    hit_model=ns.hit_model, ly_model=ns.ly_model, atime_model=ns.atime_model,
+    device=DEVICE, fisher_info_params=FISHER_PARAMS, mode='all',
+    n_steps=FISHER_N_STEPS, sample_hits=False,
+    n_samples_ly=MC_SAMPLES, n_samples_t=MC_SAMPLES)
 
-targets = OMFisherTargets(
-    exact, sampler,
+placement = dict(
     oms_per_event=OMS_PER_EVENT,
     d_perp_range=(1.0, 400.0),      # log-uniform distance from the track [m]
     d_long_range=(-200.0, 1500.0),  # along the track from the vertex [m]
     uniform_frac=0.1,
     uniform_half_size=5000,
     chunk=FISHER_CHUNK,
-    seed=0,
 )
+exact_targets = OMFisherTargets(exact, sampler, seed=0, **placement)
+targets = (exact_targets if TARGET_MODE == 'exact'
+           else OMFisherTargets(mc, sampler, seed=1, **placement))
 
 om_loss = OMFisherNetLoss(
     device=DEVICE,
@@ -88,8 +104,9 @@ om_loss = OMFisherNetLoss(
     weight_decay=1e-5,
 
     # --- target / loss ---
+    target_mode=TARGET_MODE,
     eps_floor=1e-6,             # added to F' before the Cholesky factor
-    weight_tau='median',        # dark OMs (tiny tr F') count less in the fit
+    weight_tau='median',        # 'exact': dark-OM down-weighting; 'mc': error floor
     geometry_grads='chunked',
 )
 
@@ -104,8 +121,9 @@ history = om_loss.fit_online(
     n_val_events=512,           # fixed validation draw
     val_every=100,
     early_stopping_patience=20, # in validations
-    save_every=5,               # in validations
+    save_every=5,               # in validations (every new best is saved anyway)
     checkpoint_path=CHECKPOINT,
+    val_targets=exact_targets,  # exact validation: the true error, not error + noise
 )
 pickle.dump(history, open(HISTORY, 'wb'))
 
@@ -116,7 +134,7 @@ pickle.dump(history, open(HISTORY, 'wb'))
 # ---------------------------------------------------------------------------
 if 'zenith' in FISHER_PARAMS and 'azimuth' in FISHER_PARAMS:
     P = len(FISHER_PARAMS)
-    test = targets(512)
+    test = exact_targets(512)
     zen, azi = test['zenith'], test['azimuth']
     u = torch.stack([torch.sin(zen) * torch.cos(azi), torch.sin(zen) * torch.sin(azi),
                      torch.cos(zen)], dim=1)

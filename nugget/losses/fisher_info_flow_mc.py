@@ -101,8 +101,9 @@ class FlowFisherMCResolutionLoss(FlowFisherResolutionLoss):
         with torch.set_grad_enabled(self._track):
             c_l = build_l(d0).repeat_interleave(Kq, 0)
             z1 = _push(ly, zq.reshape(-1), c_l, ns, ck).reshape(m, Kq)
-        # expected photon count given a hit: E[q] = E[q~] - 1/2
-        qbar = (ly.from_z(z1).mean(1) - 0.5).clamp_min(1.0).to(self.dtype)
+        # expected photon count given a hit: E[q] = E[q~] - 1/2. Clamp only at 0: a
+        # floor of 1 per draw would bias dim PMTs upward, most of all with one draw
+        qbar = (ly.from_z(z1).mean(1) - 0.5).clamp_min(0.0).to(self.dtype)
         if self.include_ly:
             g_q = self._scores_rows(ly, build_l, d0, z1, chunk)
             contrib = (wf.reshape(m, 1, 1)

@@ -194,9 +194,16 @@ class OMFisherNetLoss(LossFunction):
         cos(track, vertex -> OM). There are no PMT features: the target is a whole OM.
     fisher_params : sequence of str
         Must match the targets it is trained on (OMFisherTargets).
+    target_mode : 'exact' or 'mc'
+        'exact': targets are exact Fishers; MSE on their log-Cholesky factors.
+        'mc': targets are single-draw MC Fishers (unbiased, noisy); the loss is
+        ||F'_pred - F'_target||_F^2 / (sg(tr F'_pred) + tau)^2 in linear F space, whose
+        minimiser is the conditional mean E[F'_target | c] = F'. A log-space loss
+        would converge to E[log F'_target] instead, biased low for noisy targets.
     weight_tau : 'median', float or 0
-        Training weight tr F' / (tr F' + tau): dark OMs, which barely enter any sum,
-        count less. 0 weights every OM equally.
+        'exact': training weight tr F' / (tr F' + tau), so dark OMs, which barely
+        enter any sum, count less (0 weights every OM equally). 'mc': the floor of the
+        relative-error denominator above (0 falls back to 1e-12).
     geometry_grads : 'chunked', 'direct' or False
         'chunked' builds F without a graph and accumulates dL/d(points_3d) in
         bounded memory; 'direct' keeps the whole graph.
@@ -211,11 +218,14 @@ class OMFisherNetLoss(LossFunction):
                  add_dist_long=True, ly_eps=1e-6,
                  width=256, depth=6, dropout=0.0, learning_rate=1e-3,
                  lr_schedule='onecycle', warmup_frac=0.1, weight_decay=0.0,
-                 eps_floor=1e-6, weight_tau='median', geometry_grads='chunked',
-                 net_dtype=None, print_loss=False):
+                 eps_floor=1e-6, weight_tau='median', target_mode='exact',
+                 geometry_grads='chunked', net_dtype=None, print_loss=False):
         super().__init__(device=device)
         if resolution_type not in ('angular', 'energy'):
             raise ValueError("resolution_type must be 'angular' or 'energy'")
+        if target_mode not in ('exact', 'mc'):
+            raise ValueError("target_mode must be 'exact' or 'mc'")
+        self.target_mode = target_mode
         if geometry_grads not in ('chunked', 'direct', False):
             raise ValueError("geometry_grads must be 'chunked', 'direct' or False")
         self.fisher_params = list(fisher_params)
@@ -316,11 +326,20 @@ class OMFisherNetLoss(LossFunction):
             d[:, i] = energy if s == 'relative' else float(s)
         return d
 
-    def fisher_to_target(self, F, energy):
-        """(N,P,P) physical Fisher -> (N, target_dim) targets and tr F'."""
+    def _scaled(self, F, energy):
+        """F' = D F D, symmetrised: the dimensionless matrix the net works in."""
         d = self._scales(energy)
         Fs = d.unsqueeze(2) * F * d.unsqueeze(1)
-        Fs = 0.5 * (Fs + Fs.transpose(1, 2))
+        return 0.5 * (Fs + Fs.transpose(1, 2))
+
+    def _triu(self, device):
+        """Upper-triangle indices of F' and their weights in ||.||_F^2 (1 diag, 2 off)."""
+        iu, ju = torch.triu_indices(self.P, self.P, device=device)
+        return iu, ju, torch.where(iu == ju, 1.0, 2.0).to(device)
+
+    def fisher_to_target(self, F, energy):
+        """(N,P,P) physical Fisher -> (N, target_dim) log-Cholesky targets and tr F'."""
+        Fs = self._scaled(F, energy)
         eye = torch.eye(self.P, dtype=F.dtype, device=F.device)
         jitter = self.eps_floor
         for _ in range(8):                       # a few rows may need more than eps
@@ -333,8 +352,8 @@ class OMFisherNetLoss(LossFunction):
         return (torch.cat([torch.log(diag), L[:, ii, jj] / diag[:, jj]], dim=1),
                 Fs.diagonal(dim1=1, dim2=2).sum(1))
 
-    def target_to_fisher(self, y, energy):
-        """(N, target_dim) -> (N,P,P) physical Fisher."""
+    def _scaled_from_output(self, y):
+        """(N, target_dim) log-Cholesky -> F' = L L^T (N,P,P), PSD by construction."""
         P = self.P
         diag = torch.exp(y[:, :P])
         L = torch.diag_embed(diag)
@@ -342,17 +361,24 @@ class OMFisherNetLoss(LossFunction):
         if ii.numel():
             L = L.index_put((torch.arange(y.shape[0], device=y.device).unsqueeze(1),
                              ii.unsqueeze(0), jj.unsqueeze(0)), y[:, P:] * diag[:, jj])
+        return L @ L.transpose(1, 2)
+
+    def target_to_fisher(self, y, energy):
+        """(N, target_dim) -> (N,P,P) physical Fisher."""
         d = self._scales(energy.to(y.dtype))
-        return (L @ L.transpose(1, 2)) / (d.unsqueeze(2) * d.unsqueeze(1))
+        return self._scaled_from_output(y) / (d.unsqueeze(2) * d.unsqueeze(1))
 
     def _tensors(self, data):
+        """-> context, log-Cholesky target, tr F', and F' upper triangle (N, P(P+1)/2)."""
         dev = self.device
         E = data['energy'].double().to(dev)
+        F = data['F'].double().to(dev)
         u = _unit_travel(data['zenith'].double(), data['azimuth'].double()).to(dev)
         ctx = self.build_context(data['om_pos'].double().to(dev),
                                  data['vertex'].double().to(dev), E, u)
-        y, tr = self.fisher_to_target(data['F'].double().to(dev), E)
-        return ctx, y, tr
+        y, tr = self.fisher_to_target(F, E)
+        iu, ju, _ = self._triu(dev)
+        return ctx, y, tr, self._scaled(F, E)[:, iu, ju]
 
     # ---------------- network ----------------
 
@@ -384,51 +410,77 @@ class OMFisherNetLoss(LossFunction):
     def fit_normalisers(self, data):
         if list(data['fisher_params']) != self.fisher_params:
             raise ValueError(f"data has {data['fisher_params']}, loss has {self.fisher_params}")
-        ctx, y, tr = self._tensors(data)
+        # with 'mc' targets the log-Cholesky statistics are of noisy draws: they only
+        # set the output scaling, the loss itself stays in linear F space
+        ctx, y, tr, _ = self._tensors(data)
         self.context_mean, self.context_std = ctx.mean(0), ctx.std(0).clamp_min(1e-6)
         self.target_mean, self.target_std = y.mean(0), y.std(0).clamp_min(1e-6)
         self.tau = (float(tr.median()) if self.weight_tau == 'median'
                     else float(self.weight_tau or 0.0))
-        print(f"  normalisers from {ctx.shape[0]:,} OMs; weight tau = {self.tau:.3g}")
+        print(f"  normalisers from {ctx.shape[0]:,} OMs; tau = {self.tau:.3g}")
+
+    @property
+    def _buffer_dim(self):
+        return self.target_dim if self.target_mode == 'exact' else self.P * (self.P + 1) // 2
 
     def _standardise(self, data):
-        """Batch dict -> standardised (context, target, weight) in the net's dtype."""
-        ctx, y, tr = self._tensors(data)
-        w = tr / (tr + self.tau) if self.tau > 0 else torch.ones_like(tr)
+        """Batch dict -> (standardised context, target, weight) in the net's dtype.
+
+        'exact': the standardised log-Cholesky target and its tr-based weight.
+        'mc': the raw F' upper triangle; its weighting lives in _net_loss.
+        """
+        ctx, y, tr, f_up = self._tensors(data)
         dt = self.param_dtype
-        return (((ctx - self.context_mean) / self.context_std).to(dt),
-                ((y - self.target_mean) / self.target_std).to(dt), w.to(dt))
+        ctx = ((ctx - self.context_mean) / self.context_std).to(dt)
+        if self.target_mode == 'mc':
+            return ctx, f_up.to(dt), torch.ones_like(tr).to(dt)
+        w = tr / (tr + self.tau) if self.tau > 0 else torch.ones_like(tr)
+        return ctx, ((y - self.target_mean) / self.target_std).to(dt), w.to(dt)
 
     def _net_loss(self, ctx, y, w):
-        return (w * ((self.net(ctx) - y) ** 2).mean(1)).sum() / w.sum().clamp_min(1e-12)
+        out = self.net(ctx)
+        if self.target_mode == 'exact':
+            return (w * ((out - y) ** 2).mean(1)).sum() / w.sum().clamp_min(1e-12)
+        # 'mc': squared Frobenius error in linear F' space over a scale that depends on
+        # the input only (the detached prediction), so the minimiser is still E[F' | c]
+        yy = out * self.target_std.to(out.dtype) + self.target_mean.to(out.dtype)
+        Fp = self._scaled_from_output(yy)
+        iu, ju, fw = self._triu(out.device)
+        err = (fw.to(out.dtype) * (Fp[:, iu, ju] - y) ** 2).sum(1)
+        scale = Fp.diagonal(dim1=1, dim2=2).sum(1).detach() + max(self.tau, 1e-12)
+        return (err / scale ** 2).mean()
 
     def fit_online(self, targets, n_steps=20_000, events_per_step=16, updates_per_step=4,
                    batch_size=4096, buffer_size=200_000, warmup_events=256,
                    n_val_events=512, val_every=100, early_stopping_patience=20,
-                   grad_clip=1.0, save_every=None, checkpoint_path=None, verbose=True):
+                   grad_clip=1.0, save_every=None, checkpoint_path=None,
+                   val_targets=None, verbose=True):
         """Train on (event, OM) pairs drawn on the fly by ``targets`` (OMFisherTargets).
 
         Every step draws events_per_step fresh events into a replay buffer and takes
-        updates_per_step minibatch steps from it: the exact Fisher costs far more
-        than an MLP step, so each draw is reused a few times while the buffer keeps
-        the minibatches from being dominated by the latest events. warmup_events set
-        the normalisers and seed the buffer; n_val_events are drawn once and fixed.
+        updates_per_step minibatch steps from it: target Fishers cost far more than an
+        MLP step, so each draw is reused a few times while the buffer keeps the
+        minibatches from being dominated by the latest events. warmup_events set the
+        normalisers and seed the buffer; n_val_events are drawn once and fixed, from
+        val_targets if given (e.g. exact targets while training on 'mc' ones, so the
+        validation loss is the true error rather than error plus target noise).
         Validation runs every val_every steps; patience and save_every count those.
         """
-        if list(targets.fisher_params) != self.fisher_params:
-            raise ValueError(f"targets give {targets.fisher_params}, loss has "
-                             f"{self.fisher_params}")
+        for t in (targets, val_targets):
+            if t is not None and list(t.fisher_params) != self.fisher_params:
+                raise ValueError(f"targets give {t.fisher_params}, loss has "
+                                 f"{self.fisher_params}")
         if self.net is None:
             self.build_network()
         self.net.requires_grad_(True)
         warm = targets(warmup_events)
         if self.context_mean is None:
             self.fit_normalisers(warm)
-        val = self._standardise(targets(n_val_events))
+        val = self._standardise((val_targets or targets)(n_val_events))
 
         dev, dt = self.device, self.param_dtype
         buf = [torch.empty(buffer_size, d, device=dev, dtype=dt)
-               for d in (self.context_dim, self.target_dim)]
+               for d in (self.context_dim, self._buffer_dim)]
         buf.append(torch.empty(buffer_size, device=dev, dtype=dt))
         fill, head = 0, 0
 
@@ -478,6 +530,8 @@ class OMFisherNetLoss(LossFunction):
                     best_val, patience = vl, 0
                     self.best_state_dict = {k: v.detach().clone()
                                             for k, v in self.net.state_dict().items()}
+                    if checkpoint_path:                     # every new best is kept
+                        self.save_model(checkpoint_path, state=self.best_state_dict)
                 else:
                     patience += 1
                 if verbose:
@@ -624,7 +678,7 @@ class OMFisherNetLoss(LossFunction):
             **{k: getattr(self, k) for k in self._CONTEXT_FLAGS},
             'width': self.width, 'depth': self.depth,
             'dropout': self.dropout, 'eps_floor': self.eps_floor,
-            'weight_tau': self.weight_tau, 'tau': self.tau,
+            'weight_tau': self.weight_tau, 'tau': self.tau, 'target_mode': self.target_mode,
             'net_dtype': self.net_dtype,
             'context_mean': cpu(self.context_mean), 'context_std': cpu(self.context_std),
             'target_mean': cpu(self.target_mean), 'target_std': cpu(self.target_std),
@@ -634,7 +688,7 @@ class OMFisherNetLoss(LossFunction):
     def load_model(self, filepath):
         ck = torch.load(filepath, map_location=self.device, weights_only=False)
         for k in ('fisher_params', 'param_scales', *self._CONTEXT_FLAGS, 'width', 'depth',
-                  'dropout', 'eps_floor', 'weight_tau', 'tau', 'net_dtype',
+                  'dropout', 'eps_floor', 'weight_tau', 'tau', 'target_mode', 'net_dtype',
                   'train_losses', 'val_losses'):
             if k in ck:
                 setattr(self, k, ck[k])
