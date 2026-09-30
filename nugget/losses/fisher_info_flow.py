@@ -560,6 +560,28 @@ class FlowFisherResolutionLoss(LossFunction):
                 print(f'  Fisher: event {b0 + B}/{n_ev}', flush=True)
         return out.reshape(n_ev, n_str + 1, P, P)[:, :n_str]
 
+    def fisher_per_om(self, om_positions, events, event_index, chunk=8192):
+        """(N, P, P) Fisher of each OM (its PMT template summed) for its own event.
+
+        event_index (N,) maps OM n to events[event_index[n]], so OMs of many events
+        share one pass. No geometry graph. With sample_hits=False it is the exact
+        expectation (up to quadrature); used to build OMFisherNet training data.
+        """
+        pts3 = _as_t(om_positions, self.device, self.dtype).reshape(-1, 3).detach()
+        ev_idx = torch.as_tensor(event_index, device=self.device).long().reshape(-1)
+        N, K_pmt = pts3.shape[0], self._pmt_dirs.shape[0]
+        P = len(self.fisher_info_params)
+        self._track = False
+        gen = None
+        if self.hit_sample_seed is not None:
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(int(self.hit_sample_seed))
+        F = self._fisher_per_pmt(pts3.repeat_interleave(K_pmt, 0),
+                                 self._pmt_dirs.repeat(N, 1),
+                                 ev_idx.repeat_interleave(K_pmt),
+                                 self._event_batch(events), chunk, gen)
+        return F.reshape(N, K_pmt, P, P).sum(1)
+
     def _position_grad(self, points_3d, string_xy, signal_event_params, A,
                        row_states, chunk, events_per_batch=1,
                        empty_cache_after_event=False, verbose=False):
