@@ -576,11 +576,14 @@ class FlowFisherResolutionLoss(LossFunction):
         if self.hit_sample_seed is not None:
             gen = torch.Generator(device=self.device)
             gen.manual_seed(int(self.hit_sample_seed))
-        F = self._fisher_per_pmt(pts3.repeat_interleave(K_pmt, 0),
-                                 self._pmt_dirs.repeat(N, 1),
-                                 ev_idx.repeat_interleave(K_pmt),
-                                 self._event_batch(events), chunk, gen)
-        return F.reshape(N, K_pmt, P, P).sum(1)
+        # the scores are autograd derivatives, so this must run with grad on even
+        # when the caller is inside no_grad; the result is detached either way
+        with torch.enable_grad():
+            F = self._fisher_per_pmt(pts3.repeat_interleave(K_pmt, 0),
+                                     self._pmt_dirs.repeat(N, 1),
+                                     ev_idx.repeat_interleave(K_pmt),
+                                     self._event_batch(events), chunk, gen)
+        return F.detach().reshape(N, K_pmt, P, P).sum(1)
 
     def _position_grad(self, points_3d, string_xy, signal_event_params, A,
                        row_states, chunk, events_per_batch=1,

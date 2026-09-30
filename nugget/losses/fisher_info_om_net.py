@@ -126,8 +126,7 @@ class OMFisherTargets:
         placed = [self._place(ev) for ev in evs]
         idx = torch.arange(len(evs), device=dev).repeat_interleave(self.oms_per_event)
         pos = torch.as_tensor(np.concatenate([p for p, _ in placed]), device=dev, dtype=dt)
-        with torch.no_grad():
-            F = fl.fisher_per_om(pos, evs, idx, chunk=self.chunk)
+        F = fl.fisher_per_om(pos, evs, idx, chunk=self.chunk)     # needs autograd inside
         col = lambda k: torch.tensor([float(torch.as_tensor(e[k]).reshape(-1)[0])
                                       for e in evs], dtype=torch.float64, device=dev)
         vert = torch.as_tensor(np.stack([v for _, v in placed]), dtype=torch.float64,
