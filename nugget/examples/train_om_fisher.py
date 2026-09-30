@@ -10,13 +10,13 @@ from nugget.losses.fisher_info_flow_mc import FlowFisherMCResolutionLoss
 from nugget.losses.fisher_info_om_net import (OMFisherNetLoss, OMFisherTargets,
                                               resolution_from_fisher)
 
-DEVICE = 'cuda:0'
+DEVICE = 'cuda:2'
 HIT_CKPT = './flow_models/best_mc_hit_model_v1rs.pt'
 LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1rs.pt'
 ATIME_CKPT = './flow_models/best_mc_atime_muon_flow_model_v1rs.pt'
 
-CHECKPOINT = './fisher_models/best_om_muon_fisher_net_v1.pt'
-HISTORY = './fisher_models/om_muon_fisher_net_v1_training_history.pkl'
+CHECKPOINT = './fisher_models/best_om_muon_fisher_net_v1mc.pt'
+HISTORY = './fisher_models/om_muon_fisher_net_v1mc_training_history.pkl'
 
 # Parameters of the Fisher matrix. Any set FlowFisherResolutionLoss can scan works.
 FISHER_PARAMS = ('energy', 'zenith', 'azimuth')
@@ -34,7 +34,7 @@ FISHER_CHUNK = 8192
 # MC targets: one draw per PMT for the light yield and one for the arrival time.
 MC_SAMPLES = 1
 
-N_STEPS = 20_000            # each step draws EVENTS_PER_STEP fresh events
+N_STEPS = 2_000            # each step draws EVENTS_PER_STEP fresh events
 EVENTS_PER_STEP = 16 if TARGET_MODE == 'exact' else 128   # MC draws are ~20-40x cheaper
 OMS_PER_EVENT = 64          # 90% around the track, 10% uniform in a cube
 
@@ -47,8 +47,8 @@ sampler = nugget.samplers.cyl_sampler.CylinderSampler(
     uniform_zenith_sampling=True,
     random_position_along_ray=True,
     find_exact_intersection=False,
-    cylinder_radius=5000,
-    cylinder_height=2000,
+    cylinder_radius=600,
+    cylinder_height=1000,
     cylinder_center=[0, 0, 0],
 )
 
@@ -70,7 +70,7 @@ placement = dict(
     d_perp_range=(1.0, 400.0),      # log-uniform distance from the track [m]
     d_long_range=(-200.0, 1500.0),  # along the track from the vertex [m]
     uniform_frac=0.1,
-    uniform_half_size=5000,
+    uniform_half_size=2000,
     chunk=FISHER_CHUNK,
 )
 exact_targets = OMFisherTargets(exact, sampler, seed=0, **placement)
@@ -119,7 +119,7 @@ history = om_loss.fit_online(
     buffer_size=200_000,        # replay buffer of (event, OM) pairs
     warmup_events=256,          # normalisers + initial buffer
     n_val_events=512,           # fixed validation draw
-    val_every=100,
+    val_every=20,
     early_stopping_patience=20, # in validations
     save_every=5,               # in validations (every new best is saved anyway)
     checkpoint_path=CHECKPOINT,
