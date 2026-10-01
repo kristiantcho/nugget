@@ -15,8 +15,8 @@ HIT_CKPT = './flow_models/best_mc_hit_model_v1rs.pt'
 LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1rs.pt'
 ATIME_CKPT = './flow_models/best_mc_atime_muon_flow_model_v1rs.pt'
 
-CHECKPOINT = './fisher_models/best_om_muon_fisher_net_v1mc.pt'
-HISTORY = './fisher_models/om_muon_fisher_net_v1mc_training_history.pkl'
+CHECKPOINT = './fisher_models/best_om_muon_fisher_net_v2mc.pt'
+HISTORY = './fisher_models/om_muon_fisher_net_v2mc_training_history.pkl'
 
 # Parameters of the Fisher matrix. Any set FlowFisherResolutionLoss can scan works.
 FISHER_PARAMS = ('energy', 'zenith', 'azimuth')
@@ -87,8 +87,9 @@ om_loss = OMFisherNetLoss(
     rich_rel_pos_mode=True,
     include_vertex_position=False,
     add_vertex_distance=False,
-    add_distance_from_beam=True,
-    add_dist_long=True,
+    add_distance_from_beam=False,
+    add_dist_long=False,
+    add_log_distances=True,
     ly_eps=1e-6,
 
     # --- network ---
@@ -120,7 +121,7 @@ history = om_loss.fit_online(
     warmup_events=256,          # normalisers + initial buffer
     n_val_events=512,           # fixed validation draw
     val_every=20,
-    early_stopping_patience=20, # in validations
+    early_stopping_patience=50, # in validations
     save_every=5,               # in validations (every new best is saved anyway)
     checkpoint_path=CHECKPOINT,
     val_targets=exact_targets,  # exact validation: the true error, not error + noise
