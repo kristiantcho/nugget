@@ -343,11 +343,13 @@ class NuSmoothie(Surrogate):
         t_geom = [d_along + d_perp (n - cos_c)/sin_c] / c
                = s_emit / c + d_geom . n / c
         so s_emit and d_geom below are exactly the emission point and photon path
-        length the arrival-time model's t_geom implies.
+        length the arrival-time model's t_geom implies. vertex / travel_dir may be
+        one event (3,) or one per row (M, 3).
         """
-        rel = pts - vertex.reshape(1, 3)
-        d_along = (rel * travel_dir.reshape(1, 3)).sum(dim=1)
-        perp = rel - d_along.unsqueeze(1) * travel_dir.reshape(1, 3)
+        vertex, travel_dir = vertex.reshape(-1, 3), travel_dir.reshape(-1, 3)
+        rel = pts - vertex
+        d_along = (rel * travel_dir).sum(dim=1)
+        perp = rel - d_along.unsqueeze(1) * travel_dir
         d_perp = torch.sqrt((perp ** 2).sum(dim=1) + 1e-12)
 
         cos_c = 1.0 / self.refractive_index
@@ -368,18 +370,23 @@ class NuSmoothie(Surrogate):
     # ------------------------------------------------------------------
 
     def _contexts(self, pts, dirs, vertex, travel_dir, energy):
-        """-> {model name: context tensor on that model's device/dtype}."""
+        """-> {model name: context tensor on that model's device/dtype}.
+
+        vertex / travel_dir / energy may be one event or one per row, so rows from
+        many events can share a call.
+        """
         self._require_track()
         m = pts.shape[0]
-        vert = vertex.reshape(1, 3).expand(m, 3)
-        en = energy.reshape(1).expand(m)
+        vert = vertex.reshape(-1, 3).expand(m, 3)
+        trav = travel_dir.reshape(-1, 3).expand(m, 3)
+        en = energy.reshape(-1).expand(m)
 
         out = {}
         for _, names in self._ctx_groups:
             ref = getattr(self, f'{names[0]}_model')
             # track_dir_is_arrival is part of the context signature, so every
             # model in a group wants the same convention as `ref`
-            drc = self._dir_for(ref, travel_dir).reshape(1, 3).expand(m, 3)
+            drc = self._dir_for(ref, trav)
             c = ref.build_context(pts, vert, en, pmt_directions=dirs,
                                   directions=drc)
             for nm in names:
@@ -473,8 +480,15 @@ class NuSmoothie(Surrogate):
 
         pts, dirs, group, n_out = self._resolve_points(om_positions,
                                                         pmt_directions, pmt_mode)
-        ctxs = self._contexts(pts, dirs, vertex, travel, energy)
+        q = self._light(self._contexts(pts, dirs, vertex, travel, energy),
+                        sample, generator)
+        if n_out != q.shape[0]:
+            q = torch.zeros(n_out, dtype=q.dtype,
+                            device=q.device).index_add_(0, group, q)
+        return q
 
+    def _light(self, ctxs, sample=False, generator=None):
+        """Per-row photons: pi . E[q | hit], or one Bernoulli x flow draw if sample."""
         p = self.hit_prob(ctxs['hit'])
         if sample:
             u = torch.rand(p.shape[0], device=self.device, dtype=torch.float64,
@@ -483,41 +497,57 @@ class NuSmoothie(Surrogate):
                             torch.zeros_like(p))
         else:
             q = p * self.expected_ly_given_hit(ctxs['ly'], generator=generator)
+        return torch.nan_to_num(q, nan=0.0, posinf=self.poisson_rate_cap,
+                                neginf=0.0).clamp(min=0.0)
 
-        q = torch.nan_to_num(q, nan=0.0, posinf=self.poisson_rate_cap,
-                             neginf=0.0).clamp(min=0.0)
-        if n_out != q.shape[0]:
-            q = torch.zeros(n_out, dtype=q.dtype,
-                            device=q.device).index_add_(0, group, q)
-        return q
+    def _event_rows(self, M, B, b0, n_out, group):
+        """Rows for B events x M PMT rows: event of each row, and its output key."""
+        rows_ev = torch.arange(B, device=self.device).repeat_interleave(M)
+        return rows_ev, (rows_ev + b0) * n_out + group.repeat(B)
 
     def call_batched(self, track_pos, track_dir, track_energy, om_positions,
-                     pmt_directions=None, **kwargs):
-        """(n_events, n_out) expected photons. Loops over events.
+                     pmt_directions=None, pmt_mode=None, sample=False, generator=None,
+                     events_per_batch=None, **kwargs):
+        """(n_events, n_out) photons, vectorised over events.
 
-        Unlike LightSabre there is no closed form to broadcast over, so this is a
-        convenience wrapper: the per-event work is already batched internally.
+        Rows are (event, PMT) pairs, so every event shares one pass through each
+        model; events_per_batch bounds how many go into a pass (memory ~ events x
+        PMTs). sample=True draws instead of taking the mean, as in __call__.
         """
-        track_pos = torch.as_tensor(track_pos).reshape(-1, 3)
-        track_dir = torch.as_tensor(track_dir).reshape(-1, 3)
-        track_energy = torch.as_tensor(track_energy).reshape(-1)
-        return torch.stack([
-            self.__call__(track_pos=track_pos[i], track_dir=track_dir[i],
-                          track_energy=track_energy[i],
-                          om_positions=om_positions,
-                          pmt_directions=pmt_directions, **kwargs)
-            for i in range(track_pos.shape[0])])
+        self._require_track()
+        as_t = lambda x: torch.as_tensor(x).to(device=self.device, dtype=torch.float64)
+        V = as_t(track_pos).reshape(-1, 3)
+        U = as_t(track_dir).reshape(-1, 3)
+        U = U / U.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        E = as_t(track_energy).reshape(-1)
+        pts, dirs, group, n_out = self._resolve_points(om_positions, pmt_directions,
+                                                        pmt_mode)
+        M, n_ev = pts.shape[0], V.shape[0]
+        epb = n_ev if events_per_batch is None else max(int(events_per_batch), 1)
+        out = torch.zeros(n_ev * n_out, dtype=torch.float64, device=self.device)
+        for b0 in range(0, n_ev, epb):
+            B = min(epb, n_ev - b0)
+            rows_ev, key = self._event_rows(M, B, b0, n_out, group)
+            ev = rows_ev + b0
+            ctxs = self._contexts(pts.repeat(B, 1), dirs.repeat(B, 1), V[ev], U[ev], E[ev])
+            out = out.index_add(0, key, self._light(ctxs, sample, generator))
+        return out.reshape(n_ev, n_out)
+
+    def _stack_events(self, event_params_list, gradient_mode=False):
+        """List of event dicts -> vertices (B,3), travel directions (B,3), energies (B,)."""
+        parsed = [self._parse_event_params(ep, gradient_mode) for ep in event_params_list]
+        return (torch.stack([p[0] for p in parsed]), torch.stack([p[1] for p in parsed]),
+                torch.stack([p[2] for p in parsed]))
 
     def light_yield_surrogate_batched(self, om_positions, event_params_list,
                                       **kwargs):
-        """(n_events, n_out) expected photons for a list of event dicts."""
-        rows = []
-        for ep in event_params_list:
-            vertex, travel, energy = self._parse_event_params(ep)
-            rows.append(self.__call__(track_pos=vertex, track_dir=travel,
-                                      track_energy=energy,
-                                      om_positions=om_positions, **kwargs))
-        return torch.stack(rows)
+        """(n_events, n_out) photons for a list of event dicts, vectorised over events.
+
+        kwargs go to call_batched (pmt_directions, pmt_mode, sample, generator,
+        events_per_batch).
+        """
+        V, U, E = self._stack_events(event_params_list)
+        return self.call_batched(V, U, E, om_positions, **kwargs)
 
     def light_yield_surrogate(self, **kwargs):
         """Light yield at ``opt_point``, or arrival-time dicts in PATD mode.
@@ -592,91 +622,136 @@ class NuSmoothie(Surrogate):
         holding that OM's photons pooled across its PMTs; under 'split' each PMT
         gets its own dict.
         """
-        pts, dirs, group, n_out = self._resolve_points(opt_point, pmt_directions,
+        resp = self._response_core(opt_point, vertex.reshape(1, 3), travel.reshape(1, 3),
+                                   energy.reshape(1), pmt_directions, pmt_mode,
+                                   max_photons, generator, get_patd_probs=get_patd_probs)
+        return self.response_to_patd(resp)[0]
+
+    def _response_core(self, om_positions, V, U, E, pmt_directions=None, pmt_mode=None,
+                       max_photons=None, generator=None, events_per_batch=None,
+                       get_patd_probs=False):
+        """Sampled responses of events V (B,3), U (B,3) travel, E (B,) -> flat tensors.
+
+        Photons are ordered by (event, output row), the order response_to_patd
+        splits them in. Draw order per batch -- P(hit), E[q], hits, counts, times --
+        matches the single-event path, so one event with one generator reproduces it.
+        """
+        if self.atime_model is None:
+            raise ValueError("a sampled response needs an arrival-time model")
+        pts, dirs, group, n_out = self._resolve_points(om_positions, pmt_directions,
                                                         pmt_mode)
-        ctxs = self._contexts(pts, dirs, vertex, travel, energy)
+        M, n_ev = pts.shape[0], V.shape[0]
+        epb = n_ev if events_per_batch is None else max(int(events_per_batch), 1)
+        f64 = dict(dtype=torch.float64, device=self.device)
+        counts = torch.zeros(n_ev * n_out, **f64)
+        expected = torch.zeros(n_ev * n_out, **f64)
+        tg_min = torch.full((n_ev * n_out,), float('inf'), **f64)
+        keys = ('t_res', 't_geom', 'd_geom', 's_emit', 'emission_points', 'key', 'probs')
+        ph = {k: [] for k in keys}
 
-        p = self.hit_prob(ctxs['hit'])
-        expected = p * self.expected_ly_given_hit(ctxs['ly'], generator=generator)
+        for b0 in range(0, n_ev, epb):
+            B = min(epb, n_ev - b0)
+            rows_ev, key = self._event_rows(M, B, b0, n_out, group)
+            ev = rows_ev + b0
+            P, v, u = pts.repeat(B, 1), V[ev], U[ev]
+            ctxs = self._contexts(P, dirs.repeat(B, 1), v, u, E[ev])
 
-        # which PMTs fire, and how many photons each
-        u = torch.rand(p.shape[0], device=self.device, dtype=torch.float64,
-                       generator=generator)
-        fired = u < p
-        q = torch.zeros_like(p)
-        if fired.any():
-            q[fired] = self.sample_ly(ctxs['ly'][fired], generator=generator)
-        if max_photons is not None:
-            q = q.clamp(max=float(max_photons))
-        n_ph = q.to(torch.int64)
+            p = self.hit_prob(ctxs['hit'])
+            expected = expected.index_add(
+                0, key, p * self.expected_ly_given_hit(ctxs['ly'], generator=generator))
+            fired = torch.rand(p.shape[0], generator=generator, **f64) < p
+            q = torch.zeros_like(p)
+            if fired.any():
+                q[fired] = self.sample_ly(ctxs['ly'][fired], generator=generator)
+            if max_photons is not None:
+                q = q.clamp(max=float(max_photons))
+            n_ph = q.to(torch.int64)
+            counts = counts.index_add(0, key, n_ph.to(torch.float64))
 
-        # geometry, exactly consistent with the model's own t_geom
-        _, _, s_emit, d_geom = self._track_geometry(pts, vertex, travel)
-        t_geom = self.atime_model.geometric_time(
-            pts, vertex.reshape(1, 3).expand(pts.shape[0], 3),
-            directions=self._dir_for(self.atime_model, travel)
-                           .reshape(1, 3).expand(pts.shape[0], 3),
-        ).to(device=self.device, dtype=torch.float64)
+            # geometry, exactly consistent with the model's own t_geom
+            _, _, s_emit, d_geom = self._track_geometry(P, v, u)
+            t_geom = self.atime_model.geometric_time(
+                P, v, directions=self._dir_for(self.atime_model, u)).to(**f64)
+            tg_min = tg_min.scatter_reduce(0, key, t_geom.detach(), reduce='amin')
 
-        # one flow call covering every photon of every PMT
-        total = int(n_ph.sum().item())
-        probs_all = None
-        if total > 0:
-            rep = torch.repeat_interleave(
-                torch.arange(pts.shape[0], device=self.device), n_ph)
-            t_res_all = self.sample_time_residuals(ctxs['atime'][rep],
-                                                   generator=generator)
-            if get_patd_probs:
-                probs_all = torch.empty_like(t_res_all)
-                with torch.no_grad():
-                    for s, e in self._chunks(total):
-                        lp = self.atime_model.log_prob_time_residual(
-                            t_res_all[s:e].to(self.atime_model.param_dtype),
-                            ctxs['atime'][rep[s:e]], n_steps=self.n_steps)
-                        probs_all[s:e] = lp.exp().detach().to(
-                            device=self.device, dtype=torch.float64)
-            bounds = torch.cat([torch.zeros(1, dtype=torch.int64,
-                                            device=self.device),
-                                n_ph.cumsum(0)])
-        else:
-            t_res_all = None
-            bounds = torch.zeros(pts.shape[0] + 1, dtype=torch.int64,
-                                 device=self.device)
-
-        emission = vertex.reshape(1, 3) + s_emit.unsqueeze(1) * travel.reshape(1, 3)
-
-        results = []
-        for g in range(n_out):
-            members = torch.nonzero(group == g, as_tuple=True)[0]
-            exp_g = float(expected[members].sum().item())
-            spans = [(int(bounds[i].item()), int(bounds[i + 1].item()), int(i))
-                     for i in members.tolist() if n_ph[i] > 0]
-            if not spans:
-                results.append(self._empty_patd_dict(exp_g))
+            # one flow call covering every photon of every PMT of these events
+            rep = torch.repeat_interleave(torch.arange(P.shape[0], device=self.device),
+                                          n_ph)
+            if rep.numel() == 0:
                 continue
+            t_res = self.sample_time_residuals(ctxs['atime'][rep], generator=generator)
+            ph['t_res'].append(t_res)
+            ph['t_geom'].append(t_geom[rep])
+            ph['d_geom'].append(d_geom[rep])
+            ph['s_emit'].append(s_emit[rep])
+            ph['emission_points'].append(v[rep] + s_emit[rep].unsqueeze(1) * u[rep])
+            ph['key'].append(key[rep])
+            if get_patd_probs:
+                pr = torch.empty_like(t_res)
+                with torch.no_grad():
+                    for s, e in self._chunks(t_res.shape[0]):
+                        lp = self.atime_model.log_prob_time_residual(
+                            t_res[s:e].to(self.atime_model.param_dtype),
+                            ctxs['atime'][rep[s:e]], n_steps=self.n_steps)
+                        pr[s:e] = lp.exp().detach().to(**f64)
+                ph['probs'].append(pr)
 
-            t_res = torch.cat([t_res_all[a:b] for a, b, _ in spans])
-            tg = torch.cat([t_geom[i].expand(b - a) for a, b, i in spans])
-            dg = torch.cat([d_geom[i].expand(b - a) for a, b, i in spans])
-            se = torch.cat([s_emit[i].expand(b - a) for a, b, i in spans])
-            em = torch.cat([emission[i].unsqueeze(0).expand(b - a, 3)
-                            for a, b, i in spans])
-            pr = (torch.cat([probs_all[a:b] for a, b, _ in spans])
-                  if probs_all is not None else None)
+        cat = lambda k, shape: (torch.cat(ph[k]) if ph[k]
+                                else torch.empty(shape, **f64))
+        k = (torch.cat(ph['key']) if ph['key']
+             else torch.empty(0, dtype=torch.int64, device=self.device))
+        t_res, t_geom = cat('t_res', (0,)), cat('t_geom', (0,))
+        return {'counts': counts.reshape(n_ev, n_out),
+                'expected': expected.reshape(n_ev, n_out),
+                't_geom_min': tg_min.reshape(n_ev, n_out),
+                't_hit': t_geom + t_res, 't_res': t_res, 't_geom': t_geom,
+                'd_geom': cat('d_geom', (0,)),
+                'vertex_times': cat('s_emit', (0,)) / self.v_mu,
+                'emission_points': cat('emission_points', (0, 3)),
+                'event_index': k // n_out, 'row_index': k % n_out,
+                'patd_probs': cat('probs', (0,)) if get_patd_probs else None}
 
-            results.append({
-                'hit_times': tg + t_res,
-                'num_photons': int(sum(b - a for a, b, _ in spans)),
-                'expected_photons': exp_g,
-                'residual_times': t_res,
-                'geometric_times': tg,
-                'vertex_times': se / self.v_mu,
-                'emission_points': em,
-                't_geom_min': t_geom[members].min(),
-                'd_geom': dg,
-                'patd_probs': pr,
-            })
-        return results
+    def sample_response_batched(self, om_positions, event_params_list,
+                                pmt_directions=None, pmt_mode=None, max_photons=None,
+                                generator=None, events_per_batch=None,
+                                get_patd_probs=False, as_patd=False):
+        """Sampled detector responses for many events, vectorised over events.
+
+        Returns flat tensors: 'counts', 'expected' and 't_geom_min' (n_events, n_out),
+        and per photon 't_hit', 't_res', 't_geom', 'd_geom', 'vertex_times',
+        'emission_points', 'event_index', 'row_index' (its output row), 'patd_probs'.
+        as_patd=True converts to LightSabrePATD dicts: a list over events of lists
+        over output rows. events_per_batch bounds memory (~ events x PMTs rows).
+        """
+        V, U, E = self._stack_events(event_params_list)
+        resp = self._response_core(om_positions, V, U, E, pmt_directions, pmt_mode,
+                                   max_photons, generator, events_per_batch,
+                                   get_patd_probs)
+        return self.response_to_patd(resp) if as_patd else resp
+
+    def response_to_patd(self, resp):
+        """Flat response -> [event][output row] dicts with the LightSabrePATD keys."""
+        n_ev, n_out = resp['counts'].shape
+        cnt = resp['counts'].reshape(-1).to(torch.int64).tolist()     # the one sync
+        exp = resp['expected'].reshape(-1).tolist()
+        tgm = resp['t_geom_min'].reshape(-1)
+        fields = {'hit_times': 't_hit', 'residual_times': 't_res',
+                  'geometric_times': 't_geom', 'vertex_times': 'vertex_times',
+                  'emission_points': 'emission_points', 'd_geom': 'd_geom'}
+        parts = {f: torch.split(resp[k], cnt) for f, k in fields.items()}
+        probs = (torch.split(resp['patd_probs'], cnt)
+                 if resp['patd_probs'] is not None else None)
+        out, i = [], 0
+        for _ in range(n_ev):
+            rows = []
+            for _ in range(n_out):
+                d = {f: parts[f][i] for f in fields}
+                d.update(num_photons=cnt[i], expected_photons=exp[i],
+                         t_geom_min=tgm[i], patd_probs=None if probs is None else probs[i])
+                rows.append(d)
+                i += 1
+            out.append(rows)
+        return out
 
     # ------------------------------------------------------------------
     # densities, for likelihood and Fisher work
