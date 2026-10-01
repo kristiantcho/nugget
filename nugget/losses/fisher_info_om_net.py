@@ -710,7 +710,7 @@ class OMFisherNetLoss(LossFunction):
         ck = torch.load(filepath, map_location=self.device, weights_only=False)
         for k in ('fisher_params', 'param_scales', *self._CONTEXT_FLAGS, 'width', 'depth',
                   'dropout', 'eps_floor', 'weight_tau', 'tau', 'target_mode', 'net_dtype',
-                  'train_losses', 'val_losses'):
+                  'tau_diag', 'train_losses', 'val_losses'):
             if k in ck:
                 setattr(self, k, ck[k])
             elif k in self._CONTEXT_FLAGS:
