@@ -192,18 +192,25 @@ class OMFisherNetLoss(LossFunction):
         Input features, with the same meaning as in the hit / flow models (see
         build_context); always included are the travel direction, log10 E and
         cos(track, vertex -> OM). There are no PMT features: the target is a whole OM.
+    add_log_distances : bool
+        Also give log10(1 m + d_perp) and log10(1 m + |OM - vertex|). The Fisher falls
+        by orders of magnitude over 1-400 m, which linear distances standardised over
+        a km-wide spread barely resolve.
     fisher_params : sequence of str
         Must match the targets it is trained on (OMFisherTargets).
     target_mode : 'exact' or 'mc'
         'exact': targets are exact Fishers; MSE on their log-Cholesky factors.
-        'mc': targets are single-draw MC Fishers (unbiased, noisy); the loss is
-        ||F'_pred - F'_target||_F^2 / (sg(tr F'_pred) + tau)^2 in linear F space, whose
-        minimiser is the conditional mean E[F'_target | c] = F'. A log-space loss
-        would converge to E[log F'_target] instead, biased low for noisy targets.
+        'mc': targets are single-draw MC Fishers (unbiased, noisy); the loss is the
+        squared error of every entry in linear F space, each over
+        sqrt(s_i s_j) with s_i = sg(F'_pred,ii) + tau_i. The scale depends on the input
+        only, so the minimiser is still the conditional mean E[F'_target | c] = F';
+        a log-space loss would converge to E[log F'_target], biased low for noisy
+        targets. Per entry rather than per trace, so energy is not drowned out by
+        the (much larger) angular entries.
     weight_tau : 'median', float or 0
         'exact': training weight tr F' / (tr F' + tau), so dark OMs, which barely
-        enter any sum, count less (0 weights every OM equally). 'mc': the floor of the
-        relative-error denominator above (0 falls back to 1e-12).
+        enter any sum, count less (0 weights every OM equally). 'mc': 'median' sets
+        tau_i to the median F'_ii of the warm-up draw; a number sets every tau_i.
     geometry_grads : 'chunked', 'direct' or False
         'chunked' builds F without a graph and accumulates dL/d(points_3d) in
         bounded memory; 'direct' keeps the whole graph.
@@ -215,7 +222,7 @@ class OMFisherNetLoss(LossFunction):
                  resolution_type='angular', param_scales=None,
                  domain_size=20000, rich_rel_pos_mode=True, include_vertex_position=False,
                  add_vertex_distance=False, add_distance_from_beam=True,
-                 add_dist_long=True, ly_eps=1e-6,
+                 add_dist_long=True, ly_eps=1e-6, add_log_distances=False,
                  width=256, depth=6, dropout=0.0, learning_rate=1e-3,
                  lr_schedule='onecycle', warmup_frac=0.1, weight_decay=0.0,
                  eps_floor=1e-6, weight_tau='median', target_mode='exact',
@@ -238,6 +245,7 @@ class OMFisherNetLoss(LossFunction):
         self.add_distance_from_beam = bool(add_distance_from_beam)
         self.add_dist_long = bool(add_dist_long)
         self.ly_eps = float(ly_eps)
+        self.add_log_distances = bool(add_log_distances)
         self.width, self.depth, self.dropout = width, depth, dropout
         self.learning_rate, self.lr_schedule = learning_rate, lr_schedule
         self.warmup_frac, self.weight_decay = warmup_frac, weight_decay
@@ -247,14 +255,14 @@ class OMFisherNetLoss(LossFunction):
 
         self.context_mean = self.context_std = None
         self.target_mean = self.target_std = None
-        self.tau = None
+        self.tau = self.tau_diag = None
         self.net = self.optimizer = self.lr_scheduler = None
         self.train_losses, self.val_losses = [], []
         self.best_state_dict = None
 
     _CONTEXT_FLAGS = ('domain_size', 'rich_rel_pos_mode', 'include_vertex_position',
                       'add_vertex_distance', 'add_distance_from_beam', 'add_dist_long',
-                      'ly_eps')
+                      'ly_eps', 'add_log_distances')
 
     @property
     def context_dim(self):
@@ -265,7 +273,8 @@ class OMFisherNetLoss(LossFunction):
             d += 3
         d += int(self.add_vertex_distance)
         d += 1                                          # cos(track, vertex -> OM)
-        return d + int(self.add_distance_from_beam) + int(self.add_dist_long)
+        d += int(self.add_distance_from_beam) + int(self.add_dist_long)
+        return d + 2 * int(self.add_log_distances)
 
     @property
     def P(self):
@@ -317,6 +326,11 @@ class OMFisherNetLoss(LossFunction):
                 cols.append((d_perp / norm).unsqueeze(1))
             if self.add_dist_long:
                 cols.append((d_long / norm).unsqueeze(1))
+        if self.add_log_distances:
+            rel_m = om - vert_raw
+            d_perp = torch.linalg.norm(rel_m - (rel_m * u).sum(1, keepdim=True) * u, dim=1)
+            cols += [(torch.log10(d_perp + 1.0) / 3.0).unsqueeze(1),
+                     (torch.log10(rel_m.norm(dim=1) + 1.0) / 3.0).unsqueeze(1)]
         return torch.cat(cols, dim=1)
 
     def _scales(self, energy):
@@ -412,12 +426,18 @@ class OMFisherNetLoss(LossFunction):
             raise ValueError(f"data has {data['fisher_params']}, loss has {self.fisher_params}")
         # with 'mc' targets the log-Cholesky statistics are of noisy draws: they only
         # set the output scaling, the loss itself stays in linear F space
-        ctx, y, tr, _ = self._tensors(data)
+        ctx, y, tr, f_up = self._tensors(data)
         self.context_mean, self.context_std = ctx.mean(0), ctx.std(0).clamp_min(1e-6)
         self.target_mean, self.target_std = y.mean(0), y.std(0).clamp_min(1e-6)
         self.tau = (float(tr.median()) if self.weight_tau == 'median'
                     else float(self.weight_tau or 0.0))
-        print(f"  normalisers from {ctx.shape[0]:,} OMs; tau = {self.tau:.3g}")
+        iu, ju, _ = self._triu(f_up.device)
+        diag = f_up[:, iu == ju]                                   # F'_ii, (N, P)
+        self.tau_diag = (diag.median(0).values.clamp_min(1e-12) if self.weight_tau == 'median'
+                         else torch.full((self.P,), max(float(self.weight_tau or 0.0), 1e-12),
+                                         dtype=diag.dtype, device=diag.device))
+        print(f"  normalisers from {ctx.shape[0]:,} OMs; tau = {self.tau:.3g}, "
+              f"tau_diag = {[f'{t:.3g}' for t in self.tau_diag.tolist()]}")
 
     @property
     def _buffer_dim(self):
@@ -441,14 +461,14 @@ class OMFisherNetLoss(LossFunction):
         out = self.net(ctx)
         if self.target_mode == 'exact':
             return (w * ((out - y) ** 2).mean(1)).sum() / w.sum().clamp_min(1e-12)
-        # 'mc': squared Frobenius error in linear F' space over a scale that depends on
-        # the input only (the detached prediction), so the minimiser is still E[F' | c]
+        # 'mc': squared error per entry in linear F' space, each over a scale that
+        # depends on the input only (the detached prediction): minimiser E[F' | c]
         yy = out * self.target_std.to(out.dtype) + self.target_mean.to(out.dtype)
         Fp = self._scaled_from_output(yy)
         iu, ju, fw = self._triu(out.device)
-        err = (fw.to(out.dtype) * (Fp[:, iu, ju] - y) ** 2).sum(1)
-        scale = Fp.diagonal(dim1=1, dim2=2).sum(1).detach() + max(self.tau, 1e-12)
-        return (err / scale ** 2).mean()
+        s = Fp.diagonal(dim1=1, dim2=2).detach() + self.tau_diag.to(out.dtype)  # (B, P)
+        rel = (Fp[:, iu, ju] - y) / torch.sqrt(s[:, iu] * s[:, ju])
+        return (fw.to(out.dtype) * rel ** 2).sum(1).mean()
 
     def fit_online(self, targets, n_steps=20_000, events_per_step=16, updates_per_step=4,
                    batch_size=4096, buffer_size=200_000, warmup_events=256,
@@ -682,6 +702,7 @@ class OMFisherNetLoss(LossFunction):
             'net_dtype': self.net_dtype,
             'context_mean': cpu(self.context_mean), 'context_std': cpu(self.context_std),
             'target_mean': cpu(self.target_mean), 'target_std': cpu(self.target_std),
+            'tau_diag': cpu(self.tau_diag),
             'train_losses': self.train_losses, 'val_losses': self.val_losses,
         }, filepath)
 
@@ -696,7 +717,7 @@ class OMFisherNetLoss(LossFunction):
                 print(f"Warning: {k} not found in checkpoint; using {getattr(self, k)!r}")
         self.build_network()
         self.net.load_state_dict(ck['net_state_dict'])
-        for k in ('context_mean', 'context_std', 'target_mean', 'target_std'):
+        for k in ('context_mean', 'context_std', 'target_mean', 'target_std', 'tau_diag'):
             setattr(self, k, None if ck.get(k) is None else ck[k].to(self.device))
         self._freeze()
         return self
