@@ -10326,6 +10326,131 @@ def _nll_axis_values(name, rng, n, true_val):
     return np.linspace(rng[0], rng[1], n)
 
 
+def _draw_nll_landscape(axes, names, NLL, tv, best, title, contour_levels=(0, 1, 4, 9),
+                        cmap='viridis', nll_cbar_max=None, fill_scale='auto',
+                        use_mollweide=False, plot_opposite=False, figsize=(7, 5)):
+    """1-D curve or filled-contour 2-D NLL landscape, in the plot_nll_landscape style."""
+    if len(names) == 1:
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.plot(axes[0], NLL, 'o-', lw=1.8, ms=4)
+        if tv.get(names[0]) is not None:
+            ax.axvline(float(tv[names[0]]), color='red', ls='--', lw=2,
+                       label='True value')
+        ax.axvline(best[names[0]], color='green', ls=':', lw=2, label='Minimum NLL')
+        if names[0] == 'energy':
+            ax.set_xscale('log')
+        for lv in contour_levels:
+            if lv > 0:
+                ax.axhline(lv, color='gray', ls=':', alpha=.5, lw=1)
+        ax.set_xlabel(f'{names[0].capitalize()}', fontsize=12)
+        ax.set_ylabel('Negative Log-Likelihood', fontsize=11)
+        ax.set_title(title, fontsize=14)
+        ax.legend(); ax.grid(True, alpha=0.3)
+    else:
+        # filled contours + labelled white level lines, matching plot_nll_landscape.
+        # These landscapes routinely span 0 -> 1e4+ nats with the well occupying <1%
+        # of the grid, so a linear fill saturates to one colour; 'auto' switches to
+        # log-spaced levels once the range makes that a problem.
+        hi_fill = (float(nll_cbar_max) if nll_cbar_max is not None
+                   else float(np.nanmax(NLL)))
+        scale = fill_scale
+        if scale == 'auto':
+            scale = 'log' if hi_fill > 100.0 else 'linear'
+        cbar_ticks = None
+        if scale == 'log':
+            pos = NLL[NLL > 0]
+            lo_fill = min(float(np.nanmin(pos)) if pos.size else 0.1, 1.0)
+            lo_fill = max(lo_fill, 1e-2)
+            hi_fill = max(hi_fill, lo_fill * 10.0)
+            fill_kw = dict(levels=np.logspace(np.log10(lo_fill), np.log10(hi_fill), 21),
+                           extend='both')
+            cbar_ticks = 10.0 ** np.arange(np.ceil(np.log10(lo_fill)),
+                                           np.floor(np.log10(hi_fill)) + 1)
+        else:
+            fill_kw = dict(levels=np.linspace(0.0, hi_fill, 21), vmin=0.0,
+                           vmax=hi_fill,
+                           extend='max' if nll_cbar_max is not None else 'neither')
+        lines = [lv for lv in contour_levels if np.nanmin(NLL) < lv < np.nanmax(NLL)]
+
+        if use_mollweide and set(names) == {'zenith', 'azimuth'}:
+            iz, ia = names.index('zenith'), names.index('azimuth')
+            Z = NLL if iz == 0 else NLL.T
+            lat = np.pi / 2 - axes[iz]
+            lon = axes[ia] - np.pi
+            fig = plt.figure(figsize=figsize)
+            ax = fig.add_subplot(111, projection='mollweide')
+            cf = ax.contourf(lon, lat, Z, cmap=cmap, alpha=.7, **fill_kw)
+            if lines:
+                cs = ax.contour(lon, lat, Z, levels=lines, colors='white',
+                                linewidths=2, alpha=.8)
+                try:
+                    ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
+                except (IndexError, ValueError):
+                    pass                    # too sparse to label in this projection
+            ax.plot(best['azimuth'] - np.pi, np.pi / 2 - best['zenith'], 'g*',
+                    markersize=20, markeredgecolor='black', markeredgewidth=2,
+                    label='Minimum NLL', zorder=5)
+            ax.plot(float(tv['azimuth']) - np.pi, np.pi / 2 - float(tv['zenith']),
+                    'r*', markersize=20, markeredgecolor='white', markeredgewidth=2,
+                    label='True values', zorder=5)
+            if plot_opposite:
+                ax.plot((float(tv['azimuth']) + np.pi) % (2 * np.pi) - np.pi,
+                        np.pi / 2 - (np.pi - float(tv['zenith'])), 'm*',
+                        markersize=16, markeredgecolor='white', markeredgewidth=1.5,
+                        label='Opposite true direction', zorder=5)
+            # tick labels in degrees, as in plot_nll_landscape
+            ax.set_xlabel('Azimuth (degrees)', fontsize=12)
+            xt = ax.get_xticks()
+            ax.set_xticks(xt)
+            ax.set_xticklabels([f'{int(round((x + np.pi) * 180 / np.pi))}°' for x in xt])
+            ax.set_ylabel('Zenith (degrees)', fontsize=12)
+            yt = ax.get_yticks()
+            ax.set_yticks(yt)
+            ax.set_yticklabels([f'{int(round((np.pi / 2 - y) * 180 / np.pi))}°' for y in yt])
+            ax.set_title(title, fontsize=14)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.07,
+                                fraction=0.046)
+            if cbar_ticks is not None and len(cbar_ticks):
+                cbar.set_ticks(list(cbar_ticks))
+                cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
+            cbar.set_label('Negative Log-Likelihood', fontsize=11)
+        else:
+            fig, ax = plt.subplots(figsize=figsize)
+            cf = ax.contourf(axes[1], axes[0], NLL, cmap=cmap, alpha=.7, **fill_kw)
+            if lines:
+                cs = ax.contour(axes[1], axes[0], NLL, levels=lines,
+                                colors='white', linewidths=2, alpha=.8)
+                try:
+                    ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
+                except (IndexError, ValueError):
+                    pass
+            ax.plot(best[names[1]], best[names[0]], 'g*', markersize=20,
+                    markeredgecolor='black', markeredgewidth=2,
+                    label='Minimum NLL', zorder=5)
+            if tv.get(names[0]) is not None and tv.get(names[1]) is not None:
+                ax.plot(float(tv[names[1]]), float(tv[names[0]]), 'r*',
+                        markersize=20, markeredgecolor='white', markeredgewidth=2,
+                        label='True values', zorder=5)
+            if names[0] == 'energy':
+                ax.set_yscale('log')
+            if names[1] == 'energy':
+                ax.set_xscale('log')
+            ax.set_xlabel(f'{names[1].capitalize()}', fontsize=12)
+            ax.set_ylabel(f'{names[0].capitalize()}', fontsize=12)
+            ax.set_title(title, fontsize=14)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            cbar = plt.colorbar(cf, ax=ax)
+            if cbar_ticks is not None and len(cbar_ticks):
+                cbar.set_ticks(list(cbar_ticks))
+                cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
+            cbar.set_label('Negative Log-Likelihood', fontsize=11)
+    plt.tight_layout(); plt.show()
+    return fig
+
+
 def plot_model_nll_landscape(
         model, kind, true_event, points, pmt_directions,
         hit_mask=None, counts=None, photon_times=None, photon_point_index=None,
@@ -10579,124 +10704,9 @@ def plot_model_nll_landscape(
         n_obs_label = f'{int(np.asarray(hit_mask).sum()):,} hit PMTs'
     else:
         n_obs_label = f'{N:,} PMTs'
-    if len(names) == 1:
-        fig, ax = plt.subplots(figsize=figsize)
-        ax.plot(axes[0], NLL, 'o-', lw=1.8, ms=4)
-        if tv.get(names[0]) is not None:
-            ax.axvline(float(tv[names[0]]), color='red', ls='--', lw=2,
-                       label='True value')
-        ax.axvline(best[names[0]], color='green', ls=':', lw=2, label='Minimum NLL')
-        if names[0] == 'energy':
-            ax.set_xscale('log')
-        for lv in contour_levels:
-            if lv > 0:
-                ax.axhline(lv, color='gray', ls=':', alpha=.5, lw=1)
-        ax.set_xlabel(f'{names[0].capitalize()}', fontsize=12)
-        ax.set_ylabel('Negative Log-Likelihood', fontsize=11)
-        ax.set_title(f'NLL Landscape ({title}, {n_obs_label})', fontsize=14)
-        ax.legend(); ax.grid(True, alpha=0.3)
-    else:
-        # filled contours + labelled white level lines, matching plot_nll_landscape.
-        # These landscapes routinely span 0 -> 1e4+ nats with the well occupying <1%
-        # of the grid, so a linear fill saturates to one colour; 'auto' switches to
-        # log-spaced levels once the range makes that a problem.
-        hi_fill = (float(nll_cbar_max) if nll_cbar_max is not None
-                   else float(np.nanmax(NLL)))
-        scale = fill_scale
-        if scale == 'auto':
-            scale = 'log' if hi_fill > 100.0 else 'linear'
-        cbar_ticks = None
-        if scale == 'log':
-            pos = NLL[NLL > 0]
-            lo_fill = min(float(np.nanmin(pos)) if pos.size else 0.1, 1.0)
-            lo_fill = max(lo_fill, 1e-2)
-            hi_fill = max(hi_fill, lo_fill * 10.0)
-            fill_kw = dict(levels=np.logspace(np.log10(lo_fill), np.log10(hi_fill), 21),
-                           extend='both')
-            cbar_ticks = 10.0 ** np.arange(np.ceil(np.log10(lo_fill)),
-                                           np.floor(np.log10(hi_fill)) + 1)
-        else:
-            fill_kw = dict(levels=np.linspace(0.0, hi_fill, 21), vmin=0.0,
-                           vmax=hi_fill,
-                           extend='max' if nll_cbar_max is not None else 'neither')
-        lines = [lv for lv in contour_levels if np.nanmin(NLL) < lv < np.nanmax(NLL)]
-
-        if use_mollweide and set(names) == {'zenith', 'azimuth'}:
-            iz, ia = names.index('zenith'), names.index('azimuth')
-            Z = NLL if iz == 0 else NLL.T
-            lat = np.pi / 2 - axes[iz]
-            lon = axes[ia] - np.pi
-            fig = plt.figure(figsize=figsize)
-            ax = fig.add_subplot(111, projection='mollweide')
-            cf = ax.contourf(lon, lat, Z, cmap=cmap, alpha=.7, **fill_kw)
-            if lines:
-                cs = ax.contour(lon, lat, Z, levels=lines, colors='white',
-                                linewidths=2, alpha=.8)
-                try:
-                    ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
-                except (IndexError, ValueError):
-                    pass                    # too sparse to label in this projection
-            ax.plot(best['azimuth'] - np.pi, np.pi / 2 - best['zenith'], 'g*',
-                    markersize=20, markeredgecolor='black', markeredgewidth=2,
-                    label='Minimum NLL', zorder=5)
-            ax.plot(float(tv['azimuth']) - np.pi, np.pi / 2 - float(tv['zenith']),
-                    'r*', markersize=20, markeredgecolor='white', markeredgewidth=2,
-                    label='True values', zorder=5)
-            if plot_opposite_direction_true_params:
-                ax.plot((float(tv['azimuth']) + np.pi) % (2 * np.pi) - np.pi,
-                        np.pi / 2 - (np.pi - float(tv['zenith'])), 'm*',
-                        markersize=16, markeredgecolor='white', markeredgewidth=1.5,
-                        label='Opposite true direction', zorder=5)
-            # tick labels in degrees, as in plot_nll_landscape
-            ax.set_xlabel('Azimuth (degrees)', fontsize=12)
-            xt = ax.get_xticks()
-            ax.set_xticks(xt)
-            ax.set_xticklabels([f'{int(round((x + np.pi) * 180 / np.pi))}\u00b0' for x in xt])
-            ax.set_ylabel('Zenith (degrees)', fontsize=12)
-            yt = ax.get_yticks()
-            ax.set_yticks(yt)
-            ax.set_yticklabels([f'{int(round((np.pi / 2 - y) * 180 / np.pi))}\u00b0' for y in yt])
-            ax.set_title(f'NLL Landscape ({title}, {n_obs_label})', fontsize=14)
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.07,
-                                fraction=0.046)
-            if cbar_ticks is not None and len(cbar_ticks):
-                cbar.set_ticks(list(cbar_ticks))
-                cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
-            cbar.set_label('Negative Log-Likelihood', fontsize=11)
-        else:
-            fig, ax = plt.subplots(figsize=figsize)
-            cf = ax.contourf(axes[1], axes[0], NLL, cmap=cmap, alpha=.7, **fill_kw)
-            if lines:
-                cs = ax.contour(axes[1], axes[0], NLL, levels=lines,
-                                colors='white', linewidths=2, alpha=.8)
-                try:
-                    ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
-                except (IndexError, ValueError):
-                    pass
-            ax.plot(best[names[1]], best[names[0]], 'g*', markersize=20,
-                    markeredgecolor='black', markeredgewidth=2,
-                    label='Minimum NLL', zorder=5)
-            if tv.get(names[0]) is not None and tv.get(names[1]) is not None:
-                ax.plot(float(tv[names[1]]), float(tv[names[0]]), 'r*',
-                        markersize=20, markeredgecolor='white', markeredgewidth=2,
-                        label='True values', zorder=5)
-            if names[0] == 'energy':
-                ax.set_yscale('log')
-            if names[1] == 'energy':
-                ax.set_xscale('log')
-            ax.set_xlabel(f'{names[1].capitalize()}', fontsize=12)
-            ax.set_ylabel(f'{names[0].capitalize()}', fontsize=12)
-            ax.set_title(f'NLL Landscape ({title}, {n_obs_label})', fontsize=14)
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            cbar = plt.colorbar(cf, ax=ax)
-            if cbar_ticks is not None and len(cbar_ticks):
-                cbar.set_ticks(list(cbar_ticks))
-                cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
-            cbar.set_label('Negative Log-Likelihood', fontsize=11)
-    plt.tight_layout(); plt.show()
+    _draw_nll_landscape(axes, names, NLL, tv, best, f'NLL Landscape ({title}, {n_obs_label})',
+                        contour_levels, cmap, nll_cbar_max, fill_scale, use_mollweide,
+                        plot_opposite_direction_true_params, figsize)
 
     if verbose:
         for nm in names:
@@ -10705,6 +10715,238 @@ def plot_model_nll_landscape(
                   f'  minimum {best[nm]:.4g}')
     return {'axes': axes, 'param_names': names, 'nll': NLL, 'loglik': LL,
             'true': tv, 'best': best, 'loglik_true': ll_true}
+
+
+def plot_combined_nll_landscape(
+        hit_model, ly_model, atime_model, true_event, points, pmt_directions, hit_mask,
+        counts=None, photon_times=None, photon_point_index=None,
+        terms=('hit', 'ly', 'atime'), param_names=('zenith', 'azimuth'),
+        param_ranges=None, n_points=25, n_steps=32, n_dequant=4, batch_size=262144,
+        d_max=None, max_photons=None, freeze_residuals=True, plot_terms=False,
+        use_mollweide=False, plot_opposite_direction_true_params=False, figsize=(7, 5),
+        contour_levels=(0, 1, 4, 9), cmap='viridis', nll_cbar_max=None,
+        fill_scale='auto', progress_every=None, verbose=True, seed=0):
+    """NLL landscape of the summed hit + light-yield + arrival-time likelihood.
+
+    The same scan as plot_model_nll_landscape, with every requested term added:
+        hit   : sum over ALL ``points`` of y log pi + (1 - y) log(1 - pi)
+        ly    : sum over the hit PMTs of log p(q | c)
+        atime : sum over photons of log p(t_res | c)
+    Each model builds its own contexts, so their feature flags may differ.
+
+    Parameters
+    ----------
+    points, pmt_directions : (N, 3)
+        The whole geometry (the hit term needs every PMT).
+    hit_mask : (N,) bool
+    counts : (N,) or (n_hit,)
+        Photons per PMT; either over the whole geometry or over the hit PMTs in
+        np.flatnonzero(hit_mask) order.
+    photon_times, photon_point_index : (n_photons,)
+        Hit times and the index into ``points`` of each photon's PMT.
+    terms : subset of ('hit', 'ly', 'atime')
+    n_dequant : int
+        Dequantisation draws for log p(q); the same draws are reused at every grid
+        point, so the light-yield landscape is not noisy from point to point.
+    freeze_residuals : bool
+        True holds t_res = t_hit - t_geom at the true event (as plot_model_nll_landscape
+        does), so only the contexts move. False recomputes t_geom per hypothesis, the
+        physical likelihood, which also penalises the bulk time shift of a rotation.
+    plot_terms : bool
+        Also plot each term's landscape on its own.
+
+    Returns
+    -------
+    dict with 'axes', 'nll' (total, minimum at 0), 'loglik' (total), 'loglik_terms',
+    'true', 'best', 'loglik_true' and 'loglik_best' (per term).
+    """
+    terms = tuple(terms)
+    bad = [t for t in terms if t not in ('hit', 'ly', 'atime')]
+    if bad or not terms:
+        raise ValueError(f"terms must be a non-empty subset of ('hit','ly','atime'), got {terms}")
+    pts_np = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    dirs_np = np.asarray(pmt_directions, dtype=np.float64).reshape(-1, 3)
+    N = pts_np.shape[0]
+    y_np = np.asarray(hit_mask).reshape(-1).astype(bool)
+    if y_np.shape[0] != N:
+        raise ValueError(f"hit_mask has {y_np.shape[0]} entries for {N} points")
+    hit_idx = np.flatnonzero(y_np)
+    tv = dict(true_event)
+    pos0 = np.asarray(tv['position'], dtype=np.float64).reshape(3)
+
+    def _t(model, x):
+        return torch.as_tensor(np.asarray(x), device=model.device, dtype=model.param_dtype)
+
+    # ---- observed data, on each model's device -------------------------------
+    if 'hit' in terms:
+        P_h, D_h = _t(hit_model, pts_np), _t(hit_model, dirs_np)
+        y_h = _t(hit_model, y_np.astype(np.float64))
+    if 'ly' in terms:
+        if counts is None:
+            raise ValueError("terms with 'ly' need counts")
+        cnt = np.asarray(counts, dtype=np.float64).reshape(-1)
+        if cnt.shape[0] == N:
+            cnt = cnt[hit_idx]
+        elif cnt.shape[0] != hit_idx.shape[0]:
+            raise ValueError(f"counts has {cnt.shape[0]} entries; expected {N} or "
+                             f"{hit_idx.shape[0]} (the hit PMTs)")
+        P_l, D_l, c_l = (_t(ly_model, pts_np[hit_idx]), _t(ly_model, dirs_np[hit_idx]),
+                         _t(ly_model, cnt))
+    if 'atime' in terms:
+        if photon_times is None or photon_point_index is None:
+            raise ValueError("terms with 'atime' need photon_times and photon_point_index")
+        t_np = np.asarray(photon_times, dtype=np.float64).reshape(-1)
+        i_np = np.asarray(photon_point_index).reshape(-1).astype(np.int64)
+        if max_photons is not None and len(t_np) > int(max_photons):
+            k = np.random.default_rng(seed).choice(len(t_np), int(max_photons), replace=False)
+            t_np, i_np = t_np[k], i_np[k]
+        P_a, D_a, t_a = (_t(atime_model, pts_np[i_np]), _t(atime_model, dirs_np[i_np]),
+                         _t(atime_model, t_np))
+
+    def _event(vals):
+        e = dict(energy=float(tv['energy']), zenith=float(tv['zenith']),
+                 azimuth=float(tv['azimuth']), position=pos0.copy())
+        for nm, v in vals.items():
+            if nm in ('x', 'y', 'z'):
+                e['position']['xyz'.index(nm)] = float(v)
+            else:
+                e[nm] = float(v)
+        return e
+
+    def _ev_tensors(model, e, n):
+        mk = lambda v: torch.tensor(float(v), device=model.device,
+                                    dtype=model.param_dtype).reshape(1).expand(n)
+        vert = torch.as_tensor(e['position'], device=model.device,
+                               dtype=model.param_dtype).reshape(1, 3).expand(n, 3)
+        return vert, mk(e['energy']), mk(e['zenith']), mk(e['azimuth'])
+
+    def _ctx(model, P, D, e):
+        vert, en, zn, az = _ev_tensors(model, e, P.shape[0])
+        return model.build_context(P, vert, en, zn, az, pmt_directions=D)
+
+    def _t_res(e, s, f):
+        vert, _, zn, az = _ev_tensors(atime_model, e, f - s)
+        return atime_model.time_residual(t_a[s:f], P_a[s:f], vert, zeniths=zn, azimuths=az)
+
+    t_res_true = None
+    if 'atime' in terms and freeze_residuals:
+        with torch.no_grad():
+            t_res_true = torch.cat([_t_res(_event({}), s, min(s + batch_size, len(t_np)))
+                                    for s in range(0, len(t_np), batch_size)])
+
+    def _loglik(e):
+        """{term: log L} for one hypothesis."""
+        out = {}
+        if 'hit' in terms:
+            sel = torch.arange(N, device=hit_model.device)
+            if d_max is not None:
+                st, ct = math.sin(e['zenith']), math.cos(e['zenith'])
+                u = np.array([st * math.cos(e['azimuth']), st * math.sin(e['azimuth']), ct])
+                if getattr(hit_model, 'track_dir_is_arrival', False):   # -> travel
+                    u = -u
+                ut = _t(hit_model, u).reshape(1, 3)
+                rel = P_h - _t(hit_model, e['position']).reshape(1, 3)
+                dl = (rel * ut).sum(1)
+                dp = torch.linalg.norm(rel - dl.unsqueeze(1) * ut, dim=1)
+                sel = torch.nonzero((dp < float(d_max)) | (y_h > 0.5), as_tuple=True)[0]
+            tot = 0.0
+            for s in range(0, sel.shape[0], batch_size):
+                g = sel[s:s + batch_size]
+                lp1, lp0 = hit_model.log_prob_hit(_ctx(hit_model, P_h[g], D_h[g], e),
+                                                  calibrated=True)
+                tot += float((y_h[g] * lp1 + (1.0 - y_h[g]) * lp0).sum())
+            out['hit'] = tot
+        if 'ly' in terms:
+            gen = torch.Generator(device=ly_model.device).manual_seed(int(seed))
+            tot = 0.0
+            for s in range(0, c_l.shape[0], batch_size):
+                f = min(s + batch_size, c_l.shape[0])
+                tot += float(ly_model.log_prob_light_yield(
+                    c_l[s:f], _ctx(ly_model, P_l[s:f], D_l[s:f], e), n_steps=n_steps,
+                    n_dequant=n_dequant, generator=gen).sum())
+            out['ly'] = tot
+        if 'atime' in terms:
+            tot = 0.0
+            for s in range(0, t_a.shape[0], batch_size):
+                f = min(s + batch_size, t_a.shape[0])
+                tr = t_res_true[s:f] if freeze_residuals else _t_res(e, s, f)
+                tot += float(atime_model.log_prob_time_residual(
+                    tr, _ctx(atime_model, P_a[s:f], D_a[s:f], e), n_steps=n_steps).sum())
+            out['atime'] = tot
+        return out
+
+    # ---- scan ---------------------------------------------------------------
+    names = list(param_names)
+    if not 1 <= len(names) <= 2:
+        raise ValueError("param_names must hold 1 or 2 entries")
+    pr = dict(param_ranges or {})
+    defaults = {'energy': (1e2, 1e6), 'zenith': (0.0, math.pi),
+                'azimuth': (0.0, 2 * math.pi)}
+    axes = []
+    for nm in names:
+        if nm not in pr:
+            if nm in defaults:
+                pr[nm] = defaults[nm]
+            else:
+                pr[nm] = (pos0['xyz'.index(nm)] - 500.0, pos0['xyz'.index(nm)] + 500.0)
+        axes.append(_nll_axis_values(nm, pr[nm], int(n_points), tv.get(nm)))
+
+    shape = tuple(len(a) for a in axes)
+    LLt = {t: np.empty(shape) for t in terms}
+    with torch.no_grad():
+        ll_true = _loglik(_event({}))
+        if verbose:
+            nh = int(y_np.sum())
+            n_ph = (f', {t_a.shape[0]:,} photons' if 'atime' in terms else '')
+            print(f'terms={"+".join(terms)}  {nh:,} hit / {N:,} PMTs{n_ph}'
+                  f'{"" if freeze_residuals or "atime" not in terms else "  (t_res recomputed per hypothesis)"}')
+        done, total_pts = 0, int(np.prod(shape))
+        for idx in np.ndindex(*shape):
+            ll = _loglik(_event({nm: axes[k][idx[k]] for k, nm in enumerate(names)}))
+            for t in terms:
+                LLt[t][idx] = ll[t]
+            done += 1
+            if progress_every and done % progress_every == 0:
+                print(f'  {done}/{total_pts}', end='\r')
+
+    LL = sum(LLt[t] for t in terms)
+    NLL = -LL
+    NLL = NLL - np.nanmin(NLL)
+    flat = np.unravel_index(int(np.nanargmin(NLL)), shape)
+    best = {nm: axes[k][flat[k]] for k, nm in enumerate(names)}
+    ll_best = {t: float(LLt[t][flat]) for t in terms}
+
+    if verbose:
+        print('\nlog L per term   (located minimum - truth: negative = truth is better)')
+        for t in terms:
+            print(f'  {t:>6}: truth {ll_true[t]:14.2f}   minimum {ll_best[t]:14.2f}   '
+                  f'diff {ll_best[t] - ll_true[t]:+12.2f}')
+        lt, lb = sum(ll_true.values()), sum(ll_best.values())
+        print(f'  {"total":>6}: truth {lt:14.2f}   minimum {lb:14.2f}   diff {lb - lt:+12.2f}')
+        if lt > lb:
+            print('  the truth beats every grid point: the minimum lies between nodes '
+                  '(zoom the ranges or raise n_points)')
+
+    labels = {'hit': 'hit', 'ly': 'light yield', 'atime': 'arrival time'}
+    draw = lambda Z, ttl, b: _draw_nll_landscape(
+        axes, names, Z, tv, b, ttl, contour_levels, cmap, nll_cbar_max, fill_scale,
+        use_mollweide, plot_opposite_direction_true_params, figsize)
+    draw(NLL, f'NLL Landscape ({" + ".join(labels[t] for t in terms)})', best)
+    if plot_terms and len(terms) > 1:
+        for t in terms:
+            Zt = -LLt[t] - np.nanmin(-LLt[t])
+            ft = np.unravel_index(int(np.nanargmin(Zt)), shape)
+            draw(Zt, f'NLL Landscape ({labels[t]} only)',
+                 {nm: axes[k][ft[k]] for k, nm in enumerate(names)})
+
+    if verbose:
+        for nm in names:
+            t = tv.get(nm)
+            print(f'  {nm}: true {float(t):.4g}' if t is not None else f'  {nm}:',
+                  f'  minimum {best[nm]:.4g}')
+    return {'axes': axes, 'param_names': names, 'nll': NLL, 'loglik': LL,
+            'loglik_terms': LLt, 'true': tv, 'best': best,
+            'loglik_true': ll_true, 'loglik_best': ll_best}
 
 
 def _ts_prep(Xa, Xb, standardize=True, max_n=None, seed=0, paired=False):
