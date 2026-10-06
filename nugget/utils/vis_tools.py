@@ -10576,7 +10576,7 @@ def plot_model_nll_landscape(
     if kind == 'atime':
         n_obs_label = f'{ph_idx.shape[0]:,} photons'
     elif kind == 'hit':
-        n_obs_label = f'{int(np.asarray(hit_mask).sum()):,} hit / {N:,} PMTs'
+        n_obs_label = f'{int(np.asarray(hit_mask).sum()):,} hit PMTs'
     else:
         n_obs_label = f'{N:,} PMTs'
     if len(names) == 1:

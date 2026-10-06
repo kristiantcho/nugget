@@ -10,13 +10,13 @@ from nugget.losses.fisher_info_flow_mc import FlowFisherMCResolutionLoss
 from nugget.losses.fisher_info_om_net import (OMFisherNetLoss, OMFisherTargets,
                                               resolution_from_fisher)
 
-DEVICE = 'cuda:2'
-HIT_CKPT = './flow_models/best_mc_hit_model_v1rs.pt'
-LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1rs.pt'
-ATIME_CKPT = './flow_models/best_mc_atime_muon_flow_model_v1rs.pt'
+DEVICE = 'cuda:3'
+HIT_CKPT = './flow_models/best_mc_hit_model_v1r.pt'
+LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1r.pt'
+ATIME_CKPT = './flow_models/best_mc_atime_muon_flow_model_v1r.pt'
 
-CHECKPOINT = './fisher_models/best_om_muon_fisher_net_v2mc.pt'
-HISTORY = './fisher_models/om_muon_fisher_net_v2mc_training_history.pkl'
+CHECKPOINT = './fisher_models/best_om_muon_fisher_net_v3mc.pt'
+HISTORY = './fisher_models/om_muon_fisher_net_v3mc_training_history.pkl'
 
 # Parameters of the Fisher matrix. Any set FlowFisherResolutionLoss can scan works.
 FISHER_PARAMS = ('energy', 'zenith', 'azimuth')
@@ -94,7 +94,7 @@ om_loss = OMFisherNetLoss(
 
     # --- network ---
     width=256,
-    depth=6,
+    depth=10,
     dropout=0.0,
     net_dtype=torch.float32,
 
