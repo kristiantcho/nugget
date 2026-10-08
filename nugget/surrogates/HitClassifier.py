@@ -7,7 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, BatchSampler, RandomSampler, SequentialSampler
 
-from nugget.surrogates.FlowMatchLY import FlowMatchLY, _reseed_dataset_rng_in_worker
+from nugget.surrogates.FlowMatchLY import (FlowMatchLY, _reseed_dataset_rng_in_worker,
+                                           _event_split)
 
 
 # --------------------------------------------------------------------------- #
@@ -79,7 +80,8 @@ class HitLabelDataset(Dataset):
         df = read_parquet_columns(parquet_path,
                                   ['run_id', 'event_id', 'string', 'om', 'pmt',
                                    'muon_x', 'muon_y', 'muon_z',
-                                   'neutrino_energy', 'zenith', 'azimuth'])
+                                   'neutrino_energy', 'zenith', 'azimuth'],
+                                  events=event_filter)
 
         half = self._domain_half_extent()
         if filter_vertex_in_domain:
@@ -89,11 +91,6 @@ class HitLabelDataset(Dataset):
             if verbose and len(df) < n0:
                 print(f"HitLabelDataset: dropped {n0 - len(df):,} row(s) with muon "
                       f"vertex outside {half.tolist()}")
-
-        if event_filter is not None:
-            pairs = list(zip(df.run_id.astype(int), df.event_id.astype(int)))
-            mask = pd.Series(pairs, index=df.index, dtype=object).isin(set(event_filter))
-            df = df[mask.to_numpy()]
 
         df = df.merge(geo[['string', 'om', 'pmt', '_gidx']],
                       on=['string', 'om', 'pmt'], how='inner', copy=False)
@@ -542,27 +539,12 @@ class HitClassifier(FlowMatchLY):
                                       n_mult_bins=0, importance_weight=False,
                                       filter_vertex_in_domain=True,
                                       test_save_path=None, test_frac=0.1,
-                                      split_seed=None, pin_memory=None):
-        import pandas as pd
-
-        train_filter = None
-        if test_save_path is not None:
-            ev = pd.read_parquet(parquet_path, columns=['run_id', 'event_id'])
-            pairs = list(zip(ev.run_id.astype(int), ev.event_id.astype(int)))
-            uniq = sorted(set(pairs))
-            rng = np.random.default_rng(split_seed if split_seed is not None else seed)
-            perm = rng.permutation(len(uniq))
-            n_test = int(round(test_frac * len(uniq)))
-            test_events = {uniq[i] for i in perm[:n_test]}
-            train_filter = {uniq[i] for i in perm[n_test:]}
-            mask = pd.Series(pairs, dtype=object).isin(test_events).to_numpy()
-            d = os.path.dirname(test_save_path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-            pd.read_parquet(parquet_path).loc[mask].to_parquet(test_save_path,
-                                                               index=False)
-            print(f"held out {len(test_events)}/{len(uniq)} events "
-                  f"({int(mask.sum()):,} rows) -> {test_save_path}")
+                                      split_seed=None, pin_memory=None,
+                                      event_frac=None):
+        """event_frac: use only this random fraction of the file's events (all their
+        rows); the test set is then test_frac of that sample."""
+        train_filter = _event_split(parquet_path, event_frac, test_save_path, test_frac,
+                                    split_seed if split_seed is not None else seed)
 
         ds = HitLabelDataset(
             self, parquet_path, geometry_csv_path,

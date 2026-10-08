@@ -138,6 +138,23 @@ def _times_row_lengths(series):
 #  Dataset                                                                     #
 # --------------------------------------------------------------------------- #
 
+def _event_split(parquet_path, event_frac, test_save_path, test_frac, seed):
+    """Event filter for the training set (None = every event); writes the test set."""
+    from nugget.utils.parquet_io import split_events, write_event_subset
+    if test_save_path is None and event_frac is None:
+        return None
+    train, test = split_events(parquet_path, event_frac=event_frac,
+                               test_frac=test_frac if test_save_path is not None else 0.0,
+                               seed=seed)
+    if event_frac is not None:
+        print(f"sampled {len(train) + len(test):,} events ({event_frac:g} of the file)")
+    if test_save_path is not None:
+        n_rows = write_event_subset(parquet_path, test_save_path, test)
+        print(f"held out {len(test):,}/{len(train) + len(test):,} events "
+              f"({n_rows:,} rows) -> {test_save_path}")
+    return train
+
+
 class LightYieldFlowDataset(Dataset):
     """Parquet rows -> (context features, light yield). One row = one sample."""
 
@@ -161,14 +178,17 @@ class LightYieldFlowDataset(Dataset):
         # Prefer an explicit 'count' column; otherwise derive the light yield from
         # the length of each row's 'times' list, which is the same quantity. Both
         # parquet engines validate column names before reading, so the failed
-        # attempt is cheap. read_parquet_columns also takes lepton_* for muon_*.
+        # attempt is cheap. read_parquet_columns also takes lepton_* for muon_*, and
+        # reads only event_filter's rows.
         from nugget.utils.parquet_io import read_parquet_columns
         try:
-            df = read_parquet_columns(parquet_path, base_cols + ['count'])
+            df = read_parquet_columns(parquet_path, base_cols + ['count'],
+                                      events=event_filter)
             counts = df['count'].to_numpy(np.float32)
             src = 'count'
         except (ValueError, KeyError):
-            df = read_parquet_columns(parquet_path, base_cols + ['times'])
+            df = read_parquet_columns(parquet_path, base_cols + ['times'],
+                                      events=event_filter)
             counts = _times_row_lengths(df['times'])
             df = df.drop(columns=['times'])
             src = 'len(times)'
@@ -184,11 +204,6 @@ class LightYieldFlowDataset(Dataset):
             if verbose and len(df) < n0:
                 print(f"LightYieldFlowDataset: dropped {n0 - len(df)} row(s) with "
                       f"muon vertex outside {half.tolist()}")
-
-        if event_filter is not None:
-            ev_pairs = list(zip(df.run_id.astype(int), df.event_id.astype(int)))
-            mask = pd.Series(ev_pairs, index=df.index, dtype=object).isin(set(event_filter))
-            df = df[mask.to_numpy()]
 
         df = df.merge(geo, on=['string', 'om', 'pmt'], how='inner', copy=False)
         # The flow models q >= 1; a zero-photon row would give log10(0 + u) -> -inf.
@@ -859,28 +874,12 @@ class FlowMatchLY(Surrogate):
                                        n_energy_bins=20, n_coszen_bins=20,
                                        filter_vertex_in_domain=True,
                                        test_save_path=None, test_frac=0.1,
-                                       split_seed=None, pin_memory=None):
-        import pandas as pd
-
-        train_filter = None
-        if test_save_path is not None:
-            df = pd.read_parquet(parquet_path, columns=['run_id', 'event_id'])
-            pairs = list(zip(df.run_id.astype(int), df.event_id.astype(int)))
-            uniq = sorted(set(pairs))
-            rng = np.random.default_rng(split_seed if split_seed is not None else seed)
-            perm = rng.permutation(len(uniq))
-            n_test = int(round(test_frac * len(uniq)))
-            test_events = {uniq[i] for i in perm[:n_test]}
-            train_filter = {uniq[i] for i in perm[n_test:]}
-            full = pd.read_parquet(parquet_path)
-            mask = pd.Series(pairs, index=full.index, dtype=object).isin(test_events)
-            d = os.path.dirname(test_save_path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-            full.loc[mask.to_numpy()].to_parquet(test_save_path, index=False)
-            print(f"held out {len(test_events)}/{len(uniq)} events "
-                  f"({int(mask.sum()):,} rows) -> {test_save_path}")
-            del full
+                                       split_seed=None, pin_memory=None,
+                                       event_frac=None):
+        """event_frac: use only this random fraction of the file's events (all their
+        rows); the test set is then test_frac of that sample."""
+        train_filter = _event_split(parquet_path, event_frac, test_save_path, test_frac,
+                                    split_seed if split_seed is not None else seed)
 
         ds = LightYieldFlowDataset(
             self, parquet_path, geometry_csv_path,

@@ -57,6 +57,7 @@ accept either and always return the ``muon_*`` names.
 import glob
 import os
 
+import numpy as np
 import pandas as pd
 # import pyarrow.parquet as pq
 
@@ -109,15 +110,104 @@ def normalize_lepton_columns(df):
     return df.rename(columns=rename) if rename else df
 
 
-def read_parquet_columns(path, columns):
+def _event_mask(batch, keep):
+    """Boolean mask of the rows in a pyarrow batch whose (run_id, event_id) is in keep."""
+    rows = pd.DataFrame({"run_id": batch.column("run_id").to_numpy().astype(np.int64),
+                         "event_id": batch.column("event_id").to_numpy().astype(np.int64)})
+    hit = rows.reset_index().merge(keep, on=["run_id", "event_id"])["index"].to_numpy()
+    mask = np.zeros(len(rows), dtype=bool)
+    mask[hit] = True
+    return mask
+
+
+def _keep_frame(events):
+    ev = np.asarray(sorted(events), dtype=np.int64).reshape(-1, 2)
+    return pd.DataFrame({"run_id": ev[:, 0], "event_id": ev[:, 1]})
+
+
+def _iter_batches(path, columns, batch_size=1 << 18):
+    """Record batches of ``columns``. Synchronous for a single file: the dataset
+    scanner reads far ahead of a slow consumer and held ~3 GB on a 2.7 GB file."""
+    if os.path.isdir(path):
+        import pyarrow.dataset as pads
+        yield from pads.dataset(path, format="parquet").to_batches(
+            columns=columns, batch_size=batch_size)
+    else:
+        import pyarrow.parquet as pq
+        yield from pq.ParquetFile(path).iter_batches(batch_size=batch_size,
+                                                     columns=columns)
+
+
+def _schema(path):
+    import pyarrow.dataset as pads
+    return pads.dataset(path, format="parquet").schema
+
+
+def _filtered_batches(path, columns, events):
+    """Stream the file's batches (``columns`` only), keeping the rows of ``events``."""
+    keep = _keep_frame(events)
+    need = list(dict.fromkeys(list(columns) + ["run_id", "event_id"]))
+    for b in _iter_batches(path, need):
+        m = _event_mask(b, keep)
+        if m.any():
+            yield b.filter(m).select(list(columns))
+
+
+def list_events(path):
+    """Sorted unique ``(run_id, event_id)`` pairs, read batch by batch."""
+    parts = [pd.DataFrame({"run_id": b.column("run_id").to_numpy().astype(np.int64),
+                           "event_id": b.column("event_id").to_numpy().astype(np.int64)}
+                          ).drop_duplicates()
+             for b in _iter_batches(path, ["run_id", "event_id"])]
+    if not parts:
+        return []
+    ev = pd.concat(parts).drop_duplicates().sort_values(["run_id", "event_id"])
+    return list(zip(ev.run_id.tolist(), ev.event_id.tolist()))
+
+
+def split_events(path, event_frac=None, test_frac=0.0, seed=None):
+    """Draw ``event_frac`` of the file's events, then hold out ``test_frac`` of that draw.
+
+    Returns ``(train_events, test_events)`` as sets of ``(run_id, event_id)``.
+    ``event_frac=None`` (or 1) uses every event.
+    """
+    uniq = list_events(path)
+    perm = np.random.default_rng(seed).permutation(len(uniq))
+    if event_frac is not None:
+        if not 0.0 < event_frac <= 1.0:
+            raise ValueError("event_frac must be in (0, 1]")
+        perm = perm[:max(1, int(round(event_frac * len(uniq))))]
+    n_test = int(round(test_frac * len(perm)))
+    return ({uniq[i] for i in perm[n_test:]}, {uniq[i] for i in perm[:n_test]})
+
+
+def write_event_subset(path, out_path, events):
+    """Copy every row of ``events`` (all columns) to ``out_path``, streaming. Returns rows."""
+    import pyarrow.parquet as pq
+    d = os.path.dirname(out_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    schema = _schema(path)
+    n = 0
+    with pq.ParquetWriter(out_path, schema) as writer:
+        for b in _filtered_batches(path, schema.names, events):
+            writer.write_batch(b)
+            n += b.num_rows
+    return n
+
+
+def read_parquet_columns(path, columns, events=None):
     """``pd.read_parquet(path, columns=...)`` that also accepts ``lepton_*`` labels.
 
     ``columns`` uses the canonical ``muon_*`` names; where the file only has the
     ``lepton_*`` label, that column is read and renamed. A column the file has
-    under neither name raises as ``pd.read_parquet`` would.
+    under neither name raises as ``pd.read_parquet`` would. ``events`` (iterable
+    of ``(run_id, event_id)``) keeps only those events' rows, filtered while
+    streaming so the rest of the file is never held in memory.
     """
-    import pyarrow.dataset as pads
-    present = set(pads.dataset(path, format="parquet").schema.names)
+    import pyarrow as pa
+    schema = _schema(path)
+    present = set(schema.names)
     request, rename = [], {}
     for c in columns:
         alt = LEPTON_ALIASES.get(c)
@@ -126,7 +216,15 @@ def read_parquet_columns(path, columns):
             rename[alt] = c
         else:
             request.append(c)
-    df = pd.read_parquet(path, columns=request)
+    if events is None:
+        df = pd.read_parquet(path, columns=request)
+    else:
+        missing = [c for c in request if c not in present]
+        if missing:
+            raise ValueError(f"columns {missing} not in {path}")
+        table = pa.Table.from_batches(list(_filtered_batches(path, request, events)),
+                                      schema=pa.schema([schema.field(c) for c in request]))
+        df = table.to_pandas()
     return df.rename(columns=rename) if rename else df
 
 
