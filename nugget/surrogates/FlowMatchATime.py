@@ -403,10 +403,18 @@ class FlowMatchATime(FlowMatchLY):
     which removes the (large, geometry-driven) predictable part of the arrival time
     and leaves the scattering/jitter distribution. Because t_res is a pure
     translation of t_hit, log p(t_hit | c) = log p(t_res | c) with no extra Jacobian.
+
+    particle_mode : 'track' ('muon') or 'cascade' ('electron')
+        Which t_geom the residual is taken against: direct Cherenkov light from a
+        track, or straight-line light travel from the vertex for an electron, whose
+        light comes from a cascade at the interaction point.
     """
 
+    _PARTICLE_MODES = {'track': 'track', 'muon': 'track',
+                       'cascade': 'cascade', 'electron': 'cascade'}
+
     def __init__(self, *args, refractive_index=1.33, time_scale=10.0,
-                 time_transform='asinh',
+                 time_transform='asinh', particle_mode='track',
                  track_dir_is_arrival=True, **kwargs):
         # track_dir_is_arrival defaults to True here (unlike the light-yield model):
         # in this parquet zenith/azimuth are the ARRIVAL direction, and the geometric
@@ -418,15 +426,20 @@ class FlowMatchATime(FlowMatchLY):
         self.time_transform = time_transform
         if time_transform not in ('asinh', 'symlog'):
             raise ValueError("time_transform must be 'asinh' or 'symlog'")
+        if particle_mode not in self._PARTICLE_MODES:
+            raise ValueError(f"particle_mode must be one of {sorted(self._PARTICLE_MODES)}")
+        self.particle_mode = self._PARTICLE_MODES[particle_mode]
 
     # ---------------- geometric (Cherenkov) arrival time ----------------
 
     def geometric_time(self, points, vertices, zeniths=None, azimuths=None,
                        directions=None):
-        """Earliest direct-Cherenkov arrival time at each point, in ns.
+        """Earliest direct-light arrival time at each point, in ns.
 
-        t_geom = [ d_along + d_perp * (n - cos_c) / sin_c ] / c,  cos_c = 1/n
-        with d_along/d_perp measured along the muon TRAVEL direction from the vertex.
+        track:   t_geom = [ d_along + d_perp * (n - cos_c) / sin_c ] / c,  cos_c = 1/n
+                 with d_along/d_perp along the muon TRAVEL direction from the vertex.
+        cascade: t_geom = n * |x - vertex| / c, light straight from the vertex; the
+                 direction is not used.
         Differentiable in the event parameters.
         """
         # Everything follows `points`: that keeps the dataset path entirely on CPU
@@ -435,6 +448,8 @@ class FlowMatchATime(FlowMatchLY):
         pts = points.reshape(-1, 3)
         dev, dt = pts.device, pts.dtype
         vert = vertices.reshape(-1, 3).to(device=dev, dtype=dt)
+        if self.particle_mode == 'cascade':
+            return self.refractive_index * torch.linalg.norm(pts - vert, dim=1) / C_VAC
         if directions is not None:
             u = directions.reshape(-1, 3).to(device=dev, dtype=dt)
         else:
@@ -590,12 +605,14 @@ class FlowMatchATime(FlowMatchLY):
         ck.update({'refractive_index': self.refractive_index,
                    'time_scale': self.time_scale,
                    'time_transform': self.time_transform,
+                   'particle_mode': self.particle_mode,
                    })
         torch.save(ck, filepath)
 
     def load_model(self, filepath):
         ck = torch.load(filepath, map_location=self.device, weights_only=False)
-        for k in ('refractive_index', 'time_scale', 'time_transform'):
+        # checkpoints from before particle_mode existed are all tracks
+        for k in ('refractive_index', 'time_scale', 'time_transform', 'particle_mode'):
             if k in ck:
                 setattr(self, k, ck[k])
             else:
