@@ -190,8 +190,11 @@ class OMFisherNetLoss(LossFunction):
     domain_size, rich_rel_pos_mode, include_vertex_position, add_vertex_distance,
     add_distance_from_beam, add_dist_long, ly_eps
         Input features, with the same meaning as in the hit / flow models (see
-        build_context); always included are the travel direction, log10 E and
-        cos(track, vertex -> OM). There are no PMT features: the target is a whole OM.
+        build_context); always included are log10 E and cos(track, vertex -> OM).
+        There are no PMT features: the target is a whole OM.
+    include_direction : bool
+        Also give the raw travel direction 3-vector. False leaves the direction only
+        in the relative features (cos angle, d_perp, d_long).
     add_log_distances : bool
         Also give log10(1 m + d_perp) and log10(1 m + |OM - vertex|). The Fisher falls
         by orders of magnitude over 1-400 m, which linear distances standardised over
@@ -223,7 +226,7 @@ class OMFisherNetLoss(LossFunction):
                  domain_size=20000, rich_rel_pos_mode=True, include_vertex_position=False,
                  add_vertex_distance=False, add_distance_from_beam=True,
                  add_dist_long=True, ly_eps=1e-6, add_log_distances=False,
-                 width=256, depth=6, dropout=0.0, learning_rate=1e-3,
+                 include_direction=True, width=256, depth=6, dropout=0.0, learning_rate=1e-3,
                  lr_schedule='onecycle', warmup_frac=0.1, weight_decay=0.0,
                  eps_floor=1e-6, weight_tau='median', target_mode='exact',
                  geometry_grads='chunked', net_dtype=None, print_loss=False):
@@ -246,6 +249,7 @@ class OMFisherNetLoss(LossFunction):
         self.add_dist_long = bool(add_dist_long)
         self.ly_eps = float(ly_eps)
         self.add_log_distances = bool(add_log_distances)
+        self.include_direction = bool(include_direction)
         self.width, self.depth, self.dropout = width, depth, dropout
         self.learning_rate, self.lr_schedule = learning_rate, lr_schedule
         self.warmup_frac, self.weight_decay = warmup_frac, weight_decay
@@ -262,11 +266,12 @@ class OMFisherNetLoss(LossFunction):
 
     _CONTEXT_FLAGS = ('domain_size', 'rich_rel_pos_mode', 'include_vertex_position',
                       'add_vertex_distance', 'add_distance_from_beam', 'add_dist_long',
-                      'ly_eps', 'add_log_distances')
+                      'ly_eps', 'add_log_distances', 'include_direction')
 
     @property
     def context_dim(self):
-        d = 3 + 3 + 1                                   # rel, direction, log10 E
+        d = 3 + 1                                       # rel, log10 E
+        d += 3 * int(self.include_direction)            # direction
         if not self.rich_rel_pos_mode:
             d += 3                                      # absolute det + vert
         elif self.include_vertex_position:
@@ -309,12 +314,13 @@ class OMFisherNetLoss(LossFunction):
         vert_dist = torch.linalg.norm(rel, dim=1)
         cos_angle = (u * rel).sum(1) / (vert_dist + 1e-8)
 
+        dir_cols = [u] if self.include_direction else []
         if self.rich_rel_pos_mode:
-            cols = [rel, u, log_e.unsqueeze(1)]
+            cols = [rel, *dir_cols, log_e.unsqueeze(1)]
             if self.include_vertex_position:
                 cols.append(vert)
         else:
-            cols = [det, vert, u, log_e.unsqueeze(1)]
+            cols = [det, vert, *dir_cols, log_e.unsqueeze(1)]
         if self.add_vertex_distance:
             cols.append(vert_dist.unsqueeze(1))
         cols.append(cos_angle.unsqueeze(1))
@@ -708,12 +714,13 @@ class OMFisherNetLoss(LossFunction):
 
     def load_model(self, filepath):
         ck = torch.load(filepath, map_location=self.device, weights_only=False)
+        self.include_direction = bool(ck.get('include_direction', True))  # older nets all had it
         for k in ('fisher_params', 'param_scales', *self._CONTEXT_FLAGS, 'width', 'depth',
                   'dropout', 'eps_floor', 'weight_tau', 'tau', 'target_mode', 'net_dtype',
                   'tau_diag', 'train_losses', 'val_losses'):
             if k in ck:
                 setattr(self, k, ck[k])
-            elif k in self._CONTEXT_FLAGS:
+            elif k in self._CONTEXT_FLAGS and k != 'include_direction':
                 print(f"Warning: {k} not found in checkpoint; using {getattr(self, k)!r}")
         self.build_network()
         self.net.load_state_dict(ck['net_state_dict'])

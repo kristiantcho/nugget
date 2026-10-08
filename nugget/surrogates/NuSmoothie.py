@@ -28,7 +28,7 @@ class NuSmoothie(Surrogate):
     _CTX_FLAGS = ('rich_rel_pos_mode', 'include_vertex_position',
                   'add_vertex_distance', 'add_distance_from_beam',
                   'add_dist_long', 'track_dir_is_arrival',
-                  'add_pmt_direction', 'add_pmt_cosangle')
+                  'add_pmt_direction', 'add_pmt_cosangle', 'include_direction')
 
     # every key of a PATD dict (LightSabrePATD layout)
     _PATD_KEYS = ('hit_times', 'num_photons', 'expected_photons', 'residual_times',

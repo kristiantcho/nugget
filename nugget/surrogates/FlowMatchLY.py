@@ -345,6 +345,7 @@ class FlowMatchLY(Surrogate):
                  add_vertex_distance=False, add_distance_from_beam=False,
                  add_dist_long=False, track_dir_is_arrival=False,
                  add_pmt_direction=True, add_pmt_cosangle=False,
+                 include_direction=True,
                  standardize_context=True, ly_eps=1e-6,
                  **kwargs):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
@@ -368,6 +369,10 @@ class FlowMatchLY(Surrogate):
         self.track_dir_is_arrival = track_dir_is_arrival
         self.add_pmt_direction = add_pmt_direction
         self.add_pmt_cosangle = add_pmt_cosangle
+        # False drops the raw event-direction vector from the features; the direction
+        # then only enters through relative quantities (cos_angle, d_perp/d_long, and
+        # the PMT cosine with add_pmt_cosangle)
+        self.include_direction = include_direction
         self.ly_eps = ly_eps
     
 
@@ -401,7 +406,8 @@ class FlowMatchLY(Surrogate):
 
     @property
     def context_dim(self):
-        d = 3 + 3 + 1                                   # rel, direction, log10 E
+        d = 3 + 1                                       # rel, log10 E
+        d += 3 if getattr(self, 'include_direction', True) else 0   # direction
         if not self.rich_rel_pos_mode:
             d += 3                                      # absolute det + vert
         elif self.include_vertex_position:
@@ -457,13 +463,13 @@ class FlowMatchLY(Surrogate):
         cos_angle = (direction * rel).sum(1) / (dir_norm * vert_dist + 1e-8)
 
         cols = []
-       
+        dir_cols = [direction] if getattr(self, 'include_direction', True) else []
         if self.rich_rel_pos_mode:
-            cols += [rel, direction, log_e.unsqueeze(1)]
+            cols += [rel, *dir_cols, log_e.unsqueeze(1)]
             if self.include_vertex_position:
                 cols.append(vert)
         else:
-            cols += [det, vert, direction, log_e.unsqueeze(1)]
+            cols += [det, vert, *dir_cols, log_e.unsqueeze(1)]
 
         if self.add_vertex_distance:
             cols.append(vert_dist.unsqueeze(1))
@@ -813,6 +819,7 @@ class FlowMatchLY(Surrogate):
             'track_dir_is_arrival': self.track_dir_is_arrival,
             'add_pmt_direction': self.add_pmt_direction,
             'add_pmt_cosangle': self.add_pmt_cosangle,
+            'include_direction': self.include_direction,
             'standardize_context': self.standardize_context,
             'context_mean': None if self.context_mean is None else self.context_mean.cpu(),
             'context_std': None if self.context_std is None else self.context_std.cpu(),
@@ -822,6 +829,8 @@ class FlowMatchLY(Surrogate):
 
     def load_model(self, filepath):
         ck = torch.load(filepath, map_location=self.device, weights_only=False)
+        # every checkpoint from before this flag existed was trained with the direction
+        self.include_direction = bool(ck.get('include_direction', True))
         for k in ['width', 'depth', 'time_dim', 'cond_width', 'dropout', 'domain_size',
                   'dim', 'sigma_min', 'ly_eps', 'rich_rel_pos_mode',
                   'include_vertex_position', 'add_vertex_distance',
