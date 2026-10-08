@@ -75,10 +75,11 @@ class HitLabelDataset(Dataset):
             geo[['pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z']].to_numpy(np.float32))
         self._n_geo = len(geo)
 
-        df = pd.read_parquet(parquet_path,
-                             columns=['run_id', 'event_id', 'string', 'om', 'pmt',
-                                      'muon_x', 'muon_y', 'muon_z',
-                                      'neutrino_energy', 'zenith', 'azimuth'])
+        from nugget.utils.parquet_io import read_parquet_columns    # lepton_* -> muon_*
+        df = read_parquet_columns(parquet_path,
+                                  ['run_id', 'event_id', 'string', 'om', 'pmt',
+                                   'muon_x', 'muon_y', 'muon_z',
+                                   'neutrino_energy', 'zenith', 'azimuth'])
 
         half = self._domain_half_extent()
         if filter_vertex_in_domain:

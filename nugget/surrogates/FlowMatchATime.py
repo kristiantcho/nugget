@@ -131,7 +131,8 @@ class ArrivalTimeFlowDataset(Dataset):
         scalar_cols = ['run_id', 'event_id', 'string', 'om', 'pmt',
                        'muon_x', 'muon_y', 'muon_z', 'neutrino_energy',
                        'zenith', 'azimuth']
-        df = pd.read_parquet(parquet_path, columns=scalar_cols + ['times'])
+        from nugget.utils.parquet_io import read_parquet_columns    # lepton_* -> muon_*
+        df = read_parquet_columns(parquet_path, scalar_cols + ['times'])
 
         # Flatten the ragged `times` column up front, then drop it: the per-row
         # object column is by far the heaviest thing here, and carrying it through

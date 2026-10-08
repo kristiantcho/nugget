@@ -48,6 +48,10 @@ Both schemas may optionally also carry the optical-module position relative to
 the detector centre (``om_x/y/z``) and the hit-PMT direction relative to the
 module (``pmt_dir_x/y/z``); these are included whenever the producing module
 emits them.
+
+Some producers label the charged daughter ``lepton_x/y/z`` and ``lepton_energy``
+instead of ``muon_*``. :func:`read_parquet_columns` and :func:`load_parquet`
+accept either and always return the ``muon_*`` names.
 """
 
 import glob
@@ -87,6 +91,43 @@ COLUMN_ORDER = [
     "zenith",
     "azimuth",
 ]
+
+
+# canonical name -> alternative label used by some producers
+LEPTON_ALIASES = {
+    "muon_x": "lepton_x",
+    "muon_y": "lepton_y",
+    "muon_z": "lepton_z",
+    "muon_energy": "lepton_energy",
+}
+
+
+def normalize_lepton_columns(df):
+    """Rename ``lepton_*`` columns to their canonical ``muon_*`` names."""
+    rename = {alt: c for c, alt in LEPTON_ALIASES.items()
+              if alt in df.columns and c not in df.columns}
+    return df.rename(columns=rename) if rename else df
+
+
+def read_parquet_columns(path, columns):
+    """``pd.read_parquet(path, columns=...)`` that also accepts ``lepton_*`` labels.
+
+    ``columns`` uses the canonical ``muon_*`` names; where the file only has the
+    ``lepton_*`` label, that column is read and renamed. A column the file has
+    under neither name raises as ``pd.read_parquet`` would.
+    """
+    import pyarrow.dataset as pads
+    present = set(pads.dataset(path, format="parquet").schema.names)
+    request, rename = [], {}
+    for c in columns:
+        alt = LEPTON_ALIASES.get(c)
+        if c not in present and alt in present:
+            request.append(alt)
+            rename[alt] = c
+        else:
+            request.append(c)
+    df = pd.read_parquet(path, columns=request)
+    return df.rename(columns=rename) if rename else df
 
 
 def rows_to_dataframe(rows):
@@ -133,9 +174,10 @@ def load_parquet(path):
         path (str): Path to the ``.parquet`` file.
 
     Returns:
-        pandas.DataFrame: The tabulated accepted-photon data.
+        pandas.DataFrame: The tabulated accepted-photon data, with ``lepton_*``
+        columns renamed to ``muon_*``.
     """
-    return pd.read_parquet(path, engine="pyarrow")
+    return normalize_lepton_columns(pd.read_parquet(path, engine="pyarrow"))
 
 
 # def collect_parquets(folder, output_path, pattern="*.parquet"):

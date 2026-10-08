@@ -161,13 +161,14 @@ class LightYieldFlowDataset(Dataset):
         # Prefer an explicit 'count' column; otherwise derive the light yield from
         # the length of each row's 'times' list, which is the same quantity. Both
         # parquet engines validate column names before reading, so the failed
-        # attempt is cheap.
+        # attempt is cheap. read_parquet_columns also takes lepton_* for muon_*.
+        from nugget.utils.parquet_io import read_parquet_columns
         try:
-            df = pd.read_parquet(parquet_path, columns=base_cols + ['count'])
+            df = read_parquet_columns(parquet_path, base_cols + ['count'])
             counts = df['count'].to_numpy(np.float32)
             src = 'count'
         except (ValueError, KeyError):
-            df = pd.read_parquet(parquet_path, columns=base_cols + ['times'])
+            df = read_parquet_columns(parquet_path, base_cols + ['times'])
             counts = _times_row_lengths(df['times'])
             df = df.drop(columns=['times'])
             src = 'len(times)'
