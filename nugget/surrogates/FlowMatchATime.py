@@ -645,7 +645,9 @@ class FlowMatchATime(FlowMatchLY):
             event_filter=train_filter)
 
         if pin_memory is None:
-            pin_memory = torch.cuda.is_available()
+            # pinning targets the current CUDA device (cuda:0 unless set), so only
+            # pin when the model is on a GPU
+            pin_memory = torch.device(self.device).type == 'cuda'
         base = RandomSampler(ds) if shuffle else SequentialSampler(ds)
         kw = dict(dataset=ds, batch_size=None,
                   sampler=BatchSampler(base, batch_size=batch_size, drop_last=False),
