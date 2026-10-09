@@ -11,8 +11,8 @@ import torch
 from nugget.samplers.cyl_sampler import CylinderSampler
 
 # Default packaged data directory (nugget/assets/data)
-# data_dir = Path(__file__).resolve().parents[1] / "assets" / "data"
-data_dir=''
+data_dir = Path(__file__).resolve().parents[1] / "assets" / "data"
+# data_dir=''
 
 
 def _to_numpy_no_grad(x):
@@ -36,7 +36,7 @@ def average_chord_length(cos_theta, cyl_radius, cyl_height):
     """Calculate average chord length of cylinder for a given direction"""
     # Convert to torch tensor if not already, preserve gradient
     if not isinstance(cos_theta, torch.Tensor):
-        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float32)
+        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float64)
     
     # Ensure it's at least 1D for indexing
     is_scalar = cos_theta.dim() == 0
@@ -63,136 +63,19 @@ def average_chord_length(cos_theta, cyl_radius, cyl_height):
     # Return scalar if input was scalar
     if is_scalar:
         result = result.squeeze(0)
-    
+
     return result
 
 
-def _softmax_max(x: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
-    """Smooth approximation of max(x) using log-sum-exp."""
-    # temperature = torch.clamp_min(temperature, torch.finfo(x.dtype).eps)
-    return temperature * torch.logsumexp(x / temperature, dim=0)
+def projected_area(cos_theta, cyl_radius, cyl_height):
+    """Calculate projected area of cylinder for a given direction"""
+    # Ensure cos_theta is a torch tensor
+    if not isinstance(cos_theta, torch.Tensor):
+        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float64)
 
-
-def _softmax_min(x: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
-    """Smooth approximation of min(x) using log-sum-exp."""
-    # temperature = torch.clamp_min(temperature, torch.finfo(x.dtype).eps)
-    return -temperature * torch.logsumexp(-x / temperature, dim=0)
-
-
-def _extract_track_from_event_params(event_params, device, dtype):
-    """Extract a point + unit direction vector for an (infinite) track.
-
-    Expected keys:
-      - position: (3,) or (N,3) (uses first row)
-      - direction: (3,) or (N,3) (uses first row)
-        OR zenith + azimuth (radians)
-        OR cos_zenith + azimuth
-    """
-    if event_params is None:
-        raise ValueError("event_params must be provided")
-
-    # Position
-    if "position" in event_params:
-        position = torch.as_tensor(event_params["position"], device=device, dtype=dtype).reshape(-1, 3)[0]
-    elif all(k in event_params for k in ("x", "y", "z")):
-        position = torch.stack(
-            [
-                torch.as_tensor(event_params["x"], device=device, dtype=dtype).reshape(-1)[0],
-                torch.as_tensor(event_params["y"], device=device, dtype=dtype).reshape(-1)[0],
-                torch.as_tensor(event_params["z"], device=device, dtype=dtype).reshape(-1)[0],
-            ]
-        )
-    else:
-        raise ValueError("event_params must include 'position' (or scalar 'x','y','z')")
-
-    # Direction
-    if "direction" in event_params:
-        direction = torch.as_tensor(event_params["direction"], device=device, dtype=dtype).reshape(-1, 3)[0]
-    elif "dir" in event_params:
-        direction = torch.as_tensor(event_params["dir"], device=device, dtype=dtype).reshape(-1, 3)[0]
-    else:
-        if "zenith" in event_params:
-            zenith = torch.as_tensor(event_params["zenith"], device=device, dtype=dtype).reshape(-1)[0]
-            cos_zenith = torch.cos(zenith)
-            sin_zenith = torch.sin(zenith)
-        elif "cos_zenith" in event_params:
-            cos_zenith = torch.as_tensor(event_params["cos_zenith"], device=device, dtype=dtype).reshape(-1)[0]
-            sin_zenith = torch.sqrt(torch.clamp_min(1 - cos_zenith * cos_zenith, torch.finfo(dtype).eps))
-        else:
-            raise ValueError("event_params must include 'direction' or ('zenith'/'cos_zenith' + 'azimuth')")
-
-        if "azimuth" not in event_params:
-            raise ValueError("event_params must include 'azimuth' when using zenith-based direction")
-        azimuth = torch.as_tensor(event_params["azimuth"], device=device, dtype=dtype).reshape(-1)[0]
-
-        # Standard spherical convention: zenith from +z axis; azimuth in x-y plane.
-        direction = torch.stack(
-            [sin_zenith * torch.cos(azimuth), sin_zenith * torch.sin(azimuth), cos_zenith]
-        )
-
-    # eps = torch.as_tensor(torch.finfo(dtype).eps, device=device, dtype=dtype)
-    # direction = direction / torch.clamp_min(torch.linalg.norm(direction), eps)
-    return position, direction
-
-
-def _extract_tracks_from_event_params_batch(event_params_batch, device, dtype):
-    """Extract batched positions and directions from dict or list-of-dicts event params."""
-    if event_params_batch is None:
-        raise ValueError("event_params_batch must be provided")
-
-    if isinstance(event_params_batch, dict):
-        # Position
-        if "position" in event_params_batch:
-            position = torch.as_tensor(event_params_batch["position"], device=device, dtype=dtype).reshape(-1, 3)
-        elif all(k in event_params_batch for k in ("x", "y", "z")):
-            position = torch.stack(
-                [
-                    torch.as_tensor(event_params_batch["x"], device=device, dtype=dtype).reshape(-1),
-                    torch.as_tensor(event_params_batch["y"], device=device, dtype=dtype).reshape(-1),
-                    torch.as_tensor(event_params_batch["z"], device=device, dtype=dtype).reshape(-1),
-                ],
-                dim=1,
-            )
-        else:
-            raise ValueError("event_params_batch must include 'position' (or batched 'x','y','z')")
-
-        # Direction
-        if "direction" in event_params_batch:
-            direction = torch.as_tensor(event_params_batch["direction"], device=device, dtype=dtype).reshape(-1, 3)
-        elif "dir" in event_params_batch:
-            direction = torch.as_tensor(event_params_batch["dir"], device=device, dtype=dtype).reshape(-1, 3)
-        else:
-            if "zenith" in event_params_batch:
-                zenith = torch.as_tensor(event_params_batch["zenith"], device=device, dtype=dtype).reshape(-1)
-                cos_zenith = torch.cos(zenith)
-                sin_zenith = torch.sin(zenith)
-            elif "cos_zenith" in event_params_batch:
-                cos_zenith = torch.as_tensor(event_params_batch["cos_zenith"], device=device, dtype=dtype).reshape(-1)
-                sin_zenith = torch.sqrt(torch.clamp_min(1 - cos_zenith * cos_zenith, torch.finfo(dtype).eps))
-            else:
-                raise ValueError("event_params_batch must include 'direction' or ('zenith'/'cos_zenith' + 'azimuth')")
-
-            if "azimuth" not in event_params_batch:
-                raise ValueError("event_params_batch must include 'azimuth' when using zenith-based direction")
-            azimuth = torch.as_tensor(event_params_batch["azimuth"], device=device, dtype=dtype).reshape(-1)
-
-            direction = torch.stack(
-                [sin_zenith * torch.cos(azimuth), sin_zenith * torch.sin(azimuth), cos_zenith],
-                dim=1,
-            )
-
-        return position, direction
-
-    if isinstance(event_params_batch, (list, tuple)):
-        positions = []
-        directions = []
-        for event_params in event_params_batch:
-            p, d = _extract_track_from_event_params(event_params, device=device, dtype=dtype)
-            positions.append(p)
-            directions.append(d)
-        return torch.stack(positions, dim=0), torch.stack(directions, dim=0)
-
-    raise TypeError("event_params_batch must be a dict or a list/tuple of dicts")
+    cap = np.pi*cyl_radius**2
+    sides = 2*cyl_radius*cyl_height
+    return cap*torch.abs(cos_theta) + sides*torch.sqrt(1 - cos_theta**2)
 
 
 def _extract_energy_and_cos_zenith_batch(event_params_batch, device, dtype):
@@ -233,409 +116,6 @@ def _extract_energy_and_cos_zenith_batch(event_params_batch, device, dtype):
     raise TypeError("event_params_batch must be a dict or a list/tuple of dicts")
 
 
-def chord_length_through_weighted_irregular_cylinder(
-    event_params,
-    points_3d: torch.Tensor,
-    point_weights: torch.Tensor | None = None,
-    *,
-    z_bounds: tuple[float, float] | tuple[torch.Tensor, torch.Tensor] | None = None,
-    n_directions: int = 64,
-    support_temperature: float = 0.05,
-    bound_temperature: float = 0.05,
-    inside_temperature: float = 0.01,
-    big_t: float = 1e6,
-):
-    """Differentiable chord length of an infinite track through a tight irregular cylinder.
-
-    Geometry model:
-      - Z extent is fixed (non-differentiable by default): z_bounds or (min/max z of points, detached).
-      - XY cross-section is a *smooth convex hull* around points, approximated by intersecting
-        half-spaces for a set of sampled directions u_k.
-      - The support value h(u_k) is a temperature-smoothed, weight-aware max projection.
-
-    The intersection with the (convex) polygon extrusion is solved in parameter space t for
-      r(t) = position + t * direction,  t in (-inf, +inf).
-
-    Returns:
-      chord length in the same length units as points_3d.
-
-    Notes:
-      - Differentiable wrt detector XY positions and point_weights (through support + center).
-      - Uses smooth min/max to reduce kinkiness; smaller temperatures tighten but reduce smoothness.
-    """
-    if not isinstance(points_3d, torch.Tensor):
-        points_3d = torch.as_tensor(points_3d)
-
-    device = points_3d.device
-    dtype = points_3d.dtype
-    position, direction = _extract_track_from_event_params(event_params, device=device, dtype=dtype)
-
-    tau_support = torch.as_tensor(support_temperature, device=device, dtype=dtype)
-    tau_bound = torch.as_tensor(bound_temperature, device=device, dtype=dtype)
-    tau_inside = torch.as_tensor(inside_temperature, device=device, dtype=dtype)
-    big_t = torch.as_tensor(big_t, device=device, dtype=dtype)
-
-    xy = points_3d[:, :2]
-
-    if point_weights is None:
-        w = torch.ones((xy.shape[0],), device=device, dtype=dtype)
-    else:
-        w = torch.as_tensor(point_weights, device=device, dtype=dtype).reshape(-1)
-        if w.shape[0] != xy.shape[0]:
-            raise ValueError("point_weights must have shape (n_points,)")
-
-    # w = torch.clamp_min(w, eps)
-    # w_norm = w / torch.clamp_min(torch.sum(w), eps)
-    w_norm = w / torch.sum(w)
-    center_xy = torch.sum(w_norm.unsqueeze(1) * xy, dim=0)
-
-    # Fixed Z-bounds: caller-provided or inferred from points.
-    if z_bounds is None:
-        z_min = torch.amin(points_3d[:, 2])
-        z_max = torch.amax(points_3d[:, 2])
-    else:
-        z_min = torch.as_tensor(z_bounds[0], device=device, dtype=dtype)
-        z_max = torch.as_tensor(z_bounds[1], device=device, dtype=dtype)
-
-    # Sample directions on the unit circle.
-    angles = torch.linspace(
-        0.0,
-        2 * np.pi,
-        int(n_directions) + 1,
-        device=device,
-        dtype=dtype,
-    )[:-1]
-    u = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)  # (K,2)
-
-    rel_xy = xy - center_xy.unsqueeze(0)  # (N,2)
-    # Projections (N,K): s_{ik} = rel_i dot u_k
-    proj = rel_xy @ u.T
-
-    # Weight-aware smooth support function along each direction.
-    # Using log(w) makes low-weight points contribute exponentially less.
-    log_w = torch.log(w)
-    h = tau_support * torch.logsumexp((proj + log_w.unsqueeze(1)) / tau_support, dim=0)  # (K,)
-
-    # Build XY constraints: u_k · (p_xy(t) - center_xy) <= h_k
-    p0_xy = position[:2]
-    v_xy = direction[:2]
-    a0 = (p0_xy - center_xy) @ u.T  # (K,)
-    b = v_xy @ u.T  # (K,)
-
-    # Convert each halfspace inequality into a bound on t.
-    # a0_k + t b_k <= h_k  =>  t <= (h_k - a0_k)/b_k if b_k>0, else t >= ... if b_k<0
-    b_pos = b > 0
-    b_neg = b < 0
-    b_zero = ~(b_pos | b_neg)
-
-    t_bound = torch.where(b_zero, torch.zeros_like(b), (h - a0) / b)
-
-    t_upper = torch.where(b_pos, t_bound, big_t)   # no upper constraint when b<=0
-    t_lower = torch.where(b_neg, t_bound, -big_t)  # no lower constraint when b>=0
-
-    # For b==0, inequality does not constrain t unless already violated.
-    # Soft inside factor suppresses length when parallel halfspaces are violated.
-    parallel_violation = torch.where(b_zero, a0 - h, -big_t)
-    inside_factor_xy = torch.sigmoid(-_softmax_max(parallel_violation, tau_bound) / tau_inside)
-
-    t_max_xy = _softmax_min(t_upper, tau_bound)
-    t_min_xy = _softmax_max(t_lower, tau_bound)
-
-    # Z slab constraints.
-    vz = direction[2]
-    z0 = position[2]
-    vz_abs = torch.abs(vz)
-    in_z = (z0 >= z_min) & (z0 <= z_max)
-
-    vz_pos = vz > 0
-    vz_neg = vz < 0
-    vz_zero = ~(vz_pos | vz_neg)
-    t_z1 = torch.where(vz_zero, torch.zeros((), device=device, dtype=dtype), (z_min - z0) / vz)
-    t_z2 = torch.where(vz_zero, torch.zeros((), device=device, dtype=dtype), (z_max - z0) / vz)
-    t_min_z_nonzero = torch.minimum(t_z1, t_z2)
-    t_max_z_nonzero = torch.maximum(t_z1, t_z2)
-    t_min_z = torch.where(vz_zero, torch.where(in_z, -big_t, big_t), t_min_z_nonzero)
-    t_max_z = torch.where(vz_zero, torch.where(in_z, big_t, -big_t), t_max_z_nonzero)
-
-    t_min = _softmax_max(torch.stack([t_min_xy, t_min_z]), tau_bound)
-    t_max = _softmax_min(torch.stack([t_max_xy, t_max_z]), tau_bound)
-
-    # Segment length along unit direction.
-    return (t_max - t_min) * inside_factor_xy
-
-
-
-def projected_area(cos_theta, cyl_radius, cyl_height):
-    """Calculate projected area of cylinder for a given direction"""
-    # Ensure cos_theta is a torch tensor
-    if not isinstance(cos_theta, torch.Tensor):
-        cos_theta = torch.as_tensor(cos_theta, dtype=torch.float32)
-    
-    cap = np.pi*cyl_radius**2
-    sides = 2*cyl_radius*cyl_height
-    return cap*torch.abs(cos_theta) + sides*torch.sqrt(1 - cos_theta**2)
-
-
-def projected_area_weighted_irregular_cylinder(
-    event_params,
-    points_3d: torch.Tensor,
-    point_weights: torch.Tensor | None = None,
-    *,
-    z_bounds: tuple[float, float] | tuple[torch.Tensor, torch.Tensor] | None = None,
-    n_directions: int = 64,
-    support_temperature: float = 0.05,
-    bound_temperature: float = 0.05,
-):
-    """Projected area for an irregular weighted cylinder-like extrusion.
-
-    XY shape is represented by a smooth support polygon from weighted detector points,
-    and Z extent is a slab [z_min, z_max]. For viewing direction d, this uses
-
-      A_proj = A_xy * |d_z| + height * width_perp * ||d_xy||
-
-    where A_xy is the support-polygon area and width_perp is polygon width along the
-    in-plane direction perpendicular to d_xy.
-    """
-    if not isinstance(points_3d, torch.Tensor):
-        points_3d = torch.as_tensor(points_3d)
-
-    device = points_3d.device
-    dtype = points_3d.dtype
-    _, direction = _extract_track_from_event_params(event_params, device=device, dtype=dtype)
-
-    tau_support = torch.as_tensor(support_temperature, device=device, dtype=dtype)
-    tau_bound = torch.as_tensor(bound_temperature, device=device, dtype=dtype)
-
-    xy = points_3d[:, :2]
-    if point_weights is None:
-        w = torch.ones((xy.shape[0],), device=device, dtype=dtype)
-    else:
-        w = torch.as_tensor(point_weights, device=device, dtype=dtype).reshape(-1)
-        if w.shape[0] != xy.shape[0]:
-            raise ValueError("point_weights must have shape (n_points,)")
-
-    w_norm = w / torch.sum(w)
-    center_xy = torch.sum(w_norm.unsqueeze(1) * xy, dim=0)
-
-    if z_bounds is None:
-        z_min = torch.amin(points_3d[:, 2])
-        z_max = torch.amax(points_3d[:, 2])
-    else:
-        z_min = torch.as_tensor(z_bounds[0], device=device, dtype=dtype)
-        z_max = torch.as_tensor(z_bounds[1], device=device, dtype=dtype)
-    height = z_max - z_min
-
-    angles = torch.linspace(0.0, 2 * np.pi, int(n_directions) + 1, device=device, dtype=dtype)[:-1]
-    u = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)  # (K,2)
-
-    rel_xy = xy - center_xy.unsqueeze(0)
-    proj = rel_xy @ u.T
-    log_w = torch.log(w)
-    h = tau_support * torch.logsumexp((proj + log_w.unsqueeze(1)) / tau_support, dim=0)  # (K,)
-
-    # Intersections of adjacent support lines define a smooth convex polygon.
-    u_next = torch.roll(u, shifts=-1, dims=0)
-    h_next = torch.roll(h, shifts=-1, dims=0)
-    det = u[:, 0] * u_next[:, 1] - u[:, 1] * u_next[:, 0]
-    vx = (h * u_next[:, 1] - h_next * u[:, 1]) / det
-    vy = (u[:, 0] * h_next - u_next[:, 0] * h) / det
-    verts_rel = torch.stack([vx, vy], dim=1)  # (K,2)
-
-    # Shoelace area of XY support polygon.
-    x = verts_rel[:, 0]
-    y = verts_rel[:, 1]
-    x_next = torch.roll(x, shifts=-1, dims=0)
-    y_next = torch.roll(y, shifts=-1, dims=0)
-    area_xy = 0.5 * torch.abs(torch.sum(x * y_next - y * x_next))
-
-    d_norm = torch.linalg.norm(direction)
-    d_xy = direction[:2]
-    d_xy_norm_raw = torch.linalg.norm(d_xy)
-    sin_theta = d_xy_norm_raw / d_norm
-    cos_theta_abs = torch.abs(direction[2]) / d_norm
-
-    n_perp_default = torch.tensor([1.0, 0.0], device=device, dtype=dtype)
-    n_perp = torch.where(
-        d_xy_norm_raw > 0,
-        torch.stack([-d_xy[1], d_xy[0]]) / d_xy_norm_raw,
-        n_perp_default,
-    )
-
-    width_proj = verts_rel @ n_perp
-    width_perp = _softmax_max(width_proj, tau_bound) - _softmax_min(width_proj, tau_bound)
-
-    return area_xy * cos_theta_abs + height * width_perp * sin_theta
-
-
-def chord_length_through_weighted_irregular_cylinder_many(
-    event_params_batch,
-    points_3d: torch.Tensor,
-    point_weights: torch.Tensor | None = None,
-    *,
-    z_bounds: tuple[float, float] | tuple[torch.Tensor, torch.Tensor] | None = None,
-    n_directions: int = 64,
-    support_temperature: float = 0.05,
-    bound_temperature: float = 0.05,
-    inside_temperature: float = 0.01,
-    big_t: float = 1e6,
-):
-    """Vectorized differentiable chord lengths for many events through irregular weighted geometry."""
-    if not isinstance(points_3d, torch.Tensor):
-        points_3d = torch.as_tensor(points_3d)
-
-    device = points_3d.device
-    dtype = points_3d.dtype
-    positions, directions = _extract_tracks_from_event_params_batch(event_params_batch, device=device, dtype=dtype)
-
-    tau_support = torch.as_tensor(support_temperature, device=device, dtype=dtype)
-    tau_bound = torch.as_tensor(bound_temperature, device=device, dtype=dtype)
-    tau_inside = torch.as_tensor(inside_temperature, device=device, dtype=dtype)
-    big_t = torch.as_tensor(big_t, device=device, dtype=dtype)
-
-    xy = points_3d[:, :2]
-    if point_weights is None:
-        w = torch.ones((xy.shape[0],), device=device, dtype=dtype)
-    else:
-        w = torch.as_tensor(point_weights, device=device, dtype=dtype).reshape(-1)
-        if w.shape[0] != xy.shape[0]:
-            raise ValueError("point_weights must have shape (n_points,)")
-
-    w_norm = w / torch.sum(w)
-    center_xy = torch.sum(w_norm.unsqueeze(1) * xy, dim=0)
-
-    if z_bounds is None:
-        z_min = torch.amin(points_3d[:, 2])
-        z_max = torch.amax(points_3d[:, 2])
-    else:
-        z_min = torch.as_tensor(z_bounds[0], device=device, dtype=dtype)
-        z_max = torch.as_tensor(z_bounds[1], device=device, dtype=dtype)
-
-    angles = torch.linspace(0.0, 2 * np.pi, int(n_directions) + 1, device=device, dtype=dtype)[:-1]
-    u = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)  # (K,2)
-
-    rel_xy = xy - center_xy.unsqueeze(0)
-    proj = rel_xy @ u.T  # (P,K)
-    log_w = torch.log(w)
-    h = tau_support * torch.logsumexp((proj + log_w.unsqueeze(1)) / tau_support, dim=0)  # (K,)
-
-    p0_xy = positions[:, :2]  # (N,2)
-    v_xy = directions[:, :2]  # (N,2)
-    a0 = (p0_xy - center_xy.unsqueeze(0)) @ u.T  # (N,K)
-    b = v_xy @ u.T  # (N,K)
-
-    b_pos = b > 0
-    b_neg = b < 0
-    b_zero = ~(b_pos | b_neg)
-    b_safe = torch.where(b_zero, torch.ones_like(b), b)
-    t_bound = (h.unsqueeze(0) - a0) / b_safe
-
-    t_upper = torch.where(b_pos, t_bound, big_t)
-    t_lower = torch.where(b_neg, t_bound, -big_t)
-
-    parallel_violation = torch.where(b_zero, a0 - h.unsqueeze(0), -big_t)
-    inside_factor_xy = torch.sigmoid(-tau_bound * torch.logsumexp(parallel_violation / tau_bound, dim=1) / tau_inside)
-
-    t_max_xy = -tau_bound * torch.logsumexp(-t_upper / tau_bound, dim=1)
-    t_min_xy = tau_bound * torch.logsumexp(t_lower / tau_bound, dim=1)
-
-    vz = directions[:, 2]
-    z0 = positions[:, 2]
-    in_z = (z0 >= z_min) & (z0 <= z_max)
-    vz_pos = vz > 0
-    vz_neg = vz < 0
-    vz_zero = ~(vz_pos | vz_neg)
-    vz_safe = torch.where(vz_zero, torch.ones_like(vz), vz)
-    t_z1 = (z_min - z0) / vz_safe
-    t_z2 = (z_max - z0) / vz_safe
-    t_min_z_nonzero = torch.minimum(t_z1, t_z2)
-    t_max_z_nonzero = torch.maximum(t_z1, t_z2)
-    t_min_z = torch.where(vz_zero, torch.where(in_z, -big_t, big_t), t_min_z_nonzero)
-    t_max_z = torch.where(vz_zero, torch.where(in_z, big_t, -big_t), t_max_z_nonzero)
-
-    t_min = tau_bound * torch.logsumexp(torch.stack([t_min_xy, t_min_z], dim=1) / tau_bound, dim=1)
-    t_max = -tau_bound * torch.logsumexp(-torch.stack([t_max_xy, t_max_z], dim=1) / tau_bound, dim=1)
-
-    return torch.clamp_min(t_max - t_min, torch.zeros((positions.shape[0],), device=device, dtype=dtype)) * inside_factor_xy
-
-
-def projected_area_weighted_irregular_cylinder_many(
-    event_params_batch,
-    points_3d: torch.Tensor,
-    point_weights: torch.Tensor | None = None,
-    *,
-    z_bounds: tuple[float, float] | tuple[torch.Tensor, torch.Tensor] | None = None,
-    n_directions: int = 64,
-    support_temperature: float = 0.05,
-    bound_temperature: float = 0.05,
-):
-    """Vectorized projected areas for many events through irregular weighted geometry."""
-    if not isinstance(points_3d, torch.Tensor):
-        points_3d = torch.as_tensor(points_3d)
-
-    device = points_3d.device
-    dtype = points_3d.dtype
-    _, directions = _extract_tracks_from_event_params_batch(event_params_batch, device=device, dtype=dtype)
-
-    tau_support = torch.as_tensor(support_temperature, device=device, dtype=dtype)
-    tau_bound = torch.as_tensor(bound_temperature, device=device, dtype=dtype)
-
-    xy = points_3d[:, :2]
-    if point_weights is None:
-        w = torch.ones((xy.shape[0],), device=device, dtype=dtype)
-    else:
-        w = torch.as_tensor(point_weights, device=device, dtype=dtype).reshape(-1)
-        if w.shape[0] != xy.shape[0]:
-            raise ValueError("point_weights must have shape (n_points,)")
-
-    w_norm = w / torch.sum(w)
-    center_xy = torch.sum(w_norm.unsqueeze(1) * xy, dim=0)
-
-    if z_bounds is None:
-        z_min = torch.amin(points_3d[:, 2])
-        z_max = torch.amax(points_3d[:, 2])
-    else:
-        z_min = torch.as_tensor(z_bounds[0], device=device, dtype=dtype)
-        z_max = torch.as_tensor(z_bounds[1], device=device, dtype=dtype)
-    height = z_max - z_min
-
-    angles = torch.linspace(0.0, 2 * np.pi, int(n_directions) + 1, device=device, dtype=dtype)[:-1]
-    u = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)  # (K,2)
-
-    rel_xy = xy - center_xy.unsqueeze(0)
-    proj = rel_xy @ u.T
-    log_w = torch.log(w)
-    h = tau_support * torch.logsumexp((proj + log_w.unsqueeze(1)) / tau_support, dim=0)  # (K,)
-
-    u_next = torch.roll(u, shifts=-1, dims=0)
-    h_next = torch.roll(h, shifts=-1, dims=0)
-    det = u[:, 0] * u_next[:, 1] - u[:, 1] * u_next[:, 0]
-    vx = (h * u_next[:, 1] - h_next * u[:, 1]) / det
-    vy = (u[:, 0] * h_next - u_next[:, 0] * h) / det
-    verts_rel = torch.stack([vx, vy], dim=1)  # (K,2)
-
-    x = verts_rel[:, 0]
-    y = verts_rel[:, 1]
-    x_next = torch.roll(x, shifts=-1, dims=0)
-    y_next = torch.roll(y, shifts=-1, dims=0)
-    area_xy = 0.5 * torch.abs(torch.sum(x * y_next - y * x_next))
-
-    d_norm = torch.linalg.norm(directions, dim=1)
-    d_xy = directions[:, :2]
-    d_xy_norm = torch.linalg.norm(d_xy, dim=1)
-    sin_theta = d_xy_norm / d_norm
-    cos_theta_abs = torch.abs(directions[:, 2]) / d_norm
-
-    n_perp_default = torch.tensor([1.0, 0.0], device=device, dtype=dtype).unsqueeze(0).expand(directions.shape[0], -1)
-    d_xy_norm_safe = torch.where(d_xy_norm > 0, d_xy_norm, torch.ones_like(d_xy_norm))
-    n_raw = torch.stack([-d_xy[:, 1], d_xy[:, 0]], dim=1) / d_xy_norm_safe.unsqueeze(1)
-    n_perp = torch.where(d_xy_norm.unsqueeze(1) > 0, n_raw, n_perp_default)
-
-    width_proj = n_perp @ verts_rel.T  # (N,K)
-    width_perp = tau_bound * torch.logsumexp(width_proj / tau_bound, dim=1) - (-tau_bound * torch.logsumexp(-width_proj / tau_bound, dim=1))
-
-    return area_xy * cos_theta_abs + height * width_perp * sin_theta
-
-
 def neutrino_effective_area_many(
     cos_theta,
     energy,
@@ -646,26 +126,13 @@ def neutrino_effective_area_many(
     flavor="numu",
     average_nu_nubar=True,
     *,
-    event_params_batch=None,
-    points_3d: torch.Tensor | None = None,
-    point_weights: torch.Tensor | None = None,
-    z_bounds: tuple[float, float] | tuple[torch.Tensor, torch.Tensor] | None = None,
-    n_directions: int = 64,
-    support_temperature: float = 0.05,
-    bound_temperature: float = 0.05,
-    inside_temperature: float = 0.01,
-    big_t: float = 1e6,
+    include_projected_area: bool = True,
 ):
-    """Calculate neutrino effective area for many events in a single batched call."""
-    if event_params_batch is not None and (cos_theta is None or energy is None):
-        if points_3d is None:
-            raise ValueError("points_3d must be provided when deriving batched event fields")
-        energy, cos_theta = _extract_energy_and_cos_zenith_batch(
-            event_params_batch,
-            device=points_3d.device,
-            dtype=points_3d.dtype,
-        )
+    """Calculate neutrino effective area for many events in a single batched call.
 
+    If ``include_projected_area`` is False, the projected-area factor is omitted
+    (treated as 1) and only ``transmission * interaction_prob`` is returned.
+    """
     if not isinstance(cos_theta, torch.Tensor):
         cos_theta = torch.as_tensor(cos_theta)
     if not isinstance(energy, torch.Tensor):
@@ -680,21 +147,7 @@ def neutrino_effective_area_many(
     number_density = 33.3679E21  # 1/cm^-3
     nucleon_density = 18 * number_density
 
-    use_irregular = event_params_batch is not None and points_3d is not None
-    if use_irregular:
-        chord_len = chord_length_through_weighted_irregular_cylinder_many(
-            event_params_batch,
-            points_3d,
-            point_weights=point_weights,
-            z_bounds=z_bounds,
-            n_directions=n_directions,
-            support_temperature=support_temperature,
-            bound_temperature=bound_temperature,
-            inside_temperature=inside_temperature,
-            big_t=big_t,
-        ) * 1e2
-    else:
-        chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2
+    chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2
 
     def _int_prob(which, extend_range=False):
         chord_len_local = chord_len
@@ -715,16 +168,8 @@ def neutrino_effective_area_many(
     int_prob_nc = factor * (_int_prob("NC_nu") + _int_prob("NC_nubar"))
     int_prob = int_prob_cc + int_prob_nc
 
-    if use_irregular:
-        proj_a = projected_area_weighted_irregular_cylinder_many(
-            event_params_batch,
-            points_3d,
-            point_weights=point_weights,
-            z_bounds=z_bounds,
-            n_directions=n_directions,
-            support_temperature=support_temperature,
-            bound_temperature=bound_temperature,
-        )
+    if not include_projected_area:
+        proj_a = 1.0
     else:
         proj_a = projected_area(cos_theta, cyl_radius, cyl_height)
 
@@ -743,43 +188,21 @@ def interaction_prob(
     xsec,
     which="CC_nu",
     extend_range=False,
-    *,
-    event_params=None,
-    points_3d: torch.Tensor | None = None,
-    point_weights: torch.Tensor | None = None,
-    z_bounds: tuple[float, float] | tuple[torch.Tensor, torch.Tensor] | None = None,
-    n_directions: int = 64,
-    support_temperature: float = 0.05,
-    bound_temperature: float = 0.05,
 ):
     """
     Calculate neutrino interaction probability.
-    
+
     Parameters:
     -----------
     - cos_theta
     - energy
     - cyl_radius
-    
-    """    
+
+    """
     number_density = 33.3679E21 # 1/cm^-3
     nucleon_density = 18 * number_density
-    
-    if event_params is not None and points_3d is not None:
-        chord_len = (
-            chord_length_through_weighted_irregular_cylinder(
-                event_params,
-                points_3d,
-                point_weights=point_weights,
-                z_bounds=z_bounds,
-                n_directions=n_directions,
-                support_temperature=support_temperature,
-                bound_temperature=bound_temperature,
-            )
-            * 1e2
-        )  # cm
-    else:
-        chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2  # cm
+
+    chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2  # cm
 
     if extend_range:
         #extend by muon range
@@ -804,15 +227,13 @@ def neutrino_effective_area(
     flavor="numu",
     average_nu_nubar=True,
     *,
-    event_params=None,
-    points_3d: torch.Tensor | None = None,
-    point_weights: torch.Tensor | None = None,
-    z_bounds: tuple[float, float] | tuple[torch.Tensor, torch.Tensor] | None = None,
-    n_directions: int = 64,
-    support_temperature: float = 0.05,
-    bound_temperature: float = 0.05,
+    include_projected_area: bool = True,
 ):
-    """Calculate neutrino effective area"""
+    """Calculate neutrino effective area.
+
+    If ``include_projected_area`` is False, the projected-area factor is omitted
+    (treated as 1) and only ``transmission * interaction_prob`` is returned.
+    """
 
     tprob = transmission(cos_theta, energy, flavor=flavor)
     # Convert transmission probability to torch tensor if needed
@@ -820,44 +241,24 @@ def neutrino_effective_area(
         if isinstance(cos_theta, torch.Tensor):
             tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
         else:
-            tprob = torch.as_tensor(tprob, dtype=torch.float32)
+            tprob = torch.as_tensor(tprob, dtype=torch.float64)
 
     if average_nu_nubar:
         factor = 0.5
     else:
         factor = 1
 
-    interaction_kwargs = {}
-    if event_params is not None and points_3d is not None:
-        interaction_kwargs = {
-            "event_params": event_params,
-            "points_3d": points_3d,
-            "point_weights": point_weights,
-            "z_bounds": z_bounds,
-            "n_directions": n_directions,
-            "support_temperature": support_temperature,
-            "bound_temperature": bound_temperature,
-        }
-    
     int_prob_CC = factor * (
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nu", extend_range=flavor=="numu", **interaction_kwargs) +
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nubar", extend_range=flavor=="numu", **interaction_kwargs)
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nu", extend_range=flavor=="numu") +
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nubar", extend_range=flavor=="numu")
     )
     int_prob_NC = factor * (
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nu", **interaction_kwargs) +
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nubar", **interaction_kwargs)
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nu") +
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nubar")
     )
     int_prob = int_prob_CC + int_prob_NC
-    if event_params is not None and points_3d is not None:
-        proj_a = projected_area_weighted_irregular_cylinder(
-            event_params,
-            points_3d,
-            point_weights=point_weights,
-            z_bounds=z_bounds,
-            n_directions=n_directions,
-            support_temperature=support_temperature,
-            bound_temperature=bound_temperature,
-        )
+    if not include_projected_area:
+        proj_a = 1.0
     else:
         proj_a = projected_area(cos_theta, cyl_radius, cyl_height)
 
@@ -1125,13 +526,21 @@ def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.
 
     # Weighted xy center.
     center_xy = torch.sum(w.unsqueeze(1) * xy_positions, dim=0) / torch.sum(w)
+    # distances_xy = torch.sqrt(torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1))
+    # center_xy = torch.tensor([0.0, 0.0], device=device, dtype=dtype)
+    distances_xy = torch.sqrt(torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1))
+    # log_w = torch.log(w)
 
-    # Smooth radius via weighted log-sum-exp over radial distances.
-    # distances_xy = torch.sqrt(torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1) + eps)
-    # d_ref = torch.max(distances_xy).detach()
-    # radius = d_ref + tau * torch.logsumexp((distances_xy*log_w - d_ref) / tau, dim=0)
-    radius = torch.sqrt(torch.sum(w * torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1)) / torch.sum(w))
+    # weighted_terms = (distances_xy + log_w) / temperature
+    # d_ref = torch.max(weighted_terms).detach()
+    # radius = temperature * (d_ref + torch.logsumexp(weighted_terms - d_ref, dim=0))
+    # radius = torch.sqrt(torch.sum(w * torch.sum((xy_positions - center_xy.unsqueeze(0)) ** 2, dim=1)) / torch.sum(w))
 
+    # radius = torch.sum(distances_xy * w * torch.exp(temperature * distances_xy) /
+    #                    torch.sum(w * torch.exp(temperature * distances_xy)))
+
+    weighted_terms = temperature * distances_xy * w
+    radius = torch.logsumexp(weighted_terms, dim=0) / temperature
     # Smooth z-bounds via weighted log-sum-exp (stable references).
     z_max = torch.max(z_positions)
     # z_max = z_ref_max + tau * torch.logsumexp((z_positions*log_w - z_ref_max) / tau, dim=0)
@@ -1144,6 +553,108 @@ def get_weighted_bounding_cylinder(positions, point_weights=None, temperature=1.
 
     center = torch.stack([center_xy[0], center_xy[1], center_z])
     return center, radius, height
+
+
+def get_weighted_min_enclosing_circle(
+    string_xy,
+    string_weights=None,
+    temperature=1,
+    n_directions=360,
+    angular_kappa=5.0,
+    downweight_untriggerable=False,
+    trigger_neighbor_distance=550.0,
+    trigger_min_neighbors=30.0,
+    trigger_distance_sharpness=0.05,
+    trigger_count_sharpness=1.0,
+):
+    """Differentiably estimate a weighted enclosing-circle radius around a fixed origin.
+
+    Parameters
+    ----------
+    string_xy : torch.Tensor
+        XY positions of strings, shape (n_strings, 2).
+    string_weights : torch.Tensor, optional
+        Continuous importance in [0, 1] per string, shape (n_strings,). If
+        None, all strings are treated as fully active (weight 1).
+    temperature : float
+        Softmax temperature for the per-direction outer-distance soft-max.
+        Lower values sharpen it toward the true (hard) max distance among
+        effectively-active, direction-aligned strings.
+    n_directions : int
+        Number of directions sampled evenly around the origin.
+    angular_kappa : float
+        Sharpness of the angular gate. Higher values restrict each direction's
+        soft-max to strings more tightly aligned with that direction.
+    downweight_untriggerable : bool
+        If True, heavily downweight strings that cannot be part of a trigger,
+        i.e. strings that do not have at least ``trigger_min_neighbors`` other
+        (weighted) strings within ``trigger_neighbor_distance`` in the XY plane.
+        This prevents a lone, far-flung string from inflating the radius: an
+        isolated string is not "triggerable", so it should not enlarge the
+        sampling cylinder. Fully differentiable (soft neighbor count + soft gate).
+    trigger_neighbor_distance : float
+        XY neighborhood radius (same units as string_xy) used to count
+        neighbors for the triggerability gate. Mirrors the trigger's sliding-bar
+        length. Default 550.0.
+    trigger_min_neighbors : float
+        Minimum (weighted) neighbor count for a string to count as triggerable.
+        Mirrors the trigger's ``min_points_threshold``. Default 30.0.
+    trigger_distance_sharpness : float
+        Sharpness of the soft "is neighbor within trigger_neighbor_distance"
+        sigmoid (higher = sharper cutoff at the neighbor distance).
+    trigger_count_sharpness : float
+        Sharpness of the soft "neighbor count >= trigger_min_neighbors" gate
+        (higher = sharper transition around the threshold).
+
+    Returns
+    -------
+    tuple
+        (center_xy, radius) where center_xy is a fixed zero vector, shape (2,),
+        and radius is a 0-d tensor, differentiable w.r.t. string_xy and
+        string_weights.
+    """
+    device = string_xy.device
+    dtype = string_xy.dtype
+    n_strings = string_xy.shape[0]
+
+    if string_weights is None:
+        w = torch.ones(n_strings, device=device, dtype=dtype)
+    else:
+        w = string_weights.to(device=device, dtype=dtype)
+
+    if downweight_untriggerable:
+        # Soft count of weighted neighbors within trigger_neighbor_distance (excluding self),
+        # then a soft gate at trigger_min_neighbors. A string that fails the gate is
+        # multiplied down toward ~0 so it no longer contributes to (inflates) the radius.
+        pairwise = torch.cdist(string_xy, string_xy)  # (n_strings, n_strings)
+        within = torch.sigmoid(trigger_distance_sharpness * (trigger_neighbor_distance - pairwise))
+        # Exclude self from the neighbor count.
+        within = within - torch.diag(torch.diagonal(within))
+        neighbor_count = within @ w  # (n_strings,) weighted neighbor count per string
+        triggerable = torch.sigmoid(trigger_count_sharpness * (neighbor_count - trigger_min_neighbors))
+        w = w * triggerable
+
+    center_xy = torch.zeros(2, device=device, dtype=dtype)
+
+    distances = torch.sqrt(torch.sum(string_xy ** 2, dim=1) + 1e-12)  # (n_strings,)
+
+    # Unit direction of each string from the origin.
+    string_dir = string_xy / distances.unsqueeze(1)  # (n_strings, 2)
+
+    angles = torch.linspace(0.0, 2 * torch.pi, n_directions + 1, device=device, dtype=dtype)[:-1]
+    u = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)  # (n_directions, 2)
+
+    # Cosine alignment of every string with every sampled direction, in [-1, 1].
+    align = string_dir @ u.T  # (n_strings, n_directions) 
+    align = torch.nn.functional.softplus(align, beta=angular_kappa)  # (n_strings, n_directions)
+    # Per-(string, direction) score used for the outer-distance soft-max: raw
+    # distance, discounted by string weight and angular misalignment together.
+    combined = distances.unsqueeze(1) * w.unsqueeze(1) * align / temperature
+    per_direction_radius = temperature * torch.logsumexp(combined, dim=0)
+
+    radius = torch.mean(per_direction_radius)
+    return center_xy, radius
+
 
 class EffectiveAreaLoss(LossFunction):
     """Loss class to maximize neutrino effective area."""
@@ -1238,7 +749,18 @@ class EffectiveAreaLoss(LossFunction):
         energy_range = kwargs.get('energy_range', (1e2, 1e8))
         zenith_range = kwargs.get('cos_zenith_range', (-1, 1))
         temperature = kwargs.get('bounding_cylinder_temperature', 0.1)
-        use_irregular_cylinder = kwargs.get('use_irregular_cylinder', False)
+        downweight_untriggerable = kwargs.get('downweight_untriggerable', False)
+        trigger_neighbor_distance = kwargs.get('trigger_neighbor_distance', 550.0)
+        trigger_min_neighbors = kwargs.get('trigger_min_neighbors', 30.0)
+        trigger_distance_sharpness = kwargs.get('trigger_distance_sharpness', 0.05)
+        trigger_count_sharpness = kwargs.get('trigger_count_sharpness', 1.0)
+        include_projected_area = kwargs.get('include_projected_area', True)
+        # If True, use the signal_sampler's own generation cylinder
+        # (radius/height/center) for the effective-area cylinder instead of the
+        # geometry-derived bounding cylinder. This makes A_eff use a fixed
+        # generation volume (chord length, interaction prob, and projected area
+        # all), decoupling it from the string spread.
+        use_sampler_cylinder = kwargs.get('use_sampler_cyl_for_volume', False)
         use_batched_effective_area = kwargs.get('use_batched_effective_area', False)
         cylinder_kwargs = kwargs.get('cylinder_sampler_kwargs', {})
         pc_ly_per_event_per_point_per_e_per_ct = kwargs.get('pc_ly_per_point_per_event_per_e_per_ct', None)
@@ -1269,32 +791,55 @@ class EffectiveAreaLoss(LossFunction):
 
 
         # signal_sampler = CylinderSampler(event_type='signal', domain_size=2500, E_min=energy_range, E_max=1e8, energy_dist='log_uniform')
-    
-        point_weights = None
-        if string_weights is not None:
-            # string_assignment_temperature = kwargs.get('string_assignment_temperature', 1.0)
-            if string_xy is None:
-                # Get unique xy coordinates in order of first appearance
-                seen = set()
-                unique_indices = []
-                for i, xy in enumerate(points_3d[:, :2]):
-                    xy_tuple = tuple(xy.tolist())
-                    if xy_tuple not in seen:
-                        seen.add(xy_tuple)
-                        unique_indices.append(i)
-                
-                string_xy = points_3d[unique_indices, :2]
-            
-            point_weights = self.map_string_weights_to_points(points_3d, string_xy, string_weights)
-        else:
-            point_weights = torch.ones(len(points_3d), device=self.device)
+
+        if string_xy is None:
+            # Get unique xy coordinates in order of first appearance
+            seen = set()
+            unique_indices = []
+            for i, xy in enumerate(points_3d[:, :2]):
+                xy_tuple = tuple(xy.tolist())
+                if xy_tuple not in seen:
+                    seen.add(xy_tuple)
+                    unique_indices.append(i)
+
+            string_xy = points_3d[unique_indices, :2]
+
+        string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
+
         
-        if not use_irregular_cylinder:
-            center, cyl_radius, cyl_height = get_weighted_bounding_cylinder(points_3d, point_weights=point_weights, temperature=temperature)
+
+        if use_sampler_cylinder:
+            if signal_sampler is None or not hasattr(signal_sampler, 'cylinder'):
+                raise ValueError(
+                    "use_sampler_cylinder=True requires a signal_sampler with a 'cylinder' attribute"
+                )
+            sampler_cyl = signal_sampler.cylinder
+            cyl_radius = torch.as_tensor(sampler_cyl.radius, device=self.device, dtype=points_3d.dtype)
+            cyl_height = torch.as_tensor(sampler_cyl.height, device=self.device, dtype=points_3d.dtype)
+            center = torch.as_tensor(sampler_cyl.center, device=self.device, dtype=points_3d.dtype).reshape(-1)
         else:
-            center = None
-            cyl_radius = None
-            cyl_height = None
+            center_xy, cyl_radius = get_weighted_min_enclosing_circle(
+                        string_xy, string_weights=string_probs, temperature=temperature,
+                        downweight_untriggerable=downweight_untriggerable,
+                        trigger_neighbor_distance=trigger_neighbor_distance,
+                        trigger_min_neighbors=trigger_min_neighbors,
+                        trigger_distance_sharpness=trigger_distance_sharpness,
+                        trigger_count_sharpness=trigger_count_sharpness,
+                    )
+            z_positions = points_3d[:, 2]
+            z_max = torch.max(z_positions)
+            z_min = torch.min(z_positions)
+            cyl_height = z_max - z_min
+            center = torch.stack([center_xy[0], center_xy[1], 0.5 * (z_min + z_max)])
+        # geom_dict for the trigger MUST carry string_xy/string_weights so the trigger
+        # weights its points by the current (continuous) string activation. Passing only
+        # points_3d would silently give every point weight 1, making detector efficiency
+        # independent of string_weights.
+        trigger_geom_dict = {'points_3d': points_3d}
+        if string_xy is not None:
+            trigger_geom_dict['string_xy'] = string_xy
+        if string_weights is not None:
+            trigger_geom_dict['string_weights'] = string_weights
         def _extract_energy_and_cos_zenith(event_params):
             if 'energy' not in event_params:
                 raise ValueError("Each event must provide 'energy' for per-event effective area mode")
@@ -1320,7 +865,7 @@ class EffectiveAreaLoss(LossFunction):
                     precomputed_light_yield_per_point_per_event = precomputed_light_yield_per_point_per_event[selected_indices]
 
             trigger_out = self.trigger(
-                {'points_3d': points_3d},
+                trigger_geom_dict,
                 **{
                     **kwargs,
                     'signal_surrogate_func': surrogate_func,
@@ -1346,9 +891,7 @@ class EffectiveAreaLoss(LossFunction):
                     self.transmission,
                     flavor=self.flavor,
                     average_nu_nubar=self.average_nu_nubar,
-                    event_params_batch=event_params_list if use_irregular_cylinder else None,
-                    points_3d=points_3d if use_irregular_cylinder else None,
-                    point_weights=point_weights if use_irregular_cylinder else None,
+                    include_projected_area=include_projected_area,
                 )
                 per_event_effective_areas = per_event_effective_areas * per_event_trigger
             else:
@@ -1370,9 +913,7 @@ class EffectiveAreaLoss(LossFunction):
                         self.transmission,
                         flavor=self.flavor,
                         average_nu_nubar=self.average_nu_nubar,
-                        event_params=event_params if use_irregular_cylinder else None,
-                        points_3d=points_3d if use_irregular_cylinder else None,
-                        point_weights=point_weights if use_irregular_cylinder else None,
+                        include_projected_area=include_projected_area,
                     )
                     per_event_effective_areas[i] = eff_area_i * per_event_trigger[i]
 
@@ -1433,7 +974,7 @@ class EffectiveAreaLoss(LossFunction):
             counts = torch.zeros((num_zenith_bins, num_energy_bins), device=self.device)
 
             trigger_out = self.trigger(
-                {'points_3d': points_3d},
+                trigger_geom_dict,
                 **{
                     **kwargs,
                     'signal_surrogate_func': surrogate_func,
@@ -1462,28 +1003,13 @@ class EffectiveAreaLoss(LossFunction):
             for e_ind, e in enumerate(energy_centers):
                 for ct_ind, ct in enumerate(zenith_centers):
                     detector_efficiency = detector_efficiencies[ct_ind, e_ind]
-                    if use_irregular_cylinder:
-                        event_params_geom = {
-                            "position": center,
-                            "cos_zenith": ct,
-                            "azimuth": torch.zeros((), device=self.device, dtype=points_3d.dtype),
-                        }
-                        eff_area = neutrino_effective_area(
-                            ct, e, cyl_radius, cyl_height,
-                            self.xsec, self.transmission,
-                            flavor=self.flavor,
-                            average_nu_nubar=self.average_nu_nubar,
-                            event_params=event_params_geom,
-                            points_3d=points_3d,
-                            point_weights=point_weights,
-                        )
-                    else:
-                        eff_area = neutrino_effective_area(
-                            ct, e, cyl_radius, cyl_height,
-                            self.xsec, self.transmission,
-                            flavor=self.flavor,
-                            average_nu_nubar=self.average_nu_nubar,
-                        )
+                    eff_area = neutrino_effective_area(
+                        ct, e, cyl_radius, cyl_height,
+                        self.xsec, self.transmission,
+                        flavor=self.flavor,
+                        average_nu_nubar=self.average_nu_nubar,
+                        include_projected_area=include_projected_area,
+                    )
                     effective_areas[ct_ind, e_ind] = eff_area * detector_efficiency
 
         else:
@@ -1493,7 +1019,7 @@ class EffectiveAreaLoss(LossFunction):
                                                      event_type='signal', energy_dist='log_uniform', uniform_zenith_sampling=True, **cylinder_kwargs).sample_events(num_events_per_bin)
 
                     trigger_out = self.trigger(
-                        {'points_3d': points_3d},
+                        trigger_geom_dict,
                         **{
                             **kwargs,
                             'signal_surrogate_func': surrogate_func,
@@ -1504,36 +1030,17 @@ class EffectiveAreaLoss(LossFunction):
                     )
                     detector_efficiency = trigger_out['detector_efficiency']
                     detector_efficiencies[ct_ind, e_ind] = detector_efficiency
-                    if use_irregular_cylinder:
-                        event_params_geom = {
-                            "position": center,
-                            "cos_zenith": ct,
-                            "azimuth": torch.zeros((), device=self.device, dtype=points_3d.dtype),
-                        }
-                        eff_area = neutrino_effective_area(
-                            ct,
-                            e,
-                            cyl_radius,
-                            cyl_height,
-                            self.xsec,
-                            self.transmission,
-                            flavor=self.flavor,
-                            average_nu_nubar=self.average_nu_nubar,
-                            event_params=event_params_geom,
-                            points_3d=points_3d,
-                            point_weights=point_weights,
-                        )
-                    else:
-                        eff_area = neutrino_effective_area(
-                            ct,
-                            e,
-                            cyl_radius,
-                            cyl_height,
-                            self.xsec,
-                            self.transmission,
-                            flavor=self.flavor,
-                            average_nu_nubar=self.average_nu_nubar,
-                        )
+                    eff_area = neutrino_effective_area(
+                        ct,
+                        e,
+                        cyl_radius,
+                        cyl_height,
+                        self.xsec,
+                        self.transmission,
+                        flavor=self.flavor,
+                        average_nu_nubar=self.average_nu_nubar,
+                        include_projected_area=include_projected_area,
+                    )
                     effective_areas[ct_ind, e_ind] = eff_area * detector_efficiency
 
         effective_area_loss = 1/torch.mean(effective_areas)

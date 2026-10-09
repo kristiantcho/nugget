@@ -3,6 +3,10 @@ from . import LLR
 from . import SNR
 from . import RBF
 from . import fisher_info
+from . import fisher_info_flow
+from . import fisher_info_flow_mc
+from . import fisher_info_om_net
+from . import fisher_info_jax
 from . import geometry_penalties
 from . import light_yield
 from . import trigger

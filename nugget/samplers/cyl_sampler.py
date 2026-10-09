@@ -393,16 +393,18 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
 
     if uniform_zenith_sampling:
         if cos_range_mode == "horizontal": # selecting horizontal zenith angles (cosθ ∈ [-0.2, 0.2])
-            theta_min = torch.acos(torch.as_tensor(0.2, device=device, dtype=dtype))
-            theta_max = torch.acos(torch.as_tensor(-0.2, device=device, dtype=dtype))
+            # theta_min = torch.acos(torch.as_tensor(0.2, device=device, dtype=dtype))
+            # theta_max = torch.acos(torch.as_tensor(-0.2, device=device, dtype=dtype))
+            theta_min = 70*math.pi/180.0
+            theta_max = 110*math.pi/180.0
             if fixed_costheta:
                 theta = torch.full((n_samples,), theta_min, dtype=dtype, device=device)
             else:
                 u = torch.rand(n_samples, generator=rng, device=device, dtype=dtype)
                 theta = theta_min + u * (theta_max - theta_min)
         elif cos_range_mode == "vertical": # selecting vertical zenith angles (cosθ < -0.8 or cosθ > 0.8)
-            theta_min = torch.acos(torch.as_tensor(0.8, device=device, dtype=dtype))
-            theta_mid = torch.acos(torch.as_tensor(-0.8, device=device, dtype=dtype))
+            theta_min = torch.acos(torch.as_tensor(0.9, device=device, dtype=dtype))
+            theta_mid = torch.acos(torch.as_tensor(-0.9, device=device, dtype=dtype))
             theta_max = torch.pi
             side_selector = torch.rand(n_samples, generator=rng, device=device, dtype=dtype) < 0.5
             u = torch.rand(n_samples, generator=rng, device=device, dtype=dtype)
@@ -428,9 +430,11 @@ def sample_uniform_ray(rng, cyl, cos_range = torch.tensor([-1.0, 1.0]),
                 u = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
                 cand = -1.0 + 2.0 * u
                 if cos_range_mode == "horizontal":
-                    range_mask = torch.abs(cand) < 0.2
+                    range_mask = torch.abs(cand) < torch.cos(torch.tensor(70*math.pi/180.0, device=device, dtype=dtype))  # cos(70°) ≈ 0.342
+                elif cos_range_mode == "vertical":
+                    range_mask = torch.abs(cand) > 0.9
                 else:
-                    range_mask = torch.abs(cand) > 0.8
+                    raise ValueError(f"Unexpected cos_range_mode: {cos_range_mode}")
                 q = torch.rand(batch_size, generator=rng, device=device, dtype=dtype)
                 proj_areas = torch.tensor([projected_area(cyl, c) for c in cand], 
                                           dtype=dtype, device=device)
@@ -671,6 +675,7 @@ class CylinderSampler(Sampler):
         """
         super().__init__(device, dim, domain_size)
         self.kwargs = kwargs
+        self.gamma = kwargs.get('gamma', 2.7)
         
         # Set up cylinder geometry
         if cylinder_center is None:
@@ -710,6 +715,8 @@ class CylinderSampler(Sampler):
         
         # Event type for energy sampling
         self.event_type = kwargs.get('event_type', 'signal')
+
+        self.energy_dist = kwargs.get('energy_dist', 'power_law')  # 'power_law' or 'log_uniform'
     
     def sample_power_law(self, E_min=0.8, E_max=1, gamma=2.7, n_samples=1):
         """
@@ -766,7 +773,9 @@ class CylinderSampler(Sampler):
         """
         Adjusted to mirror ToySampler output:
         Keys: energy (1,), zenith (1,), azimuth (1,), position (1,3)
-        Dtypes: float32 except background zenith (float64) to match ToySampler's current behavior.
+        Dtypes: float64 throughout (nugget.__init__ sets float64 as the torch
+        default dtype; the Fisher-information matrix inversions and effective-area
+        calculations downstream are numerically fragile in float32).
         """
         E_min = self.kwargs.get('E_min', 0.8)
         E_max = self.kwargs.get('E_max', 1.0)
@@ -786,7 +795,7 @@ class CylinderSampler(Sampler):
             else:
                 energies = self.sample_power_law(E_min=E_min, E_max=E_max, gamma=gamma, n_samples=num_events)
         else:
-            energies = torch.full((num_events,), E_min, device=self.device)
+            energies = torch.full((num_events,), E_min, device=self.device, dtype=torch.float64)
         # Reuse existing geometric sampler for positions (discard directions afterward)
         cos_range = self.kwargs.get('cos_range', torch.tensor([-1.0, 1.0]))
         seed = self.kwargs.get('seed', None)
@@ -807,8 +816,8 @@ class CylinderSampler(Sampler):
             box_intersection=self.box_intersection,
         )
 
-        # Build bias tensor (float32)
-        # bias = torch.tensor([x_bias, y_bias, z_bias], device=self.device, dtype=torch.float32) * 1.0
+        # Build bias tensor (float64)
+        # bias = torch.tensor([x_bias, y_bias, z_bias], device=self.device, dtype=torch.float64) * 1.0
 
         # Override directions if point_towards_center is enabled
         if self.point_towards_center:
@@ -828,18 +837,18 @@ class CylinderSampler(Sampler):
 
             # Match ToySampler dtype behavior:
             
-            zenith_tensor = torch.tensor([theta.item()], device=self.device, dtype=torch.float32)
+            zenith_tensor = torch.tensor([theta.item()], device=self.device, dtype=torch.float64)
 
-            azimuth_tensor = torch.tensor([phi.item()], device=self.device, dtype=torch.float32)
+            azimuth_tensor = torch.tensor([phi.item()], device=self.device, dtype=torch.float64)
 
-            pos = positions[i].unsqueeze(0).to(torch.float32)  # (1,3) float32
+            pos = positions[i].unsqueeze(0).to(torch.float64)  # (1,3) float64
 
             event_params = {
-                'energy': energies[i:i+1],          # (1,) float32
-                'zenith': zenith_tensor,             # (1,) float32 or float64 (background)
-                'azimuth': azimuth_tensor,           # (1,) float32
-                'position': pos,                     # (1,3) float32
-                'direction': directions[i].to(torch.float32)  # (1,3) float32
+                'energy': energies[i:i+1],          # (1,) float64
+                'zenith': zenith_tensor,             # (1,) float64
+                'azimuth': azimuth_tensor,           # (1,) float64
+                'position': pos,                     # (1,3) float64
+                'direction': directions[i].to(torch.float64)  # (1,3) float64
                 # 'direction' removed to match ToySampler
             }
             event_params_list.append(event_params)
@@ -873,5 +882,71 @@ class CylinderSampler(Sampler):
             point = torch.tensor([x, y, z], device=self.device)
             point = point + self.cylinder.center
             points.append(point)
-        
+
         return torch.stack(points)
+
+    def _load_pmt_directions(self, geometry_csv_path):
+        """Load and cache the PMT direction table from a geometry CSV.
+
+        The CSV is the one produced by ``extract_geom.py`` and must contain the
+        columns ``pmt_dir_x``, ``pmt_dir_y``, ``pmt_dir_z``.  Directions are
+        cached per file path so repeated sampling calls don't re-read the file.
+
+        Parameters
+        ----------
+        geometry_csv_path : str
+            Path to the geometry CSV file.
+
+        Returns
+        -------
+        torch.Tensor
+            All PMT directions, shape (n_pmts, 3), on self.device.
+        """
+        if not hasattr(self, '_pmt_direction_cache'):
+            self._pmt_direction_cache = {}
+        if geometry_csv_path not in self._pmt_direction_cache:
+            import pandas as pd
+            df = pd.read_csv(geometry_csv_path)
+            missing = {'pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z'} - set(df.columns)
+            if missing:
+                raise ValueError(
+                    f"geometry CSV '{geometry_csv_path}' is missing column(s): "
+                    f"{sorted(missing)}"
+                )
+            dirs = df[['pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z']].to_numpy()
+            self._pmt_direction_cache[geometry_csv_path] = torch.tensor(
+                dirs, device=self.device, dtype=torch.float64
+            )
+        return self._pmt_direction_cache[geometry_csv_path]
+
+    def sample_pmt_direction(self, geometry_csv_path, num_samples=1, seed=None):
+        """Sample random PMT direction(s) from a geometry CSV file.
+
+        Draws uniformly (with replacement) from the PMT pointing directions
+        listed in the geometry CSV produced by ``extract_geom.py``.
+
+        Parameters
+        ----------
+        geometry_csv_path : str
+            Path to the geometry CSV (with pmt_dir_x/y/z columns).
+        num_samples : int
+            Number of PMT directions to sample (default 1).
+        seed : int or None
+            Optional seed for a reproducible draw. If None, uses global RNG state.
+
+        Returns
+        -------
+        torch.Tensor
+            Sampled unit direction(s), shape (num_samples, 3), on self.device.
+        """
+        directions = self._load_pmt_directions(geometry_csv_path)
+        n_pmts = directions.shape[0]
+        if n_pmts == 0:
+            raise ValueError(f"geometry CSV '{geometry_csv_path}' contains no PMT directions")
+
+        if seed is not None:
+            rng = torch.Generator(device=self.device).manual_seed(seed)
+        else:
+            rng = None
+        idx = torch.randint(0, n_pmts, (num_samples,), generator=rng, device=self.device)
+        return directions[idx]

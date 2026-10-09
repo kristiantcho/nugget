@@ -81,9 +81,9 @@ class Geometry:
         
         # Binary search to find optimal spacing using torch operations
         if optimal_spacing is None:
-            min_spacing = torch.tensor(1e-6, device=self.device, dtype=torch.float32)
+            min_spacing = torch.tensor(1e-6, device=self.device, dtype=torch.float64)
             max_spacing = torch.tensor(self.domain_size - self.domain_size/10, 
-                                     device=self.device, dtype=torch.float32)
+                                     device=self.device, dtype=torch.float64)
             
             # Find the largest spacing that allows at least n_points
             optimal_spacing = max_spacing.clone()
@@ -102,16 +102,16 @@ class Geometry:
         else:
             # Ensure optimal_spacing is a torch tensor
             if not isinstance(optimal_spacing, torch.Tensor):
-                optimal_spacing = torch.tensor(optimal_spacing, device=self.device, dtype=torch.float32)
-            optimal_spacing = optimal_spacing.to(device=self.device, dtype=torch.float32)
+                optimal_spacing = torch.tensor(optimal_spacing, device=self.device, dtype=torch.float64)
+            optimal_spacing = optimal_spacing.to(device=self.device, dtype=torch.float64)
         
         
         # Generate points starting from center using torch operations
         spacing = optimal_spacing
         
         # Start with center point
-        all_points = torch.zeros(0, 2, device=self.device, dtype=torch.float32)
-        center_point = torch.zeros(1, 2, device=self.device, dtype=torch.float32)
+        all_points = torch.zeros(0, 2, device=self.device, dtype=torch.float64)
+        center_point = torch.zeros(1, 2, device=self.device, dtype=torch.float64)
         all_points = torch.cat([all_points, center_point], dim=0)
         
         if n_points == 1:
@@ -121,7 +121,7 @@ class Geometry:
         # For hexagonal grid: points in rings 0 to r = 1 + 3*r*(r+1)
         # Solve for r: 3r^2 + 3r + 1 - n_points = 0
         # Using quadratic formula: r = (-3 + sqrt(9 + 12*(n_points-1))) / 6
-        n_points_tensor = torch.tensor(n_points - 1, device=self.device, dtype=torch.float32)
+        n_points_tensor = torch.tensor(n_points - 1, device=self.device, dtype=torch.float64)
         required_rings = torch.ceil((-3 + torch.sqrt(9 + 12 * n_points_tensor)) / 6).int().item()
         
         # Use required rings to generate exactly n_points (allow points beyond domain)
@@ -130,7 +130,7 @@ class Geometry:
         # Generate rings; for the final (partial) ring, distribute points evenly along the hex perimeter
         for ring in range(1, max_possible_rings + 1):
                 
-            ring_tensor = torch.tensor(ring, device=self.device, dtype=torch.float32)
+            ring_tensor = torch.tensor(ring, device=self.device, dtype=torch.float64)
             
             # Define hexagon corners using torch operations
             sqrt3_half = torch.sqrt(torch.tensor(3.0, device=self.device)) / 2
@@ -152,7 +152,7 @@ class Geometry:
 
             if points_remaining >= full_ring_points:
                 # Generate a full ring: ring points per side (total 6*ring), excluding duplicate corners
-                ring_points = torch.zeros(0, 2, device=self.device, dtype=torch.float32)
+                ring_points = torch.zeros(0, 2, device=self.device, dtype=torch.float64)
                 for side in range(6):
                     start_corner = corners[side]  # (2,)
                     end_corner = corners[(side + 1) % 6]
@@ -173,12 +173,12 @@ class Geometry:
 
                 # Evenly spaced arc-length positions along [0, total_perimeter)
                 # Use arange to avoid reliance on endpoint kwarg
-                positions = (torch.arange(m, device=self.device, dtype=torch.float32) / m) * total_perimeter
+                positions = (torch.arange(m, device=self.device, dtype=torch.float64) / m) * total_perimeter
                 # Side index for each position (0..5)
                 side_idx = torch.floor(positions / edge_len).to(torch.int64)
                 side_idx = torch.clamp(side_idx, 0, 5)
                 # Local parameter t in [0,1) along each side
-                t_on_side = (positions - side_idx.to(torch.float32) * edge_len) / edge_len
+                t_on_side = (positions - side_idx.to(torch.float64) * edge_len) / edge_len
 
                 # Gather start and end corners for each side
                 start_corners = corners[side_idx]               # (m, 2)
@@ -199,7 +199,7 @@ class Geometry:
             if all_points.shape[0] > 0:
                 last_point = all_points[-1:].repeat(needed_points, 1)
             else:
-                last_point = torch.zeros(needed_points, 2, device=self.device, dtype=torch.float32)
+                last_point = torch.zeros(needed_points, 2, device=self.device, dtype=torch.float64)
             hex_points = torch.cat([all_points, last_point], dim=0)
         
         return hex_points
@@ -232,19 +232,19 @@ class Geometry:
             # For hexagonal packing, each point occupies sqrt(3)/2 * spacing^2 area
             hexagonal_area_factor = np.sqrt(3) / 2
             optimal_spacing = torch.sqrt(torch.tensor(area_per_point / hexagonal_area_factor, 
-                                                    device=self.device, dtype=torch.float32))
+                                                    device=self.device, dtype=torch.float64))
         else:
             # Ensure optimal_spacing is a torch tensor
             if not isinstance(optimal_spacing, torch.Tensor):
-                optimal_spacing = torch.tensor(optimal_spacing, device=self.device, dtype=torch.float32)
-            optimal_spacing = optimal_spacing.to(device=self.device, dtype=torch.float32)
+                optimal_spacing = torch.tensor(optimal_spacing, device=self.device, dtype=torch.float64)
+            optimal_spacing = optimal_spacing.to(device=self.device, dtype=torch.float64)
         
         spacing = optimal_spacing
         max_radius = self.half_domain * 0.95
         
         # Start with center point
-        all_points = torch.zeros(0, 2, device=self.device, dtype=torch.float32)
-        center_point = torch.zeros(1, 2, device=self.device, dtype=torch.float32)
+        all_points = torch.zeros(0, 2, device=self.device, dtype=torch.float64)
+        center_point = torch.zeros(1, 2, device=self.device, dtype=torch.float64)
         all_points = torch.cat([all_points, center_point], dim=0)
         
         if n_points == 1:
@@ -263,7 +263,7 @@ class Geometry:
             if ring_radius > max_radius:
                 break
             
-            ring_tensor = torch.tensor(ring, device=self.device, dtype=torch.float32)
+            ring_tensor = torch.tensor(ring, device=self.device, dtype=torch.float64)
             
             # Calculate number of points in this ring based on circumference
             # For hexagonal packing, points are spaced by 'spacing' along the circumference
@@ -317,7 +317,7 @@ class Geometry:
                 circular_hex_points = torch.cat([all_points, boundary_points], dim=0)
             else:
                 # Fallback to center points
-                padding_points = torch.zeros(needed_points, 2, device=self.device, dtype=torch.float32)
+                padding_points = torch.zeros(needed_points, 2, device=self.device, dtype=torch.float64)
                 circular_hex_points = torch.cat([all_points, padding_points], dim=0)
         
         return circular_hex_points
@@ -345,18 +345,18 @@ class Geometry:
         if scaling_factor is None:
             # Calculate scaling factor to fit points within domain
             max_radius = self.half_domain * 0.95  # Leave small margin
-            scaling_factor = torch.tensor(max_radius / torch.sqrt(torch.tensor(n_points, dtype=torch.float32)), 
-                                        device=self.device, dtype=torch.float32)
+            scaling_factor = torch.tensor(max_radius / torch.sqrt(torch.tensor(n_points, dtype=torch.float64)), 
+                                        device=self.device, dtype=torch.float64)
         else:
             if not isinstance(scaling_factor, torch.Tensor):
-                scaling_factor = torch.tensor(scaling_factor, device=self.device, dtype=torch.float32)
-            scaling_factor = scaling_factor.to(device=self.device, dtype=torch.float32)
+                scaling_factor = torch.tensor(scaling_factor, device=self.device, dtype=torch.float64)
+            scaling_factor = scaling_factor.to(device=self.device, dtype=torch.float64)
         
         # Golden angle in radians (approximately 137.5 degrees)
-        golden_angle = torch.tensor(np.pi * (3 - np.sqrt(5)), device=self.device, dtype=torch.float32)
+        golden_angle = torch.tensor(np.pi * (3 - np.sqrt(5)), device=self.device, dtype=torch.float64)
         
         # Generate point indices
-        indices = torch.arange(n_points, device=self.device, dtype=torch.float32)
+        indices = torch.arange(n_points, device=self.device, dtype=torch.float64)
         
         # Calculate angles using golden angle spiral
         angles = indices * golden_angle
@@ -402,7 +402,7 @@ class Geometry:
 
         # Normalize mix
         if not isinstance(mix, (torch.Tensor)):
-            mix_t = torch.tensor(mix, device=self.device, dtype=torch.float32).clamp(0.0, 1.0)
+            mix_t = torch.tensor(mix, device=self.device, dtype=torch.float64).clamp(0.0, 1.0)
         else:
             mix_t = mix.clamp(0.0, 1.0)
 
@@ -430,7 +430,7 @@ class Geometry:
             hex_radii = torch.sqrt((hex_points ** 2).sum(dim=1))
             hex_max = hex_radii.max()
             if n_points <= 1:
-                sunflower_spacing = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                sunflower_spacing = torch.tensor(0.0, device=self.device, dtype=torch.float64)
             else:
                 sunflower_spacing = hex_max / torch.sqrt(torch.tensor(float(n_points - 1), device=self.device))
             sunflower_points = self.create_sunflower_grid(n_points=n_points, optimal_spacing=sunflower_spacing)
@@ -729,10 +729,10 @@ def _assign_string_weights_to_points(points, string_xy, string_weights, geometry
     
     # If no string structure, return uniform weights
     if string_xy is None or string_weights is None:
-        return torch.ones(n_points, device=device, dtype=torch.float32)
+        return torch.ones(n_points, device=device, dtype=torch.float64)
     
     n_strings = string_xy.shape[0]
-    point_weights = torch.zeros(n_points, device=device, dtype=torch.float32)
+    point_weights = torch.zeros(n_points, device=device, dtype=torch.float64)
     
     # Get points_per_string from geometry if available
     points_per_string_list = geometry_dict.get('points_per_string_list', None)

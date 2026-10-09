@@ -47,7 +47,7 @@ class ContinuousString(Geometry):
             if 'string_weights' in initial_geometry:
                 string_weights = initial_geometry['string_weights']
                 if not isinstance(string_weights, torch.Tensor):
-                    string_weights = torch.tensor(string_weights, device=self.device, dtype=torch.float32)
+                    string_weights = torch.tensor(string_weights, device=self.device, dtype=torch.float64)
                 elif string_weights.device != self.device:
                     string_weights = string_weights.to(self.device)
                 
@@ -61,7 +61,7 @@ class ContinuousString(Geometry):
             if 'path_positions' in initial_geometry:
                 path_positions = initial_geometry['path_positions']
                 if not isinstance(path_positions, torch.Tensor):
-                    path_positions = torch.tensor(path_positions, device=self.device, dtype=torch.float32)
+                    path_positions = torch.tensor(path_positions, device=self.device, dtype=torch.float64)
                 elif path_positions.device != self.device:
                     path_positions = path_positions.to(self.device)
             elif 'z_values' in initial_geometry and 'string_indices' in initial_geometry:
@@ -69,7 +69,7 @@ class ContinuousString(Geometry):
                 z_values = initial_geometry['z_values']
                 string_indices = initial_geometry['string_indices']
                 if not isinstance(z_values, torch.Tensor):
-                    z_values = torch.tensor(z_values, device=self.device, dtype=torch.float32)
+                    z_values = torch.tensor(z_values, device=self.device, dtype=torch.float64)
                 elif z_values.device != self.device:
                     z_values = z_values.to(self.device)
                 
@@ -83,7 +83,7 @@ class ContinuousString(Geometry):
             if 'string_xy' in initial_geometry:
                 string_xy = initial_geometry['string_xy']
                 if not isinstance(string_xy, torch.Tensor):
-                    string_xy = torch.tensor(string_xy, device=self.device, dtype=torch.float32)
+                    string_xy = torch.tensor(string_xy, device=self.device, dtype=torch.float64)
                 elif string_xy.device != self.device:
                     string_xy = string_xy.to(self.device)
                 

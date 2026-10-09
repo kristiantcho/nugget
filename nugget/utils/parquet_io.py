@@ -17,12 +17,13 @@ There are two output modes, each with its own schema.
     string                int64     string id of the hit module
     om                    int64     om id of the hit module
     pmt                   int64     hit PMT number (1-16)
-    muon_x                float64   injection position x [m]
-    muon_y                float64   injection position y [m]
-    muon_z                float64   injection position z [m]
-    muon_energy           float64   muon energy [GeV]
-    muon_zenith           float64   muon zenith [rad]
-    muon_azimuth          float64   muon azimuth [rad]
+    muon_x                float64   muon interaction-vertex position x [m]
+    muon_y                float64   muon interaction-vertex position y [m]
+    muon_z                float64   muon interaction-vertex position z [m]
+    muon_energy           float64   muon (CC daughter) energy [GeV]
+    neutrino_energy       float64   primary neutrino energy [GeV]
+    zenith                float64   primary neutrino zenith [rad]
+    azimuth               float64   primary neutrino azimuth [rad]
 
 **Light-yield mode** -- one row per hit PMT per event, no per-photon times.
 The ``time`` column is replaced by an integer ``count`` giving the number of
@@ -30,15 +31,35 @@ accepted photons that reached that (string, om, pmt) in the event::
 
     run_id, event_id, frame_index, string, om, pmt,
     count                 int64     number of accepted photons at this PMT
-    muon_x ... muon_azimuth         (as above)
+    muon_x ... azimuth              (as above)
+
+**List mode** -- one row per hit PMT per event, like light-yield mode, but
+keeping every photon's arrival time instead of just the count. The ``time``
+column is replaced by a ``times`` list column::
+
+    run_id, event_id, frame_index, string, om, pmt,
+    times                 list[float64]  arrival times of all accepted
+                                         photons at this PMT in the event
+    muon_x ... azimuth              (as above)
+
+Use ``DataFrame.explode("times")`` to recover one row per photon.
 
 Both schemas may optionally also carry the optical-module position relative to
 the detector centre (``om_x/y/z``) and the hit-PMT direction relative to the
 module (``pmt_dir_x/y/z``); these are included whenever the producing module
 emits them.
+
+Some producers label the charged daughter ``lepton_x/y/z`` and ``lepton_energy``
+instead of ``muon_*``. :func:`read_parquet_columns` and :func:`load_parquet`
+accept either and always return the ``muon_*`` names.
 """
 
+import glob
+import os
+
+import numpy as np
 import pandas as pd
+# import pyarrow.parquet as pq
 
 
 # Preferred column ordering.  Any keys present in the rows are ordered by this
@@ -52,6 +73,8 @@ COLUMN_ORDER = [
     "time",
     # light-yield mode
     "count",
+    # list mode
+    "times",
     "string",
     "om",
     "pmt",
@@ -65,9 +88,144 @@ COLUMN_ORDER = [
     "muon_y",
     "muon_z",
     "muon_energy",
-    "muon_zenith",
-    "muon_azimuth",
+    "neutrino_energy",
+    "zenith",
+    "azimuth",
 ]
+
+
+# canonical name -> alternative label used by some producers
+LEPTON_ALIASES = {
+    "muon_x": "lepton_x",
+    "muon_y": "lepton_y",
+    "muon_z": "lepton_z",
+    "muon_energy": "lepton_energy",
+}
+
+
+def normalize_lepton_columns(df):
+    """Rename ``lepton_*`` columns to their canonical ``muon_*`` names."""
+    rename = {alt: c for c, alt in LEPTON_ALIASES.items()
+              if alt in df.columns and c not in df.columns}
+    return df.rename(columns=rename) if rename else df
+
+
+def _event_mask(batch, keep):
+    """Boolean mask of the rows in a pyarrow batch whose (run_id, event_id) is in keep."""
+    rows = pd.DataFrame({"run_id": batch.column("run_id").to_numpy().astype(np.int64),
+                         "event_id": batch.column("event_id").to_numpy().astype(np.int64)})
+    hit = rows.reset_index().merge(keep, on=["run_id", "event_id"])["index"].to_numpy()
+    mask = np.zeros(len(rows), dtype=bool)
+    mask[hit] = True
+    return mask
+
+
+def _keep_frame(events):
+    ev = np.asarray(sorted(events), dtype=np.int64).reshape(-1, 2)
+    return pd.DataFrame({"run_id": ev[:, 0], "event_id": ev[:, 1]})
+
+
+def _iter_batches(path, columns, batch_size=1 << 18):
+    """Record batches of ``columns``. Synchronous for a single file: the dataset
+    scanner reads far ahead of a slow consumer and held ~3 GB on a 2.7 GB file."""
+    if os.path.isdir(path):
+        import pyarrow.dataset as pads
+        yield from pads.dataset(path, format="parquet").to_batches(
+            columns=columns, batch_size=batch_size)
+    else:
+        import pyarrow.parquet as pq
+        yield from pq.ParquetFile(path).iter_batches(batch_size=batch_size,
+                                                     columns=columns)
+
+
+def _schema(path):
+    import pyarrow.dataset as pads
+    return pads.dataset(path, format="parquet").schema
+
+
+def _filtered_batches(path, columns, events):
+    """Stream the file's batches (``columns`` only), keeping the rows of ``events``."""
+    keep = _keep_frame(events)
+    need = list(dict.fromkeys(list(columns) + ["run_id", "event_id"]))
+    for b in _iter_batches(path, need):
+        m = _event_mask(b, keep)
+        if m.any():
+            yield b.filter(m).select(list(columns))
+
+
+def list_events(path):
+    """Sorted unique ``(run_id, event_id)`` pairs, read batch by batch."""
+    parts = [pd.DataFrame({"run_id": b.column("run_id").to_numpy().astype(np.int64),
+                           "event_id": b.column("event_id").to_numpy().astype(np.int64)}
+                          ).drop_duplicates()
+             for b in _iter_batches(path, ["run_id", "event_id"])]
+    if not parts:
+        return []
+    ev = pd.concat(parts).drop_duplicates().sort_values(["run_id", "event_id"])
+    return list(zip(ev.run_id.tolist(), ev.event_id.tolist()))
+
+
+def split_events(path, event_frac=None, test_frac=0.0, seed=None):
+    """Draw ``event_frac`` of the file's events, then hold out ``test_frac`` of that draw.
+
+    Returns ``(train_events, test_events)`` as sets of ``(run_id, event_id)``.
+    ``event_frac=None`` (or 1) uses every event.
+    """
+    uniq = list_events(path)
+    perm = np.random.default_rng(seed).permutation(len(uniq))
+    if event_frac is not None:
+        if not 0.0 < event_frac <= 1.0:
+            raise ValueError("event_frac must be in (0, 1]")
+        perm = perm[:max(1, int(round(event_frac * len(uniq))))]
+    n_test = int(round(test_frac * len(perm)))
+    return ({uniq[i] for i in perm[n_test:]}, {uniq[i] for i in perm[:n_test]})
+
+
+def write_event_subset(path, out_path, events):
+    """Copy every row of ``events`` (all columns) to ``out_path``, streaming. Returns rows."""
+    import pyarrow.parquet as pq
+    d = os.path.dirname(out_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    schema = _schema(path)
+    n = 0
+    with pq.ParquetWriter(out_path, schema) as writer:
+        for b in _filtered_batches(path, schema.names, events):
+            writer.write_batch(b)
+            n += b.num_rows
+    return n
+
+
+def read_parquet_columns(path, columns, events=None):
+    """``pd.read_parquet(path, columns=...)`` that also accepts ``lepton_*`` labels.
+
+    ``columns`` uses the canonical ``muon_*`` names; where the file only has the
+    ``lepton_*`` label, that column is read and renamed. A column the file has
+    under neither name raises as ``pd.read_parquet`` would. ``events`` (iterable
+    of ``(run_id, event_id)``) keeps only those events' rows, filtered while
+    streaming so the rest of the file is never held in memory.
+    """
+    import pyarrow as pa
+    schema = _schema(path)
+    present = set(schema.names)
+    request, rename = [], {}
+    for c in columns:
+        alt = LEPTON_ALIASES.get(c)
+        if c not in present and alt in present:
+            request.append(alt)
+            rename[alt] = c
+        else:
+            request.append(c)
+    if events is None:
+        df = pd.read_parquet(path, columns=request)
+    else:
+        missing = [c for c in request if c not in present]
+        if missing:
+            raise ValueError(f"columns {missing} not in {path}")
+        table = pa.Table.from_batches(list(_filtered_batches(path, request, events)),
+                                      schema=pa.schema([schema.field(c) for c in request]))
+        df = table.to_pandas()
+    return df.rename(columns=rename) if rename else df
 
 
 def rows_to_dataframe(rows):
@@ -114,9 +272,57 @@ def load_parquet(path):
         path (str): Path to the ``.parquet`` file.
 
     Returns:
-        pandas.DataFrame: The tabulated accepted-photon data.
+        pandas.DataFrame: The tabulated accepted-photon data, with ``lepton_*``
+        columns renamed to ``muon_*``.
     """
-    return pd.read_parquet(path, engine="pyarrow")
+    return normalize_lepton_columns(pd.read_parquet(path, engine="pyarrow"))
+
+
+# def collect_parquets(folder, output_path, pattern="*.parquet"):
+#     """Concatenate every parquet file in a folder into one output parquet file.
+
+#     Files are streamed row-group by row-group through a single
+#     ``pyarrow.parquet.ParquetWriter`` rather than being loaded as full
+#     DataFrames and concatenated, so peak memory use stays roughly constant
+#     regardless of how many input files there are. All matched files must
+#     share the same schema (e.g. all produced by the same
+#     ``extract_accepted_photons.py`` mode).
+
+#     Args:
+#         folder (str): Directory to search for input parquet files.
+#         output_path (str): Path of the combined parquet file to write.
+#         pattern (str): Glob pattern (relative to ``folder``) selecting which
+#             files to collect. Defaults to ``"*.parquet"``.
+
+#     Returns:
+#         str: ``output_path``, for convenience.
+#     """
+#     paths = sorted(glob.glob(os.path.join(folder, pattern)))
+#     paths = [p for p in paths if os.path.abspath(p) != os.path.abspath(output_path)]
+#     if not paths:
+#         raise FileNotFoundError(
+#             "No parquet files matching %r found in %s" % (pattern, folder)
+#         )
+
+#     writer = None
+#     total_rows = 0
+#     try:
+#         for path in paths:
+#             pf = pq.ParquetFile(path)
+#             for batch in pf.iter_batches():
+#                 if writer is None:
+#                     writer = pq.ParquetWriter(output_path, batch.schema)
+#                 writer.write_batch(batch)
+#                 total_rows += batch.num_rows
+#     finally:
+#         if writer is not None:
+#             writer.close()
+
+#     print(
+#         "Collected %d row(s) from %d file(s) into %s"
+#         % (total_rows, len(paths), output_path)
+#     )
+#     return output_path
 
 
 def iter_events(df):

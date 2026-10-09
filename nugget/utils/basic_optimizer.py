@@ -220,6 +220,104 @@ class Optimizer():
                 snapshot[key] = value
         return snapshot
 
+    def _geom_dict_has_nan(self):
+        """Check whether any tensor in the current geom_dict contains NaNs."""
+        for value in self.geom_dict.values():
+            if torch.is_tensor(value) and torch.isnan(value).any():
+                return True
+        return False
+
+    def _checkpoint_state(self):
+        """Save a restorable checkpoint of the geometry and optimizer state.
+
+        Only the tensors actually being optimized (the keys in `self.optimizers`,
+        i.e. the leaves each Adam instance was constructed around) are kept as
+        live, grad-eligible parameters. Every other entry in `geom_dict` (e.g.
+        `points_3d`, fixed buffers like `string_indices`) is *derived* from the
+        leaves by `update_points`, so it is recomputed on restore rather than
+        cloned independently.
+
+        Some geometries alias a non-optimizer key to the same tensor object as
+        an optimized leaf (e.g. `old_string_weights` pointing at the exact
+        tensor managed under `string_weights`) so that gradients computed via
+        either key reach the one Adam-tracked parameter. `alias_of` records
+        which "other" keys are such aliases (by identity) so restore can
+        repoint them at the restored leaf instead of an independently cloned,
+        non-grad copy - cloning them independently would silently detach that
+        key from the optimized leaf's graph.
+
+        This also captures each optimizer's internal state (e.g. Adam's
+        running moment estimates), since reverting only the parameter values
+        while leaving poisoned optimizer state in place can immediately
+        reproduce the same NaN on the very next step.
+        """
+        leaf_checkpoint = {
+            name: self.geom_dict[name].detach().clone()
+            for name in self.optimizers
+            if torch.is_tensor(self.geom_dict.get(name))
+        }
+        other_checkpoint = {}
+        alias_of = {}
+        for key, value in self.geom_dict.items():
+            if key in self.optimizers:
+                continue
+            if torch.is_tensor(value):
+                aliased_leaf = next(
+                    (name for name in self.optimizers if self.geom_dict.get(name) is value),
+                    None,
+                )
+                if aliased_leaf is not None:
+                    alias_of[key] = aliased_leaf
+                else:
+                    other_checkpoint[key] = value.detach().clone()
+            else:
+                other_checkpoint[key] = value
+        optimizer_checkpoint = {
+            name: pickle.loads(pickle.dumps(optimizer.state_dict()))
+            for name, optimizer in self.optimizers.items()
+        }
+        return {
+            'leaves': leaf_checkpoint,
+            'other': other_checkpoint,
+            'alias_of': alias_of,
+            'optimizer_states': optimizer_checkpoint,
+        }
+
+    def _restore_checkpoint(self, checkpoint):
+        """Restore geometry parameters and optimizer state from a checkpoint.
+
+        Restored leaf tensors are re-created as fresh `requires_grad=True`
+        tensors so the rebuilt optimizers reference valid, grad-eligible
+        parameters. Keys that aliased a leaf at checkpoint time are repointed
+        at the corresponding restored leaf (preserving that aliasing) before
+        the full geom_dict (including derived entries) is recomputed from
+        those leaves via `update_points`, exactly like the normal
+        per-iteration update - this keeps grad connectivity consistent with
+        the non-reverted code path.
+        """
+        restored_leaves = {}
+        for name, value in checkpoint['leaves'].items():
+            new_tensor = value.clone().to(self.device)
+            new_tensor.requires_grad = True
+            restored_leaves[name] = new_tensor
+
+        for name, optimizer in self.optimizers.items():
+            if name not in restored_leaves:
+                continue
+            new_optimizer = torch.optim.Adam([restored_leaves[name]], lr=optimizer.param_groups[0]['lr'])
+            if name in checkpoint['optimizer_states']:
+                new_optimizer.load_state_dict(checkpoint['optimizer_states'][name])
+            self.optimizers[name] = new_optimizer
+
+        restored_aliases = {
+            key: restored_leaves[leaf_name]
+            for key, leaf_name in checkpoint['alias_of'].items()
+            if leaf_name in restored_leaves
+        }
+
+        self.geom_dict = {**checkpoint['other'], **restored_aliases, **restored_leaves}
+        self.geom_dict = self.geometry.update_points(**self.geom_dict)
+
     def optimize(self, loss_func_dict, loss_dict=None, uw_loss_dict=None, loss_weights_dict=None, loss_params_dict=None, n_iter=100, print_freq=10, vis_freq=None, vis_kwargs=None, gif_freq=None, **kwargs):
         
         if loss_dict is None:
@@ -247,6 +345,9 @@ class Optimizer():
         self.save_geom_folder = kwargs.get('save_geom_folder', None)
         self.save_geom_freq = kwargs.get('save_geom_freq', 100)
         self.continue_saving = kwargs.get('continue_saving', False)  # Whether to continue incrementing geom save index from existing files in save_geom_folder
+        # Optional: detect when the geometry becomes NaN and revert to the last good checkpoint.
+        self.revert_on_nan = kwargs.get('revert_on_nan', False)
+        self.max_nan_retries = kwargs.get('max_nan_retries', 5)
         # Optional: only apply sigmoid to a subset of losses.
         # - If provided (list/tuple/set of strings), sigmoid is applied only to those loss names.
         # - If not provided, preserves legacy behavior (sigmoid applied to all losses when enabled).
@@ -321,125 +422,199 @@ class Optimizer():
             for key in self.optimizers:
                 self.optimizer_phases[key] = False
         
-        max_iter = max([len(v) for v in self.loss_iterations_dict.values()]) if len(self.loss_iterations_dict) > 0 else 0     
+  
+        max_iter = max(
+            [len(v) for v in self.loss_iterations_dict.values()]
+            + [len(v) for v in self.loss_dict.values()]
+            + [len(v) for v in self.uw_loss_dict.values()]
+            + [0]
+        )
+        self._stopped_early_on_nan = False
         for it in range(max_iter, max_iter+n_iter):
-            self._current_loss_dict = {}
-            self._current_uw_loss_dict = {}
-            vis_kwargs.update({'iteration': it})
-            if self.sample_every is not None:
-                if loss_params_dict.get('signal_sampler', None) is not None and it % self.sample_every == 0:
-                    loss_params_dict['signal_event_params'] = loss_params_dict['signal_sampler'].sample_events(loss_params_dict.get('num_events', 100))
-                    # print(f"Resampled events at iteration {it}")
-                    if loss_params_dict.get('background_sampler', None) is not None:
-                        loss_params_dict['background_event_params'] = loss_params_dict['background_sampler'].sample_events(loss_params_dict.get('num_events', 100))
-            for key in self.loss_iterations_dict:
-                self.loss_iterations_dict[key].append(it)
-            if self.alternate_freq is not None:
-                for ik, key in enumerate(self.optimizers):
-                    if ik == 0 and it == 0:
-                        self.optimizer_phases[key] = True
-                    else:
-                        if it % (ik+1)*self.alternate_freq == 0:
+            if self._stopped_early_on_nan:
+                break
+            nan_retries = 0
+            while True:
+                if self.revert_on_nan:
+                    pre_step_checkpoint = self._checkpoint_state()
+                    history_lengths = {
+                        'loss_iterations_dict': {k: len(v) for k, v in self.loss_iterations_dict.items()},
+                        'loss_dict': {k: len(v) for k, v in self.loss_dict.items()},
+                        'uw_loss_dict': {k: len(v) for k, v in self.uw_loss_dict.items()},
+                        'vis_loss_dict': {k: len(v) for k, v in self.vis_loss_dict.items()},
+                        'vis_uw_loss_dict': {k: len(v) for k, v in self.vis_uw_loss_dict.items()},
+                        'total_loss': len(self.total_loss),
+                        'alm_lambdas_history': {k: len(v) for k, v in self.alm_lambdas_history.items()},
+                        'alm_mus_history': {k: len(v) for k, v in self.alm_mus_history.items()},
+                    }
+                self._current_loss_dict = {}
+                self._current_uw_loss_dict = {}
+                vis_kwargs.update({'iteration': it})
+                if self.sample_every is not None:
+                    if loss_params_dict.get('signal_sampler', None) is not None and it % self.sample_every == 0:
+                        loss_params_dict['signal_event_params'] = loss_params_dict['signal_sampler'].sample_events(loss_params_dict.get('num_events', 100))
+                        # print(f"Resampled events at iteration {it}")
+                        if loss_params_dict.get('background_sampler', None) is not None:
+                            loss_params_dict['background_event_params'] = loss_params_dict['background_sampler'].sample_events(loss_params_dict.get('num_events', 100))
+                for key in self.loss_iterations_dict:
+                    self.loss_iterations_dict[key].append(it)
+                if self.alternate_freq is not None:
+                    for ik, key in enumerate(self.optimizers):
+                        if ik == 0 and it == 0:
                             self.optimizer_phases[key] = True
                         else:
-                            self.optimizer_phases[key] = False
-            for key in self.optimizers.keys():
-                if self.alternate_freq is not None:
-                    if self.optimizer_phases[key]:
+                            if it % (ik+1)*self.alternate_freq == 0:
+                                self.optimizer_phases[key] = True
+                            else:
+                                self.optimizer_phases[key] = False
+                for key in self.optimizers.keys():
+                    if self.alternate_freq is not None:
+                        if self.optimizer_phases[key]:
+                            self.optimizers[key].zero_grad()
+                    else:
                         self.optimizers[key].zero_grad()
-                else:
-                    self.optimizers[key].zero_grad()
-            for loss_name, loss_func in loss_func_dict.items():
-                # params = loss_params_dict.get(loss_name, {})
-                loss_stuff = loss_func(self.geom_dict, **loss_params_dict)
-                if isinstance(loss_stuff, dict):
-                    loss_value = loss_stuff.get(loss_name, None)
-                    vis_kwargs.update(loss_stuff)
-                elif isinstance(loss_stuff, tuple) or isinstance(loss_stuff, list):
-                    loss_value = loss_stuff[0]
-                    vis_kwargs.update({loss_name: loss_stuff[0]})
-                else:
-                    loss_value = loss_stuff
-                    vis_kwargs.update({loss_name: loss_stuff})
-                if loss_value is not None:
-                    weight = self.loss_weights_dict.get(loss_name, 1.0)
-                    # Store the per-loss objective term that will actually be used downstream.
-                    # For ALM constraints, this is the augmented loss: λC(θ) + (1/2)μC(θ)^2.
-                    weighted_loss = weight * loss_value
-                    if self.sigmoid_losses:
-                        apply_sigmoid = True
-                        if self.sigmoid_loss_list is not None:
-                            apply_sigmoid = loss_name in set(self.sigmoid_loss_list)
-                        if apply_sigmoid:
-                            weighted_loss = torch.sigmoid(self.sigmoid_softness * weighted_loss) - 0.5
-                    if self.use_alm and loss_name in self.constraints_list:
-                        weighted_loss = (
-                            self.alm_lambdas[loss_name] * weighted_loss
-                            + 0.5 * self.alm_mus[loss_name] * weighted_loss ** 2
-                        )
-                    if weight != 0.0:
-                        self._current_loss_dict[loss_name] = weighted_loss
-                        self._current_uw_loss_dict[loss_name] = loss_value
-                        self.loss_dict[loss_name].append(weighted_loss.detach().item())
-                        self.uw_loss_dict[loss_name].append(loss_value.detach().item())
-                    self.vis_loss_dict[loss_name].append(weighted_loss.item())
-                    self.vis_uw_loss_dict[loss_name].append(loss_value.item())
-                else:
-                    print(f"Warning: {loss_name} did not return a valid loss value.")
+                for loss_name, loss_func in loss_func_dict.items():
+                    # params = loss_params_dict.get(loss_name, {})
+                    loss_stuff = loss_func(self.geom_dict, **loss_params_dict)
+                    if isinstance(loss_stuff, dict):
+                        loss_value = loss_stuff.get(loss_name, None)
+                        vis_kwargs.update(loss_stuff)
+                    elif isinstance(loss_stuff, tuple) or isinstance(loss_stuff, list):
+                        loss_value = loss_stuff[0]
+                        vis_kwargs.update({loss_name: loss_stuff[0]})
+                    else:
+                        loss_value = loss_stuff
+                        vis_kwargs.update({loss_name: loss_stuff})
+                    if loss_value is not None:
+                        weight = self.loss_weights_dict.get(loss_name, 1.0)
+                        # Store the per-loss objective term that will actually be used downstream.
+                        # For ALM constraints, this is the augmented loss: λC(θ) + (1/2)μC(θ)^2.
+                        weighted_loss = weight * loss_value
+                        if self.sigmoid_losses:
+                            apply_sigmoid = True
+                            if self.sigmoid_loss_list is not None:
+                                apply_sigmoid = loss_name in set(self.sigmoid_loss_list)
+                            if apply_sigmoid:
+                                weighted_loss = torch.sigmoid(self.sigmoid_softness * weighted_loss) - 0.5
+                        if self.use_alm and loss_name in self.constraints_list:
+                            weighted_loss = (
+                                self.alm_lambdas[loss_name] * weighted_loss
+                                + 0.5 * self.alm_mus[loss_name] * weighted_loss ** 2
+                            )
+                        if weight != 0.0:
+                            self._current_loss_dict[loss_name] = weighted_loss
+                            self._current_uw_loss_dict[loss_name] = loss_value
+                            self.loss_dict[loss_name].append(weighted_loss.detach().item())
+                            self.uw_loss_dict[loss_name].append(loss_value.detach().item())
+                        self.vis_loss_dict[loss_name].append(weighted_loss.item())
+                        self.vis_uw_loss_dict[loss_name].append(loss_value.item())
+                    else:
+                        print(f"Warning: {loss_name} did not return a valid loss value.")
                 vis_kwargs['loss_dict'] = self.vis_loss_dict
                 vis_kwargs['uw_loss_dict'] = self.vis_uw_loss_dict
                 vis_kwargs['loss_weights_dict'] = self.loss_weights_dict
                 vis_kwargs['loss_func_dict'] = loss_func_dict
                 vis_kwargs['loss_iterations_dict'] = self.loss_iterations_dict
+                
                 if self.use_alm:
                     vis_kwargs['alm_lambdas_history'] = self.alm_lambdas_history
                     vis_kwargs['alm_mus_history'] = self.alm_mus_history
-            self.total_loss.append(self.loss_update_step())
-            
-            # Update ALM history after loss update step
-            if self.use_alm:
-                for constraint_name in self.constraints_list:
-                    self.alm_lambdas_history[constraint_name].append(self.alm_lambdas[constraint_name].item())
-                    self.alm_mus_history[constraint_name].append(self.alm_mus[constraint_name].item())
+                vis_kwargs.update(self.geom_dict)
 
-            # Step the schedulers
-            if len(self.schedulers) > 0:
-                for key in self.schedulers.keys():
-                    if self.alternate_freq is not None:
-                        if not self.optimizer_phases[key]:
-                            continue
-                    self.schedulers[key].step()
-            self.geom_dict = self.geometry.update_points(**self.geom_dict)
+                if self.visualizer is not None and vis_freq is not None:
+                    if (it % vis_freq == 0 or it == n_iter - 1):
+                        vis_kwargs.update({"make_gif": False})
+                        self.visualizer.visualize_progress(**vis_kwargs)
+                if self.visualizer is not None and gif_freq is not None:
+                    if (it % gif_freq == 0 or it == n_iter - 1):
+                        vis_kwargs.update({"make_gif": True})
+                        self.visualizer.visualize_progress(**vis_kwargs)
+                    
+                self.total_loss.append(self.loss_update_step())
+                
+                # Update ALM history after loss update step
+                if self.use_alm:
+                    for constraint_name in self.constraints_list:
+                        self.alm_lambdas_history[constraint_name].append(self.alm_lambdas[constraint_name].item())
+                        self.alm_mus_history[constraint_name].append(self.alm_mus[constraint_name].item())
 
-            if self.clear_cuda_cache and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # Step the schedulers
+                if len(self.schedulers) > 0:
+                    for key in self.schedulers.keys():
+                        if self.alternate_freq is not None:
+                            if not self.optimizer_phases[key]:
+                                continue
+                        self.schedulers[key].step()
+                self.geom_dict = self.geometry.update_points(**self.geom_dict)
 
-            if self._geom_save_enabled:
-                local_step = (it - max_iter) + 1  # 1..n_iter for this optimize() call
-                if local_step % self.save_geom_freq == 0:
-                    self._geom_save_idx += 1
-                    geom_path = os.path.join(self.save_geom_folder, f"geom_{self._geom_save_idx}.pkl")
-                    with open(geom_path, 'wb') as f:
+                if self.revert_on_nan and self._geom_dict_has_nan():
+                    nan_retries += 1
+                    # Revert the parameters/optimizer state and drop this iteration's history
+                    # entries regardless of whether we retry or give up, so neither the saved
+                    # geometry nor the loss histories ever reflect a NaN step.
+                    self._restore_checkpoint(pre_step_checkpoint)
+                    for key, length in history_lengths['loss_iterations_dict'].items():
+                        del self.loss_iterations_dict[key][length:]
+                    for key, length in history_lengths['loss_dict'].items():
+                        del self.loss_dict[key][length:]
+                    for key, length in history_lengths['uw_loss_dict'].items():
+                        del self.uw_loss_dict[key][length:]
+                    for key, length in history_lengths['vis_loss_dict'].items():
+                        del self.vis_loss_dict[key][length:]
+                    for key, length in history_lengths['vis_uw_loss_dict'].items():
+                        del self.vis_uw_loss_dict[key][length:]
+                    del self.total_loss[history_lengths['total_loss']:]
+                    for key, length in history_lengths['alm_lambdas_history'].items():
+                        del self.alm_lambdas_history[key][length:]
+                    for key, length in history_lengths['alm_mus_history'].items():
+                        del self.alm_mus_history[key][length:]
+
+                    if nan_retries > self.max_nan_retries:
+                        print(f"Iter {it+1}: geometry became NaN and max_nan_retries ({self.max_nan_retries}) "
+                            "exceeded; stopping optimization early and keeping the last non-NaN geometry.")
+                        self._stopped_early_on_nan = True
+                        break
+                    else:
+                        print(f"Iter {it+1}: geometry became NaN, reverting to previous step and retrying "
+                            f"(attempt {nan_retries}/{self.max_nan_retries}).")
+                        continue
+
+                if self.clear_cuda_cache and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                if self._geom_save_enabled:
+                    local_step = (it - max_iter) + 1  # 1..n_iter for this optimize() call
+                    if local_step % self.save_geom_freq == 0:
+                        self._geom_save_idx += 1
+                        geom_path = os.path.join(self.save_geom_folder, f"geom_{self._geom_save_idx}.pkl")
+                        with open(geom_path, 'wb') as f:
+                            pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
+                if self.save_best_geom_file is not None and (self.total_loss[-1] == min(self.total_loss) or self.save_last_geom):
+                    with open(self.save_best_geom_file, 'wb') as f:
                         pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
-            if self.save_best_geom_file is not None and (self.total_loss[-1] == min(self.total_loss) or self.save_last_geom):
+                # print(self.geom_dict['string_weights'])
+                
+                if it % print_freq == 0 or it == n_iter - 1:
+                    # print('string weights:', self.geom_dict.get('string_weights'))
+                    loss_str = ' | '.join([f'{key}: {loss_hist[-1]:.4f}' if self.loss_weights_dict.get(key) != 0.0 and len(loss_hist) > 0 else '' for key, loss_hist in self.loss_dict.items()])
+                    print(f'Iter {it+1}/{n_iter}, Total Loss: {self.total_loss[-1]:.4f} | {loss_str}', flush=True)
+                
+                
+                break
+
+        if self._stopped_early_on_nan:
+            # The iteration that triggered the stop never ran the usual save block
+            # (its history was rolled back), so make sure the last non-NaN geometry
+            # still gets persisted via the normal save options before returning.
+            if self.save_best_geom_file is not None:
                 with open(self.save_best_geom_file, 'wb') as f:
-                    pickle.dump(self.geom_dict, f)
-            # print(self.geom_dict['string_weights'])
-            vis_kwargs.update(self.geom_dict)
-            if it % print_freq == 0 or it == n_iter - 1:
-                # print('string weights:', self.geom_dict.get('string_weights'))
-                loss_str = ' | '.join([f'{key}: {loss_hist[-1]:.4f}' if self.loss_weights_dict.get(key) != 0.0 and len(loss_hist) > 0 else '' for key, loss_hist in self.loss_dict.items()])
-                print(f'Iter {it+1}/{n_iter}, Total Loss: {self.total_loss[-1]:.4f} | {loss_str}', flush=True)
-            
-            if self.visualizer is not None and vis_freq is not None:
-                if (it % vis_freq == 0 or it == n_iter - 1):
-                    vis_kwargs.update({"make_gif": False})
-                    self.visualizer.visualize_progress(**vis_kwargs)
-            if self.visualizer is not None and gif_freq is not None:
-                if (it % gif_freq == 0 or it == n_iter - 1):
-                    vis_kwargs.update({"make_gif": True})
-                    self.visualizer.visualize_progress(**vis_kwargs)
-        
+                    pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
+            if self._geom_save_enabled:
+                self._geom_save_idx += 1
+                geom_path = os.path.join(self.save_geom_folder, f"geom_{self._geom_save_idx}.pkl")
+                with open(geom_path, 'wb') as f:
+                    pickle.dump(self._snapshot_geom_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
+
         return self.geom_dict
     
 class CustomWeight(WeightModel):

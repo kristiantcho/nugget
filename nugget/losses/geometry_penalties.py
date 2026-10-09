@@ -11,6 +11,7 @@ except ImportError:
 
 from nugget.losses.base_loss import LossFunction
 
+
 class BoundaryPenalty(LossFunction):
     """Loss function for boundary penalties."""
     def __init__(self, device=None):
@@ -115,8 +116,8 @@ class StringBoundaryPenaltyCircle(LossFunction):
         domain_size = kwargs.get('boundary_range', 2.0)
         string_weights = geom_dict.get('string_weights', None)
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else 1.0
-        boundary_sharpness = kwargs.get('boundary_sharpness', 10.0)
-        clamped_string_xy = torch.sigmoid(boundary_sharpness * (torch.sqrt(string_xy[:,0] ** 2 + string_xy[:,1] ** 2) - domain_size/2))
+        # boundary_sharpness = kwargs.get('boundary_sharpness', 10.0)
+        clamped_string_xy = torch.nn.functional.softplus((torch.sqrt(string_xy[:,0] ** 2 + string_xy[:,1] ** 2 + 1e-8) - domain_size/2))
         # clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy))
         return {'string_boundary_penalty': torch.mean(clamped_string_xy * string_probs)}
 
@@ -218,7 +219,7 @@ class LocalRepulsionPenalty(LossFunction):
         radius_weight = torch.sigmoid((max_radius - dist) * sharpness)  # Sharp transition around max_radius
         # radius_mask  = (dist < max_radius) & (~self_mask)
         # radius_weight = radius_mask.int()
-        radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
+        radius_weight = radius_weight * (~self_mask).double()  # Zero out self-pairs
         # print(f"total radius weight: {torch.sum(radius_weight)}")
         repulsion_matrix = radius_weight / (dist_sq + min_dist)
         # print(f"Max repulsion value: {torch.max(repulsion_matrix)}")
@@ -296,17 +297,68 @@ class LocalStringRepulsionPenalty(LossFunction):
         """
         super().__init__(device)
 
+    @staticmethod
+    def _repulsion_core(string_xy, string_weights, max_radius, beta, ignore_border, domain_size):
+        """Pure-tensor repulsion core. Returns (repulsion, repulsion_per_string).
+
+        Soft quadratic hinge: penalty per pair grows as strings get closer than
+        max_radius and is ~0 once they are beyond it. Unlike the previous
+        sigmoid((max_radius - dist) * sharpness) indicator -- which saturated to a
+        constant 1 for close pairs and therefore had a VANISHING gradient exactly
+        where repulsion is most needed -- this hinge keeps a live, growing repulsive
+        force all the way down to contact (dist -> 0).
+
+          h(dist)  = 1 - dist / max_radius            (>0 inside radius, <0 outside)
+          hinge    = softplus(beta * h) / beta        (smooth relu; ->0 as dist>>R)
+          pair_pen = hinge ** 2                        (quadratic; C1, force grows to R)
+
+        softplus (rather than a hard relu) rounds the corner at dist == max_radius so
+        the term stays differentiable there; `beta` controls how sharp that corner is
+        and how quickly the penalty decays to ~0 beyond max_radius.
+        """
+        n = string_xy.shape[0]
+        # Compute pairwise squared distances
+        diff = string_xy.unsqueeze(1) - string_xy.unsqueeze(0)  # (n, n, 2)
+        dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
+        dist = torch.sqrt(dist_sq + 1e-10)  # Add small epsilon for numerical stability
+
+        self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
+        h = 1.0 - dist / max_radius
+        hinge = F.softplus(beta * h) / beta
+        radius_weight = hinge ** 2
+        radius_weight = radius_weight * (~self_mask).double()  # Zero out self-pairs
+
+        if ignore_border:
+            clamped_string_xy = torch.clamp(torch.abs(string_xy) - domain_size / 2, min=0.0) ** 2
+            clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy, dim=1))
+            border_mask = (clamped_string_xy < 1e-3).unsqueeze(1) | (clamped_string_xy < 1e-3).unsqueeze(0)
+            radius_weight = radius_weight * (~border_mask).double()
+
+        if string_weights is not None:
+            string_probs = torch.sigmoid(string_weights)
+            # Outer product for all pairs
+            weight_matrix = string_probs.unsqueeze(1) * string_probs.unsqueeze(0)  # (n, n)
+            repulsion_matrix = weight_matrix * radius_weight
+            repulsion_per_string = repulsion_matrix.sum(dim=1)  # Total repulsion for each string
+            repulsion = repulsion_per_string.mean()
+        else:
+            # Mirror weighted behavior with implicit unit weights.
+            repulsion_per_string = radius_weight.sum(dim=1)
+            repulsion = repulsion_per_string.mean()
+
+        return repulsion, repulsion_per_string
+
     def __call__(self, geom_dict, **kwargs):
         """
         Compute repulsion penalty between strings, but only for pairs within a given radius.
-        
+
         Parameters:
         -----------
         geom_dict : dict
             Geometry dictionary containing 'string_xy' and optional 'string_weights' keys.
         **kwargs
             Additional keyword arguments including 'max_radius' and 'min_dist'.
-            
+
         Returns:
         --------
         torch.Tensor
@@ -316,66 +368,24 @@ class LocalStringRepulsionPenalty(LossFunction):
         string_weights = geom_dict.get('string_weights', None)
         max_radius = kwargs.get('max_radius', 0.1)
         min_dist = kwargs.get('min_dist', 1e-3)
-        sharpness = kwargs.get('local_sharpness', 10.0)  # Controls steepness of sigmoid transition
+        # Softness of the hinge corner at max_radius (dimensionless, on the normalized
+        # overshoot h = 1 - dist/max_radius). Larger -> sharper cutoff, i.e. the penalty
+        # decays to ~0 faster once dist exceeds max_radius.
+        sharpness = kwargs.get('local_sharpness', 10.0)
         ignore_border = kwargs.get('ignore_border', False)
         domain_size = kwargs.get('boundary_range', 2.0)
-        
+
         if string_xy is None:
             return {'local_string_repulsion_penalty': torch.tensor(0.0)}
         n = string_xy.shape[0]
         if n == 0:
             return {'local_string_repulsion_penalty': torch.tensor(0.0)}
-        # Compute pairwise squared distances
-        diff = string_xy.unsqueeze(1) - string_xy.unsqueeze(0)  # (n, n, 2)
-        dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
-        dist = torch.sqrt(dist_sq + 1e-10)  # Add small epsilon for numerical stability
-        
-        # Soft mask using sigmoid - smoother transition at radius boundary
-        self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
-        radius_weight = torch.sigmoid((max_radius - dist) * sharpness)  # Sharp transition around max_radius
-        # radius_weight = torch.ones_like(dist)
-        # radius_mask = dist < max_radius
-        # radius_weight = radius_weight * radius_mask.float()
-        radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
-        
-        if ignore_border:
-            clamped_string_xy = torch.clamp(torch.abs(string_xy) - domain_size/2, min=0.0)** 2
-            clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy, dim=1))
-            border_mask = (clamped_string_xy < 1e-3).unsqueeze(1) | (clamped_string_xy < 1e-3).unsqueeze(0)
-            radius_weight = radius_weight * (~border_mask).float()
-        repulsion = 0.0
-        repulsion_per_string = torch.zeros(n, device=string_xy.device)
-        if string_weights is not None:
-            string_probs = torch.sigmoid(string_weights)
-            # Outer product for all pairs
-            weight_matrix = string_probs.unsqueeze(1) * string_probs.unsqueeze(0)  # (n, n)
-            # repulsion_matrix = weight_matrix * radius_weight / (dist_sq + min_dist)
-            repulsion_matrix = weight_matrix * radius_weight #* torch.exp(-dist_sq / (max_radius**2 + 1e-10))
-            # repulsion = torch.sum(repulsion_matrix) / n
-            # num_neighbors_per_string = radius_weight.sum(dim=1)  # Count neighbors for each string
-            repulsion_per_string = repulsion_matrix.sum(dim=1)  # Total repulsion for each string
-            
-            # Avoid division by zero and normalize
-            # normalized_repulsion = torch.where(
-            #     num_neighbors_per_string > 0,
-            #     repulsion_per_string / (num_neighbors_per_string + 1e-10),
-            #     torch.zeros_like(repulsion_per_string)
-            # )
-            # repulsion_per_string = normalized_repulsion
-            repulsion = repulsion_per_string.mean() #* string_probs.sum()
-        else:
-            # Mirror weighted behavior with implicit unit weights.
-            # This keeps the same smooth, differentiable dependence on string_xy.
-            repulsion_matrix = radius_weight
-            # num_neighbors_per_string = radius_weight.sum(dim=1)
-            repulsion_per_string = repulsion_matrix.sum(dim=1)
-            # normalized_repulsion = torch.where(
-            #     num_neighbors_per_string > 0,
-            #     repulsion_per_string / (num_neighbors_per_string + 1e-10),
-            #     torch.zeros_like(repulsion_per_string)
-            # )
-            # repulsion_per_string = normalized_repulsion
-            repulsion = repulsion_per_string.mean()
+
+        beta = max(float(sharpness), 1e-6)
+
+        repulsion, repulsion_per_string = self._repulsion_core(
+            string_xy, string_weights, max_radius, beta, ignore_border, domain_size,
+        )
         return {
             'local_string_repulsion_penalty': repulsion,
             'local_string_repulsion_penalty_per_string': repulsion_per_string,
@@ -551,7 +561,7 @@ class LocalZDistRepulsionPenalty(LossFunction):
                     z_dist = torch.sqrt(z_dist_sq + 1e-10)  # Add small epsilon for numerical stability
                     self_mask = torch.eye(num_points, dtype=torch.bool, device=z_values.device)
                     radius_weight = torch.sigmoid((max_radius - z_dist) * sharpness)  # Sharp transition around max_radius
-                    radius_weight = radius_weight * (~self_mask).float()  # Zero out self-pairs
+                    radius_weight = radius_weight * (~self_mask).double()  # Zero out self-pairs
 
                     repulsion += torch.sum(radius_weight * (1.0 / (z_dist_sq + min_dist)))
                     total_valid_pairs += torch.sum(radius_weight > 0).item()
@@ -872,13 +882,17 @@ class ROVPenalty(LossFunction):
     def _compute_blockage_per_angle_default(
         self, all_relative, angles, half_height, tri_length, rec_width,
         soft_inside=False, inside_sharpness=5.0, other_probs=None,
-        use_chunked=False, chunk_size=16,
+        use_chunked=False, chunk_size=16, use_softplus=False,
     ):
         """Vectorized triangle+rectangle blockage via per-angle rotation.
 
-        Pure-tensor core (no kwargs/dict access) so it can be wrapped with
-        torch.compile independently of __call__'s dynamic argument parsing.
         Mirrors _compute_blockage_per_angle_alt's role for the non-alt path.
+
+        For the soft_inside path, each per-constraint half-plane membership gate is by
+        default sigmoid(k*margin) (bounded in [0,1]). If `use_softplus=True`, the gate
+        is instead the bounded softplus-shaped gate sp/(1+sp) with sp=softplus(k*margin)
+        (~0 outside the constraint, ->1 deep inside); still in [0,1) so the product
+        (soft-AND) and 1-(1-a)(1-b) (soft-OR) combination stays valid.
         """
         L_tri = tri_length
         L_rect = rec_width
@@ -891,11 +905,18 @@ class ROVPenalty(LossFunction):
 
         num_angles = angles.shape[0]
 
+       
+        def _gate(m, k):
+            if use_softplus:
+                sp = F.softplus(k * m)
+                return sp / (1.0 + sp)
+            return torch.sigmoid(k * m)
+
         if use_chunked:
             k = inside_sharpness
 
             def _soft_between(x, lo, hi):
-                return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
+                return _gate(x - lo, k) * _gate(hi - x, k)
 
             blockage_per_angle = torch.zeros(
                 all_relative.shape[0], num_angles, device=all_relative.device, dtype=all_relative.dtype)
@@ -908,11 +929,11 @@ class ROVPenalty(LossFunction):
                 y_rot_abs = (rel_expanded[..., 0] * s_ch + rel_expanded[..., 1] * c_ch).abs()
 
                 tri_x      = _soft_between(x_rot, 0.0, L_tri)
-                tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
+                tri_y      = _gate(slope * x_rot - y_rot_abs, k)
                 inside_tri = tri_x * tri_y
 
                 rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
-                rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
+                rect_y      = _gate(half_height - y_rot_abs, k)
                 inside_rect = rect_x * rect_y
 
                 inside_ch = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)   # (N, N-1, chunk)
@@ -931,41 +952,43 @@ class ROVPenalty(LossFunction):
         if not soft_inside:
             inside_tri  = (x_rot >= 0) & (x_rot <= L_tri) & (y_rot_abs <= slope * x_rot)
             inside_rect = (x_rot >= L_tri) & (x_rot <= L_tri + L_rect) & (y_rot_abs <= half_height)
-            inside = (inside_rect | inside_tri).float()
+            inside = (inside_rect | inside_tri).double()
         else:
             k = inside_sharpness
 
             def _soft_between(x, lo, hi):
-                return torch.sigmoid(k * (x - lo)) * torch.sigmoid(k * (hi - x))
+                return _gate(x - lo, k) * _gate(hi - x, k)
 
             tri_x      = _soft_between(x_rot, 0.0, L_tri)
-            tri_y      = torch.sigmoid(k * (slope * x_rot - y_rot_abs))
+            tri_y      = _gate(slope * x_rot - y_rot_abs, k)
             inside_tri = tri_x * tri_y
 
             rect_x      = _soft_between(x_rot, L_tri, L_tri + L_rect)
-            rect_y      = torch.sigmoid(k * (half_height - y_rot_abs))
+            rect_y      = _gate(half_height - y_rot_abs, k)
             inside_rect = rect_x * rect_y
 
             inside = 1.0 - (1.0 - inside_rect) * (1.0 - inside_tri)
 
         if other_probs is not None:
-            blockage_per_angle = (inside.float() * other_probs.unsqueeze(-1)).sum(dim=1)
+            blockage_per_angle = (inside.double() * other_probs.unsqueeze(-1)).sum(dim=1)
         else:
-            blockage_per_angle = inside.float().sum(dim=1)
+            blockage_per_angle = inside.double().sum(dim=1)
 
         return blockage_per_angle
+
 
     def __call__(self, geom_dict, **kwargs):
         """
         points: (N, 2) tensor of 2D points
-        Returns: scalar penalty loss
+        Returns: dict with 'rov_penalty' (scalar), 'rov_penalty_per_string' (N,), and
+                 'rov_least_blocked_angle_per_string' (N,).
+
         """
         points = geom_dict.get('string_xy', None)
         num_angles = kwargs.get('num_angles', 6)
         string_weights = geom_dict.get('string_weights', None)
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
 
-        # Backward-compatible options (defaults preserve old behavior):
         # - soft_inside=False: use hard boolean masks for corridor membership (non-differentiable w.r.t. positions)
         # - angle_softmin_tau=0.0: use hard min over angles (non-differentiable at argmin switches)
         # - detach_other_probs=True: do not backprop into blocking strings' weights
@@ -974,7 +997,9 @@ class ROVPenalty(LossFunction):
         angle_softmin_tau = float(kwargs.get('rov_angle_softmin_tau', 0.0))
         detach_other_probs = kwargs.get('detach_other_probs', True)
         alt_mode = bool(kwargs.get('rov_alt_mode', False))
-
+        # soft_inside gate: default bounded sigmoid; if True, use the unbounded
+        # softplus(k*m)/k one-sided hinge instead (only affects the soft_inside path).
+        inside_use_softplus = bool(kwargs.get('rov_inside_use_softplus', False))
         N = points.shape[0]
         
         # Vectorized computation
@@ -990,7 +1015,7 @@ class ROVPenalty(LossFunction):
             num_angles,
             device=points.device,
         )
-        
+
         # Geometry checks
         # Intended shape: a triangular "nose" starting at the string that widens
         # to the corridor width, followed by a rectangular corridor.
@@ -1019,20 +1044,6 @@ class ROVPenalty(LossFunction):
                 rec_width=L_rect,
                 other_probs=other_probs,
             )
-            angle_scores_per_angle = blockage_per_angle
-
-            if angle_softmin_tau > 0.0:
-                penalty_per_string = -angle_softmin_tau * torch.logsumexp(
-                    -blockage_per_angle / angle_softmin_tau, dim=1
-                )
-                penalty_per_string = penalty_per_string.clamp(min=0.0)
-            else:
-                penalty_per_string = blockage_per_angle.min(dim=1)[0]
-
-            if string_probs is not None:
-                loss = (penalty_per_string * string_probs).sum()
-            else:
-                loss = penalty_per_string.sum()
 
         else:
             if string_probs is not None:
@@ -1059,41 +1070,36 @@ class ROVPenalty(LossFunction):
                 other_probs=other_probs,
                 use_chunked=use_chunked,
                 chunk_size=chunk_size,
+                use_softplus=inside_use_softplus,
             )
-            angle_scores_per_angle = blockage_per_angle
 
-            if other_probs is not None:
-                if angle_softmin_tau > 0.0:
-                    penalty_per_string = -angle_softmin_tau * torch.logsumexp(
-                        -blockage_per_angle / angle_softmin_tau, dim=1
-                    )
-                    penalty_per_string = penalty_per_string.clamp(min=0.0)
-                else:
-                    penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
+        angle_scores_per_angle = blockage_per_angle
 
-                # Weight by string probability and sum
-                loss = (penalty_per_string * string_probs).sum()
-            else:
-                if angle_softmin_tau > 0.0:
-                    penalty_per_string = -angle_softmin_tau * torch.logsumexp(
-                        -blockage_per_angle / angle_softmin_tau, dim=1
-                    )
-                    penalty_per_string = penalty_per_string.clamp(min=0.0)
-                else:
-                    penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
+        # --- Per-string penalty and reported least-blocked heading ---
+        
+        if angle_softmin_tau > 0.0:
+            penalty_per_string = -angle_softmin_tau * torch.logsumexp(
+                -blockage_per_angle / angle_softmin_tau, dim=1
+            )
+            penalty_per_string = penalty_per_string.clamp(min=0.0)
+        else:
+            penalty_per_string = blockage_per_angle.min(dim=1)[0]  # (N,)
 
-                loss = penalty_per_string.sum()
-
-        # Reporting: least-blocked angle per string (hard argmin), regardless of
-        # whether a softmin was used for the penalty aggregation.
-        # Use a small tolerance when selecting the least-blocked angle so
-        # numerically equivalent boundary bins resolve to the first bin
-        # consistently across alt and non-alt implementations.
+        # Reported least-blocked angle (hard argmin over near-min bins). A small
+        # tolerance resolves numerically-equivalent boundary bins to the first bin
+        # consistently across the alt and non-alt implementations.
         min_scores = angle_scores_per_angle.min(dim=1, keepdim=True)[0]
         tie_tol = 1e-6
         near_min_mask = angle_scores_per_angle <= (min_scores + tie_tol)
         least_blocked_angle_idx_per_string = near_min_mask.to(torch.int64).argmax(dim=1)  # (N,)
         least_blocked_angle_per_string = angles[least_blocked_angle_idx_per_string]  # (N,)
+
+        # Aggregate into the scalar loss, weighting by string probability if available.
+        if string_probs is not None:
+            loss = (penalty_per_string * string_probs).sum()
+        else:
+            loss = penalty_per_string.sum()
+
         # least_blocked_angle_deg_per_string = least_blocked_angle_per_string * (180.0 / torch.pi)
         penalty_per_string = torch.clamp(penalty_per_string, min=0.0)  # Ensure non-negative for reporting
         return {
@@ -1314,7 +1320,7 @@ class DiversityPenalty(LossFunction):
             if value is None:
                 continue
             if not isinstance(value, torch.Tensor):
-                value = torch.as_tensor(value, device=self.device, dtype=torch.float32)
+                value = torch.as_tensor(value, device=self.device, dtype=torch.float64)
             elif value.device != self.device:
                 value = value.to(self.device)
             moved_geometry[key] = value

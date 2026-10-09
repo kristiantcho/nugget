@@ -8,7 +8,7 @@ from torch.func import jacrev, jacfwd, vmap, linearize
 from torch.func import jvp as func_jvp
 
 
-def _pos_norm_divisor_from_domain_size(domain_size, *, device, dtype=torch.float32):
+def _pos_norm_divisor_from_domain_size(domain_size, *, device, dtype=torch.float64):
     """Match LLRnet's norm_pos scaling.
 
     - Scalar domain_size: divide all coordinates by (domain_size/2).
@@ -210,7 +210,7 @@ def _sample_detector_responses_batched(
       responses_processed: (L, B) after noise + optional log scaling
       light_yields_true:   (L, B) pre-noise (used for masking)
     """
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
     B = pts_3.shape[0]
     responses_list = []
     ly_list = []
@@ -218,10 +218,10 @@ def _sample_detector_responses_batched(
         for _ in range(llr_iterations):
             resp = surrogate_func(opt_point=pts_3, event_params=params_for_sampling)
             if isinstance(resp, np.ndarray):
-                resp = torch.tensor(resp, device=device, dtype=torch.float32)
+                resp = torch.tensor(resp, device=device, dtype=torch.float64)
             elif not isinstance(resp, torch.Tensor):
-                resp = torch.tensor(resp, device=device, dtype=torch.float32)
-            resp = resp.float().to(device).reshape(-1)
+                resp = torch.tensor(resp, device=device, dtype=torch.float64)
+            resp = resp.double().to(device).reshape(-1)
             if resp.numel() != B:
                 if resp.numel() == 1:
                     resp = resp.expand(B)
@@ -266,7 +266,7 @@ def _build_features_from_cached_responses(
         fixed_params=fixed_params,
     )
 
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
     if pts_3.dim() == 1:
         pts_3 = pts_3.unsqueeze(0)
     B = pts_3.shape[0]
@@ -285,10 +285,10 @@ def _build_features_from_cached_responses(
     if bool(getattr(llr_net, 'add_relative_pos', False)) and ('position' in params):
         event_pos = params['position']
         if isinstance(event_pos, np.ndarray):
-            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float64)
         elif not isinstance(event_pos, torch.Tensor):
-            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
-        event_pos = event_pos.float().to(device)
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float64)
+        event_pos = event_pos.double().to(device)
         if event_pos.dim() == 1:
             event_pos = event_pos.unsqueeze(0)
         relative_pos = pts_3 - event_pos
@@ -297,19 +297,19 @@ def _build_features_from_cached_responses(
     if bool(getattr(llr_net, 'add_distance_from_beam', False)) and ("direction" in params) and ("position" in params):
         track_dir = params["direction"]
         if isinstance(track_dir, np.ndarray):
-            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float32)
+            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float64)
         elif not isinstance(track_dir, torch.Tensor):
-            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float32)
-        track_dir = track_dir.float().to(device)
+            track_dir = torch.tensor(track_dir, device=device, dtype=torch.float64)
+        track_dir = track_dir.double().to(device)
         if track_dir.dim() == 1:
             track_dir = track_dir.unsqueeze(0)
 
         event_pos = params["position"]
         if isinstance(event_pos, np.ndarray):
-            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float64)
         elif not isinstance(event_pos, torch.Tensor):
-            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float32)
-        event_pos = event_pos.float().to(device)
+            event_pos = torch.tensor(event_pos, device=device, dtype=torch.float64)
+        event_pos = event_pos.double().to(device)
         if event_pos.dim() == 1:
             event_pos = event_pos.unsqueeze(0)
 
@@ -322,10 +322,10 @@ def _build_features_from_cached_responses(
             continue
         feature = params[key]
         if isinstance(feature, np.ndarray):
-            feature = torch.tensor(feature, device=device, dtype=torch.float32)
+            feature = torch.tensor(feature, device=device, dtype=torch.float64)
         elif not isinstance(feature, torch.Tensor):
-            feature = torch.tensor(feature, device=device, dtype=torch.float32)
-        feature = feature.float().to(device)
+            feature = torch.tensor(feature, device=device, dtype=torch.float64)
+        feature = feature.double().to(device)
         if bool(getattr(llr_net, 'log_scale_energy', False)) and key == 'energy':
             feature = torch.log10(feature + 1e-10)
         if bool(getattr(llr_net, 'norm_pos', False)) and key == 'position':
@@ -378,7 +378,7 @@ def _sample_rich_observations(
         for iteration l, point b. For charge: a scalar tensor. For PATD: a dict.
     cached_ly_true : (L, B) float tensor of light yields for masking.
     """
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
     B = pts_3.shape[0]
     is_patd = bool(getattr(llr_net, 'use_patd', False))
 
@@ -402,14 +402,14 @@ def _sample_rich_observations(
                                if isinstance(r.get('num_photons', 0), torch.Tensor)
                                else r.get('num_photons', 0))
                          for r in obs_row],
-                        dtype=torch.float32, device=device,
+                        dtype=torch.float64, device=device,
                     )
                 else:
                     if isinstance(batch_raw, dict):
                         batch_raw = batch_raw.get('light_yield', next(iter(batch_raw.values())))
                     if not isinstance(batch_raw, torch.Tensor):
                         raise TypeError
-                    batch_raw = batch_raw.detach().float().reshape(-1)
+                    batch_raw = batch_raw.detach().double().reshape(-1)
                     if batch_raw.numel() != B:
                         raise ValueError
                     obs_row = batch_raw          # keep as tensor, no per-element Python loop
@@ -426,12 +426,12 @@ def _sample_rich_observations(
                         if isinstance(raw, dict):
                             raw = raw.get('light_yield', next(iter(raw.values())))
                         if isinstance(raw, torch.Tensor):
-                            raw = raw.detach().float()
+                            raw = raw.detach().double()
                         else:
-                            raw = torch.tensor(float(raw), dtype=torch.float32, device=device)
+                            raw = torch.tensor(float(raw), dtype=torch.float64, device=device)
                         ly_vals.append(float(raw.item()))
                     obs_row.append(raw)
-                ly_row_t = torch.tensor(ly_vals, dtype=torch.float32, device=device)
+                ly_row_t = torch.tensor(ly_vals, dtype=torch.float64, device=device)
 
             cached_obs.append(obs_row)
             ly_tensor_rows.append(ly_row_t)
@@ -472,7 +472,7 @@ def _build_rich_features_from_cached_obs(
         fixed_params=fixed_params,
     )
 
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
     if pts_3.dim() == 1:
         pts_3 = pts_3.unsqueeze(0)
     B = pts_3.shape[0]
@@ -486,23 +486,23 @@ def _build_rich_features_from_cached_obs(
     if vert is None:
         raise KeyError("'position' not found in params for rich feature builder")
     if isinstance(vert, np.ndarray):
-        vert = torch.tensor(vert, device=device, dtype=torch.float32)
-    vert = vert.float().to(device).reshape(1, 3) / norm  # (1, 3)
+        vert = torch.tensor(vert, device=device, dtype=torch.float64)
+    vert = vert.double().to(device).reshape(1, 3) / norm  # (1, 3)
 
     direction = params.get('direction')
     if direction is None:
         raise KeyError("'direction' not found in params for rich feature builder")
     if isinstance(direction, np.ndarray):
-        direction = torch.tensor(direction, device=device, dtype=torch.float32)
-    direction = direction.float().to(device).reshape(1, 3)  # (1, 3)
+        direction = torch.tensor(direction, device=device, dtype=torch.float64)
+    direction = direction.double().to(device).reshape(1, 3)  # (1, 3)
     dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)  # (1, 1)
 
     energy = params.get('energy')
     if energy is None:
         raise KeyError("'energy' not found in params for rich feature builder")
     if isinstance(energy, np.ndarray):
-        energy = torch.tensor(energy, device=device, dtype=torch.float32)
-    log_energy = torch.log10(energy.float().to(device).squeeze() + 1e-10) / 8.0  # scalar
+        energy = torch.tensor(energy, device=device, dtype=torch.float64)
+    log_energy = torch.log10(energy.double().to(device).squeeze() + 1e-10) / 8.0  # scalar
 
     # Batched geometry over B points — one operation, not B scalar calls
     det = pts_3 / norm                                      # (B, 3)
@@ -537,9 +537,9 @@ def _build_rich_features_from_cached_obs(
             for b in range(B):
                 ly_raw = cached_obs[l][b]
                 if isinstance(ly_raw, torch.Tensor):
-                    val = ly_raw.float().to(device).squeeze()
+                    val = ly_raw.double().to(device).squeeze()
                 else:
-                    val = torch.tensor(float(ly_raw), dtype=torch.float32, device=device)
+                    val = torch.tensor(float(ly_raw), dtype=torch.float64, device=device)
                 obs_b.append(torch.log10(torch.abs(val) + 1e-10) / 4.0)
             obs_rows.append(torch.stack(obs_b))          # (B,)
         log_ly = torch.stack(obs_rows).unsqueeze(-1)     # (L, B, 1) — detached constants
@@ -555,14 +555,14 @@ def _build_rich_features_from_cached_obs(
         for l in range(L):
             for b in range(B):
                 raw = cached_obs[l][b]
-                hit_times = raw['hit_times'].float().to(device)
+                hit_times = raw['hit_times'].double().to(device)
                 if bool(getattr(llr_net, 'rel_time', False)):
                     t_geom_min = raw.get('t_geom_min', None)
                     if t_geom_min is not None:
                         if not isinstance(t_geom_min, torch.Tensor):
                             t_geom_min = torch.tensor(t_geom_min, device=device, dtype=hit_times.dtype)
                         else:
-                            t_geom_min = t_geom_min.float().to(device)
+                            t_geom_min = t_geom_min.double().to(device)
                         hit_times = hit_times - t_geom_min
                 t_scaled = torch.where(
                     hit_times < 0,
@@ -664,7 +664,7 @@ def _fisher_points_all_iters_jvp(
         B = pts_3.shape[0]
         L = llr_iterations
         norm_const = llr_net._pos_norm_divisor()
-        det_const = (pts_3.float().to(device) / norm_const).detach()
+        det_const = (pts_3.double().to(device) / norm_const).detach()
 
         # cached_ly_true is already (L, B) — use it directly, no Python loop needed.
         log_ly_const = (torch.log10(cached_ly_true.abs() + 1e-10) / 4.0).unsqueeze(-1).detach()  # (L, B, 1)
@@ -677,10 +677,10 @@ def _fisher_points_all_iters_jvp(
                 theta_numels=theta_numels,
                 fixed_params=fixed_params,
             )
-            vert = params['position'].float().to(device).reshape(1, 3) / norm_const
-            direction = params['direction'].float().to(device).reshape(1, 3)
+            vert = params['position'].double().to(device).reshape(1, 3) / norm_const
+            direction = params['direction'].double().to(device).reshape(1, 3)
             dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
-            energy = params['energy'].float().to(device).squeeze()
+            energy = params['energy'].double().to(device).squeeze()
             log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
 
             rel = det_const - vert
@@ -811,7 +811,7 @@ def _fisher_points_patd_quadrature(
     uninformative, but not exactly zero (so downstream inverses stay well-posed).
     """
     B = pts_3.shape[0]
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
 
     if llr_net is None and eval_patd_log_probs is None:
         raise ValueError(
@@ -848,7 +848,7 @@ def _fisher_points_patd_quadrature(
                 for b, r in enumerate(raw_batch):
                     if isinstance(r, dict):
                         tgm = r.get('t_geom_min', torch.tensor(0.0))
-                        tgm = tgm.float().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
+                        tgm = tgm.double().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
                         t_geom_min_per_pt[b] = tgm
                         n = r.get('expected_photons', r.get('num_photons', 0))
                         lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
@@ -859,7 +859,7 @@ def _fisher_points_patd_quadrature(
                 raise TypeError  # dict means single-point; fall through to loop
             elif isinstance(raw_batch, torch.Tensor):
                 # scalar surrogate: no t_geom_min available, default to 0
-                lambda_per_pt = raw_batch.detach().float().reshape(-1)[:B]
+                lambda_per_pt = raw_batch.detach().double().reshape(-1)[:B]
             else:
                 raise TypeError
         except Exception:
@@ -867,7 +867,7 @@ def _fisher_points_patd_quadrature(
                 r = surrogate_func(opt_point=pts_3[b], event_params=params0)
                 if isinstance(r, dict):
                     tgm = r.get('t_geom_min', torch.tensor(0.0))
-                    tgm = tgm.float().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
+                    tgm = tgm.double().mean() if isinstance(tgm, torch.Tensor) else torch.tensor(float(tgm))
                     t_geom_min_per_pt[b] = tgm
                     n = r.get('expected_photons', r.get('num_photons', 0))
                     lambda_per_pt[b] = float(n.item()) if isinstance(n, torch.Tensor) else float(n)
@@ -971,10 +971,10 @@ def _fisher_points_patd_quadrature(
                     theta_numels=theta_numels,
                     fixed_params=fixed_params,
                 )
-                vert = params['position'].float().to(device).reshape(1, 3) / norm_const
-                direction = params['direction'].float().to(device).reshape(1, 3)
+                vert = params['position'].double().to(device).reshape(1, 3) / norm_const
+                direction = params['direction'].double().to(device).reshape(1, 3)
                 dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
-                energy = params['energy'].float().to(device).squeeze()
+                energy = params['energy'].double().to(device).squeeze()
                 log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(B, 1)
 
                 rel = det_s - vert
@@ -1294,7 +1294,7 @@ def _fisher_points_charge_quadrature(
         )
 
     B = pts_3.shape[0]
-    pts_3 = pts_3.float().to(device)
+    pts_3 = pts_3.double().to(device)
 
     norm_const = llr_net._pos_norm_divisor()
     det_const = (pts_3 / norm_const).detach()  # (B, 3)
@@ -1315,10 +1315,10 @@ def _fisher_points_charge_quadrature(
             theta_numels=theta_numels,
             fixed_params=fixed_params,
         )
-        vert = params['position'].float().to(device).reshape(1, 3) / norm_const
-        direction = params['direction'].float().to(device).reshape(1, 3)
+        vert = params['position'].double().to(device).reshape(1, 3) / norm_const
+        direction = params['direction'].double().to(device).reshape(1, 3)
         dir_norm = torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
-        energy = params['energy'].float().to(device).squeeze()
+        energy = params['energy'].double().to(device).squeeze()
         log_energy = (torch.log10(energy + 1e-10) / 8.0).reshape(1, 1).expand(Bc, 1)
 
         rel = det_const - vert
@@ -1374,7 +1374,7 @@ def _fisher_points_charge_quadrature(
             try:
                 raw = surrogate_func(opt_point=pts_3, event_params=params0)
                 if isinstance(raw, torch.Tensor):
-                    lambda_per_pt = raw.detach().float().reshape(-1)[:B]
+                    lambda_per_pt = raw.detach().double().reshape(-1)[:B]
                 elif isinstance(raw, (list, tuple)) and len(raw) == B:
                     for b, r in enumerate(raw):
                         if isinstance(r, dict):
@@ -1783,14 +1783,15 @@ def directional_resolution(F3, n):
     is_batched = F3.dim() == 3
     
     if not is_batched:
-        # Single input case - normalize and compute
+        # Single input case - normalize and compute. Epsilon-guard the norm so a
+        # degenerate (zero) direction does not give 0/0 = NaN.
         n = n / torch.norm(n)
 
         # --- Build tangent basis B (3x2) ---
         ref = torch.tensor([0.0, 0.0, 1.0], dtype=n.dtype, device=n.device)
         if abs(torch.dot(n, ref)) > 0.9:
             ref = torch.tensor([1.0, 0.0, 0.0], dtype=n.dtype, device=n.device)
-        
+
         b1 = torch.cross(n, ref)
         b1 = b1 / torch.norm(b1)
         b2 = torch.cross(n, b1)
@@ -1803,7 +1804,7 @@ def directional_resolution(F3, n):
         # finite when F2 is near-singular (zero-Fisher strings); the gradient of
         # inverse scales like O(1/eps^2), so 1e-10 -> ~1e20. 1e-6 keeps it bounded
         # while remaining small relative to physically-informative Fisher values.
-        F2 = F2 + 1e-6 * torch.eye(2, device=F2.device, dtype=F2.dtype)
+        # F2 = F2 + 1e-12 * torch.eye(2, device=F2.device, dtype=F2.dtype)
 
         # --- Invert to get covariance ---
         try:
@@ -1812,12 +1813,21 @@ def directional_resolution(F3, n):
             Cov2 = torch.pinverse(F2)
 
         # --- Angular resolution (approx small-angle) ---
-        eigvals = torch.linalg.eigvalsh(Cov2)
-        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
-        # eigvals = torch.clamp_min(eigvals, 1e-10)  # Ensure positive eigenvalues
-        sigma_eff = torch.sqrt(torch.mean(eigvals) + 1e-10)  # Add epsilon for numerical stability
+        # Closed-form 2x2 symmetric eigenvalues instead of torch.linalg.eigvalsh,
+        # whose backward has 1/(lambda_i - lambda_j) terms that NaN for degenerate
+        # eigenvalues (Cov2 ~ (1/eps)*I when the Fisher matrix is near-zero, e.g.
+        # all sigmoided string weights ~0). Discriminant is a sum of squares so
+        # sqrt never sees a negative arg; +1e-12 keeps its gradient finite.
+        c00 = Cov2[0, 0]
+        c11 = Cov2[1, 1]
+        c01 = Cov2[0, 1]
+        half_tr = 0.5 * (c00 + c11)
+        half_gap = torch.sqrt((0.5 * (c00 - c11)) ** 2 + c01 ** 2)
+        eigvals = torch.stack([half_tr - half_gap, half_tr + half_gap])
+        # eigvals = torch.nn.functional.softplus(eigvals, beta=10) - (math.log(2.0) / 10)
+        sigma_eff = torch.sqrt(torch.mean(eigvals))  # Add epsilon for numerical stability
         r68 = 1.515 * sigma_eff
-        
+
         return r68
     
     else:
@@ -1825,27 +1835,28 @@ def directional_resolution(F3, n):
         batch_size = F3.shape[0]
         device = F3.device
         dtype = F3.dtype
-        
-        # Normalize direction vectors (N, 3)
+  
         n = n / torch.norm(n, dim=1, keepdim=True)
-        
-        # --- Build tangent basis B for all directions (N, 3, 2) ---
-        # Reference vector
-        ref = torch.tensor([0.0, 0.0, 1.0], dtype=dtype, device=device).expand(batch_size, 3)
-        
+
+        ref = torch.zeros(batch_size, 3, dtype=dtype, device=device)
+        ref[:, 2] = 1.0  # default reference [0, 0, 1] for every row
+
         # Check which directions are nearly parallel to ref (use different ref for those)
         dots = torch.abs(torch.sum(n * ref, dim=1))  # (N,)
         parallel_mask = dots > 0.9
+        # Swap those rows to [1, 0, 0] (guaranteed not parallel to a near-z direction)
         ref[parallel_mask] = torch.tensor([1.0, 0.0, 0.0], dtype=dtype, device=device)
-        
-        # First tangent vector
+
+        # First tangent vector. Epsilon-guarded normalization: with the per-row
+        # ref swap above, ||b1|| is bounded away from 0 for valid unit
+        # directions, but the clamp keeps it finite even for degenerate inputs.
         b1 = torch.cross(n, ref, dim=1)  # (N, 3)
         b1 = b1 / torch.norm(b1, dim=1, keepdim=True)
-        
+
         # Second tangent vector
         b2 = torch.cross(n, b1, dim=1)  # (N, 3)
         b2 = b2 / torch.norm(b2, dim=1, keepdim=True)
-        
+
         # Stack to form basis: (N, 3, 2)
         B = torch.stack([b1, b2], dim=2)
         
@@ -1857,7 +1868,7 @@ def directional_resolution(F3, n):
         # stays finite when F2 is near-singular (zero-Fisher strings); the gradient
         # of inverse scales like O(1/eps^2), so 1e-8 -> ~1e16. 1e-6 keeps it bounded
         # while remaining small relative to physically-informative Fisher values.
-        F2 = F2 + 1e-6 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)
+        # F2 = F2 + 1e-15 * torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, 2, 2)
         
         # --- Invert to get covariance (N, 2, 2) ---
         try:
@@ -1873,16 +1884,25 @@ def directional_resolution(F3, n):
             Cov2 = torch.stack(Cov2)
         
         # --- Angular resolution for all events ---
-        try:
-            eigvals = torch.linalg.eigvalsh(Cov2)  # (N, 2)
-        except Exception:
-            # Closed-form 2x2 eigenvalues — always numerically stable
-            tr = Cov2[:, 0, 0] + Cov2[:, 1, 1]
-            det = Cov2[:, 0, 0] * Cov2[:, 1, 1] - Cov2[:, 0, 1] ** 2
-            half_gap = 0.5 * torch.sqrt(tr ** 2 - 4.0 * det)
-            eigvals = torch.stack([0.5 * tr - half_gap, 0.5 * tr + half_gap], dim=1)  # (N, 2)
-        eigvals = torch.nn.functional.softplus(eigvals, beta=5) - (math.log(2.0) / 5)
-        sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) + 1e-10)  # (N,)
+        # Closed-form 2x2 symmetric eigenvalues instead of torch.linalg.eigvalsh.
+        # eigvalsh's BACKWARD contains 1/(lambda_i - lambda_j) terms that blow up
+        # to NaN/Inf for degenerate (equal) eigenvalues -- exactly the situation
+        # when the Fisher matrix is near-zero (e.g. all sigmoided string weights
+        # close to 0), where Cov2 ~ (1/eps) * I has two equal eigenvalues.
+        #
+        # Use the discriminant form ((c00 - c11)/2)^2 + c01^2, which is a SUM OF
+        # SQUARES and therefore provably >= 0 (the tr^2 - 4*det form can go
+        # slightly negative from float error at degeneracy -> sqrt NaN). The
+        # +1e-12 inside the sqrt keeps the gradient finite at exact degeneracy,
+        # where sqrt'(0) would otherwise be infinite.
+        c00 = Cov2[:, 0, 0]
+        c11 = Cov2[:, 1, 1]
+        c01 = Cov2[:, 0, 1]
+        half_tr = 0.5 * (c00 + c11)
+        half_gap = torch.sqrt((0.5 * (c00 - c11)) ** 2 + c01 ** 2 )
+        eigvals = torch.stack([half_tr - half_gap, half_tr + half_gap], dim=1)  # (N, 2)
+        # eigvals = torch.nn.functional.softplus(eigvals, beta=10) - (math.log(2.0) / 10)
+        sigma_eff = torch.sqrt(torch.mean(eigvals, dim=1) )  # (N,)
         r68 = 1.515 * sigma_eff  # (N,)
 
         return r68
@@ -1904,11 +1924,73 @@ def _resolve_lightsabre_instance(surrogate_func):
     return None
 
 
+# Cache of torch.compile'd (J, lambda) closures, keyed by the identity of the
+# surrogate instance plus the tuple of differentiated params. Compilation is
+# fairly expensive (graph capture + Inductor codegen), so we compile once per
+# (surrogate, fisher_info_params) combination and reuse across calls/chunks
+# instead of re-tracing on every invocation.
+_POISSON_BATCHED_COMPILE_CACHE = {}
+
+
+def _make_compiled_call_batched(surrogate, torch_compile_kwargs=None, points_require_grad=False):
+    """Build (and cache) a torch.compile'd wrapper around ``surrogate.call_batched``.
+
+    """
+    cache_key = (id(surrogate), bool(points_require_grad))
+    cached = _POISSON_BATCHED_COMPILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    kwargs = dict(torch_compile_kwargs) if torch_compile_kwargs else {}
+    kwargs.setdefault('dynamic', True)
+    if points_require_grad:
+        # Never let a caller opt into CUDA-graph capture (mode='reduce-overhead'
+        # / 'max-autotune') on the differentiable path -- see docstring.
+        kwargs['mode'] = 'default'
+    compiled_call_batched = torch.compile(surrogate.call_batched, **kwargs)
+
+    _POISSON_BATCHED_COMPILE_CACHE[cache_key] = compiled_call_batched
+    return compiled_call_batched
+
+
+def _make_lambda_and_jac_fn(call_batched_fn, fisher_info_params):
+    """Build the (jacfwd, plain-eval) closures over a given ``call_batched``-like
+    callable (eager or torch.compile'd), sharing logic between the eager and
+    compiled-surrogate code paths in ``compute_fisher_info_poisson_batched_events``.
+    """
+    def _lambda_e(theta_flat_e, pos_e, dir_e, energy_e, pts_chunk):
+        idx = 0
+        e_val = energy_e
+        d_val = dir_e
+        p_val = pos_e
+        for p in fisher_info_params:
+            if p == 'energy':
+                e_val = theta_flat_e[idx:idx + 1].reshape(())
+                idx += 1
+            elif p == 'direction':
+                d_val = theta_flat_e[idx:idx + 3].reshape(3)
+                idx += 3
+            else:  # position
+                p_val = theta_flat_e[idx:idx + 3].reshape(3)
+                idx += 3
+        ly = call_batched_fn(
+            p_val.reshape(1, 3), d_val.reshape(1, 3),
+            e_val.reshape(1), pts_chunk,
+        )
+        return ly.reshape(-1)  # (n_pts_chunk,)
+
+    def _J_e(theta_flat_e, pos_e, dir_e, energy_e, pts_chunk):
+        return jacfwd(lambda t: _lambda_e(t, pos_e, dir_e, energy_e, pts_chunk))(theta_flat_e)
+
+    return _lambda_e, _J_e
+
+
 def compute_fisher_info_poisson_batched_events(
     fisher_info_params, points, event_params_list, surrogate_func,
     string_xy=None, device=None, point_chunk_size=None, grad_chunk_size=None,
     skip_zero_response=True, zero_response_threshold=0.5,
     uninformative_fisher_value=1e-6, detach_fisher_tensors=True,
+    use_torch_compile=False, torch_compile_kwargs=None,
 ):
     """Event-batched Poisson-mean Fisher information via forward-mode JVP.
 
@@ -1943,6 +2025,32 @@ def compute_fisher_info_poisson_batched_events(
         Accepted for API symmetry with the per-event path but unused here: the
         forward-mode Jacobian over the (small) parameter dimension D is computed
         in one jacfwd call.
+    use_torch_compile : bool
+        If True, evaluate the per-chunk (Jacobian, lambda) computation through a
+        ``torch.compile``'d closure instead of eager ``vmap(jacfwd(...))``. The
+        compiled closure is cached per (surrogate instance, fisher_info_params,
+        whether gradients must survive to `points`/`theta0`) so the
+        (potentially expensive) graph capture happens once per configuration;
+        subsequent calls and point-chunks reuse it. Numerically equivalent to
+        the default eager path -- only worth enabling when this function is
+        called repeatedly (e.g. across many training steps) so the compilation
+        cost is amortised.
+
+        When ``detach_fisher_tensors=False`` and ``points`` (or the per-event
+        parameter tensors) require grad -- i.e. the Fisher matrix itself must
+        stay differentiable w.r.t. detector positions, such as during geometry
+        optimisation -- the compiled closure is automatically re-specialised
+        for that case and forced to ``mode='default'`` regardless of
+        ``torch_compile_kwargs``, so a CUDA-graph-capturing mode never risks
+        replaying a stale graph against new leaf tensors (e.g. `string_xy`
+        after an optimizer step). This mirrors the eager path exactly:
+        gradients flow from the returned Fisher matrix through `J`/`ly` back to
+        `points` via `surrogate.call_batched`.
+    torch_compile_kwargs : dict or None
+        Extra keyword arguments forwarded to ``torch.compile`` (e.g. ``mode``,
+        ``fullgraph``). Ignored unless ``use_torch_compile=True``. ``mode`` is
+        overridden to ``'default'`` whenever gradients must reach `points`/
+        `theta0` (see ``use_torch_compile`` above).
 
     Returns
     -------
@@ -1977,14 +2085,14 @@ def compute_fisher_info_poisson_batched_events(
         if 'direction' in ep and ep['direction'] is not None:
             d = ep['direction']
             if not isinstance(d, torch.Tensor):
-                d = torch.tensor(d, dtype=torch.float32, device=device)
+                d = torch.tensor(d, dtype=torch.float64, device=device)
             return d.to(device).reshape(3)
         theta = ep['zenith']
         phi = ep['azimuth']
         if not isinstance(theta, torch.Tensor):
-            theta = torch.tensor(theta, dtype=torch.float32, device=device)
+            theta = torch.tensor(theta, dtype=torch.float64, device=device)
         if not isinstance(phi, torch.Tensor):
-            phi = torch.tensor(phi, dtype=torch.float32, device=device)
+            phi = torch.tensor(phi, dtype=torch.float64, device=device)
         theta = theta.to(device).squeeze()
         phi = phi.to(device).squeeze()
         return torch.stack([
@@ -1996,13 +2104,13 @@ def compute_fisher_info_poisson_batched_events(
     def _event_scalar(ep, key):
         v = ep[key]
         if not isinstance(v, torch.Tensor):
-            v = torch.tensor(v, dtype=torch.float32, device=device)
+            v = torch.tensor(v, dtype=torch.float64, device=device)
         return v.to(device).reshape(())
 
     def _event_pos(ep):
         pos = ep['position']
         if not isinstance(pos, torch.Tensor):
-            pos = torch.tensor(pos, dtype=torch.float32, device=device)
+            pos = torch.tensor(pos, dtype=torch.float64, device=device)
         return pos.to(device).reshape(3)
 
     # Per-parameter layout in the flat θ vector (order follows fisher_info_params).
@@ -2032,52 +2140,51 @@ def compute_fisher_info_poisson_batched_events(
 
     pt_chunk = point_chunk_size if point_chunk_size is not None else n_points
 
-    # Output accumulator (per point). String reduction happens after.
-    fisher_per_point = torch.zeros(n_events, n_points, total_dims, total_dims, device=device)
+    # When detaching, no autograd graph needs to survive, so chunks can be
+    # written directly into a pre-allocated accumulator (cheapest option: no
+    # Python list of chunk tensors, no final torch.cat copy). When NOT
+    # detaching, in-place slice assignment into a plain torch.zeros(...)
+    # tensor would silently disconnect the written values from autograd (the
+    # base tensor was never part of the graph), so chunks are instead
+    # collected in a list and joined via torch.cat, which does preserve graph
+    # history from each chunk.
+    if detach_fisher_tensors:
+        fisher_per_point = torch.zeros(n_events, n_points, total_dims, total_dims, device=device)
+    else:
+        fisher_chunks = []
 
-    # Per-event λ(θ_e) over a chunk of points, built from θ_flat + fixed values.
-    def _make_lambda_fn(pts_chunk):
-        def _lambda_e(theta_flat_e, pos_e, dir_e, energy_e):
-            # Rebuild the three call_batched inputs, substituting the
-            # differentiated pieces from theta_flat_e.
-            idx = 0
-            e_val = energy_e
-            d_val = dir_e
-            p_val = pos_e
-            for p in fisher_info_params:
-                if p == 'energy':
-                    e_val = theta_flat_e[idx:idx + 1].reshape(())
-                    idx += 1
-                elif p == 'direction':
-                    d_val = theta_flat_e[idx:idx + 3].reshape(3)
-                    idx += 3
-                else:  # position
-                    p_val = theta_flat_e[idx:idx + 3].reshape(3)
-                    idx += 3
-            # call_batched expects a leading event dim; use size-1 batch.
-            ly = surrogate.call_batched(
-                p_val.reshape(1, 3), d_val.reshape(1, 3),
-                e_val.reshape(1), pts_chunk,
-            )
-            return ly.reshape(-1)  # (n_pts_chunk,)
-        return _lambda_e
+    # Choose the call_batched implementation: the raw surrogate method, or a
+    # torch.compile'd wrapper around it. Either way, vmap/jacfwd stay eager --
+    # see _make_compiled_call_batched's docstring for why compiling *through*
+    # vmap(jacfwd(...)) is not attempted.
+    if use_torch_compile:
+        # Any leaf that gradients must survive back to (detector positions via
+        # `points`, or event params via `theta0`) forces the safe (non-CUDA-graph)
+        # compile mode -- see _make_compiled_call_batched's docstring. Only
+        # relevant when the caller isn't detaching (detach_fisher_tensors=False).
+        points_require_grad = (not detach_fisher_tensors) and (
+            points.requires_grad or theta0.requires_grad
+        )
+        call_batched_fn = _make_compiled_call_batched(
+            surrogate, torch_compile_kwargs=torch_compile_kwargs,
+            points_require_grad=points_require_grad,
+        )
+    else:
+        call_batched_fn = surrogate.call_batched
+
+    _lambda_e, _J_e = _make_lambda_and_jac_fn(call_batched_fn, fisher_info_params)
 
     for p_start in range(0, n_points, pt_chunk):
         p_end = min(p_start + pt_chunk, n_points)
         pts_chunk = points[p_start:p_end]
-        lambda_fn = _make_lambda_fn(pts_chunk)
 
         # Forward-mode Jacobian per event: jacfwd gives J (n_pts_chunk, D) and we
         # evaluate λ separately. Both are vmapped over the event axis, so all
-        # events in the batch run in a single set of GPU kernels.
-        def _J_e(theta_flat_e, pos_e, dir_e, energy_e):
-            return jacfwd(lambda t: lambda_fn(t, pos_e, dir_e, energy_e))(theta_flat_e)
-
-        def _lambda_only_e(theta_flat_e, pos_e, dir_e, energy_e):
-            return lambda_fn(theta_flat_e, pos_e, dir_e, energy_e)
-
-        J = vmap(_J_e)(theta0, poss, dirs, energies)          # (E, n_pts, D)
-        ly = vmap(_lambda_only_e)(theta0, poss, dirs, energies)  # (E, n_pts)
+        # events in the batch run in a single set of GPU kernels. Identical
+        # eager torch.func composition regardless of use_torch_compile -- only
+        # the underlying call_batched differs.
+        J = vmap(lambda t, p, d, e: _J_e(t, p, d, e, pts_chunk))(theta0, poss, dirs, energies)  # (E, n_pts, D)
+        ly = vmap(lambda t, p, d, e: _lambda_e(t, p, d, e, pts_chunk))(theta0, poss, dirs, energies)  # (E, n_pts)
 
         # Per-point Fisher (Poisson mean): outer(J) / λ. Mirrors the per-event
         # surrogate-only branch of compute_fisher_info_single_averaged exactly
@@ -2091,31 +2198,89 @@ def compute_fisher_info_poisson_batched_events(
             # gating here matches the non-LLR quadrature convention (>= threshold).
             mask = (ly >= zero_response_threshold).to(outer.dtype).unsqueeze(-1).unsqueeze(-1)
             outer = outer * mask
-        fisher_per_point[:, p_start:p_end] = outer.detach() if detach_fisher_tensors else outer
+        if detach_fisher_tensors:
+            fisher_per_point[:, p_start:p_end] = outer.detach()
+        else:
+            fisher_chunks.append(outer)
         del J, ly, outer
         _fisher_chunk_cleanup(device)
+
+    if not detach_fisher_tensors:
+        # torch.cat preserves autograd history from each chunk, unlike writing
+        # into a pre-allocated torch.zeros(...) accumulator.
+        fisher_per_point = torch.cat(fisher_chunks, dim=1)  # (E, n_points, D, D)
+        del fisher_chunks
 
     if string_xy is None:
         return fisher_per_point  # (E, n_points, D, D)
 
-    # Reduce points -> strings (shared geometry across events).
+    # Reduce points -> strings (shared geometry across events), fully
+    # vectorized: build point_to_string with one comparison against all
+    # strings at once (no Python loop, no per-string .any() host sync), then
+    # scatter-add per-point Fishers into their string via index_add_.
     n_strings = len(string_xy)
-    point_to_string = torch.full((n_points,), -1, dtype=torch.long, device=device)
-    for s_idx in range(n_strings):
-        sx, sy = string_xy[s_idx][0], string_xy[s_idx][1]
-        sx = sx.to(device) if isinstance(sx, torch.Tensor) else torch.tensor(sx, device=device)
-        sy = sy.to(device) if isinstance(sy, torch.Tensor) else torch.tensor(sy, device=device)
-        mask = (points[:, 0] == sx) & (points[:, 1] == sy)
-        point_to_string[mask] = s_idx
 
-    fisher_by_string = torch.zeros(n_events, n_strings, total_dims, total_dims, device=device)
-    for s_idx in range(n_strings):
-        string_mask = (point_to_string == s_idx)
-        if string_mask.any():
-            fisher_by_string[:, s_idx] = fisher_per_point[:, string_mask].sum(dim=1)
-        elif uninformative_fisher_value:
-            eye = torch.eye(total_dims, device=device)
-            fisher_by_string[:, s_idx] = uninformative_fisher_value * eye
+    def _to_scalar_tensor(v):
+        return v.to(device) if isinstance(v, torch.Tensor) else torch.tensor(v, device=device, dtype=points.dtype)
+
+    string_xy_tensor = torch.stack([
+        torch.stack([_to_scalar_tensor(sx), _to_scalar_tensor(sy)]) for sx, sy in string_xy
+    ]).detach()  # (n_strings, 2); detached since this reduction (== comparison)
+                 # carries no gradient regardless of whether string_xy entries require grad
+    # matches[s, p] True if point p belongs to string s
+    matches = (
+        (points[:, 0].unsqueeze(0) == string_xy_tensor[:, 0].unsqueeze(1)) &
+        (points[:, 1].unsqueeze(0) == string_xy_tensor[:, 1].unsqueeze(1))
+    )  # (n_strings, n_points)
+    has_match = matches.any(dim=1)  # (n_strings,) -- one sync for the whole
+                                     # batch of strings, not one per string
+    # -1 sentinel for points that match no string (should not normally occur)
+    point_to_string = torch.where(
+        matches.any(dim=0), matches.double().argmax(dim=0), torch.full((n_points,), -1, device=device)
+    ).long()  # (n_points,)
+
+    if detach_fisher_tensors:
+        fisher_by_string = torch.zeros(n_events, n_strings, total_dims, total_dims, device=device)
+        valid_mask = point_to_string >= 0
+        fisher_by_string.index_add_(
+            1, point_to_string[valid_mask].clamp(min=0),
+            fisher_per_point[:, valid_mask],
+        )
+    else:
+        # index_add_ is in-place and does not track a clean autograd graph the
+        # way out-of-place scatter does; use a one-hot matmul instead so the
+        # string reduction stays differentiable when requested.
+        one_hot = F.one_hot(point_to_string.clamp(min=0), num_classes=n_strings).to(fisher_per_point.dtype)  # (n_points, n_strings)
+        one_hot = one_hot * (point_to_string >= 0).to(fisher_per_point.dtype).unsqueeze(-1)
+        fisher_by_string = torch.einsum('epij,ps->esij', fisher_per_point, one_hot)
+
+    if uninformative_fisher_value:
+        # Unconditional broadcasted fill for strings with no matching points;
+        # a no-op where `missing` is all False, without an extra host sync to
+        # check that first.
+        eye = torch.eye(total_dims, device=device)
+        missing = ~has_match  # (n_strings,)
+        fill = (uninformative_fisher_value * eye).view(1, 1, total_dims, total_dims)
+        fisher_by_string = torch.where(missing.view(1, -1, 1, 1), fill, fisher_by_string)
+
+    # Sanitize any non-finite (NaN/Inf) per-(event, string) Fisher matrix by
+    # replacing it with the uninformative default. Without this, a single
+    # degenerate geometry (e.g. a detector point on a track line producing an
+    # overflowing J, or any other numerical edge case) yields a NaN/Inf Fisher
+    # that then propagates into the resolution: crucially, downstream the Fisher
+    # is combined as sum_s sigmoid(w_s) * Fisher[s], and 0 * NaN = NaN, so even
+    # driving a string's weight to ~0 does NOT neutralize a non-finite Fisher.
+    # This guarantees a finite Fisher regardless of the string weights.
+    sanitize_fill = (uninformative_fisher_value if uninformative_fisher_value else 0.0)
+    eye = torch.eye(total_dims, device=device)
+    fill = (sanitize_fill * eye).view(1, 1, total_dims, total_dims)
+    finite_mask = torch.isfinite(fisher_by_string).all(dim=(2, 3), keepdim=True)  # (E, S, 1, 1)
+    # Zero out non-finite entries FIRST so the torch.where "kept" branch is
+    # always finite -- otherwise torch.where's backward leaks 0*NaN = NaN even
+    # where the mask selects `fill` (matters when detach_fisher_tensors=False).
+    fisher_clean = torch.nan_to_num(fisher_by_string, nan=0.0, posinf=0.0, neginf=0.0)
+    fisher_by_string = torch.where(finite_mask, fisher_clean, fill)
+
     del fisher_per_point
     _fisher_chunk_cleanup(device)
     return fisher_by_string  # (E, n_strings, D, D)
@@ -2339,12 +2504,12 @@ def compute_fisher_info_single_averaged(
         all_params_detached = {k: v.detach().to(device) for k, v in event_params.items()}
 
         t_residuals_per_pt = [[] for _ in range(n_points)]
-        charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+        charge_sums = torch.zeros(n_points, dtype=torch.float64, device=device)
 
         with torch.no_grad():
             # Charge: llr_iterations calls
             # First, check if expected_photons is already in surrogate results
-            charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+            charge_sums = torch.zeros(n_points, dtype=torch.float64, device=device)
             use_expected_photons = False
             
             # Do a single initial call to check for expected_photons
@@ -2364,12 +2529,12 @@ def compute_fisher_info_single_averaged(
                             all_have_expected = False
                     use_expected_photons = all_have_expected
                 elif isinstance(results, torch.Tensor):
-                    charge_sums = results.detach().float().reshape(-1)[:n_points]
+                    charge_sums = results.detach().double().reshape(-1)[:n_points]
                     use_expected_photons = False
             
             # If expected_photons is not available, accumulate over iterations
             if not use_expected_photons:
-                charge_sums = torch.zeros(n_points, dtype=torch.float32, device=device)
+                charge_sums = torch.zeros(n_points, dtype=torch.float64, device=device)
                 for iter_idx in range(llr_iterations):
                     if n_points == 1:
                         res = surrogate_func(opt_point=point[0], event_params=all_params_detached)
@@ -2386,7 +2551,7 @@ def compute_fisher_info_single_averaged(
                                 else:
                                     charge_sums[_i] += float(res)
                         elif isinstance(results, torch.Tensor):
-                            charge_sums += results.detach().float().reshape(-1)[:n_points]
+                            charge_sums += results.detach().double().reshape(-1)[:n_points]
                 mean_charges = charge_sums / max(llr_iterations, 1)
             else:
                 mean_charges = charge_sums  # Use pre-computed expected_photons directly
@@ -2423,7 +2588,7 @@ def compute_fisher_info_single_averaged(
             if _parts:
                 _all_rt = torch.cat(_parts, dim=0)[:llr_iterations]
             else:
-                _all_rt = torch.tensor([], dtype=torch.float32)
+                _all_rt = torch.tensor([], dtype=torch.float64)
             t_residuals_compiled.append(_all_rt.to(device))
 
         # Grad phase: per-detector Fisher via jacrev (only mode supported for PATD)
@@ -2495,7 +2660,7 @@ def compute_fisher_info_single_averaged(
             p_end = min(p_start + pt_chunk_patd, n_points)
             pts_chunk = point[p_start:p_end]
             t_res_chunk = t_residuals_compiled[p_start:p_end]
-            n_hits_chunk = torch.tensor([int(t.numel()) for t in t_res_chunk], device=device, dtype=torch.float32)
+            n_hits_chunk = torch.tensor([int(t.numel()) for t in t_res_chunk], device=device, dtype=torch.float64)
             
             # Process chunk
             fishers_chunk = _process_point_chunk(pts_chunk, t_res_chunk, n_hits_chunk)

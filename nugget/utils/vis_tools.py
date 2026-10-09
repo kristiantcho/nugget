@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
+import matplotlib.patches as mpatches
 from matplotlib.colors import Normalize
 from matplotlib.ticker import MaxNLocator, FuncFormatter
 import math
@@ -33,6 +34,15 @@ try:
     PLOTLY_AVAILABLE = True
 except ImportError:
     PLOTLY_AVAILABLE = False
+
+# Try importing shapely for polygon union operations (e.g. unioning ROV safe
+# spaces across strings), but don't fail if not available.
+try:
+    from shapely.geometry import Polygon as ShapelyPolygon
+    from shapely.ops import unary_union
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    SHAPELY_AVAILABLE = False
 
 def sph_to_cart(theta, phi):
     """Converts spherical coordinates (zenith, azimuth) to a 3D Cartesian vector."""
@@ -121,15 +131,21 @@ class Visualizer:
     PLOT_ANGULAR_RESOLUTION_VS_ENERGY = "angular_resolution_vs_energy"
     PLOT_ENERGY_RESOLUTION_VS_ENERGY = "energy_resolution_vs_energy"
     PLOT_POINTSOURCE_FOM_VS_ENERGY = "pointsource_fom_vs_energy"
+    PLOT_EFFECTIVE_AREA_VS_ENERGY = "effective_area_vs_energy"
     PLOT_LOSS_COMPONENTS = "loss_components"
     PLOT_UW_LOSS_COMPONENTS = "uw_loss_components"
     PLOT_LLR_HISTOGRAM_POINTS = "llr_histogram_points"
     PLOT_STRING_XY_ROV_PENALTY = "string_xy_rov_penalty"
     PLOT_STRING_XY_LOCAL_STRING_REPULSION = "string_xy_local_string_repulsion_penalty"
+    PLOT_STRING_HISTORY = "string_history"
     PLOT_ALM_MU = "alm_mu"
     PLOT_ALM_LAMBDA = "alm_lambda"
+    PLOT_DETECTOR_EFFICIENCY_HISTORY = "detector_efficiency_history"
+    PLOT_EFFECTIVE_AREA_HISTORY = "effective_area_history"
+    PLOT_FLUX_VARIANCE_HISTORY = "flux_variance_history"
+    PLOT_NN_DISTANCE_HISTORY = "nn_distance_history"
 
-    
+
     def __init__(self, device=None, dim=3, domain_size=2.0, gif_temp_dir=None):
         """
         Initialize the visualizer.
@@ -150,6 +166,39 @@ class Visualizer:
         self.gif_frames = [] # Added to store frames for the GIF
         self.gif_temp_dir = gif_temp_dir# Temporary directory for storing individual images
         self.gif_image_paths = [] # List to track saved image paths
+
+        # Running histories of scalar summaries derived from per-iteration tensors
+        # (e.g. mean detector efficiency, mean effective area) that aren't already
+        # accumulated in the optimizer's loss_dict/uw_loss_dict. Each entry is stored
+        # as {iteration: value} so the plotted x-axis reflects the actual optimizer
+        # iteration count (see Optimizer.optimize in basic_optimizer.py) rather than
+        # the number of times visualize_progress happened to be called, and so a
+        # NaN-revert (which replays the same iteration) overwrites instead of duplicating.
+        self._mean_detector_efficiency_history = {}
+        self._mean_effective_area_history = {}
+        # Angular resolution history aggregated from resolution_per_event (via
+        # resolution_stat), rather than the scalar angular_resolution_loss already
+        # tracked in uw_loss_dict. Also keyed by iteration.
+        self._angular_resolution_per_event_history = {}
+        # History of the (weighted) average per-string mean distance to its 5 nearest
+        # neighbours, accumulated across iterations for the 'nn_distance_history' plot.
+        # Keyed by iteration (see the iteration-dict rationale on the detector
+        # efficiency / effective area histories above) so the x-axis reflects the
+        # actual optimizer iteration count and NaN-revert replays overwrite cleanly.
+        self._nn_distance_history = {}
+        # History of the global (weighted-softmin, if string_weights given) minimum
+        # pairwise string-string distance, also shown on the 'nn_distance_history' plot.
+        self._min_pairwise_distance_history = {}
+
+        # Cache of string XY positions (and weights) snapshotted once per unique
+        # iteration whenever a 'string_history' plot is requested, so the full
+        # trajectory each string traced over optimization can be drawn without the
+        # caller needing to pass the starting positions or intermediate snapshots
+        # themselves. The first snapshot recorded is treated as the starting geometry.
+        self._string_xy_history = []
+        self._string_weights_history = []
+        self._string_history_iterations = []
+        self._last_recorded_iteration_string_history = None
 
     @staticmethod
     def _z_value_for_confidence(confidence_level: float = 0.95) -> float:
@@ -191,7 +240,7 @@ class Visualizer:
 
         inv_sq = 1.0 / np.square(vals)
         fom = float(np.sqrt(np.sum(inv_sq)))
-        if not np.isfinite(fom) or fom <= 0.0:
+        if not np.isfinite(fom) or fom < 0.0:
             return np.nan, np.nan
 
         inv_four = np.square(inv_sq)
@@ -199,6 +248,28 @@ class Visualizer:
         if not np.isfinite(fom_err):
             fom_err = np.nan
         return fom, fom_err
+
+    @staticmethod
+    def _moving_average(values, window):
+        """Trailing (causal) moving average, defined at every index like the input.
+
+        At index i, averages values[max(0, i-window+1):i+1] so the returned array
+        has the same length as the input and the first `window-1` points are
+        averaged over however many samples are actually available (no NaN warm-up).
+        `None` entries (used elsewhere to represent skipped iterations) are treated
+        as missing and excluded from the local average.
+        """
+        window = max(1, int(window))
+        arr = np.array([np.nan if v is None else v for v in values], dtype=np.float64)
+        n = arr.shape[0]
+        result = np.full(n, np.nan, dtype=np.float64)
+        for i in range(n):
+            lo = max(0, i - window + 1)
+            segment = arr[lo:i + 1]
+            finite_segment = segment[np.isfinite(segment)]
+            if finite_segment.size > 0:
+                result[i] = np.mean(finite_segment)
+        return result
 
     @staticmethod
     def _compute_pointsource_fom_from_resolution_and_aeff(res_values, aeff_values, min_resolution=1e-12):
@@ -218,7 +289,7 @@ class Visualizer:
 
         terms = aeff / (4.0 * np.pi * np.square(res))
         fom = float(np.sqrt(np.sum(terms)))
-        if not np.isfinite(fom) or fom <= 0.0:
+        if not np.isfinite(fom) or fom < 0.0:
             return np.nan, np.nan
 
         # First-order propagation for F = sqrt(S): sigma_F ≈ (1/(2F)) * sigma_S.
@@ -328,10 +399,82 @@ class Visualizer:
             ax.tick_params(axis='x', rotation=0, pad=3)
             ax.tick_params(axis='y', rotation=0, pad=3)
     
-    def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=1, zoom_range=None):
+    def _draw_slice_lines(self, ax, xy_np=None, **kwargs):
+        """Overlay the N-fold slice (wedge) boundaries on an XY plot.
+
+        Used by the string_xy family of plots. `n_folds` reaches here
+        automatically via the geometry dict (the optimizer merges it into
+        vis_kwargs), so the wedges appear whenever the geometry is N-fold
+        symmetric -- e.g. NFoldString -- and nothing is drawn otherwise.
+
+        Parameters
+        ----------
+        ax : matplotlib axes
+            Axes to draw on. Its limits are restored afterwards so the long
+            boundary lines never rescale the view.
+        xy_np : np.ndarray or None
+            String XY positions, used only as a fallback for the line length
+            when the axes have no usable limits yet.
+
+        Recognised kwargs: ``n_folds``, ``fold_angle``, ``fold_offset``,
+        ``draw_slice_lines`` (default True), ``shade_slice`` (default False),
+        ``slice_line_color`` (default 'grey').
+        """
+        n_folds = kwargs.get('n_folds', None)
+        if n_folds is None or not kwargs.get('draw_slice_lines', True):
+            return
+        n_folds = int(n_folds)
+        # n_folds == 1 is degenerate: the whole plane is a single fold.
+        if n_folds <= 1:
+            return
+
+        fold_offset = float(kwargs.get('fold_offset', 0.0) or 0.0)
+        fold_angle = kwargs.get('fold_angle', None)
+        fold_angle = (2 * np.pi / n_folds) if fold_angle is None else float(fold_angle)
+
+        # Extend the lines past the plot edge so the wedges stay visible no
+        # matter how far out the strings wander.
+        x_lim, y_lim = ax.get_xlim(), ax.get_ylim()
+        line_len = max(abs(x_lim[0]), abs(x_lim[1]), abs(y_lim[0]), abs(y_lim[1])) * 1.5
+        if not np.isfinite(line_len) or line_len <= 0:
+            xy_np = np.asarray(xy_np) if xy_np is not None else None
+            line_len = float(np.max(np.abs(xy_np))) * 1.5 if (xy_np is not None and xy_np.size) else 1.0
+
+        slice_line_color = kwargs.get('slice_line_color', 'grey')
+        for k in range(n_folds):
+            ang = fold_offset + k * fold_angle
+            ax.plot(
+                [0, line_len * np.cos(ang)],
+                [0, line_len * np.sin(ang)],
+                color=slice_line_color,
+                linestyle=':',
+                linewidth=1.0,
+                alpha=0.5,
+                zorder=0,
+            )
+
+        # Optionally shade the first fold to show which wedge is the one
+        # actually being parameterized.
+        if kwargs.get('shade_slice', False):
+            ax.add_patch(mpatches.Wedge(
+                (0.0, 0.0),
+                line_len,
+                np.degrees(fold_offset),
+                np.degrees(fold_offset + fold_angle),
+                color=slice_line_color,
+                alpha=0.08,
+                zorder=0,
+            ))
+
+        # Restore limits -- the long lines/wedge would otherwise rescale the
+        # axes and shrink the strings.
+        ax.set_xlim(x_lim)
+        ax.set_ylim(y_lim)
+
+    def _draw_rov_safe_space(self, ax, rov_penalty=None, position='bottom_left', scale_factor=1, zoom_range=None, half_domain=None):
         """
         Draw ROV safe space shape on the given axes.
-        
+
         Parameters:
         -----------
         ax : matplotlib.axes.Axes
@@ -342,10 +485,14 @@ class Visualizer:
             Where to place the ROV shape ('bottom_left', 'bottom_right', etc.)
         scale_factor : float
             Scale factor for the ROV shape relative to plot domain
+        half_domain : float or None
+            Half-width of the domain actually plotted on `ax` (e.g. an auto-expanded
+            domain when strings lie outside the nominal one). Falls back to
+            `self.half_domain` if not provided. Ignored if `zoom_range` is given.
         """
         if rov_penalty is None:
             return
-            
+
         # Get ROV dimensions
         # rov_rec_width = rov_penalty.rov_rec_width
         rov_rec_width = rov_penalty.rov_rec_width
@@ -354,7 +501,7 @@ class Visualizer:
         if zoom_range is not None:
             ax_lims = zoom_range*2
         else:
-            ax_lims = self.domain_size
+            ax_lims = (half_domain * 2) if half_domain is not None else self.domain_size
         
         # Scale dimensions to fit in corner of plot
         scale = scale_factor #* self.domain_size
@@ -444,33 +591,26 @@ class Visualizer:
             # Best-effort sizing; keep default fontsize on failure.
             pass
 
-    def _draw_rov_safe_space_at_string(
-        self,
-        ax,
-        origin_xy,
-        angle_rad,
-        rov_penalty=None,
-        *,
-        alpha=0.12,
-        line_alpha=0.55,
-        linewidth=1.5,
-        zorder=2,
-    ):
-        """Draw a rotated ROV safe-space corridor anchored at a string.
+    def _rov_safe_space_vertices_at_string(self, origin_xy, angle_rad, rov_penalty=None):
+        """Compute the world-space vertices of a string's ROV safe-space corridor.
 
         The geometry matches `ROVPenalty`.
         Note: the angle convention is the one used in `ROVPenalty`'s rotation
         (local->world is a rotation by `-angle_rad`).
+
+        Returns
+        -------
+        np.ndarray of shape (5, 2), or None if inputs are invalid.
         """
         if rov_penalty is None or origin_xy is None or angle_rad is None:
-            return
+            return None
 
         try:
             x0 = float(origin_xy[0])
             y0 = float(origin_xy[1])
             a = float(angle_rad)
         except Exception:
-            return
+            return None
 
         L_rect = float(rov_penalty.rov_rec_width)
         W_rect = float(rov_penalty.rov_height)
@@ -497,6 +637,30 @@ class Visualizer:
         poly_world[:, 0] += x0
         poly_world[:, 1] += y0
 
+        return poly_world
+
+    def _draw_rov_safe_space_at_string(
+        self,
+        ax,
+        origin_xy,
+        angle_rad,
+        rov_penalty=None,
+        *,
+        alpha=0.12,
+        line_alpha=0.55,
+        linewidth=1.5,
+        zorder=2,
+    ):
+        """Draw a rotated ROV safe-space corridor anchored at a string.
+
+        The geometry matches `ROVPenalty`.
+        Note: the angle convention is the one used in `ROVPenalty`'s rotation
+        (local->world is a rotation by `-angle_rad`).
+        """
+        poly_world = self._rov_safe_space_vertices_at_string(origin_xy, angle_rad, rov_penalty)
+        if poly_world is None:
+            return
+
         poly_world_closed = np.vstack([poly_world, poly_world[0]])
         ax.plot(
             poly_world_closed[:, 0],
@@ -513,6 +677,345 @@ class Visualizer:
             alpha=float(np.clip(alpha, 0.0, 1.0)),
             zorder=zorder,
         )
+
+    @staticmethod
+    def _rov_space_color_for_index(idx):
+        """Deterministic rainbow color for a given (global) string index.
+
+        Picks a pseudo-random point on the `rainbow` colormap seeded by the string
+        index, so the same string always gets the same color across iterations while
+        different strings get well-scattered colors.
+        """
+        rng = np.random.default_rng(int(idx))
+        return plt.cm.rainbow(float(rng.random()))
+
+    @staticmethod
+    def _weighted_mean_nn_distance(string_xy, string_weights=None, num_neighbours=5, nn_tau=None):
+        """Weighted average of each string's mean distance to its 5 nearest neighbours.
+
+        All strings are included; the contribution of each string (and each of its
+        neighbours) is weighted by string_weights, matching the soft neighbour-
+        weighting used by ROVPenalty. `string_weights` is expected to already be in
+        [0, 1] (i.e. sigmoid(raw_weights)) - the same convention `_create_plot` uses
+        everywhere else (it sigmoids `kwargs['string_weights']` once, up front) - so
+        this does NOT re-apply sigmoid internally; pass raw (pre-sigmoid) logits only
+        if you also apply sigmoid() yourself before calling this. The "5 nearest" is
+        a soft selection via softmax over -distance (like
+        ROVPenalty._compute_away_theta), so the metric varies smoothly:
+
+            w_ij   = w_j * softmax_j(-dist_ij / tau)     (over j != i)
+            d_i    = sum_j w_ij * dist_ij / sum_j w_ij
+            metric = sum_i w_i * d_i / sum_i w_i
+
+        tau defaults to 0.5 * (median k-th nearest distance) so it is robust to the
+        absolute coordinate units.
+
+        Returns
+        -------
+        float, or None if there are fewer than 2 strings.
+        """
+        xy = np.asarray(string_xy, dtype=float)
+        if xy.ndim != 2 or xy.shape[0] < 2:
+            return None
+        n = xy.shape[0]
+        k = int(max(1, min(int(num_neighbours), n - 1)))
+
+        # Pairwise distances, excluding self (diagonal -> +inf so it is never a NN).
+        diff = xy[:, None, :] - xy[None, :, :]  # (n, n, 2)
+        dist = np.sqrt((diff ** 2).sum(axis=-1) + 1e-12)  # (n, n)
+        np.fill_diagonal(dist, np.inf)
+
+        # Off-diagonal distances per row -> (n, n-1).
+        off = ~np.eye(n, dtype=bool)
+        dist_off = dist[off].reshape(n, n - 1)
+
+        # Scale-aware softmax temperature from the median k-th nearest distance.
+        kth = np.sort(dist_off, axis=1)[:, k - 1]  # (n,)
+        dist_scale = max(float(np.median(kth)), 1e-12)
+        tau_mult = 0.5 if nn_tau is None else float(nn_tau)
+        tau = max(tau_mult * dist_scale, 1e-12)
+
+        # Softmax over -distance -> soft top-k emphasis on the nearest strings.
+        z = -dist_off / tau
+        z -= z.max(axis=1, keepdims=True)  # numerical stability
+        soft = np.exp(z)  # (n, n-1)
+
+        # Neighbour weights (per column j, excluding self). Already in [0, 1] - see
+        # the docstring note on why this does not apply sigmoid() itself.
+        if string_weights is not None:
+            probs = np.asarray(string_weights, dtype=float).reshape(-1)
+            probs_off = np.broadcast_to(probs[None, :], (n, n))[off].reshape(n, n - 1)
+            own_probs = probs
+        else:
+            probs_off = np.ones((n, n - 1), dtype=float)
+            own_probs = np.ones(n, dtype=float)
+
+        w = soft * probs_off  # (n, n-1)
+        w_sum = w.sum(axis=1)
+        valid = w_sum > 1e-12
+        d_per_string = np.zeros(n, dtype=float)
+        d_per_string[valid] = (w[valid] * dist_off[valid]).sum(axis=1) / w_sum[valid]
+
+        own_sum = own_probs[valid].sum()
+        if own_sum <= 1e-12:
+            return None
+        metric = float((own_probs[valid] * d_per_string[valid]).sum() / own_sum)
+        return metric
+
+    @staticmethod
+    def _mean_min_nn_distance(string_xy, string_weights=None, min_tau=None):
+        """Weighted average, across strings, of each string's own (soft) nearest-
+        neighbour distance.
+
+        For each string i, its nearest-neighbour distance is computed as a softmin
+        over distances to all other strings j (a smooth version of the per-string
+        1-NN distance, avoiding a hard-argmin discontinuity):
+
+            min_i  = -tau * log( sum_j exp(-dist_ij / tau) )     (j != i)
+            metric = sum_i w_i * min_i / sum_i w_i
+
+      
+
+        Returns
+        -------
+        float, or None if there are fewer than 2 strings.
+        """
+        xy = np.asarray(string_xy, dtype=float)
+        if xy.ndim != 2 or xy.shape[0] < 2:
+            return None
+        n = xy.shape[0]
+
+        diff = xy[:, None, :] - xy[None, :, :]  # (n, n, 2)
+        dist = np.sqrt((diff ** 2).sum(axis=-1) + 1e-12)  # (n, n)
+        np.fill_diagonal(dist, np.inf)
+
+        off = ~np.eye(n, dtype=bool)
+        dist_off = dist[off].reshape(n, n - 1)  # (n, n-1)
+
+        # Scale-aware temperature: 0.05 * median 1-NN (hard) distance -- deliberately
+        # much sharper than _weighted_mean_nn_distance's 0.5x default (see docstring).
+        nn_1 = dist_off.min(axis=1)  # (n,)
+        dist_scale = max(float(np.median(nn_1)), 1e-12)
+        tau_mult = 0.05 if min_tau is None else float(min_tau)
+        tau = max(tau_mult * dist_scale, 1e-12)
+
+        # Per-string softmin over its distances to all other strings.
+        z = -dist_off / tau
+        z_max = z.max(axis=1, keepdims=True)
+        logsumexp = z_max.squeeze(1) + np.log(np.exp(z - z_max).sum(axis=1))
+        min_per_string = -tau * logsumexp  # (n,)
+
+        if string_weights is not None:
+            probs = np.asarray(string_weights, dtype=float).reshape(-1)
+        else:
+            probs = np.ones(n, dtype=float)
+
+        probs_sum = probs.sum()
+        if probs_sum <= 1e-12:
+            return None
+        metric = float((probs * min_per_string).sum() / probs_sum)
+        return metric
+
+    @staticmethod
+    def _tile_rov_safe_spaces_across_folds(origins_xy, angles_rad, string_indices, kwargs):
+        """Repeat one fold's ROV safe-space corridors across every other fold.
+
+       
+
+        Parameters
+        ----------
+        origins_xy, angles_rad, string_indices : array-like
+            The already-selected (e.g. active-only) global strings' corridor inputs,
+            as built by the caller (same shapes/order as each other).
+        kwargs : dict
+            The plot's kwargs, used to read `fold_indices`, `n_folds`, `fold_angle`,
+            `fold_offset`.
+
+        Returns
+        -------
+        tuple(np.ndarray, np.ndarray, np.ndarray)
+            Expanded `(origins_xy, angles_rad, string_indices)` covering all folds, or
+            the inputs unchanged (as arrays) if fold info isn't available or there's
+            only one fold.
+        """
+        origins_xy = np.asarray(origins_xy, dtype=float)
+        angles_rad = np.asarray(angles_rad, dtype=float)
+        string_indices = np.asarray(string_indices)
+
+        fold_indices = kwargs.get('fold_indices', None)
+        n_folds = kwargs.get('n_folds', None)
+        if fold_indices is None or n_folds is None or origins_xy.shape[0] == 0:
+            return origins_xy, angles_rad, string_indices
+        n_folds = int(n_folds)
+        if n_folds <= 1:
+            return origins_xy, angles_rad, string_indices
+
+        if torch.is_tensor(fold_indices):
+            fold_indices_np = fold_indices.detach().cpu().numpy()
+        else:
+            fold_indices_np = np.asarray(fold_indices)
+        if fold_indices_np.shape[0] < int(np.max(string_indices)) + 1:
+            # fold_indices doesn't cover the given string indices - can't restrict.
+            return origins_xy, angles_rad, string_indices
+
+        # Keep only fold 0's strings among the ones the caller already selected.
+        fold0_mask = fold_indices_np[string_indices] == 0
+        if not np.any(fold0_mask):
+            return origins_xy, angles_rad, string_indices
+
+        fold0_origins = origins_xy[fold0_mask]
+        fold0_angles = angles_rad[fold0_mask]
+        fold0_indices = string_indices[fold0_mask]
+
+        fold_angle = kwargs.get('fold_angle', None)
+        fold_angle = (2.0 * np.pi / n_folds) if fold_angle is None else float(fold_angle)
+
+        tiled_origins = []
+        tiled_angles = []
+        tiled_indices = []
+        for k in range(n_folds):
+            rot = k * fold_angle
+            c, s = np.cos(rot), np.sin(rot)
+    
+            rot_mat = np.array([[c, -s], [s, c]])
+            tiled_origins.append(fold0_origins @ rot_mat.T)
+       
+            tiled_angles.append(fold0_angles - rot)
+            tiled_indices.append(fold0_indices)
+
+        return (
+            np.concatenate(tiled_origins, axis=0),
+            np.concatenate(tiled_angles, axis=0),
+            np.concatenate(tiled_indices, axis=0),
+        )
+
+    def _draw_rov_safe_space_union(
+        self,
+        ax,
+        origins_xy,
+        angles_rad,
+        rov_penalty=None,
+        *,
+        alpha=0.18,
+        line_alpha=0,
+        linewidth=1.8,
+        zorder=2,
+        color='purple',
+        label='Unioned ROV Safe Space',
+        per_space_colors=False,
+        string_indices=None,
+    ):
+        """Draw the unioned shape of multiple strings' ROV safe-space corridors.
+
+        Parameters
+        ----------
+        origins_xy : array-like of shape (N, 2)
+            String XY positions to anchor each safe-space corridor at.
+        angles_rad : array-like of shape (N,)
+            Orientation (radians) for each string's corridor, e.g. the
+            least-blocked angle for that string.
+        rov_penalty : ROVPenalty object or None
+            Used to get corridor dimensions.
+        per_space_colors : bool
+            If True, fill each string's individual corridor in its own color
+            (semi-transparent, so overlaps blend) instead of drawing a single
+            merged union shape. No union outline is drawn in this mode. Colors are
+            keyed on `string_indices` so they stay consistent across iterations.
+        string_indices : array-like of shape (N,) or None
+            Global string index for each corridor, used to pick a stable per-space
+            color when `per_space_colors` is True. Falls back to positional index.
+
+        Requires the optional `shapely` package. No-ops (with a message drawn
+        on the axes) if it is not installed.
+        """
+        if rov_penalty is None or origins_xy is None or angles_rad is None:
+            return
+
+        # Per-space colored fills: draw each corridor individually, no union geometry.
+        if per_space_colors:
+            for pos, (origin_xy, angle_rad) in enumerate(zip(origins_xy, angles_rad)):
+                verts = self._rov_safe_space_vertices_at_string(origin_xy, angle_rad, rov_penalty)
+                if verts is None:
+                    continue
+                key = int(string_indices[pos]) if string_indices is not None else pos
+                space_color = self._rov_space_color_for_index(key)
+                verts_closed = np.vstack([verts, verts[0]])
+                ax.fill(
+                    verts_closed[:, 0],
+                    verts_closed[:, 1],
+                    color=space_color,
+                    alpha=float(np.clip(alpha, 0.0, 1.0)),
+                    zorder=zorder,
+                )
+                if line_alpha > 0:
+                    ax.plot(
+                        verts_closed[:, 0],
+                        verts_closed[:, 1],
+                        color=space_color,
+                        linewidth=linewidth,
+                        alpha=float(np.clip(line_alpha, 0.0, 1.0)),
+                        zorder=zorder,
+                    )
+            return
+
+        if not SHAPELY_AVAILABLE:
+            ax.text(
+                0.5, 0.02,
+                "shapely not installed: cannot draw unioned ROV safe space",
+                ha='center', va='bottom', transform=ax.transAxes,
+                fontsize=8, color='red',
+            )
+            return
+
+        polygons = []
+        for origin_xy, angle_rad in zip(origins_xy, angles_rad):
+            verts = self._rov_safe_space_vertices_at_string(origin_xy, angle_rad, rov_penalty)
+            if verts is None:
+                continue
+            poly = ShapelyPolygon(verts)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if not poly.is_empty:
+                polygons.append(poly)
+
+        if not polygons:
+            return
+
+        union_shape = unary_union(polygons)
+        geoms = list(union_shape.geoms) if hasattr(union_shape, 'geoms') else [union_shape]
+
+        first = True
+        for geom in geoms:
+            if geom.is_empty:
+                continue
+            exterior_coords = np.asarray(geom.exterior.coords)
+            ax.fill(
+                exterior_coords[:, 0],
+                exterior_coords[:, 1],
+                color=color,
+                alpha=float(np.clip(alpha, 0.0, 1.0)),
+                zorder=zorder,
+                label=label if first else None,
+            )
+            ax.plot(
+                exterior_coords[:, 0],
+                exterior_coords[:, 1],
+                color=color,
+                linewidth=linewidth,
+                alpha=float(np.clip(line_alpha, 0.0, 1.0)),
+                zorder=zorder,
+            )
+            for interior in geom.interiors:
+                interior_coords = np.asarray(interior.coords)
+                ax.plot(
+                    interior_coords[:, 0],
+                    interior_coords[:, 1],
+                    color=color,
+                    linewidth=linewidth,
+                    alpha=float(np.clip(line_alpha, 0.0, 1.0)),
+                    zorder=zorder,
+                )
+            first = False
 
     def _safe_griddata_interpolation(self, points_xy, values, grid_points, resolution, method='linear', fill_value=None):
         """
@@ -660,19 +1163,51 @@ class Visualizer:
             - 'llr_histogram_points': LLR density histogram comparing signal and background distributions per point
             - 'snr_contour': SNR contour plot based on per-string values
             - 'string_xy_local_string_repulsion_penalty': String XY scatter colored by per-string local string repulsion penalty
+            - 'string_history': Traced path of each string's XY position across every recorded
+              iteration, from its start-of-optimization position (red) to its current/final
+              position (green)
             - 'signal_light_yield_contour': Signal light yield contour plot based on per-string values
             - 'signal_light_yield_contour_points': Signal light yield contour plot based on per-point values
             - 'fisher_info_logdet': Log determinant of Fisher Information matrix contour plot
             - 'angular_resolution': Angular resolution from Fisher Information using Cramér-Rao bound
             - 'energy_resolution': Energy resolution from Fisher Information using Cramér-Rao bound
             - 'pointsource_fom': Pointsource FoM history from unweighted loss dictionary
+            - 'flux_variance_history': Combined variance/error of the signal flux parameters
+              from `AnalysisLoss` over iterations, read from `uw_loss_dict['fisher_analysis_loss']`
+              (the A-optimality value, i.e. sum of marginal 1-sigma errors). Optional kwargs:
+              'flux_param_variance_history' ({param: [variance, ...]}) to overlay per-parameter
+              curves from the loss's 'flux_param_variances'; 'flux_param_names' to label the
+              combined curve; 'flux_variance_as_sigma' (default True) to plot sum-of-sigmas
+              rather than its square.
             - 'angular_resolution_vs_zenith': Binned angular resolution vs zenith
             - 'angular_resolution_vs_energy': Binned angular resolution vs energy
             - 'energy_resolution_vs_energy': Binned energy resolution vs energy
-            - 'loss_components': Individual loss components and total loss from loss dictionary
-            - 'uw_loss_components': Individual unweighted loss components and total unweighted loss
+            - 'effective_area_vs_energy': Binned (mean/median) effective area vs energy, from
+              'effective_area_per_event' and event params (same source as
+              'pointsource_fom_vs_energy'). Supports 'resolution_stat' ('mean' or 'median';
+              'fom' is not applicable here), 'show_resolution_ci' /
+              'resolution_ci_percentiles' / 'resolution_ci_level', 'energy_range',
+              'n_energy_bins', and 'effective_area_logy' for a log-scale y-axis (independent
+              of the other vs-plots' log-y toggles - see 'effective_area_logy' below).
+            - 'loss_components': Individual loss components and total loss from loss dictionary.
+              Pass 'moving_average_losses' (list of loss names) to draw those components'
+              raw series faded with a moving average (window 'moving_average_window',
+              default 10) overlaid at full opacity; 'Total Loss' sums the moving-average
+              values for those losses (and raw values for the rest).
+            - 'uw_loss_components': Individual unweighted loss components and total unweighted loss.
+              Also supports 'moving_average_losses' / 'moving_average_window' as above.
             - 'alm_mu': ALM penalty parameters (mu) history for each constraint
             - 'alm_lambda': ALM Lagrange multipliers (lambda) history for each constraint
+            - 'detector_efficiency_history': Mean detector efficiency over optimization iterations
+              (from 'detector_efficiencies' in kwargs, as returned by EffectiveAreaLoss/FoMLoss)
+            - 'effective_area_history': Mean effective area over optimization iterations
+              (from 'effective_area_per_event' or 'effective_area_matrix' in kwargs, as returned
+              by EffectiveAreaLoss/FoMLoss)
+            - 'nn_distance_history': History of two distance series, computed from the current
+              'string_xy' each iteration and plotted together: (1) the (weight-weighted) average
+              per-string mean distance to its 5 nearest neighbours, and (2) the (weight-weighted)
+              average, across strings, of each string's own (soft) nearest-neighbour distance --
+          
         make_gif : bool
             Whether to generate and save a GIF of the progress.
         gif_plot_selection : list of str or None
@@ -710,13 +1245,28 @@ class Visualizer:
             - background_funcs: List of background functions (old format)
             - signal_surrogate_func: Surrogate function for signal (e.g., light_yield_surrogate method)
             - signal_event_params: Event parameters dict for signal surrogate function
-                        - background_surrogate_func: Surrogate function for background
-                        - background_event_params: Event parameters dict for background surrogate function
-                        - rov_penalty / rov_penalty_func: ROVPenalty object used by `string_xy_rov_penalty`
-                        - rov_draw_safe_space_on_violations: bool, optional. If True, the `string_xy_rov_penalty` plot will
-                            draw a per-string ROV safe-space corridor for strings with violation >= 1, oriented by
-                            `rov_least_blocked_angle_per_string` (both are expected to be present in kwargs from `ROVPenalty`).
-            - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range] 
+            - background_surrogate_func: Surrogate function for background
+            - background_event_params: Event parameters dict for background surrogate function
+            - rov_penalty / rov_penalty_func: ROVPenalty object used by `string_xy_rov_penalty`
+            - rov_draw_safe_space_on_violations: bool, optional. If True, the `string_xy_rov_penalty` plot will
+                draw a per-string ROV safe-space corridor for strings with violation >= 1, oriented by
+                `rov_least_blocked_angle_per_string` (both are expected to be present in kwargs from `ROVPenalty`).
+            - rov_draw_safe_space_active_only: bool, optional. If True, further restricts
+                `rov_draw_safe_space_on_violations` to only draw the per-string corridor for active strings
+                (string_weights >= weight_threshold).
+            - rov_draw_safe_space_union: bool, optional. If True, the `string_xy_rov_penalty` plot will draw
+                the unioned shape of the best (least-blocked-angle) ROV safe spaces across all active strings
+                (string_weights >= weight_threshold, or all strings if string_weights is not provided).
+                Requires the optional `shapely` package.
+            - rov_union_per_space_colors: bool, optional. If True, draws each string's individual ROV safe
+                space in its own (semi-transparent, overlap-blending) color instead of one merged union shape.
+                Colors are keyed on the global string index so they stay consistent across iterations. In this
+                mode no union outline is drawn and shapely is not required.
+            - rov_safe_space_one_fold_only: bool, optional. For N-fold symmetric geometries (e.g. `NFoldString`,
+                which puts `fold_indices`/`n_folds`/`fold_angle` in the geometry dict), restricts the
+                `rov_draw_safe_space_on_violations` / `rov_draw_safe_space_union` corridors to fold 0's strings
+                only, then reuses that fold's corridors
+            - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range]
               instead of the default domain boundaries [-half_domain, half_domain]
             - plot_with_surrogate: bool, optional. If True and 'light_surrogate_func' and 'surrogate_event_params' 
               are provided, will generate full domain contour plot using the surrogate function for 'signal_light_yield_contour'
@@ -726,29 +1276,30 @@ class Visualizer:
               Can be a single dict containing 'position', 'zenith', 'azimuth', 'energy', etc., or a list of such dicts.
               If a list is provided, the light yield will be averaged over all events in the list.
 
-                        For resolution-vs-* plots ('angular_resolution_vs_zenith', 'angular_resolution_vs_energy', 'energy_resolution_vs_energy'):
-                        - resolution_per_event: array-like, per-event resolution values
-                        - resolution_params: list of dicts, each containing 'zenith' and/or 'energy'
-                                                - resolution_stat: {'median', 'mean'}, optional. Defaults to 'median'.
-                                                        If 'median': the line is the median and `resolution_ci_percentiles` apply to residuals around the median.
-                                                        If 'mean': the line is the mean and the band is ±2σ per bin (ignores residual quantiles).
-                                                        (Backwards-compat alias: resolution_use_mean=True)
-                                                - resolution_use_fom: bool, optional. If True, plots per-bin FOM = sqrt(sum(1/resolution^2)).
-                                                    Error bars are propagated as (1/(2*FOM))*sqrt(sum(1/resolution^4)).
-                                                - resolution_fom_min_resolution: float, optional. Minimum allowed resolution used in FOM mode
-                                                    to avoid divide-by-zero (default: 1e-12).
-                                                - show_resolution_ci: bool, optional. If True, draws a two-sided residual-quantile band around the median in each bin
-                                                - resolution_ci_percentiles: tuple(float, float), optional. Percentiles for the residual band (default: (16, 84))
-                                                - resolution_ci_level: float in (0, 1), optional. Alternative specification as a central containment level. Ignored if
-                                                    resolution_ci_percentiles is provided.
-                        - zenith_range / zenith_range_deg: tuple(min, max), optional. Restrict zenith range for binning.
-                        - energy_range: tuple(min, max), optional. Restrict energy range for binning.
-                                                - resolution_logy: bool, optional. If True, uses log scale for y-axis on all resolution/FoM-vs plots
-                                                    ('angular_resolution_vs_zenith', 'angular_resolution_vs_energy',
-                                                    'energy_resolution_vs_energy', 'pointsource_fom_vs_energy').
-                                                    (Backwards-compat aliases: resolution_logy_angular, resolution_logy_vs_zenith,
-                                                    resolution_logy_vs_energy)
-                        - n_zenith_bins / n_energy_bins: int, optional. Number of bins
+            For resolution-vs-* plots ('angular_resolution_vs_zenith', 'angular_resolution_vs_energy', 'energy_resolution_vs_energy'):
+            - resolution_per_event: array-like, per-event resolution values
+            - resolution_params: list of dicts, each containing 'zenith' and/or 'energy'
+                                    - resolution_stat: {'median', 'mean'}, optional. Defaults to 'median'.
+                                            If 'median': the line is the median and `resolution_ci_percentiles` apply to residuals around the median.
+                                            If 'mean': the line is the mean and the band is ±2σ per bin (ignores residual quantiles).
+                                            (Backwards-compat alias: resolution_use_mean=True)
+                                    - resolution_use_fom: bool, optional. If True, plots per-bin FOM = sqrt(sum(1/resolution^2)).
+                                        Error bars are propagated as (1/(2*FOM))*sqrt(sum(1/resolution^4)).
+                                    - resolution_fom_min_resolution: float, optional. Minimum allowed resolution used in FOM mode
+                                        to avoid divide-by-zero (default: 1e-12).
+                                    - show_resolution_ci: bool, optional. If True, draws a two-sided residual-quantile band around the median in each bin
+                                    - resolution_ci_percentiles: tuple(float, float), optional. Percentiles for the residual band (default: (16, 84))
+                                    - resolution_ci_level: float in (0, 1), optional. Alternative specification as a central containment level. Ignored if
+                                        resolution_ci_percentiles is provided.
+            - zenith_range / zenith_range_deg: tuple(min, max), optional. Restrict zenith range for binning.
+            - energy_range: tuple(min, max), optional. Restrict energy range for binning.
+                                    - Log-y toggles are independent per plot type - setting one never affects another:
+                                        - resolution_logy_angular: 'angular_resolution_vs_zenith' and 'angular_resolution_vs_energy'
+                                        - resolution_logy_energy: 'energy_resolution_vs_energy'
+                                        - ps_fom_logy: 'pointsource_fom_vs_energy'
+                                        - effective_area_logy: 'effective_area_vs_energy'
+                                        There is no shared/generic 'resolution_logy' switch; each plot only reads its own key above.
+            - n_zenith_bins / n_energy_bins: int, optional. Number of bins
         """
         # Backwards-compat: allow callers to pass `points_3d`.
         if points is None and points_3d is not None:
@@ -1056,10 +1607,12 @@ class Visualizer:
             self.PLOT_ANGULAR_RESOLUTION,
             self.PLOT_ENERGY_RESOLUTION,
             self.PLOT_POINTSOURCE_FOM,
+            self.PLOT_FLUX_VARIANCE_HISTORY,
             self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH,
             self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
             self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
             self.PLOT_POINTSOURCE_FOM_VS_ENERGY,
+            self.PLOT_EFFECTIVE_AREA_VS_ENERGY,
             self.PLOT_LOSS_COMPONENTS,
             self.PLOT_UW_LOSS_COMPONENTS,
             self.PLOT_ALM_MU,
@@ -1087,6 +1640,7 @@ class Visualizer:
             self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
             self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
             self.PLOT_POINTSOURCE_FOM_VS_ENERGY,
+            self.PLOT_EFFECTIVE_AREA_VS_ENERGY,
         }
 
         if ratio_baseline_geometry is not None:
@@ -1123,23 +1677,80 @@ class Visualizer:
                 any_series = False
                 any_fom_series = False
 
-                # Shared y-log toggle across all resolution/FoM-vs overlay plots.
-                if plot_type in ratio_plot_types:
-                    overlay_resolution_logy = bool(shared_kwargs.get('resolution_logy', False))
-                    if not overlay_resolution_logy:
-                        overlay_resolution_logy = bool(shared_kwargs.get('resolution_logy_angular', False))
-                    if not overlay_resolution_logy:
-                        overlay_resolution_logy = bool(
-                            shared_kwargs.get('resolution_logy_vs_zenith', shared_kwargs.get('resolution_logy_vs_energy', False))
-                        )
+                # Y-log toggle for this plot_type only. Each vs-plot has its own dedicated
+                # key (matching the single-geometry _create_plot path) so setting one never
+                # affects another: resolution_logy_angular for the two angular plots,
+                # resolution_logy_energy for energy resolution, ps_fom_logy for pointsource
+                # FoM, effective_area_logy for effective area. There is no shared/generic key.
+                _logy_key_by_plot_type = {
+                    self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH: 'resolution_logy_angular',
+                    self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY: 'resolution_logy_angular',
+                    self.PLOT_ENERGY_RESOLUTION_VS_ENERGY: 'resolution_logy_energy',
+                    self.PLOT_POINTSOURCE_FOM_VS_ENERGY: 'ps_fom_logy',
+                    self.PLOT_EFFECTIVE_AREA_VS_ENERGY: 'effective_area_logy',
+                }
+                logy_key = _logy_key_by_plot_type.get(plot_type)
+                if logy_key is not None:
+                    overlay_resolution_logy = bool(shared_kwargs.get(logy_key, False))
                     if not overlay_resolution_logy:
                         overlay_resolution_logy = any(
-                            bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
-                            or bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
-                            for _, payload in geom_items
+                            bool(payload.get(logy_key, False)) for _, payload in geom_items
                         )
                 else:
                     overlay_resolution_logy = False
+
+                # Shared bin edges for the vs-energy plots below (angular/energy
+                # resolution, pointsource FoM, effective area).
+           
+                _energy_binned_plot_types = {
+                    self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
+                    self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
+                    self.PLOT_POINTSOURCE_FOM_VS_ENERGY,
+                    self.PLOT_EFFECTIVE_AREA_VS_ENERGY,
+                }
+                shared_bin_edges = None
+                shared_bin_centers = None
+                if plot_type in _energy_binned_plot_types:
+                    n_bins_shared = int(shared_kwargs.get('n_energy_bins', 10))
+                    all_energies = []
+                    for _, geom_payload in geom_items:
+                        merged_payload = dict(geom_payload)
+                        merged_payload.update(shared_kwargs)
+                        event_params = merged_payload.get('resolution_params', None)
+                        if event_params is None:
+                            event_params = merged_payload.get('effective_area_params', None)
+                        if event_params is None:
+                            event_params = merged_payload.get('signal_event_params', None)
+                        if not event_params:
+                            continue
+                        for ep in event_params:
+                            if isinstance(ep, dict) and 'energy' in ep:
+                                raw_val = ep['energy']
+                                try:
+                                    all_energies.append(float(raw_val.detach().cpu().item()))
+                                except Exception:
+                                    try:
+                                        all_energies.append(float(raw_val))
+                                    except Exception:
+                                        pass
+
+                    all_energies = np.asarray(all_energies, dtype=float)
+                    all_energies = all_energies[np.isfinite(all_energies) & (all_energies > 0)]
+
+                    if all_energies.size > 0:
+                        vmin, vmax = float(all_energies.min()), float(all_energies.max())
+                        shared_energy_range = shared_kwargs.get('energy_range', None)
+                        if shared_energy_range is not None and len(shared_energy_range) == 2:
+                            try:
+                                emin, emax = float(shared_energy_range[0]), float(shared_energy_range[1])
+                                if emax < emin:
+                                    emin, emax = emax, emin
+                                vmin, vmax = max(vmin, emin), min(vmax, emax)
+                            except Exception:
+                                pass
+                        if vmax > vmin:
+                            shared_bin_edges = np.logspace(np.log10(vmin), np.log10(vmax), n_bins_shared + 1)
+                            shared_bin_centers = np.sqrt(shared_bin_edges[:-1] * shared_bin_edges[1:])
 
                 # For ratio subplot: store y(x) per geometry.
                 ratio_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
@@ -1205,13 +1816,17 @@ class Visualizer:
                                 any_series = True
                         continue
 
-                    if plot_type in (self.PLOT_ANGULAR_RESOLUTION, self.PLOT_ENERGY_RESOLUTION, self.PLOT_POINTSOURCE_FOM):
+                    if plot_type in (self.PLOT_ANGULAR_RESOLUTION, self.PLOT_ENERGY_RESOLUTION, self.PLOT_POINTSOURCE_FOM, self.PLOT_FLUX_VARIANCE_HISTORY):
                         uw_loss_dict = payload.get('uw_loss_dict', None)
                         if isinstance(uw_loss_dict, dict):
                             if plot_type == self.PLOT_ANGULAR_RESOLUTION:
                                 series = uw_loss_dict.get('angular_resolution_loss', None)
                             elif plot_type == self.PLOT_ENERGY_RESOLUTION:
                                 series = uw_loss_dict.get('energy_resolution_loss', None)
+                            elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
+                                series = uw_loss_dict.get('fisher_analysis_loss', None)
+                                if series is None:
+                                    series = uw_loss_dict.get('analysis_loss', None)
                             else:
                                 series = uw_loss_dict.get('pointsource_fom_loss', None)
                                 if series is None:
@@ -1222,12 +1837,14 @@ class Visualizer:
                                 series = np.array(series)
                                 if plot_type == self.PLOT_ANGULAR_RESOLUTION:
                                     series = series * 180.0
+                                elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY and not bool(payload.get('flux_variance_as_sigma', True)):
+                                    series = series ** 2
                                 ax.plot(series, linewidth=2, label=geom_name_str, color=geom_color.get(geom_name_str, None))
                                 any_series = True
                         continue
 
                     if plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
-                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_per_event = payload.get('angular_resolution_per_event', None)
                         resolution_params = payload.get('resolution_params', None)
                         n_bins = payload.get('n_zenith_bins', 10)
                         resolution_stat = payload.get('resolution_stat', None)
@@ -1245,11 +1862,9 @@ class Visualizer:
                         resolution_ci_level = payload.get('resolution_ci_level', None)
                         zenith_range = payload.get('zenith_range', None)
                         zenith_range_deg = payload.get('zenith_range_deg', None)
-                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
+                        resolution_logy = bool(payload.get('resolution_logy_angular', False))
                         min_ang_res = payload.get('min_angular_resolution', None)
                         max_ang_res = payload.get('max_angular_resolution', None)
-                        if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
 
                         if resolution_per_event is not None and resolution_params is not None:
                             try:
@@ -1480,7 +2095,7 @@ class Visualizer:
                         continue
 
                     if plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY:
-                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_per_event = payload.get('angular_resolution_per_event', None)
                         resolution_params = payload.get('resolution_params', None)
                         n_bins = payload.get('n_energy_bins', 10)
                         resolution_stat = payload.get('resolution_stat', None)
@@ -1497,9 +2112,7 @@ class Visualizer:
                         resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
                         resolution_ci_level = payload.get('resolution_ci_level', None)
                         energy_range = payload.get('energy_range', None)
-                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
-                        if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
+                        resolution_logy = bool(payload.get('resolution_logy_angular', False))
                         min_ang_res = payload.get('min_angular_resolution', None)
                         max_ang_res = payload.get('max_angular_resolution', None)
 
@@ -1543,17 +2156,22 @@ class Visualizer:
                                 energy_values = np.array(energy_values)[pos_mask]
 
                             if len(res_values) > 0 and len(energy_values) > 0:
-                                log_energy_min = np.log10(energy_values.min())
-                                log_energy_max = np.log10(energy_values.max())
-                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
-                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                if shared_bin_edges is not None:
+                                    bin_edges = shared_bin_edges
+                                    bin_centers = shared_bin_centers
+                                else:
+                                    log_energy_min = np.log10(energy_values.min())
+                                    log_energy_max = np.log10(energy_values.max())
+                                    bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                n_bins_effective = len(bin_edges) - 1
 
                                 bin_medians = []
                                 band_lower = []
                                 band_upper = []
                                 fom_errors = []
                                 bin_counts = []
-                                for i in range(int(n_bins)):
+                                for i in range(n_bins_effective):
                                     mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         vals = np.array(res_values[mask], dtype=float)
@@ -1726,7 +2344,7 @@ class Visualizer:
                         continue
 
                     if plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
-                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_per_event = payload.get('energy_resolution_per_event', None)
                         resolution_params = payload.get('resolution_params', None)
                         n_bins = payload.get('n_energy_bins', 10)
                         use_relative_energy = payload.get('use_relative_energy', False)
@@ -1744,9 +2362,7 @@ class Visualizer:
                         resolution_ci_percentiles = payload.get('resolution_ci_percentiles', None)
                         resolution_ci_level = payload.get('resolution_ci_level', None)
                         energy_range = payload.get('energy_range', None)
-                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
-                        if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
+                        resolution_logy = bool(payload.get('resolution_logy_energy', False))
 
                         if resolution_per_event is not None and resolution_params is not None:
                             try:
@@ -1788,17 +2404,22 @@ class Visualizer:
                                 energy_values = np.array(energy_values)[pos_mask]
 
                             if len(res_values) > 0 and len(energy_values) > 0:
-                                log_energy_min = np.log10(energy_values.min())
-                                log_energy_max = np.log10(energy_values.max())
-                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
-                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                if shared_bin_edges is not None:
+                                    bin_edges = shared_bin_edges
+                                    bin_centers = shared_bin_centers
+                                else:
+                                    log_energy_min = np.log10(energy_values.min())
+                                    log_energy_max = np.log10(energy_values.max())
+                                    bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                n_bins_effective = len(bin_edges) - 1
 
                                 bin_medians = []
                                 band_lower = []
                                 band_upper = []
                                 fom_errors = []
                                 bin_counts = []
-                                for i in range(int(n_bins)):
+                                for i in range(n_bins_effective):
                                     mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         vals = np.array(res_values[mask], dtype=float)
@@ -1943,7 +2564,7 @@ class Visualizer:
                         continue
 
                     if plot_type == self.PLOT_POINTSOURCE_FOM_VS_ENERGY:
-                        resolution_per_event = payload.get('resolution_per_event', None)
+                        resolution_per_event = payload.get('angular_resolution_per_event', None)
                         effective_area_per_event = payload.get('effective_area_per_event', None)
                         event_params = payload.get('resolution_params', None)
                         if event_params is None:
@@ -1953,9 +2574,7 @@ class Visualizer:
                         n_bins = payload.get('n_energy_bins', 10)
                         energy_range = payload.get('energy_range', None)
                         fom_min_resolution = payload.get('resolution_fom_min_resolution', 1e-12)
-                        resolution_logy = bool(payload.get('resolution_logy', payload.get('resolution_logy_angular', False)))
-                        if not resolution_logy:
-                            resolution_logy = bool(payload.get('resolution_logy_vs_zenith', payload.get('resolution_logy_vs_energy', False)))
+                        resolution_logy = bool(payload.get('ps_fom_logy', False))
 
                         if (
                             resolution_per_event is not None
@@ -2014,14 +2633,19 @@ class Visualizer:
                                     pass
 
                             if len(res_values) > 0 and len(aeff_values) > 0 and len(energy_values) > 0:
-                                log_energy_min = np.log10(energy_values.min())
-                                log_energy_max = np.log10(energy_values.max())
-                                bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
-                                bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                if shared_bin_edges is not None:
+                                    bin_edges = shared_bin_edges
+                                    bin_centers = shared_bin_centers
+                                else:
+                                    log_energy_min = np.log10(energy_values.min())
+                                    log_energy_max = np.log10(energy_values.max())
+                                    bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                n_bins_effective = len(bin_edges) - 1
 
                                 bin_fom = []
                                 bin_fom_err = []
-                                for i in range(int(n_bins)):
+                                for i in range(n_bins_effective):
                                     mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
                                     if mask.sum() > 0:
                                         fval, ferr = self._compute_pointsource_fom_from_resolution_and_aeff(
@@ -2072,6 +2696,113 @@ class Visualizer:
                                             color=geom_color.get(geom_name_str, None),
                                         )
                                     any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_EFFECTIVE_AREA_VS_ENERGY:
+                        effective_area_per_event = payload.get('effective_area_per_event', None)
+                        event_params = payload.get('resolution_params', None)
+                        if event_params is None:
+                            event_params = payload.get('effective_area_params', None)
+                        if event_params is None:
+                            event_params = payload.get('signal_event_params', None)
+                        n_bins = payload.get('n_energy_bins', 10)
+                        energy_range = payload.get('energy_range', None)
+                        resolution_stat = payload.get('resolution_stat', None)
+                        if resolution_stat is None and bool(payload.get('resolution_use_mean', False)):
+                            resolution_stat = 'mean'
+                        resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+                        if resolution_stat not in ('median', 'mean'):
+                            resolution_stat = 'median'
+                        resolution_logy = bool(payload.get('effective_area_logy', False))
+
+                        if effective_area_per_event is not None and event_params is not None:
+                            try:
+                                aeff_values = effective_area_per_event.clone().detach().cpu().numpy().flatten()
+                            except Exception:
+                                aeff_values = np.array(effective_area_per_event).flatten()
+
+                            energy_values = []
+                            for ep in event_params:
+                                if isinstance(ep, dict) and 'energy' in ep:
+                                    energy = ep['energy']
+                                    try:
+                                        energy_values.append(float(energy.detach().cpu().item()))
+                                    except Exception:
+                                        try:
+                                            energy_values.append(float(energy))
+                                        except Exception:
+                                            pass
+                            energy_values = np.array(energy_values)
+
+                            n = min(len(aeff_values), len(energy_values))
+                            if n > 0:
+                                aeff_values = aeff_values[:n]
+                                energy_values = energy_values[:n]
+
+                            valid_mask = np.isfinite(aeff_values) & np.isfinite(energy_values) & (energy_values > 0)
+                            aeff_values = aeff_values[valid_mask]
+                            energy_values = energy_values[valid_mask]
+
+                            if energy_range is not None and len(energy_range) == 2:
+                                try:
+                                    emin, emax = float(energy_range[0]), float(energy_range[1])
+                                    if emax < emin:
+                                        emin, emax = emax, emin
+                                    range_mask = (energy_values >= emin) & (energy_values <= emax)
+                                    aeff_values = aeff_values[range_mask]
+                                    energy_values = energy_values[range_mask]
+                                except Exception:
+                                    pass
+
+                            if resolution_logy:
+                                pos_mask = aeff_values > 0
+                                aeff_values = aeff_values[pos_mask]
+                                energy_values = energy_values[pos_mask]
+
+                            if len(aeff_values) > 0 and len(energy_values) > 0:
+                                if shared_bin_edges is not None:
+                                    bin_edges = shared_bin_edges
+                                    bin_centers = shared_bin_centers
+                                else:
+                                    log_energy_min = np.log10(energy_values.min())
+                                    log_energy_max = np.log10(energy_values.max())
+                                    bin_edges = np.logspace(log_energy_min, log_energy_max, int(n_bins) + 1)
+                                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+                                n_bins_effective = len(bin_edges) - 1
+
+                                bin_medians = []
+                                for i in range(n_bins_effective):
+                                    mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
+                                    if mask.sum() > 0:
+                                        vals = np.array(aeff_values[mask], dtype=float)
+                                        if resolution_stat == 'mean':
+                                            bin_medians.append(float(np.nanmean(vals)))
+                                        else:
+                                            bin_medians.append(float(np.nanmedian(vals)))
+                                    else:
+                                        bin_medians.append(np.nan)
+
+                                bin_medians = np.array(bin_medians)
+                                x_plot = np.log10(bin_centers)
+                                valid_bins = np.isfinite(bin_medians)
+                                if resolution_logy:
+                                    valid_bins = valid_bins & (bin_medians > 0)
+                                if np.any(valid_bins):
+                                    ratio_cache[geom_name_str] = (
+                                        np.array(x_plot)[valid_bins],
+                                        np.array(bin_medians)[valid_bins],
+                                    )
+                                    any_series = True
+
+                                    ax.plot(
+                                        x_plot[valid_bins],
+                                        bin_medians[valid_bins],
+                                        'o-',
+                                        linewidth=2,
+                                        markersize=6,
+                                        label=geom_name_str,
+                                        color=geom_color.get(geom_name_str, None),
+                                    )
                         continue
 
                 # Add ratio subplot if requested for resolution-vs-* plots.
@@ -2175,6 +2906,13 @@ class Visualizer:
                     ax.set_xlabel('Iteration')
                     ax.set_ylabel('Pointsource FoM')
                     ax.grid(True, alpha=0.3)
+                    if payload.get('ps_fom_logy', False):
+                        ax.set_yscale('log')
+                elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
+                    ax.set_title('Flux Parameter Variance History')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel(r'Combined flux error  $\sum_p \sigma_p$')
+                    ax.grid(True, alpha=0.3)
                 elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
                     ax.set_title('Angular FOM vs Zenith' if any_fom_series else 'Angular Resolution vs Zenith')
                     ax.set_xlabel('Zenith Angle (degrees)')
@@ -2221,6 +2959,13 @@ class Visualizer:
                     ax.set_title('Pointsource FoM vs log$_{10}$(Energy)')
                     ax.set_xlabel('log$_{10}$(Energy / GeV)')
                     ax.set_ylabel('Pointsource FoM')
+                    ax.grid(True, alpha=0.3)
+                    if overlay_resolution_logy:
+                        ax.set_yscale('log')
+                elif plot_type == self.PLOT_EFFECTIVE_AREA_VS_ENERGY:
+                    ax.set_title('Effective Area vs log$_{10}$(Energy)')
+                    ax.set_xlabel('log$_{10}$(Energy / GeV)')
+                    ax.set_ylabel('Effective Area (m$^2$)')
                     ax.grid(True, alpha=0.3)
                     if overlay_resolution_logy:
                         ax.set_yscale('log')
@@ -2472,15 +3217,31 @@ class Visualizer:
         
         # Extract zoom_range parameter for contour plots
         zoom_range = kwargs.get('zoom_range', None)
-        
-        # Helper function to set axis limits based on zoom_range or default domain
+
+        # If any string lies outside the nominal domain, expand the plotted half-domain
+        # just enough to include it (with a small margin) rather than silently clipping
+        # strings out of view. Only kicks in when no explicit zoom_range was requested -
+        # an explicit zoom_range is a deliberate user choice and is left untouched.
+        # String point sizes are shrunk proportionally (via string_size_scale) so plots
+        # stay visually consistent with the un-expanded domain when nothing is out of bounds.
+        string_size_scale = 1.0
+        effective_half_domain = self.half_domain
+        if zoom_range is None and string_xy is not None:
+            string_xy_np = string_xy.detach().cpu().numpy() if torch.is_tensor(string_xy) else np.asarray(string_xy)
+            if string_xy_np.size > 0:
+                max_abs_coord = float(np.max(np.abs(string_xy_np)))
+                if np.isfinite(max_abs_coord) and max_abs_coord > self.half_domain:
+                    effective_half_domain = max_abs_coord * 1.05  # small margin so edge strings aren't flush with the border
+                    string_size_scale = self.half_domain / effective_half_domain
+
+        # Helper function to set axis limits based on zoom_range or default (possibly expanded) domain
         def set_axis_limits(ax_obj):
             if zoom_range is not None:
                 ax_obj.set_xlim(-zoom_range, zoom_range)
                 ax_obj.set_ylim(-zoom_range, zoom_range)
             else:
-                ax_obj.set_xlim(-self.half_domain, self.half_domain)
-                ax_obj.set_ylim(-self.half_domain, self.half_domain)
+                ax_obj.set_xlim(-effective_half_domain, effective_half_domain)
+                ax_obj.set_ylim(-effective_half_domain, effective_half_domain)
         
         # Create the requested plot type
         if plot_type == self.PLOT_LOSS:
@@ -2696,7 +3457,7 @@ class Visualizer:
                         sc = ax.scatter(
                             xy_weighted[:, 0],
                             xy_weighted[:, 1],
-                            s=min([40, 30 * 200 / max(1, len(xy_weighted))]),
+                            s=min([40, 30 * 200 / max(1, len(xy_weighted))]) * string_size_scale,
                             c=points_weighted,
                             cmap=cmap,
                             alpha=alpha_vals[weight_mask],
@@ -2720,7 +3481,7 @@ class Visualizer:
                         weight_mask = np.array([True]*len(xy_np))
 
                     if np.any(weight_mask):    
-                        ax.scatter(xy_np[:, 0][weight_mask], xy_np[:, 1][weight_mask], s=min([40,30*200/len(xy_np[weight_mask])]), alpha=alpha_vals[weight_mask])
+                        ax.scatter(xy_np[:, 0][weight_mask], xy_np[:, 1][weight_mask], s=min([40,30*200/len(xy_np[weight_mask])]) * string_size_scale, alpha=alpha_vals[weight_mask])
 
                 set_axis_limits(ax)
                 ax.set_title('String Positions in XY Plane')
@@ -2729,10 +3490,14 @@ class Visualizer:
                 
                 # Draw radius circle around origin if requested
                 if draw_radius and max_radius is not None:
-                    circle = plt.Circle((0, 0), max_radius, color='blue', fill=False, 
+                    circle = plt.Circle((0, 0), max_radius, color='blue', fill=False,
                                        linewidth=5, linestyle='--', alpha=0.2)
                     ax.add_patch(circle)
                     # ax.legend()
+
+                # Draw the N-fold slice (wedge) boundaries, if this is an
+                # N-fold symmetric geometry.
+                self._draw_slice_lines(ax, xy_np, **kwargs)
 
                 # Draw weighted bounding cylinder overlay if requested.
                 if draw_weighted_cylinder:
@@ -2786,6 +3551,10 @@ class Visualizer:
                 rov_least_blocked_angle_per_string = kwargs.get('rov_least_blocked_angle_per_string', None)
                 string_weights = kwargs.get('string_weights', None)
                 draw_rov_safe_space_on_violations = bool(kwargs.get('rov_draw_safe_space_on_violations', False))
+                draw_rov_safe_space_active_only = bool(kwargs.get('rov_draw_safe_space_active_only', False))
+                draw_rov_safe_space_union = bool(kwargs.get('rov_draw_safe_space_union', False))
+                rov_union_per_space_colors = bool(kwargs.get('rov_union_per_space_colors', False))
+                rov_safe_space_one_fold_only = bool(kwargs.get('rov_safe_space_one_fold_only', False))
                 weight_threshold = kwargs.get('weight_threshold', 0.7)
                 if rov_penalty_per_string is not None:
                     # Convert ROV penalty per string to numpy
@@ -2795,29 +3564,72 @@ class Visualizer:
                         rov_penalty_np = np.array(rov_penalty_per_string)
                     rov_penalty_np*= len(xy_np)
 
+                    # Active-string mask (weight >= threshold), matching the
+                    # convention used by the other string_xy plots.
+                    active_mask = None
+                    if string_weights is not None:
+                        string_weights_np = np.array(
+                            [string_weights[idx] for idx in range(len(xy_np))]
+                        )
+                        active_mask = string_weights_np >= weight_threshold
+
                     # Optionally draw the per-string ROV safe-space corridor for
                     # strings with a (displayed) violation >= 1, oriented by the
-                    # least-blocked angle.
-                    if draw_rov_safe_space_on_violations:
-                        rov_penalty_func = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
-                        if rov_penalty_func is not None and rov_least_blocked_angle_per_string is not None:
-                            if torch.is_tensor(rov_least_blocked_angle_per_string):
-                                rov_angles_np = rov_least_blocked_angle_per_string.detach().cpu().numpy()
-                            else:
-                                rov_angles_np = np.array(rov_least_blocked_angle_per_string)
+                    # least-blocked angle. When `rov_draw_safe_space_active_only`
+                    # is set, this is further restricted to active strings only.
+                    rov_angles_np = None
+                    if rov_least_blocked_angle_per_string is not None:
+                        if torch.is_tensor(rov_least_blocked_angle_per_string):
+                            rov_angles_np = rov_least_blocked_angle_per_string.detach().cpu().numpy()
+                        else:
+                            rov_angles_np = np.array(rov_least_blocked_angle_per_string)
+                        if rov_angles_np.shape[0] != xy_np.shape[0]:
+                            rov_angles_np = None
 
-                            if rov_angles_np.shape[0] == xy_np.shape[0]:
-                                violation_mask = rov_penalty_np >= weight_threshold
-                                viol_idx = np.where(violation_mask)[0]
-                                for i in viol_idx:
-                                    self._draw_rov_safe_space_at_string(
-                                        ax,
-                                        origin_xy=xy_np[i],
-                                        angle_rad=rov_angles_np[i],
-                                        rov_penalty=rov_penalty_func,
-                                        zorder=1,
+                    rov_penalty_func = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
+
+                    if draw_rov_safe_space_on_violations:
+                        if rov_penalty_func is not None and rov_angles_np is not None:
+                            violation_mask = rov_penalty_np >= weight_threshold
+                            if draw_rov_safe_space_active_only and active_mask is not None:
+                                violation_mask = violation_mask & active_mask
+                            viol_idx = np.where(violation_mask)[0]
+                            viol_origins, viol_angles, viol_idx_expanded = xy_np[viol_idx], rov_angles_np[viol_idx], viol_idx
+                            if rov_safe_space_one_fold_only:
+                                viol_origins, viol_angles, viol_idx_expanded = self._tile_rov_safe_spaces_across_folds(
+                                    viol_origins, viol_angles, viol_idx_expanded, kwargs,
+                                )
+                            for origin_xy, angle_rad in zip(viol_origins, viol_angles):
+                                self._draw_rov_safe_space_at_string(
+                                    ax,
+                                    origin_xy=origin_xy,
+                                    angle_rad=angle_rad,
+                                    rov_penalty=rov_penalty_func,
+                                    zorder=1,
+                                )
+
+                    # Optionally draw the unioned shape of all (active) strings'
+                    # best (least-blocked-angle) ROV safe spaces.
+                    if draw_rov_safe_space_union:
+                        if rov_penalty_func is not None and rov_angles_np is not None:
+                            union_idx_mask = active_mask if active_mask is not None else np.ones(len(xy_np), dtype=bool)
+                            union_idx = np.where(union_idx_mask)[0]
+                            if union_idx.size > 0:
+                                union_origins, union_angles, union_idx_expanded = xy_np[union_idx], rov_angles_np[union_idx], union_idx
+                                if rov_safe_space_one_fold_only:
+                                    union_origins, union_angles, union_idx_expanded = self._tile_rov_safe_spaces_across_folds(
+                                        union_origins, union_angles, union_idx_expanded, kwargs,
                                     )
-                    
+                                self._draw_rov_safe_space_union(
+                                    ax,
+                                    origins_xy=union_origins,
+                                    angles_rad=union_angles,
+                                    rov_penalty=rov_penalty_func,
+                                    zorder=1,
+                                    per_space_colors=rov_union_per_space_colors,
+                                    string_indices=union_idx_expanded,
+                                )
+
                     # Use string weights for alpha transparency (no threshold filtering)
                     if string_weights is not None:
                         alpha_vals = np.array([string_weights[idx] for idx in string_indices])
@@ -2831,14 +3643,14 @@ class Visualizer:
                     
                     # Normalize penalties for colormap
                     vmin = np.min(rov_penalty_np)
-                    vmax = np.max(rov_penalty_np)
+                    vmax = max(np.max(rov_penalty_np), 1.0)
                     norm = Normalize(vmin=vmin, vmax=vmax)
                     
                     # Plot strings colored by ROV penalty with alpha based on weights
                     sc = ax.scatter(
                         xy_np[:, 0],
                         xy_np[:, 1],
-                        s=min([30, 50 * 200 / len(xy_np)]),
+                        s=min([30, 50 * 200 / len(xy_np)]) * string_size_scale,
                         c=rov_penalty_np,
                         cmap=cmap,
                         norm=norm,
@@ -2853,12 +3665,13 @@ class Visualizer:
                     
                     rov_penalty = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
                     if rov_penalty is not None:
-                        self._draw_rov_safe_space(ax, rov_penalty, zoom_range=zoom_range)
+                        self._draw_rov_safe_space(ax, rov_penalty, zoom_range=zoom_range, half_domain=effective_half_domain)
                     
                     set_axis_limits(ax)
                     ax.set_title('ROV Penalty per String')
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
+                    self._draw_slice_lines(ax, xy_np, **kwargs)
                 else:
                     ax.text(0.5, 0.5, "ROV penalty per string data not available", 
                           ha='center', va='center', transform=ax.transAxes)
@@ -2891,13 +3704,13 @@ class Visualizer:
 
                         cmap = plt.cm.RdYlGn_r  # Red for high penalty, green for low penalty
                         vmin = 0
-                        vmax = np.max(local_repulsion_np) if np.max(local_repulsion_np) > 0 else 1.0
+                        vmax = max(np.max(local_repulsion_np), 1.0) if np.max(local_repulsion_np) > 0 else 1.0
                         norm = Normalize(vmin=vmin, vmax=vmax)
 
                         sc = ax.scatter(
                             xy_np[:, 0],
                             xy_np[:, 1],
-                            s=min([30, 50 * 200 / len(xy_np)]),
+                            s=min([30, 50 * 200 / len(xy_np)]) * string_size_scale,
                             c=local_repulsion_np,
                             cmap=cmap,
                             norm=norm,
@@ -2913,13 +3726,55 @@ class Visualizer:
                         ax.set_title('Local String Repulsion per String')
                         ax.set_xlabel('X')
                         ax.set_ylabel('Y')
+                        self._draw_slice_lines(ax, xy_np, **kwargs)
                 else:
                     ax.text(0.5, 0.5, "Local string repulsion per string data not available", 
                           ha='center', va='center', transform=ax.transAxes)
             else:
-                ax.text(0.5, 0.5, "String XY data not available", 
+                ax.text(0.5, 0.5, "String XY data not available",
                       ha='center', va='center', transform=ax.transAxes)
-                
+
+        elif plot_type == self.PLOT_STRING_HISTORY:
+            # Traced path of each string's XY position across every recorded iteration,
+            # from its starting position (red) to its current/final position (green).
+            # Snapshots are cached on self so the caller never has to pass the starting
+            # geometry or intermediate positions themselves - just keep requesting this
+            # plot type (e.g. via vis_freq during optimizer.optimize()) and each unique
+            # iteration's string_xy/string_weights are appended automatically.
+            string_weights = kwargs.get('string_weights', None)
+            if string_xy is not None and (iteration is None or iteration != self._last_recorded_iteration_string_history):
+                xy_snapshot = string_xy.clone().detach().cpu().numpy() if torch.is_tensor(string_xy) else np.array(string_xy)
+                self._string_xy_history.append(xy_snapshot)
+                if string_weights is not None:
+                    w_snapshot = string_weights.clone().detach().cpu().numpy() if torch.is_tensor(string_weights) else np.array(string_weights)
+                else:
+                    w_snapshot = None
+                self._string_weights_history.append(w_snapshot)
+                self._string_history_iterations.append(iteration)
+                self._last_recorded_iteration_string_history = iteration
+
+            if len(self._string_xy_history) >= 2:
+                self._draw_string_history(
+                    ax,
+                    string_xy_history=self._string_xy_history,
+                    string_weights_history=self._string_weights_history,
+                    weight_threshold=kwargs.get('weight_threshold', 0.7),
+                    # `kwargs['string_weights']` was already sigmoid-applied above (see the
+                    # top of _create_plot), and each snapshot cached here came from that same
+                    # already-sigmoided kwarg, so do not sigmoid it again by default.
+                    apply_sigmoid=kwargs.get('string_history_apply_sigmoid', False),
+                    match_strings=kwargs.get('string_history_match_strings', None),
+                    min_segment_length=kwargs.get('string_history_min_segment_length', 1e-3),
+                    zoom_range=zoom_range,
+                    color_start=kwargs.get('string_history_color_start', 'red'),
+                    color_end=kwargs.get('string_history_color_end', 'green'),
+                    line_kwargs=kwargs.get('string_history_line_kwargs', None),
+                    title=kwargs.get('string_history_title', 'String Position History'),
+                )
+            else:
+                ax.text(0.5, 0.5, "String history not available yet\n(Need at least 2 recorded iterations;\nrequires 'string_xy' in kwargs)",
+                      ha='center', va='center', transform=ax.transAxes)
+
         elif plot_type == self.PLOT_Z_DIST:
             # Z value distribution histogram
             z_values = points_xyz[:, 2]
@@ -3077,7 +3932,7 @@ class Visualizer:
                 # print("Alpha values:", alpha_values)
                 # alpha_values = [alpha_values[i] if alpha_values[i] > 0.7 else 0.1 for i in range(len(alpha_values))]
                 
-                ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='white')
+                ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='white')
                 
                 # Set appropriate title based on input type
                 if signal_surrogate_func is not None:
@@ -3195,7 +4050,7 @@ class Visualizer:
             
             # alpha_values = [alpha_values[i] if alpha_values[i] > 0.7 else 0.1 for i in range(len(alpha_values))]
                 
-            ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+            ax.scatter(string_xy[:, 0], string_xy[:, 1], c='red', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
             
             ax.set_title(plot_title)
             ax.set_xlabel("X")
@@ -3453,7 +4308,7 @@ class Visualizer:
                     alpha_values = np.clip(alpha_values, 0.05, 1.0)
                 else:
                     alpha_values = 0.8
-                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
             else:
                 title_str += " (Z=0)"
                 # For single-slice, show points near the z=0 slice
@@ -3469,7 +4324,7 @@ class Visualizer:
                         alpha_values = np.clip(alpha_values, 0.05, 1.0)
                     else:
                         alpha_values = 0.8
-                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
                 else: # If no points are near z=0, show all points projected
                     if string_weights is not None and string_indices is not None:
                         alpha_values = np.array([string_weights[idx] for idx in string_indices])
@@ -3479,7 +4334,7 @@ class Visualizer:
                         alpha_values = np.clip(alpha_values, 0.05, 1.0)
                     else:
                         alpha_values = 0.8
-                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
 
             # Add detail to title based on what was visualized
             if vis_all_surrogates and len(surrogate_funcs_list) > 1:
@@ -3694,7 +4549,7 @@ class Visualizer:
                 alpha_values = 0.8
 
             if multi_slice:
-                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
             else: # Single slice (Z=0.0)
                 xy_points_z0 = points_np[np.abs(points_np[:, 2] - 0.0) < 0.2] # Points near Z=0
                 if len(xy_points_z0) > 0:
@@ -3704,9 +4559,9 @@ class Visualizer:
                         z0_alpha_values = alpha_values[z0_indices]
                     else:
                         z0_alpha_values = alpha_values
-                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=z0_alpha_values, edgecolor='black')
+                    ax.scatter(xy_points_z0[:, 0], xy_points_z0[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=z0_alpha_values, edgecolor='black')
                 else: # If no points near Z=0, show all points projected
-                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]), alpha=alpha_values, edgecolor='black')
+                    ax.scatter(points_np[:, 0], points_np[:, 1], c='r', s=min([40,30*200/len(string_indices)]) * string_size_scale, alpha=alpha_values, edgecolor='black')
             
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
@@ -3723,7 +4578,8 @@ class Visualizer:
                     xy_np = string_xy.clone().detach().cpu().numpy()
                     weights_np = string_weights
                     # Create alpha values: 1 if weight > 0.7, else 0.5
-                    alphas = [1 if weights_np[i] > 0.7 else 0.6 for i in range(len(weights_np))]
+                    # alphas = [1 if weights_np[i] > 0.7 else 0.6 for i in range(len(weights_np))]
+                    alphas = [1 for i in range(len(weights_np))]  # For now, set all alphas to 1 for visibility
                     # edge_colors=['k' if weights_np[i] > 0.7 else 'none' for i in range(len(weights_np))]
                     # Create scatter plot with explicit normalization
                     
@@ -3735,7 +4591,7 @@ class Visualizer:
                         cmap='Greens',
                         alpha=alphas,
                         edgecolors=None,
-                        s=min([40,30*200/len(weights_np)]),
+                        s=min([40,30*200/len(weights_np)]) * string_size_scale,
                         norm=norm
                         )
                     
@@ -3749,7 +4605,8 @@ class Visualizer:
                     ax.set_ylabel('Y Coordinate')
                     ax.set_title(f'Active strings = {len(weights_np[weights_np > 0.7])}, Total strings = {len(weights_np)}')
                     set_axis_limits(ax)
-                    
+                    self._draw_slice_lines(ax, xy_np, **kwargs)
+
                     # Add ROV safe space visualization if ROV penalty is available
                     # rov_penalty = kwargs.get('rov_penalty', None)
                     # if rov_penalty is not None:
@@ -3816,7 +4673,7 @@ class Visualizer:
                 
                 # Show string positions colored by their LLR values
                 scatter = ax.scatter(string_x, string_y, c=llr_values_np, 
-                                   cmap='RdYlBu_r', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='RdYlBu_r', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -3883,7 +4740,7 @@ class Visualizer:
                 
                 # Show string positions colored by their signal LLR values
                 scatter = ax.scatter(string_x, string_y, c=signal_llr_values_np, 
-                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -3950,7 +4807,7 @@ class Visualizer:
                 
                 # Show string positions colored by their signal LLR values
                 scatter = ax.scatter(string_x, string_y, c=signal_llr_values_np, 
-                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='Reds', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -4075,7 +4932,7 @@ class Visualizer:
                 
                 # Show string positions colored by their background LLR values
                 scatter = ax.scatter(string_x, string_y, c=background_llr_values_np, 
-                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -4142,7 +4999,7 @@ class Visualizer:
                 
                 # Show string positions colored by their background LLR values
                 scatter = ax.scatter(string_x, string_y, c=background_llr_values_np, 
-                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='Blues', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -4631,12 +5488,12 @@ class Visualizer:
                         signal_light_yield_values_np = np.array(signal_light_yield_per_string)
                         
                     scatter = ax.scatter(string_x, string_y, c=signal_light_yield_values_np, 
-                                       cmap='Oranges', s=min([60, 40*200*size_factor/len(string_indices)]), 
+                                       cmap='Oranges', s=min([60, 40*200*size_factor/len(string_indices)]) * string_size_scale, 
                                        alpha=alpha_values, edgecolor='black', linewidth=1,
                                        label='String Positions')
                 else:
                     # Just show string positions without color coding
-                    point_size = min([60, 40*200*size_factor/len(string_indices)]) if (string_indices is not None and len(string_indices) > 0) else 60
+                    point_size = (min([60, 40*200*size_factor/len(string_indices)]) if (string_indices is not None and len(string_indices) > 0) else 60) * string_size_scale
                     scatter = ax.scatter(string_x, string_y, c='red', 
                                        s=point_size, 
                                        alpha=alpha_values, edgecolor='black', linewidth=1,
@@ -4759,7 +5616,7 @@ class Visualizer:
                 
                 # Show string positions colored by their SNR values
                 scatter = ax.scatter(string_x, string_y, c=snr_values_np, 
-                                   cmap='viridis', s=min([60, 40*200/len(string_indices)]), 
+                                   cmap='viridis', s=min([60, 40*200/len(string_indices)]) * string_size_scale, 
                                    alpha=alpha_values, edgecolor='black', linewidth=1,
                                    label='String Positions')
                 
@@ -4862,7 +5719,7 @@ class Visualizer:
                         alpha_values = 0.8
                     
                     scatter = ax.scatter(string_x, string_y, c=fisher_logdet_values, 
-                                       cmap='plasma', s=min([60, 40*200/len(string_x)]), 
+                                       cmap='plasma', s=min([60, 40*200/len(string_x)]) * string_size_scale, 
                                        alpha=alpha_values, edgecolor='black', linewidth=1)
                     
                     ax.set_title(f"Fisher Info Inv. Trace per String")
@@ -4873,7 +5730,7 @@ class Visualizer:
                     if num_finite > 0:
                         ax.scatter(string_x[finite_mask], string_y[finite_mask], 
                                  c=fisher_logdet_values[finite_mask], cmap='plasma', 
-                                 s=min([60, 40*200/len(string_x)]), alpha=0.8, 
+                                 s=min([60, 40*200/len(string_x)]) * string_size_scale, alpha=0.8, 
                                  edgecolor='black', linewidth=1)
                         ax.set_title(f"Fisher Info Inv. Trace per String")
                         ax.text(0.5, 0.02, f"Interpolation failed: {error_msg}", 
@@ -4891,30 +5748,80 @@ class Visualizer:
                       ha='center', va='center', transform=ax.transAxes)
         
         elif plot_type == self.PLOT_ANGULAR_RESOLUTION:
-            # Angular resolution history from Fisher Information matrix using Cramér-Rao bound
-            loss_dict = kwargs.get('uw_loss_dict', None)
-            
-            if loss_dict is not None:
-                angular_resolution_history = loss_dict.get('angular_resolution_loss', None)
+            # Angular resolution history from Fisher Information matrix using Cramér-Rao bound.
+            #
+            # Preferred source: resolution_per_event (same per-event array used by
+            # PLOT_ANGULAR_RESOLUTION_VS_ZENITH / PLOT_ANGULAR_RESOLUTION_VS_ENERGY),
+            # aggregated per-iteration with the same resolution_stat convention
+            # ('mean', 'median', or 'fom') those plots use. Falls back to the scalar
+            # angular_resolution_loss history in uw_loss_dict when resolution_per_event
+            # isn't provided (e.g. non-weighted resolution loss without per-event output).
+            resolution_per_event = kwargs.get('angular_resolution_per_event', None)
+            resolution_stat = kwargs.get('resolution_stat', None)
+            if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
+                resolution_stat = 'mean'
+            resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+            if resolution_stat not in ('median', 'mean', 'fom'):
+                resolution_stat = 'median'
+            resolution_use_fom = bool(kwargs.get('resolution_use_fom', False)) or resolution_stat == 'fom'
+            resolution_fom_min_resolution = kwargs.get('resolution_fom_min_resolution', 1e-12)
+
+            angular_resolution_history = None
+            using_per_event_history = False
+
+            if resolution_per_event is not None and iteration is not None:
+                if isinstance(resolution_per_event, torch.Tensor):
+                    res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
+                else:
+                    res_values = np.array(resolution_per_event).flatten()
+                res_values = res_values[np.isfinite(res_values)]
+
+                if res_values.size > 0:
+                    if resolution_use_fom:
+                        agg_val, _ = self._compute_fom_from_resolution(
+                            res_values, min_resolution=resolution_fom_min_resolution,
+                        )
+                    elif resolution_stat == 'mean':
+                        agg_val = float(np.nanmean(res_values))
+                    else:
+                        agg_val = float(np.nanmedian(res_values))
+
+                    if np.isfinite(agg_val):
+                        self._angular_resolution_per_event_history[int(iteration)] = float(agg_val)
+
+            if len(self._angular_resolution_per_event_history) > 0:
+                iters_sorted = sorted(self._angular_resolution_per_event_history.keys())
+                angular_resolution_history = np.array(
+                    [self._angular_resolution_per_event_history[i] for i in iters_sorted]
+                )
+                using_per_event_history = True
+            else:
+                loss_dict = kwargs.get('uw_loss_dict', None)
+                if loss_dict is not None:
+                    angular_resolution_history = loss_dict.get('angular_resolution_loss', None)
+                iters_sorted = None
 
             if angular_resolution_history is not None:
-                angular_resolution_history = np.array(angular_resolution_history) * 180.0  # Convert to degrees
-                # Plot the history of weighted total angular resolution
-                ax.plot(angular_resolution_history, color='blue', linewidth=2, markersize=4)
-                ax.set_title('Angular Resolution History')
+                angular_resolution_history = np.array(angular_resolution_history)
+                # Plot the history of angular resolution (aggregated per resolution_stat when
+                # using per-event data; otherwise the weighted total angular resolution).
+                x_axis = iters_sorted if using_per_event_history else range(len(angular_resolution_history))
+                is_fom = using_per_event_history and resolution_use_fom
+                if not is_fom:
+                    angular_resolution_history = angular_resolution_history * 180.0/np.pi  # radians -> degrees
+                ax.plot(x_axis, angular_resolution_history, color='blue', linewidth=2, markersize=4)
+                title_stat = (
+                    ('FoM' if resolution_use_fom else resolution_stat.capitalize())
+                    if using_per_event_history else 'Total'
+                )
+                ax.set_title(f'Angular Resolution History ({title_stat})')
                 ax.set_xlabel('Iteration')
-                ax.set_ylabel('Angular Resolution (degrees)')
+                ax.set_ylabel('Angular FoM (rad$^{-1}$)' if is_fom else 'Angular Resolution (degrees)')
+                if kwargs.get('resolution_logy_angular', False):
+                    ax.set_yscale('log')
                 ax.grid(True, alpha=0.3)
-                
-                # # Add current value annotation
-                # if len(angular_resolution_history) > 0:
-                #     current_val = angular_resolution_history[-1]
-                #     ax.annotate(f'Current: {current_val:.2f}°', 
-                #               xy=(len(angular_resolution_history)-1, current_val),
-                #               xytext=(10, 10), textcoords='offset points',
-                #               fontsize=10, ha='left')
             else:
-                ax.text(0.5, 0.5, "Angular resolution history not available\n(Pass 'angular_resolution_history' in kwargs)", 
+                ax.text(0.5, 0.5, "Angular resolution history not available\n(Pass 'resolution_per_event' or 'angular_resolution_history' in kwargs)",
                       ha='center', va='center', transform=ax.transAxes)
         
         elif plot_type == self.PLOT_ENERGY_RESOLUTION:
@@ -4942,8 +5849,218 @@ class Visualizer:
                 #               xytext=(10, 10), textcoords='offset points',
                 #               fontsize=10, ha='left')
             else:
-                ax.text(0.5, 0.5, "Energy resolution history not available\n(Pass 'energy_resolution_history' in kwargs)", 
+                ax.text(0.5, 0.5, "Energy resolution history not available\n(Pass 'energy_resolution_history' in kwargs)",
                       ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_DETECTOR_EFFICIENCY_HISTORY:
+            # Mean detector efficiency (per-event trigger probability, or binned
+            # efficiency matrix, from EffectiveAreaLoss/FoMLoss) over optimization iterations.
+            # Recorded against the actual optimizer iteration number (see the `it` loop
+            # variable / vis_kwargs['iteration'] in Optimizer.optimize), not call order,
+            # so gaps from vis_freq skipping and NaN-revert overwrites are both handled correctly.
+            detector_efficiencies = kwargs.get('detector_efficiencies', None)
+
+            if detector_efficiencies is not None and iteration is not None:
+                if isinstance(detector_efficiencies, torch.Tensor):
+                    eff_values = detector_efficiencies.clone().detach().cpu().numpy().flatten()
+                else:
+                    eff_values = np.array(detector_efficiencies).flatten()
+
+                finite_eff = eff_values[np.isfinite(eff_values)]
+                if finite_eff.size > 0:
+                    self._mean_detector_efficiency_history[int(iteration)] = float(np.mean(finite_eff))
+
+            if len(self._mean_detector_efficiency_history) > 0:
+                iters_sorted = sorted(self._mean_detector_efficiency_history.keys())
+                values_sorted = [self._mean_detector_efficiency_history[i] for i in iters_sorted]
+                ax.plot(iters_sorted, values_sorted, color='green', linewidth=2, markersize=4)
+                ax.set_title('Mean Detector Efficiency History')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Mean Detector Efficiency')
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, "Detector efficiency history not available\n(Pass 'detector_efficiencies' in kwargs)",
+                      ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_EFFECTIVE_AREA_HISTORY:
+            # Mean effective area (per-event or binned effective area matrix from
+            # EffectiveAreaLoss/FoMLoss) over optimization iterations. Recorded against
+            # the actual optimizer iteration number, same rationale as detector efficiency above.
+            effective_area_values = kwargs.get('effective_area_per_event', None)
+            if effective_area_values is None:
+                effective_area_values = kwargs.get('effective_area_matrix', None)
+
+            if effective_area_values is not None and iteration is not None:
+                if isinstance(effective_area_values, torch.Tensor):
+                    aeff_values = effective_area_values.clone().detach().cpu().numpy().flatten()
+                else:
+                    aeff_values = np.array(effective_area_values).flatten()
+
+                finite_aeff = aeff_values[np.isfinite(aeff_values)]
+                if finite_aeff.size > 0:
+                    self._mean_effective_area_history[int(iteration)] = float(np.mean(finite_aeff))
+
+            if len(self._mean_effective_area_history) > 0:
+                iters_sorted = sorted(self._mean_effective_area_history.keys())
+                values_sorted = [self._mean_effective_area_history[i] for i in iters_sorted]
+                ax.plot(iters_sorted, values_sorted, color='orange', linewidth=2, markersize=4)
+                ax.set_title('Mean Effective Area History')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Mean Effective Area (m$^2$)')
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, "Effective area history not available\n(Pass 'effective_area_per_event' or 'effective_area_matrix' in kwargs)",
+                      ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_NN_DISTANCE_HISTORY:
+            # History of the (weighted) average per-string mean distance to its 5
+            # nearest neighbours, accumulated across optimization iterations, alongside
+            # the global minimum pairwise string-string distance.
+            #
+            # When string_weights is provided, distances are restricted to active
+            # strings only - those with sigmoid(weight) >= weight_threshold (default
+            # 0.7), matching the hard active_mask convention used by the ROV penalty
+            # and string_xy plots (see 'weight_threshold' elsewhere, e.g. the
+            # string_xy_rov_penalty active_mask). kwargs['string_weights'] here is
+            # already sigmoided (done once, up front, for all plot types), so the
+            # threshold and the weights passed to the helpers below both operate
+            # directly on those probabilities. Within that active subset, the helpers
+            # still apply their own soft weighting/softmin, but since every remaining
+            # string has weight >= threshold, that soft weighting no longer
+            # meaningfully discounts any of them.
+            if string_xy is not None:
+                num_neighbours = int(kwargs.get('nn_distance_num_neighbours', 5))
+                nn_tau = kwargs.get('nn_distance_nn_tau', None)
+                min_tau = kwargs.get('nn_distance_min_tau', None)
+                string_weights = kwargs.get('string_weights', None)
+                weight_threshold = kwargs.get('weight_threshold', 0.7)
+
+                xy_np = string_xy.clone().detach().cpu().numpy() if torch.is_tensor(string_xy) else np.asarray(string_xy)
+
+                nn_string_weights = string_weights
+                if string_weights is not None:
+                    string_weights_np = (
+                        string_weights.clone().detach().cpu().numpy()
+                        if torch.is_tensor(string_weights) else np.asarray(string_weights)
+                    ).reshape(-1)
+                    active_mask = string_weights_np >= weight_threshold
+                    xy_np = xy_np[active_mask]
+                    nn_string_weights = string_weights_np[active_mask]
+
+                mean_metric = self._weighted_mean_nn_distance(
+                    xy_np,
+                    string_weights=nn_string_weights,
+                    num_neighbours=num_neighbours,
+                    nn_tau=nn_tau,
+                )
+                if mean_metric is not None and np.isfinite(mean_metric) and iteration is not None:
+                    self._nn_distance_history[int(iteration)] = float(mean_metric)
+
+                min_metric = self._mean_min_nn_distance(
+                    xy_np,
+                    string_weights=nn_string_weights,
+                    min_tau=min_tau,
+                )
+                if min_metric is not None and np.isfinite(min_metric) and iteration is not None:
+                    self._min_pairwise_distance_history[int(iteration)] = float(min_metric)
+
+            if len(self._nn_distance_history) > 0 or len(self._min_pairwise_distance_history) > 0:
+                if len(self._nn_distance_history) > 0:
+                    nn_iters_sorted = sorted(self._nn_distance_history.keys())
+                    ax.plot(
+                        nn_iters_sorted, [self._nn_distance_history[i] for i in nn_iters_sorted],
+                        color='teal', linewidth=2, markersize=4,
+                        label=f'Mean {int(kwargs.get("nn_distance_num_neighbours", 5))} N.N.',
+                    )
+                if len(self._min_pairwise_distance_history) > 0:
+                    min_iters_sorted = sorted(self._min_pairwise_distance_history.keys())
+                    ax.plot(
+                        min_iters_sorted, [self._min_pairwise_distance_history[i] for i in min_iters_sorted],
+                        color='crimson', linewidth=2, markersize=4,
+                        label='Min.',
+                    )
+                ax.set_title(f'String Spacing History')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Distance')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, "Nearest-neighbour distance history not available\n(Pass 'string_xy')",
+                      ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
+            # Combined variance of the signal flux parameters from AnalysisLoss,
+            # over optimization iterations.
+            #
+            # AnalysisLoss returns A-optimality: sum_p sqrt(Cov_pp), i.e. the sum
+            # of marginal 1-sigma errors on the flux parameters listed in
+            # 'analysis_signal_flux_var_names'. The optimizer records that scalar
+            # under 'fisher_analysis_loss' in uw_loss_dict, so the combined
+            # history is read straight from there - no extra state needed.
+            loss_dict = kwargs.get('uw_loss_dict', None)
+
+            flux_variance_history = None
+            if loss_dict is not None:
+                flux_variance_history = loss_dict.get('fisher_analysis_loss', None)
+                if flux_variance_history is None:
+                    flux_variance_history = loss_dict.get('analysis_loss', None)
+
+            # Optional per-parameter breakdown: pass 'flux_param_variance_history'
+            # as {param_name: [variance_per_iteration, ...]} to overlay the
+            # individual contributions (from the loss's 'flux_param_variances'),
+            # and 'flux_param_names' to label the combined curve.
+            per_param_history = kwargs.get('flux_param_variance_history', None)
+            flux_param_names = kwargs.get('flux_param_names', None)
+            plot_as_sigma = kwargs.get('flux_variance_as_sigma', True)
+
+            if flux_variance_history is not None and len(flux_variance_history) > 0:
+                combined = np.asarray(flux_variance_history, dtype=float)
+
+                # A_optimality already returns a sum of sigmas; square it only if
+                # the caller explicitly asks for a variance-like quantity.
+                if plot_as_sigma:
+                    combined_plot = combined
+                    ylabel = r'Combined flux error  $\sum_p \sigma_p$'
+                else:
+                    combined_plot = combined ** 2
+                    ylabel = r'Combined flux variance  $(\sum_p \sigma_p)^2$'
+
+                ax.plot(combined_plot, color='crimson', linewidth=2, markersize=4,
+                        label='combined', zorder=3)
+
+                if per_param_history:
+                    names = list(per_param_history.keys())
+                    cmap = plt.get_cmap('viridis')
+                    for idx, name in enumerate(names):
+                        series = np.asarray(per_param_history[name], dtype=float)
+                        if series.size == 0:
+                            continue
+                        # Stored as variances; show sigma to match the combined curve.
+                        series_plot = np.sqrt(np.clip(series, 0.0, None)) if plot_as_sigma else series
+                        denom = max(1, len(names) - 1)
+                        ax.plot(series_plot, linewidth=1.4, alpha=0.85, linestyle='--',
+                                color=cmap(0.15 + 0.7 * idx / denom), label=str(name))
+
+                title = 'Flux Parameter Variance History'
+                if flux_param_names:
+                    title += f"  ({', '.join(str(n) for n in flux_param_names)})"
+                ax.set_title(title)
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel(ylabel)
+                ax.grid(True, alpha=0.3)
+                if np.all(np.isfinite(combined_plot)) and np.all(combined_plot > 0):
+                    ax.set_yscale('log')
+                if per_param_history or flux_param_names:
+                    ax.legend(fontsize=8, loc='best')
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "Flux variance history not available\n(Pass 'uw_loss_dict' with 'fisher_analysis_loss' history)",
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes,
+                )
 
         elif plot_type == self.PLOT_POINTSOURCE_FOM:
             # Pointsource FoM history from unweighted loss dictionary.
@@ -4958,10 +6075,12 @@ class Visualizer:
                     pointsource_fom_history = loss_dict.get('pointsource_fom', None)
 
             if pointsource_fom_history is not None:
-                pointsource_fom_history = np.array(pointsource_fom_history)
+                pointsource_fom_history = 1/np.array(pointsource_fom_history)
                 ax.plot(pointsource_fom_history, color='purple', linewidth=2, markersize=4)
                 ax.set_title('Pointsource FoM History')
                 ax.set_xlabel('Iteration')
+                if kwargs.get('ps_fom_logy', False):
+                    ax.set_yscale('log')
                 ax.set_ylabel('Pointsource FoM')
                 ax.grid(True, alpha=0.3)
             else:
@@ -4976,7 +6095,7 @@ class Visualizer:
         
         elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH:
             # Plot binned angular resolution vs zenith angle
-            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_per_event = kwargs.get('angular_resolution_per_event', None)
             signal_event_params = kwargs.get('resolution_params', None)
             # max_angular_resolution = kwargs.get('max_angular_resolution', np.pi)
             n_bins = kwargs.get('n_zenith_bins', 10)
@@ -4995,12 +6114,13 @@ class Visualizer:
             resolution_ci_level = kwargs.get('resolution_ci_level', None)
             zenith_range = kwargs.get('zenith_range', None)
             zenith_range_deg = kwargs.get('zenith_range_deg', None)
-            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
+            # Dedicated to this plot only: does not fall back to the generic
+            # 'resolution_logy' or to the energy-resolution/FoM/effective-area plots'
+            # keys, so toggling log-y on one vs-plot never silently affects another.
+            resolution_logy = bool(kwargs.get('resolution_logy_angular', kwargs.get('resolution_logy_vs_zenith', False)))
             min_ang_res = kwargs.get('min_angular_resolution', None)
             max_ang_res = kwargs.get('max_angular_resolution', None)
-            if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
-            
+
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
                 if isinstance(resolution_per_event, torch.Tensor):
@@ -5296,7 +6416,7 @@ class Visualizer:
         
         elif plot_type == self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY:
             # Plot binned angular resolution vs log10(energy)
-            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_per_event = kwargs.get('angular_resolution_per_event', None)
             signal_event_params = kwargs.get('resolution_params', None)
             n_bins = kwargs.get('n_energy_bins', 10)
             resolution_stat = kwargs.get('resolution_stat', None)
@@ -5313,11 +6433,13 @@ class Visualizer:
             resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
             resolution_ci_level = kwargs.get('resolution_ci_level', None)
             energy_range = kwargs.get('energy_range', None)
-            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
+            # Dedicated to this plot only: shares 'resolution_logy_angular' with the
+            # angular-vs-zenith plot (both are angular resolution), but does not fall
+            # back to the generic 'resolution_logy' or to the energy-resolution/FoM/
+            # effective-area plots' keys.
+            resolution_logy = bool(kwargs.get('resolution_logy_angular', kwargs.get('resolution_logy_vs_energy', False)))
             min_ang_res = kwargs.get('min_angular_resolution', None)
             max_ang_res = kwargs.get('max_angular_resolution', None)
-            if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
 
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
@@ -5591,7 +6713,7 @@ class Visualizer:
 
         elif plot_type == self.PLOT_POINTSOURCE_FOM_VS_ENERGY:
             # Plot binned pointsource FoM vs log10(energy)
-            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_per_event = kwargs.get('angular_resolution_per_event', None)
             effective_area_per_event = kwargs.get('effective_area_per_event', None)
             signal_event_params = kwargs.get('resolution_params', None)
             if signal_event_params is None:
@@ -5601,9 +6723,10 @@ class Visualizer:
             n_bins = kwargs.get('n_energy_bins', 10)
             energy_range = kwargs.get('energy_range', None)
             fom_min_resolution = kwargs.get('resolution_fom_min_resolution', 1e-12)
-            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
-            if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
+            # Dedicated to this plot only: does not fall back to the generic
+            # 'resolution_logy' or to the angular/energy-resolution/effective-area
+            # plots' keys, so e.g. setting only 'ps_fom_logy' never affects them.
+            resolution_logy = bool(kwargs.get('ps_fom_logy', False))
 
             if (
                 resolution_per_event is not None
@@ -5731,9 +6854,204 @@ class Visualizer:
                     fontsize=12,
                 )
 
+        elif plot_type == self.PLOT_EFFECTIVE_AREA_VS_ENERGY:
+            # Plot binned (mean or median) effective area vs energy, from the same
+            # per-event 'effective_area_per_event' + event params used by
+            # 'pointsource_fom_vs_energy'. Unlike the resolution/FoM-vs plots, there is
+            # no 'fom' aggregation here - effective area isn't a resolution, so a FOM
+            # transform (1/r^2-style) doesn't apply; only 'mean'/'median' are supported
+            # for resolution_stat, same as the other vs-energy plots otherwise.
+            effective_area_per_event = kwargs.get('effective_area_per_event', None)
+            signal_event_params = kwargs.get('resolution_params', None)
+            if signal_event_params is None:
+                signal_event_params = kwargs.get('effective_area_params', None)
+            if signal_event_params is None:
+                signal_event_params = kwargs.get('signal_event_params', None)
+            n_bins = kwargs.get('n_energy_bins', 10)
+            resolution_stat = kwargs.get('resolution_stat', None)
+            if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
+                resolution_stat = 'mean'
+            resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+            if resolution_stat not in ('median', 'mean'):
+                resolution_stat = 'median'
+            show_resolution_ci = bool(kwargs.get('show_resolution_ci', False))
+            resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
+            resolution_ci_level = kwargs.get('resolution_ci_level', None)
+            energy_range = kwargs.get('energy_range', None)
+            # Dedicated to this plot only: does not fall back to the generic
+            # 'resolution_logy' or to the angular/energy-resolution/FoM plots' keys.
+            resolution_logy = bool(kwargs.get('effective_area_logy', False))
+
+            if effective_area_per_event is not None and signal_event_params is not None:
+                if isinstance(effective_area_per_event, torch.Tensor):
+                    aeff_values = effective_area_per_event.clone().detach().cpu().numpy().flatten()
+                else:
+                    aeff_values = np.array(effective_area_per_event).flatten()
+
+                energy_values = []
+                for event_params in signal_event_params:
+                    if isinstance(event_params, dict) and 'energy' in event_params:
+                        energy = event_params['energy']
+                        if isinstance(energy, torch.Tensor):
+                            energy_values.append(energy.detach().cpu().item())
+                        else:
+                            energy_values.append(float(energy))
+                energy_values = np.array(energy_values)
+
+                n = min(len(aeff_values), len(energy_values))
+                if n > 0:
+                    aeff_values = aeff_values[:n]
+                    energy_values = energy_values[:n]
+
+                valid_mask = np.isfinite(aeff_values) & np.isfinite(energy_values) & (energy_values > 0)
+                aeff_values = aeff_values[valid_mask]
+                energy_values = energy_values[valid_mask]
+
+                if energy_range is not None and len(energy_range) == 2:
+                    try:
+                        emin, emax = float(energy_range[0]), float(energy_range[1])
+                        if emax < emin:
+                            emin, emax = emax, emin
+                        range_mask = (energy_values >= emin) & (energy_values <= emax)
+                        aeff_values = aeff_values[range_mask]
+                        energy_values = energy_values[range_mask]
+                    except Exception:
+                        pass
+
+                if resolution_logy:
+                    pos_mask = aeff_values > 0
+                    aeff_values = aeff_values[pos_mask]
+                    energy_values = energy_values[pos_mask]
+
+                if len(aeff_values) > 0 and len(energy_values) > 0:
+                    log_energy_min = np.log10(energy_values.min())
+                    log_energy_max = np.log10(energy_values.max())
+                    bin_edges = np.logspace(log_energy_min, log_energy_max, n_bins + 1)
+                    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])  # Geometric mean for log scale
+
+                    bin_medians = []
+                    band_lower = []
+                    band_upper = []
+
+                    for i in range(n_bins):
+                        mask = (energy_values >= bin_edges[i]) & (energy_values < bin_edges[i + 1])
+                        if mask.sum() > 0:
+                            vals = np.array(aeff_values[mask], dtype=float)
+                            if resolution_stat == 'mean':
+                                center_val = float(np.nanmean(vals))
+                                spread_val = float(np.nanstd(vals))
+                            else:
+                                center_val = float(np.nanmedian(vals))
+                                spread_val = np.nan
+                            bin_medians.append(center_val)
+                            if show_resolution_ci:
+                                if resolution_stat == 'mean':
+                                    band_lower.append(center_val - 2.0 * spread_val)
+                                    band_upper.append(center_val + 2.0 * spread_val)
+                                else:
+                                    q_lo = None
+                                    q_hi = None
+                                    if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                        try:
+                                            q_lo = float(resolution_ci_percentiles[0])
+                                            q_hi = float(resolution_ci_percentiles[1])
+                                        except Exception:
+                                            q_lo, q_hi = None, None
+                                    if q_lo is None or q_hi is None:
+                                        if resolution_ci_level is not None:
+                                            try:
+                                                lvl = float(resolution_ci_level)
+                                                lvl = float(np.clip(lvl, 0.0, 1.0))
+                                                alpha = 0.5 * (1.0 - lvl)
+                                                q_lo = 100.0 * alpha
+                                                q_hi = 100.0 * (1.0 - alpha)
+                                            except Exception:
+                                                q_lo, q_hi = 16.0, 84.0
+                                        else:
+                                            q_lo, q_hi = 16.0, 84.0
+                                    if q_hi < q_lo:
+                                        q_lo, q_hi = q_hi, q_lo
+                                    resid = vals - center_val
+                                    band_lower.append(center_val + np.nanpercentile(resid, q_lo))
+                                    band_upper.append(center_val + np.nanpercentile(resid, q_hi))
+                            else:
+                                band_lower.append(np.nan)
+                                band_upper.append(np.nan)
+                        else:
+                            bin_medians.append(np.nan)
+                            band_lower.append(np.nan)
+                            band_upper.append(np.nan)
+
+                    bin_medians = np.array(bin_medians)
+                    band_lower = np.array(band_lower)
+                    band_upper = np.array(band_upper)
+
+                    valid_bins = np.isfinite(bin_medians)
+                    if resolution_logy:
+                        valid_bins = valid_bins & (bin_medians > 0)
+
+                    if show_resolution_ci:
+                        valid_ci = valid_bins & np.isfinite(band_lower) & np.isfinite(band_upper)
+                        if np.any(valid_ci):
+                            q_lo, q_hi = 16.0, 84.0
+                            if resolution_stat == 'mean':
+                                ci_label = 'Mean ± 2σ'
+                            else:
+                                if resolution_ci_percentiles is not None and len(resolution_ci_percentiles) == 2:
+                                    try:
+                                        q_lo = float(resolution_ci_percentiles[0])
+                                        q_hi = float(resolution_ci_percentiles[1])
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                elif resolution_ci_level is not None:
+                                    try:
+                                        lvl = float(resolution_ci_level)
+                                        lvl = float(np.clip(lvl, 0.0, 1.0))
+                                        alpha = 0.5 * (1.0 - lvl)
+                                        q_lo = 100.0 * alpha
+                                        q_hi = 100.0 * (1.0 - alpha)
+                                    except Exception:
+                                        q_lo, q_hi = 16.0, 84.0
+                                if q_hi < q_lo:
+                                    q_lo, q_hi = q_hi, q_lo
+                                ci_label = f"Residual band (p{q_lo:g}-p{q_hi:g})"
+                            # ax.fill_between(
+                            #     bin_centers[valid_ci],
+                            #     band_lower[valid_ci],
+                            #     band_upper[valid_ci],
+                            #     alpha=0.2,
+                            #     label=str(ci_label),
+                            #     zorder=1,
+                            # )
+
+                    ax.plot(
+                        bin_centers[valid_bins],
+                        bin_medians[valid_bins],
+                        'o-',
+                        linewidth=2,
+                        markersize=8,
+                        label=('Mean' if resolution_stat == 'mean' else 'Median'),
+                        color='orange',
+                    )
+
+                    ax.set_xlabel('Energy (GeV)', fontsize=10)
+                    ax.set_ylabel('Effective Area (m$^2$)', fontsize=10)
+                    ax.set_title('Effective Area vs Energy', fontsize=12)
+                    ax.set_xscale('log')
+                    if resolution_logy:
+                        ax.set_yscale('log')
+                    ax.grid(True, alpha=0.3, which='both')
+                    ax.legend()
+                else:
+                    ax.text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                           transform=ax.transAxes, fontsize=14)
+            else:
+                ax.text(0.5, 0.5, 'Data not available\nProvide effective_area_per_event and event params',
+                       ha='center', va='center', transform=ax.transAxes, fontsize=12)
+
         elif plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
             # Plot binned energy resolution vs energy
-            resolution_per_event = kwargs.get('resolution_per_event', None)
+            resolution_per_event = kwargs.get('energy_resolution_per_event', None)
             signal_event_params = kwargs.get('resolution_params', None)
             n_bins = kwargs.get('n_energy_bins', 10)
             use_relative_energy = kwargs.get('use_relative_energy', False)
@@ -5751,10 +7069,11 @@ class Visualizer:
             resolution_ci_percentiles = kwargs.get('resolution_ci_percentiles', None)
             resolution_ci_level = kwargs.get('resolution_ci_level', None)
             energy_range = kwargs.get('energy_range', None)
-            resolution_logy = bool(kwargs.get('resolution_logy', kwargs.get('resolution_logy_angular', False)))
-            if not resolution_logy:
-                resolution_logy = bool(kwargs.get('resolution_logy_vs_zenith', kwargs.get('resolution_logy_vs_energy', False)))
-            
+            # Dedicated to this plot only: does not fall back to the generic
+            # 'resolution_logy' or to the angular-resolution/FoM/effective-area
+            # plots' keys.
+            resolution_logy = bool(kwargs.get('resolution_logy_energy', False))
+
             if resolution_per_event is not None and signal_event_params is not None:
                 # Convert to numpy
                 if isinstance(resolution_per_event, torch.Tensor):
@@ -5981,12 +7300,24 @@ class Visualizer:
                        ha='center', va='center', transform=ax.transAxes, fontsize=12)
         
         elif plot_type == self.PLOT_LOSS_COMPONENTS:
-            # Loss components plot from loss dictionary
+            # Loss components plot from loss dictionary.
+            #
+            # moving_average_losses: optional list of loss names (keys of loss_dict) whose
+            # raw series should be drawn faded, with a moving average (window
+            # moving_average_window, default 10) overlaid at normal opacity. Total Loss
+            # sums the moving-average values for those losses (and the raw values for
+            # everything else), so it reflects the same smoothing shown for each component.
             loss_dict = kwargs.get('loss_dict', None)
             loss_filter_list = kwargs.get('loss_filter', [])
             loss_weights_dict = kwargs.get('loss_weights_dict', None)
             loss_iterations_dict = kwargs.get('loss_iterations_dict', None)
+            moving_average_losses = set(kwargs.get('moving_average_losses', []) or [])
+            moving_average_window = kwargs.get('moving_average_window', 10)
             if loss_dict is not None and isinstance(loss_dict, dict) and loss_dict:
+                # Per-loss series actually used for the Total Loss sum below: the moving
+                # average where requested, otherwise the raw (gap-filled) history.
+                totals_input = {}
+
                 # Plot each loss component
                 for loss_name, loss_history in loss_dict.items():
                     if loss_name in loss_filter_list:
@@ -5995,6 +7326,8 @@ class Visualizer:
                         weight = loss_weights_dict[loss_name]
                         if weight == 0.0:
                             continue
+                    use_moving_average = loss_name in moving_average_losses
+
                     if loss_iterations_dict is not None:
                         iterations = loss_iterations_dict.get(loss_name, None)
                         if iterations is not None and len(iterations) == len(loss_history):
@@ -6002,7 +7335,7 @@ class Visualizer:
                             # Create a full range from 0 to max iteration
                             max_iter = max(iterations)
                             full_range = list(range(max_iter + 1))
-                            
+
                             # Create loss values array with None for missing iterations
                             full_loss_history = []
                             iter_idx = 0
@@ -6012,66 +7345,88 @@ class Visualizer:
                                     iter_idx += 1
                                 else:
                                     full_loss_history.append(None)
-                            
-                            # Plot with gaps handled
-                            ax.plot(full_range, full_loss_history, label=loss_name, alpha=0.8, linewidth=2)
+
+                            if use_moving_average:
+                                smoothed = self._moving_average(full_loss_history, moving_average_window)
+                                line, = ax.plot(full_range, full_loss_history, alpha=0.25, linewidth=2)
+                                ax.plot(full_range, smoothed, label=loss_name, color=line.get_color(),
+                                        alpha=0.9, linewidth=2)
+                                totals_input[loss_name] = list(smoothed)
+                            else:
+                                # Plot with gaps handled
+                                ax.plot(full_range, full_loss_history, label=loss_name, alpha=0.8, linewidth=2)
+                                totals_input[loss_name] = full_loss_history
                             continue
                     if loss_history and len(loss_history) > 0:
-                        ax.plot(loss_history, label=loss_name, alpha=0.8, linewidth=2)
-                
-                # Calculate and plot total loss (sum of all components)
+                        if use_moving_average:
+                            smoothed = self._moving_average(loss_history, moving_average_window)
+                            line, = ax.plot(loss_history, alpha=0.25, linewidth=2)
+                            ax.plot(smoothed, label=loss_name, color=line.get_color(), alpha=0.9, linewidth=2)
+                            totals_input[loss_name] = list(smoothed)
+                        else:
+                            ax.plot(loss_history, label=loss_name, alpha=0.8, linewidth=2)
+                            totals_input[loss_name] = loss_history
+
+                # Calculate and plot total loss (sum of all components, using the
+                # moving-average series in place of the raw one for smoothed losses).
                 # Find the maximum length of all loss histories
-                max_length = max(len(history) for history in loss_dict.values() if history)
-                
+                max_length = max(len(history) for history in totals_input.values() if history)
+
                 # Calculate total loss at each iteration
                 total_loss = []
                 for i in range(max_length):
                     iteration_total = 0.0
-                    for loss_name, loss_history in loss_dict.items():
-                        if loss_name in loss_filter_list:
-                            continue
+                    for loss_name, loss_history in totals_input.items():
                         if loss_weights_dict is not None and loss_name in loss_weights_dict:
                             weight = loss_weights_dict[loss_name]
                             if weight == 0.0:
                                 continue
                         if loss_history and i < len(loss_history):
-                            iteration_total += loss_history[i]
+                            val = loss_history[i]
+                            if val is not None and np.isfinite(val):
+                                iteration_total += val
                     total_loss.append(iteration_total)
-                
+
                 # Plot total loss with a distinct style
-                ax.plot(total_loss, label='Total Loss', color='black', 
+                ax.plot(total_loss, label='Total Loss', color='black',
                        linewidth=3, linestyle='--', alpha=0.9)
-                
+
                 ax.set_title(f"Loss Components")
                 ax.set_xlabel("Iteration")
                 ax.set_ylabel("Loss Value")
                 ax.legend(loc='best', fontsize='small')
                 ax.grid(True, alpha=0.3)
-                
+
                 # Use log scale if all values are positive
-                all_values = [val for history in loss_dict.values() for val in history if val is not None and val != 0]
+                all_values = [val for history in totals_input.values() for val in history if val is not None and np.isfinite(val) and val != 0]
                 all_values.extend(total_loss)
                 if all_values and all(val > 0 for val in all_values):
                     ax.set_yscale('log')
                     # Set y-axis limits
                     min_val = min(all_values) if all_values else 1e-4
                     max_val = max(total_loss) if total_loss else 1.0
-                    
+
                     # Set lower limit to 1e-4 if any loss reaches that value
                     if min_val <= 1e-4:
                         ax.set_ylim(bottom=1e-4)
-                    
+
                     # Adjust upper limit based on total loss with some margin
                     ax.set_ylim(top=max_val * 1.5)
             else:
-                ax.text(0.5, 0.5, "Loss dictionary not available or empty\n(Pass 'loss_dict' in kwargs)", 
+                ax.text(0.5, 0.5, "Loss dictionary not available or empty\n(Pass 'loss_dict' in kwargs)",
                       ha='center', va='center', transform=ax.transAxes)
         
         elif plot_type == self.PLOT_UW_LOSS_COMPONENTS:
-            # Unweighted loss components plot from unweighted loss dictionary
+            # Unweighted loss components plot from unweighted loss dictionary.
+            #
+            # moving_average_losses: optional list of loss names (keys of uw_loss_dict)
+            # whose (normalized) raw series should be drawn faded, with a moving average
+            # (window moving_average_window, default 10) overlaid at normal opacity.
             uw_loss_dict = kwargs.get('uw_loss_dict', None)
             loss_weights_dict = kwargs.get('loss_weights_dict', None)
             loss_iterations_dict = kwargs.get('loss_iterations_dict', None)
+            moving_average_losses = set(kwargs.get('moving_average_losses', []) or [])
+            moving_average_window = kwargs.get('moving_average_window', 10)
             if uw_loss_dict is not None and isinstance(uw_loss_dict, dict) and uw_loss_dict:
                 # Plot each unweighted loss component
                 for loss_name, loss_history in uw_loss_dict.items():
@@ -6086,9 +7441,16 @@ class Visualizer:
                         else:
                             # If all values are the same, set them to middle of range
                             normalized_loss = np.full_like(loss_array, 0.5)
-                        
-                        if loss_iterations_dict is None:    
-                            ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
+
+                        use_moving_average = loss_name in moving_average_losses
+
+                        if loss_iterations_dict is None:
+                            if use_moving_average:
+                                smoothed = self._moving_average(normalized_loss, moving_average_window)
+                                line, = ax.plot(normalized_loss, alpha=0.25, linewidth=2)
+                                ax.plot(smoothed, label=f"{loss_name}", color=line.get_color(), alpha=0.9, linewidth=2)
+                            else:
+                                ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
                         else:
                             iterations = loss_iterations_dict.get(loss_name, None)
                             if iterations is not None:
@@ -6096,7 +7458,7 @@ class Visualizer:
                                 # Create a full range from 0 to max iteration
                                 max_iter = max(iterations)
                                 full_range = list(range(max_iter + 1))
-                                
+
                                 # Create loss values array with None for missing iterations
                                 full_loss_history = []
                                 iter_idx = 0
@@ -6107,9 +7469,20 @@ class Visualizer:
                                     else:
                                         full_loss_history.append(None)
                                 # Plot with gaps handled
-                                ax.plot(full_range, full_loss_history, label=f"{loss_name}", alpha=0.8, linewidth=2)
+                                if use_moving_average:
+                                    smoothed = self._moving_average(full_loss_history, moving_average_window)
+                                    line, = ax.plot(full_range, full_loss_history, alpha=0.25, linewidth=2)
+                                    ax.plot(full_range, smoothed, label=f"{loss_name}", color=line.get_color(),
+                                            alpha=0.9, linewidth=2)
+                                else:
+                                    ax.plot(full_range, full_loss_history, label=f"{loss_name}", alpha=0.8, linewidth=2)
                             else:
-                                ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
+                                if use_moving_average:
+                                    smoothed = self._moving_average(normalized_loss, moving_average_window)
+                                    line, = ax.plot(normalized_loss, alpha=0.25, linewidth=2)
+                                    ax.plot(smoothed, label=f"{loss_name}", color=line.get_color(), alpha=0.9, linewidth=2)
+                                else:
+                                    ax.plot(normalized_loss, label=f"{loss_name}", alpha=0.8, linewidth=2)
 
                 # Calculate and plot total unweighted loss (sum of all components)
                 # Find the maximum length of all loss histories
@@ -6283,6 +7656,279 @@ class Visualizer:
             **kwargs
         )
     
+    def _draw_string_history(self, ax, string_xy_history, string_weights_history=None,
+                           weight_threshold=0.7, apply_sigmoid=True,
+                           match_strings=None, min_segment_length=1e-3,
+                           zoom_range=None,
+                           color_start='red', color_end='green',
+                           line_kwargs=None, title='String Position History: Start to End of Optimization'):
+        """
+        Draw the full path traced by each detector string across every recorded
+        iteration, from its position at the start of optimization (red) to its
+        position at the end (green), onto an existing axis. Each string's path is
+        drawn as a poly-line color-graded from red to green along its length, with
+        an arrowhead on the final segment showing the direction of travel.
+
+        Parameters:
+        -----------
+        ax : matplotlib.axes.Axes
+            Axis to draw on.
+        string_xy_history : list of (torch.Tensor or np.ndarray)
+            Sequence of (N, 2) XY string positions, one snapshot per recorded
+            iteration, in chronological order. The first entry is treated as the
+            starting geometry and the last as the current/final geometry.
+        string_weights_history : list of (torch.Tensor, np.ndarray, or None) or None
+            Optional per-snapshot per-string weights (raw, pre-sigmoid unless
+            apply_sigmoid=False), used to determine which strings are active in the
+            final snapshot (weight < weight_threshold strings are dropped entirely).
+            If None, all strings are treated as active.
+        weight_threshold : float
+            Minimum (post-sigmoid, if apply_sigmoid) weight for a string to be
+            considered active in the final snapshot and included in the plot.
+        apply_sigmoid : bool
+            Whether to apply a sigmoid to the raw weights before thresholding.
+        match_strings : bool or None
+            Whether to match strings between consecutive snapshots via
+            nearest-neighbor (Hungarian) assignment rather than by index. If None,
+            matching is automatic: index-aligned when consecutive snapshots have the
+            same number of active strings, and Hungarian-matched otherwise (e.g. if
+            strings were added/removed during optimization).
+        min_segment_length : float
+            Segments shorter than this are skipped (avoids zero-length artifacts).
+        zoom_range : float or None
+            If provided, sets axis limits to [-zoom_range, zoom_range]. Defaults to
+            the visualizer's domain.
+        color_start, color_end : str
+            Colors for the start (first snapshot) and end (last snapshot) of each
+            string's path; intermediate segments are linearly interpolated between
+            them.
+        line_kwargs : dict or None
+            Extra keyword arguments forwarded to each path's `LineCollection`.
+        title : str
+            Plot title.
+
+        Returns:
+        --------
+        dict with keys 'xy_snapshots' (list of active-string-filtered snapshots,
+        index-aligned across snapshots) and 'n_strings'.
+        """
+        from matplotlib.collections import LineCollection
+        from matplotlib.patches import FancyArrowPatch
+        from matplotlib.lines import Line2D
+        from matplotlib.colors import to_rgb
+
+        if string_xy_history is None or len(string_xy_history) < 2:
+            ax.text(0.5, 0.5, "Need at least 2 string_xy snapshots to trace a history",
+                  ha='center', va='center', transform=ax.transAxes)
+            return {'xy_snapshots': [], 'n_strings': 0}
+
+        n_snapshots = len(string_xy_history)
+        if string_weights_history is None:
+            string_weights_history = [None] * n_snapshots
+
+        snapshots = [np.asarray(self._safe_tensor_convert(xy), dtype=float) for xy in string_xy_history]
+        weights = [
+            np.asarray(self._safe_tensor_convert(w), dtype=float).reshape(-1) if w is not None else None
+            for w in string_weights_history
+        ]
+
+        # Determine the active-string mask from the final snapshot's weights (if any),
+        # applied uniformly across all snapshots so each string's path is complete.
+        final_weights = weights[-1]
+        n_final = len(snapshots[-1])
+        if final_weights is not None and len(final_weights) == n_final:
+            w = final_weights
+            if apply_sigmoid:
+                w = 1.0 / (1.0 + np.exp(-w))
+            w = np.nan_to_num(w, nan=0.0)
+            final_mask = w >= weight_threshold
+        else:
+            final_mask = np.ones(n_final, dtype=bool)
+
+        # Walk snapshots backwards from the final one, matching each snapshot to the
+        # previous one so string identity is tracked consistently even if string
+        # count/order changes between snapshots (e.g. strings added/removed). The
+        # result is one aligned path per final active string, in chronological order.
+        # `latest_xy[k]` is path k's most-recently-matched point (initially its final
+        # position); each step matches it against the previous snapshot's active
+        # strings and prepends the match (or stops extending that path if unmatched).
+        latest_xy = snapshots[-1][final_mask]
+        n_strings = len(latest_xy)
+        paths = [[pt] for pt in latest_xy]
+
+        for snap_idx in range(n_snapshots - 2, -1, -1):
+            xy_prev_full = snapshots[snap_idx]
+            w_prev = weights[snap_idx]
+            if w_prev is not None and len(w_prev) == len(xy_prev_full):
+                wp = w_prev
+                if apply_sigmoid:
+                    wp = 1.0 / (1.0 + np.exp(-wp))
+                wp = np.nan_to_num(wp, nan=0.0)
+                mask_prev = wp >= weight_threshold
+            else:
+                mask_prev = np.ones(len(xy_prev_full), dtype=bool)
+            xy_prev_active = xy_prev_full[mask_prev]
+
+            if len(xy_prev_active) == 0:
+                # Nothing to match against this snapshot; paths stop extending here.
+                continue
+
+            do_match = match_strings
+            if do_match is None:
+                do_match = len(xy_prev_active) != len(latest_xy)
+
+            if do_match:
+                from scipy.optimize import linear_sum_assignment
+                dist_matrix = np.linalg.norm(
+                    latest_xy[:, None, :] - xy_prev_active[None, :, :], axis=-1
+                )
+                row_idx, col_idx = linear_sum_assignment(dist_matrix)
+                match_of = {r: c for r, c in zip(row_idx.tolist(), col_idx.tolist())}
+            else:
+                n_common = min(len(latest_xy), len(xy_prev_active))
+                match_of = {i: i for i in range(n_common)}
+
+            new_latest_xy = list(latest_xy)
+            for k in range(n_strings):
+                if k in match_of:
+                    matched_pt = xy_prev_active[match_of[k]]
+                    paths[k].append(matched_pt)
+                    new_latest_xy[k] = matched_pt
+            latest_xy = np.array(new_latest_xy)
+
+        for path in paths:
+            path.reverse()  # chronological order: start -> end
+
+        # Expand the plotted half-domain to cover any string whose path strays outside
+        # the nominal domain, rather than clipping it out of view; shrink point/marker
+        # sizes proportionally so the plot stays visually consistent when nothing is out
+        # of bounds. An explicit zoom_range is a deliberate user choice and wins outright.
+        string_size_scale = 1.0
+        effective_half_domain = self.half_domain
+        if zoom_range is None and n_strings > 0:
+            all_coords = np.concatenate([np.array(path) for path in paths], axis=0)
+            max_abs_coord = float(np.max(np.abs(all_coords))) if all_coords.size > 0 else 0.0
+            if np.isfinite(max_abs_coord) and max_abs_coord > self.half_domain:
+                effective_half_domain = max_abs_coord * 1.05
+                string_size_scale = self.half_domain / effective_half_domain
+
+        if zoom_range is not None:
+            ax.set_xlim(-zoom_range, zoom_range)
+            ax.set_ylim(-zoom_range, zoom_range)
+        else:
+            ax.set_xlim(-effective_half_domain, effective_half_domain)
+            ax.set_ylim(-effective_half_domain, effective_half_domain)
+
+        rgb_start = np.array(to_rgb(color_start))
+        rgb_end = np.array(to_rgb(color_end))
+
+        default_line_kwargs = dict(linewidth=1.2, alpha=0.7, zorder=2)
+        if line_kwargs:
+            default_line_kwargs.update(line_kwargs)
+
+        start_points = []
+        end_points = []
+        for path in paths:
+            path_arr = np.array(path)
+            # Drop consecutive duplicate points (string didn't move that step).
+            deltas = np.linalg.norm(np.diff(path_arr, axis=0), axis=-1)
+            keep = np.concatenate([[True], deltas >= min_segment_length])
+            path_arr = path_arr[keep]
+            if len(path_arr) < 2:
+                if len(path_arr) == 1:
+                    start_points.append(path_arr[0])
+                    end_points.append(path_arr[0])
+                continue
+
+            segments = np.stack([path_arr[:-1], path_arr[1:]], axis=1)
+            n_segs = len(segments)
+            t = np.linspace(0.0, 1.0, n_segs) if n_segs > 1 else np.array([0.0])
+            seg_colors = rgb_start[None, :] * (1 - t[:, None]) + rgb_end[None, :] * t[:, None]
+
+            lc = LineCollection(segments, colors=seg_colors, **default_line_kwargs)
+            ax.add_collection(lc)
+
+            # Arrowhead on the final segment to show direction of travel.
+            arrow = FancyArrowPatch(
+                posA=tuple(path_arr[-2]), posB=tuple(path_arr[-1]),
+                arrowstyle='-|>', mutation_scale=8, linewidth=0,
+                color=color_end, alpha=0.9, zorder=3,
+            )
+            ax.add_patch(arrow)
+
+            start_points.append(path_arr[0])
+            end_points.append(path_arr[-1])
+
+        start_points = np.array(start_points) if start_points else np.empty((0, 2))
+        end_points = np.array(end_points) if end_points else np.empty((0, 2))
+
+        if len(start_points) > 0:
+            ax.scatter(start_points[:, 0], start_points[:, 1], c=color_start, alpha=0.8, s=25 * string_size_scale, zorder=4)
+        if len(end_points) > 0:
+            ax.scatter(end_points[:, 0], end_points[:, 1], c=color_end, alpha=0.8, s=25 * string_size_scale, zorder=4)
+
+        legend_elements = [
+            Line2D([0], [0], marker='o', color='none', markerfacecolor=color_start,
+                   markersize=8, label='Original string positions'),
+            Line2D([0], [0], marker='o', color='none', markerfacecolor=color_end,
+                   markersize=8, label='New string positions'),
+            # Line2D([0], [0], color=color_end, lw=1.5, marker='>', markersize=6),
+        ]
+        ax.legend(handles=legend_elements, loc='best', fontsize='small')
+
+        ax.set_aspect('equal')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_title(title)
+
+        return {'xy_snapshots': paths, 'n_strings': n_strings}
+
+    def plot_string_history(self, string_xy_history=None, string_weights_history=None,
+                          weight_threshold=0.7, apply_sigmoid=True,
+                          match_strings=None, min_segment_length=1e-3,
+                          zoom_range=None, figsize=(7, 7), ax=None,
+                          color_start='red', color_end='green',
+                          line_kwargs=None, title='String Position History: Start to End of Optimization',
+                          use_cached_history=True):
+        """
+        Standalone convenience wrapper around `_draw_string_history` that creates its own
+        figure/axis (unless one is passed in).
+
+        By default (`use_cached_history=True`, `string_xy_history=None`) this plots
+        whatever trajectory has already been cached on this Visualizer instance from
+        prior `visualize_progress(plot_types=['string_history'], ...)` calls (e.g.
+        made automatically during `optimizer.optimize(vis_kwargs=..., vis_freq=...)`)
+        - so no positions need to be passed in explicitly. Pass an explicit
+        `string_xy_history` list to bypass the cache, or call `clear_string_history()`
+        first to start a fresh trajectory.
+
+        See `_draw_string_history` for full parameter details.
+
+        Returns:
+        --------
+        dict with keys 'fig', 'ax', 'xy_snapshots', 'n_strings'.
+        """
+        if string_xy_history is None and use_cached_history:
+            string_xy_history = self._string_xy_history
+            string_weights_history = self._string_weights_history
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.get_figure()
+
+        result = self._draw_string_history(
+            ax, string_xy_history, string_weights_history=string_weights_history,
+            weight_threshold=weight_threshold, apply_sigmoid=apply_sigmoid,
+            match_strings=match_strings, min_segment_length=min_segment_length,
+            zoom_range=zoom_range,
+            color_start=color_start, color_end=color_end,
+            line_kwargs=line_kwargs, title=title,
+        )
+        result['fig'] = fig
+        result['ax'] = ax
+        return result
+
     def create_interactive_3d_plot(self, points_3d, weight_threshold=None,
                                  points_per_string_list=None, string_xy=None, string_weights=None):
         """
@@ -6586,17 +8232,69 @@ class Visualizer:
                 print(f"Error cleaning up temporary directory: {e}")
         print("GIF temporary files cleanup completed.")
 
+    def clear_string_history(self) -> None:
+        """
+        Clear the cached string XY position/weight history used by the
+        'string_history' plot type (and the 'nn_distance_history' plot). Call
+        this before starting a fresh optimization run if you want the traced
+        path / metric history to restart from that run's initial geometry
+        rather than continuing from a previous run.
+        """
+        self._string_xy_history = []
+        self._string_weights_history = []
+        self._string_history_iterations = []
+        self._last_recorded_iteration_string_history = None
+        self._nn_distance_history = {}
+        self._min_pairwise_distance_history = {}
+
 def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        param_names=None, param_ranges=None, n_points=50,
                        event_labels=['position', 'energy', 'zenith', 'azimuth'],
                        true_event=None, detector_point=None, figsize=(10, 8),
                        contour_levels=[0, 1, 4, 9], cmap='viridis',
+                       nll_cbar_max=None,
                        use_mollweide=False, skip_zero_response=False, use_patd=False,
                        num_detector_points=1, min_detector_points=1,
                        min_detector_response=0.0, max_detector_resample_attempts=1000,
                        plot_opposite_direction_true_params=False,
                        use_rich_features=False,
-                       progress_print_every_n_points=None):
+                       progress_print_every_n_points=None,
+                       parquet_dataset=None, parquet_event_seed=None,
+                       flow_model=None, flow_n_steps=32, flow_seed=0,
+                       flow_pmt_direction=(0.0, 0.0, -1.0)):
+    # flow_model : FlowMatchLY or None
+    #     If provided, the per-PMT term is the flow's log p(q | theta, x) instead of
+    #     the LLRnet log-ratio, and `llrnet` may be None.
+    #
+    #     With parquet_dataset: detector positions and observed light yields come
+    #     from a real event, exactly as on the LLRnet path.
+    #     Without parquet_dataset: the flow generates its own pseudo-data -- the
+    #     true event comes from signal_sampler, detector points are sampled as
+    #     usual, and each light yield is DRAWN FROM THE FLOW at the true params.
+    #     That makes the scan a self-consistency test: the NLL minimum should sit
+    #     at the parameters the data were generated from.
+    #
+    #     Flow and LLRnet landscapes have the same SHAPE: the LLR differs from the
+    #     true log-likelihood by + log p_marg(q), which is theta-independent and
+    #     cancels once the landscape is shifted to NLL=0 at its minimum. The flow
+    #     version is properly normalised, so its absolute scale is meaningful too.
+    #
+    #     flow_n_steps : ODE steps per hypothesis evaluation (cost scales with this).
+    #     flow_seed    : seeds both the pseudo-data light yields and the
+    #         dequantisation draw q~ = q + u. The dequantisation is fixed ONCE and
+    #         reused at every grid point, so the landscape is smooth and
+    #         reproducible instead of carrying fresh U(0,1) noise per hypothesis.
+    #     flow_pmt_direction : PMT direction used on the synthetic (non-parquet)
+    #         path when the flow was trained with add_pmt_direction=True. Real PMT
+    #         directions only exist for parquet events; the same value is used for
+    #         generation and evaluation, so the test stays self-consistent.
+    # parquet_dataset : LLRnet.LightYieldParquetDataset or None
+    #     If provided, the true event, detector points (OM positions) and the
+    #     observed light yields are taken from a randomly chosen event in this
+    #     dataset instead of being sampled via signal_surrogate_func. The number
+    #     of detector points used is min(num_detector_points, PMTs hit in that
+    #     event); pass num_detector_points=None (or <=0) to use all hit PMTs.
+    #     parquet_event_seed seeds the random event choice for reproducibility.
     """
     Plot negative log-likelihood landscape for a trained signal-only LLRnet.
     
@@ -6659,6 +8357,10 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         NLL contour levels to plot (default: [0, 1, 4, 9])
     cmap : str
         Colormap for the plot
+    nll_cbar_max : float or None
+        Maximum value for the contour fill color scale in the 2D landscape plot.
+        Values above this threshold are clipped for color mapping so colorbars can
+        be kept consistent across multiple plots. If None, uses the data maximum.
     use_mollweide : bool
         If True and param_names are ['zenith', 'azimuth'] or ['azimuth', 'zenith'],
         use Mollweide projection for plotting (default: False)
@@ -6680,10 +8382,20 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
 
    """
 
-    
-    if not llrnet.is_trained:
-        raise RuntimeError("LLRnet must be trained before plotting NLL landscape")
-    
+    if flow_model is None:
+        if llrnet is None:
+            raise ValueError("provide either llrnet or flow_model")
+        if not llrnet.is_trained:
+            raise RuntimeError("LLRnet must be trained before plotting NLL landscape")
+    else:
+        if not getattr(flow_model, 'is_trained', False):
+            raise RuntimeError("flow_model must be trained before plotting NLL landscape")
+        if llrnet is None:
+            # The flow exposes the same device / domain_size / add_pmt_direction
+            # attributes, so all the geometry and bookkeeping below work unchanged.
+            # Every call that would hit an LLRnet-only method is routed to the flow.
+            llrnet = flow_model
+
     # Default parameter names
     if param_names is None:
         param_names = ['energy', 'zenith']
@@ -6696,6 +8408,81 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     #     if param_name not in event_labels and param_name not in ['position', 'x', 'y', 'z']:
     #         raise ValueError(f"Parameter '{param_name}' not in event_labels or position coordinates: {event_labels}")
     
+    # ---- Optionally take the true event + detector points + observed light
+    #      yields from a randomly chosen event in a LightYieldParquetDataset ----
+    parquet_light_yields = None  # per-detector observed light yields (list of tensors)
+    if parquet_dataset is not None:
+        pq = parquet_dataset
+        prng = np.random.default_rng(parquet_event_seed)
+
+        # Pick a random event that has at least one hit PMT.
+        ev = pq._events[int(prng.integers(0, pq._n_events))]
+        rows = np.asarray(pq._event_rows[ev])  # row indices (one per hit PMT) for this event
+
+        # How many detector points (PMTs) to use: min(requested, available), or
+        # all available when num_detector_points is None/<=0.
+        n_avail = len(rows)
+        if num_detector_points is None or int(num_detector_points) <= 0:
+            n_use = n_avail
+        else:
+            n_use = min(int(num_detector_points), n_avail)
+        if n_use < n_avail:
+            sel = prng.choice(n_avail, size=n_use, replace=False)
+            rows = rows[np.sort(sel)]
+
+        # Build the true event dict from the first row (event params are shared
+        # across all rows of the same event). Add zenith/azimuth scalars so the
+        # landscape's direction-varying logic works.
+        rep = int(rows[0])
+        true_event = pq._event_data(rep)
+        true_event['zenith'] = torch.tensor(
+            [float(pq._zenith[rep])], device=llrnet.device, dtype=torch.float32)
+        true_event['azimuth'] = torch.tensor(
+            [float(pq._azimuth[rep])], device=llrnet.device, dtype=torch.float32)
+
+        # Detector points = OM positions of the hit PMTs; observed light yields =
+        # their recorded counts. Per-PMT direction is carried in per-row event dicts.
+        detector_point = [
+            torch.tensor(pq._point[int(i)], device=llrnet.device, dtype=torch.float32)
+            for i in rows
+        ]
+        parquet_light_yields = [
+            torch.tensor(float(pq._count[int(i)]), device=llrnet.device, dtype=torch.float32)
+            for i in rows
+        ]
+        # Per-PMT event dicts (differ only in 'pmt_direction') for feature building.
+        parquet_pmt_event_data = [pq._event_data(int(i)) for i in rows]
+        for ed in parquet_pmt_event_data:
+            ed['zenith'] = true_event['zenith']
+            ed['azimuth'] = true_event['azimuth']
+
+        # Pre-stacked constants for the batched charge-feature path (these do NOT
+        # change across the parameter grid; only the hypothesis event does):
+        #   points (n_det, 3), light yields (n_det,), pmt directions (n_det, 3).
+        parquet_points_stacked = torch.stack(detector_point).to(llrnet.device)   # (n_det, 3)
+        parquet_ly_stacked = torch.stack([l.reshape(()) for l in parquet_light_yields]).to(llrnet.device)  # (n_det,)
+        parquet_pmt_dir_stacked = None
+        if getattr(llrnet, 'add_pmt_direction', False):
+            parquet_pmt_dir_stacked = torch.stack([
+                torch.as_tensor(pq._pmt_direction[int(i)], device=llrnet.device, dtype=torch.float32)
+                for i in rows
+            ])  # (n_det, 3)
+
+        print("plot_nll_landscape: using parquet event "
+              f"{ev} with {n_use}/{n_avail} hit PMT(s).")
+        print(f"  neutrino energy : {float(pq._energy[rep]):.4g} GeV")
+        print(f"  zenith          : {float(pq._zenith[rep]):.4f} rad "
+              f"(cos = {np.cos(float(pq._zenith[rep])):.4f})")
+        print(f"  azimuth         : {float(pq._azimuth[rep]):.4f} rad")
+        print(f"  muon vertex     : "
+              f"({float(pq._muon_pos[rep][0]):.2f}, "
+              f"{float(pq._muon_pos[rep][1]):.2f}, "
+              f"{float(pq._muon_pos[rep][2]):.2f}) m")
+        print(f"  light yields    : "
+              f"min {min(float(l) for l in parquet_light_yields):.1f}, "
+              f"max {max(float(l) for l in parquet_light_yields):.1f}, "
+              f"sum {sum(float(l) for l in parquet_light_yields):.1f}")
+
     # Sample true event and detector point if not provided
     if true_event is None:
         true_event = signal_sampler.sample_events(1)[0]
@@ -6703,6 +8490,60 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
     # use_rich_features is now stored on the model — read from it,
     # falling back to the explicit parameter for backward compatibility.
     use_rich_features = getattr(llrnet, 'use_rich_features', use_rich_features)
+    if flow_model is not None:
+        # The flow always evaluates through the batched charge-style path.
+        use_rich_features = True
+
+        _flow_pmt_dir_t = torch.as_tensor(
+            flow_pmt_direction, device=flow_model.device, dtype=flow_model.param_dtype
+        ).reshape(1, 3)
+
+        def _flow_context(points, event):
+            """(n,3) detector points + one hypothesis event -> (n, context_dim)."""
+            pts = (points if torch.is_tensor(points) else torch.as_tensor(points))
+            pts = pts.to(device=flow_model.device,
+                         dtype=flow_model.param_dtype).reshape(-1, 3)
+            n = pts.shape[0]
+
+            def _v3(v):
+                t = v if torch.is_tensor(v) else torch.tensor(v)
+                return t.reshape(-1)[:3].to(device=flow_model.device,
+                                            dtype=flow_model.param_dtype
+                                            ).unsqueeze(0).expand(n, 3)
+
+            def _sc(v):
+                t = v if torch.is_tensor(v) else torch.tensor(v)
+                return t.reshape(-1)[0].to(device=flow_model.device,
+                                           dtype=flow_model.param_dtype).expand(n)
+
+            # parquet_pmt_dir_stacked only exists when the parquet block ran AND the
+            # model wants PMT directions; fall back to the fixed synthetic direction.
+            if (parquet_light_yields is not None
+                    and getattr(flow_model, 'add_pmt_direction', False)):
+                pmt_dirs = parquet_pmt_dir_stacked.to(device=flow_model.device,
+                                                      dtype=flow_model.param_dtype)
+            else:
+                pmt_dirs = _flow_pmt_dir_t.expand(n, 3)
+            return flow_model.build_context(
+                pts, _v3(event['position']), _sc(event['energy']),
+                pmt_directions=pmt_dirs, directions=_v3(event['direction']),
+            )
+
+        if parquet_light_yields is None:
+            # No parquet: the flow generates its own observations. Replacing the
+            # surrogate here means the existing detector-point selection, the
+            # min_detector_response filtering and the true-light-yield bookkeeping
+            # all work unchanged downstream.
+            # A dedicated generator (rather than torch.manual_seed) keeps this
+            # reproducible without disturbing global RNG state for the caller.
+            _flow_gen = torch.Generator(device=flow_model.device)
+            _flow_gen.manual_seed(int(flow_seed))
+
+            def signal_surrogate_func(opt_point=None, event_params=None, **_kw):
+                ctx = _flow_context(opt_point, event_params)
+                q = flow_model.sample_light_yield(ctx, n_steps=flow_n_steps,
+                                                  generator=_flow_gen)
+                return q.reshape(-1)[0].detach()
 
     progress_print_every_n_points = (
         int(progress_print_every_n_points)
@@ -6766,6 +8607,69 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         if zen is None or azi is None:
             return None, None
         return float(np.pi - zen), float(np.mod(azi + np.pi, 2 * np.pi))
+
+    def _charge_event(event, det_idx):
+        """Event dict for prepare_features_charge at detector index det_idx.
+
+        For a parquet event, inject that PMT's own 'pmt_direction' (each hit PMT
+        has a different direction) while keeping the varied hypothesis params.
+        Otherwise return the event unchanged.
+        """
+        if parquet_light_yields is None or not getattr(llrnet, 'add_pmt_direction', False):
+            return event
+        merged = dict(event)
+        merged['pmt_direction'] = parquet_pmt_event_data[det_idx]['pmt_direction']
+        return merged
+
+    _flow_state = {}
+
+    def _flow_loglik_sum(event):
+        """Summed log p(q_i | theta, x_i) over all detector points, via the flow.
+
+        The dequantisation q~ = q + u is drawn once on the first call and cached, so
+        every hypothesis in the scan is scored against the SAME observation and the
+        landscape is smooth rather than noisy.
+        """
+        if not _flow_state:
+            if parquet_light_yields is not None:
+                pts = parquet_points_stacked
+                lys = parquet_ly_stacked.reshape(-1)
+            else:
+                pts = torch.stack([
+                    p.reshape(-1)[:3] if torch.is_tensor(p) else torch.as_tensor(p).reshape(-1)[:3]
+                    for p in detector_points])
+                lys = torch.as_tensor([float(l) for l in true_light_yields])
+            pts = pts.to(device=flow_model.device, dtype=flow_model.param_dtype)
+            lys = lys.to(device=flow_model.device, dtype=flow_model.param_dtype)
+            g = torch.Generator(device='cpu').manual_seed(int(flow_seed) + 1)
+            u = torch.rand(lys.shape[0], generator=g).to(lys.device, lys.dtype)
+            q_deq = lys + u
+            _flow_state['points'] = pts
+            _flow_state['z'] = flow_model.to_z(q_deq)
+            # theta-independent Jacobian; kept so absolute NLL values are correct.
+            _flow_state['logdet'] = float(flow_model.log_det_dz_dq(q_deq).sum().item())
+
+        ctx = _flow_context(_flow_state['points'], event)
+        with torch.no_grad():
+            lp = flow_model.log_prob_z(_flow_state['z'], ctx, n_steps=flow_n_steps)
+        return float(lp.sum().item()) + _flow_state['logdet']
+
+    def _parquet_charge_llr_sum(event):
+        """Summed per-PMT log-likelihood term for one hypothesis, in one forward pass.
+
+        Builds features for every detector point in a single batch instead of looping
+        per detector. Dispatches to the flow model when one was supplied; otherwise
+        the LLRnet parquet charge path (use_rich_features, not PATD).
+        """
+        if flow_model is not None:
+            return _flow_loglik_sum(event)
+        feats = llrnet.prepare_features_charge_batched(
+            parquet_points_stacked, event, parquet_ly_stacked,
+            pmt_directions=parquet_pmt_dir_stacked,
+        )  # (n_det, feat_dim)
+        with torch.no_grad():
+            log_llrs = llrnet.predict_log_likelihood_ratio(feats)  # (n_det,)
+        return float(log_llrs.reshape(-1).sum().item())
 
     # Normalize detector point inputs into a list of tensors.
     def _to_detector_points_list(detector_point_input):
@@ -6833,7 +8737,11 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         true_detector_responses = selected_responses
     else:
         detector_points = _to_detector_points_list(detector_point)
-    
+        # For a parquet event the observed responses are the recorded light
+        # yields (used for skip_zero_response / effective-point counting).
+        if parquet_light_yields is not None:
+            true_detector_responses = [float(l) for l in parquet_light_yields]
+
     # num_detector_points = len(detector_points)
     
     if true_event.get('azimuth') is not None:
@@ -6931,25 +8839,35 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         else:
             # Standard mode using light yield features.
             # Pre-compute true light yields once so the observation is held fixed
-            # across the grid (same semantics as the PATD path above).
-            true_light_yields = []
-            for det_point in detector_points:
-                with torch.no_grad():
-                    ly = signal_surrogate_func(opt_point=det_point, event_params=true_event)
-                true_light_yields.append(ly)
+            # across the grid (same semantics as the PATD path above). For a
+            # parquet event these are the recorded per-PMT counts.
+            if parquet_light_yields is not None:
+                true_light_yields = list(parquet_light_yields)
+            else:
+                true_light_yields = []
+                for det_point in detector_points:
+                    with torch.no_grad():
+                        ly = signal_surrogate_func(opt_point=det_point, event_params=true_event)
+                    true_light_yields.append(ly)
 
-            for det_point, true_ly in zip(detector_points, true_light_yields):
-                if use_rich_features:
-                    true_features = llrnet.prepare_features_charge(det_point, true_event, true_ly)
-                else:
-                    true_features = llrnet.prepare_data_from_raw(
-                        point=det_point,
-                        event_data=true_event,
-                        surrogate_func=signal_surrogate_func,
-                        event_labels=event_labels,
-                        noise_scale=llrnet.signal_noise_scale,
-                    )
-                true_llr_sum += llrnet.predict_log_likelihood_ratio(true_features.unsqueeze(0)).item()
+            if flow_model is not None or (parquet_light_yields is not None
+                                          and use_rich_features):
+                # Fast batched path: one forward pass over all detector points.
+                true_llr_sum = _parquet_charge_llr_sum(true_event)
+            else:
+                for det_idx, (det_point, true_ly) in enumerate(zip(detector_points, true_light_yields)):
+                    if use_rich_features:
+                        true_features = llrnet.prepare_features_charge(
+                            det_point, _charge_event(true_event, det_idx), true_ly)
+                    else:
+                        true_features = llrnet.prepare_data_from_raw(
+                            point=det_point,
+                            event_data=true_event,
+                            surrogate_func=signal_surrogate_func,
+                            event_labels=event_labels,
+                            noise_scale=llrnet.signal_noise_scale,
+                        )
+                    true_llr_sum += llrnet.predict_log_likelihood_ratio(true_features.unsqueeze(0)).item()
     
     # Create parameter grids
     if len(param_names) == 1:
@@ -7019,12 +8937,17 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                     llr_sum = llrnet.evaluate_patd_likelihood_batched_hypothesis(
                         modified_event, patd_precomputed_obs
                     )
+            elif flow_model is not None or (parquet_light_yields is not None
+                                            and use_rich_features and not use_patd):
+                # Fast batched charge path: one forward pass over all detector
+                # points for this hypothesis.
+                llr_sum = _parquet_charge_llr_sum(modified_event)
             else:
                 patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
                 ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
-                for det_point, true_response, true_patd, true_ly in zip(
+                for det_idx, (det_point, true_response, true_patd, true_ly) in enumerate(zip(
                     detector_points, true_detector_responses, patd_iter, ly_iter
-                ):
+                )):
                     if skip_zero_response and true_response == 0.0:
                         continue
                     with torch.no_grad():
@@ -7040,7 +8963,7 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                             llr_sum += llr_result['joint_log_likelihood']
                         elif use_rich_features:
                             features = llrnet.prepare_features_charge(
-                                det_point, modified_event, true_ly
+                                det_point, _charge_event(modified_event, det_idx), true_ly
                             )
                             llr_sum += llrnet.predict_log_likelihood_ratio(features.unsqueeze(0)).item()
                         else:
@@ -7248,6 +9171,12 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                         llr_sum = llrnet.evaluate_patd_likelihood_batched_hypothesis(
                             modified_event, patd_precomputed_obs
                         )
+                elif flow_model is not None or (parquet_light_yields is not None
+                                                and use_rich_features and not use_patd):
+                    # Fast batched charge path: one forward pass over all detector
+                    # points for this hypothesis. (The 2-D grid previously fell
+                    # through to the per-detector loop even for parquet events.)
+                    llr_sum = _parquet_charge_llr_sum(modified_event)
                 else:
                     patd_iter = true_patd_results if use_patd else [None] * len(detector_points)
                     ly_iter = true_light_yields if (not use_patd) else [None] * len(detector_points)
@@ -7295,6 +9224,20 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
         # Normalize to minimum NLL value
         min_nll = np.min(nll_grid)
         nll_grid = nll_grid - min_nll
+
+        # Optional fixed color scale for contour fill/colorbar consistency across plots.
+        nll_grid_for_fill = nll_grid
+        fixed_fill_levels = None
+        fixed_fill_vmax = None
+        if nll_cbar_max is not None:
+            try:
+                nll_cbar_max = float(nll_cbar_max)
+            except Exception:
+                nll_cbar_max = None
+            if nll_cbar_max is not None and np.isfinite(nll_cbar_max) and nll_cbar_max > 0.0:
+                fixed_fill_vmax = float(nll_cbar_max)
+                nll_grid_for_fill = np.clip(nll_grid, 0.0, fixed_fill_vmax)
+                fixed_fill_levels = np.linspace(0.0, fixed_fill_vmax, 21)
         
         # Find minimum location
         min_idx = np.unravel_index(np.argmin(nll_grid), nll_grid.shape)
@@ -7323,8 +9266,27 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             ax = fig.add_subplot(111, projection='mollweide')
             
             # Plot filled contours
-            contourf = ax.contourf(lon_grid, lat_grid, nll_grid, 
-                                   levels=20, cmap=cmap, alpha=0.7)
+            if fixed_fill_levels is not None and fixed_fill_vmax is not None:
+                contourf = ax.contourf(
+                    lon_grid,
+                    lat_grid,
+                    nll_grid_for_fill,
+                    levels=fixed_fill_levels,
+                    vmin=0.0,
+                    vmax=fixed_fill_vmax,
+                    cmap=cmap,
+                    alpha=0.7,
+                    extend='max',
+                )
+            else:
+                contourf = ax.contourf(
+                    lon_grid,
+                    lat_grid,
+                    nll_grid_for_fill,
+                    levels=20,
+                    cmap=cmap,
+                    alpha=0.7,
+                )
             
             # Plot contour lines at specific levels
             contour = ax.contour(lon_grid, lat_grid, nll_grid, 
@@ -7442,8 +9404,27 @@ def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
             fig, ax = plt.subplots(figsize=figsize)
             
             # Plot filled contours
-            contourf = ax.contourf(param1_grid, param2_grid, nll_grid, 
-                                   levels=20, cmap=cmap, alpha=0.7)
+            if fixed_fill_levels is not None and fixed_fill_vmax is not None:
+                contourf = ax.contourf(
+                    param1_grid,
+                    param2_grid,
+                    nll_grid_for_fill,
+                    levels=fixed_fill_levels,
+                    vmin=0.0,
+                    vmax=fixed_fill_vmax,
+                    cmap=cmap,
+                    alpha=0.7,
+                    extend='max',
+                )
+            else:
+                contourf = ax.contourf(
+                    param1_grid,
+                    param2_grid,
+                    nll_grid_for_fill,
+                    levels=20,
+                    cmap=cmap,
+                    alpha=0.7,
+                )
             
             # Plot contour lines at specific levels
             contour = ax.contour(param1_grid, param2_grid, nll_grid, 
@@ -8093,3 +10074,1268 @@ def plot_nll_landscape_with_sampling(
         'num_detector_points': num_detector_points,
         'num_iterations': num_iterations
     }
+
+
+def plot_corner_compare(sets, variables=None, bins=40, levels=(0.393, 0.865),
+                        smooth=1.0, colors=None, range_pct=(0.5, 99.5),
+                        ranges=None, weights=None, fill_contours=True,
+                        title=None, save_path=None, legend_fontsize=11,
+                        show=True, **corner_kwargs):
+    """Overlay corner plots of two or more labelled sample sets.
+
+    Parameters
+    ----------
+    sets : dict
+        ``{set name: {variable label: 1-D array}}``, e.g.
+        ``{'data': {...}, 'sim': {...}}``. Insertion order sets the draw order.
+    variables : list of str, optional
+        Which variable labels to plot, in order. Defaults to the keys of the
+        first set. Pass a subset to drop panels.
+    ranges : list of (lo, hi), optional
+        Per-variable axis ranges. By default taken from the ``range_pct``
+        percentiles of all sets pooled, so the overlay stays aligned.
+    weights : dict, optional
+        ``{set name: 1-D array}`` of per-sample weights.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import corner as _corner
+
+    names = list(sets.keys())
+    if not names:
+        raise ValueError("sets is empty")
+    if variables is None:
+        variables = list(sets[names[0]].keys())
+    variables = list(variables)
+    if len(variables) < 2:
+        raise ValueError("need at least 2 variables for a corner plot")
+
+    if colors is None:
+        colors = ['C0', 'C1', 'C2', 'C3', 'C4'][:len(names)]
+
+    arrs, wts = {}, {}
+    for nm in names:
+        missing = [v for v in variables if v not in sets[nm]]
+        if missing:
+            raise KeyError(f"set '{nm}' is missing variables {missing}")
+        cols = [np.asarray(sets[nm][v], dtype=float).ravel() for v in variables]
+        n = min(len(c) for c in cols)
+        a = np.column_stack([c[:n] for c in cols])
+        w = None
+        if weights is not None and nm in weights and weights[nm] is not None:
+            w = np.asarray(weights[nm], dtype=float).ravel()[:n]
+        keep = np.isfinite(a).all(axis=1)
+        if w is not None:
+            keep &= np.isfinite(w)
+        arrs[nm] = a[keep]
+        wts[nm] = None if w is None else w[keep]
+        if len(arrs[nm]) < 10:
+            raise ValueError(f"set '{nm}' has only {len(arrs[nm])} finite rows")
+
+    if ranges is None:
+        pooled = np.vstack([arrs[nm] for nm in names])
+        ranges = []
+        for k in range(len(variables)):
+            lo, hi = np.percentile(pooled[:, k], range_pct)
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo, hi = float(pooled[:, k].min()), float(pooled[:, k].max())
+            if hi <= lo:
+                hi = lo + 1e-9
+            pad = 0.03 * (hi - lo)
+            ranges.append((lo - pad, hi + pad))
+
+    fig = None
+    for nm, col in zip(names, colors):
+        fig = _corner.corner(
+            arrs[nm], labels=variables, range=ranges, bins=bins, levels=levels,
+            smooth=smooth, color=col, fig=fig, weights=wts[nm],
+            plot_datapoints=False, plot_density=False,
+            fill_contours=fill_contours, no_fill_contours=not fill_contours,
+            contour_kwargs=dict(linewidths=1.5),
+            contourf_kwargs=dict(alpha=0.2),
+            hist_kwargs=dict(density=True, lw=1.8),
+            label_kwargs=dict(fontsize=11), max_n_ticks=4,
+            **corner_kwargs)
+
+    handles = [mpatches.Patch(color=c, label=f'{nm}  (n={len(arrs[nm]):,})')
+               for nm, c in zip(names, colors)]
+    fig.legend(handles=handles, loc='upper right', frameon=False,
+               fontsize=legend_fontsize,
+               bbox_to_anchor=(0.98, 0.98) if len(variables) > 2 else (1.0, 1.0))
+    if title:
+        fig.suptitle(title, fontsize=13, y=1.01)
+    if save_path:
+        fig.savefig(save_path, dpi=130, bbox_inches='tight')
+    if show:
+        plt.show()
+    return fig
+
+
+def animate_flow_transport(model, context, z_range=(-4.5, 4.5), n_z=321,
+                           n_steps=64, n_particles=1200, n_traj=21,
+                           frame_stride=1, fps=12, save_path=None,
+                           z_label='z  (standardised target)', title=None,
+                           figsize=(13, 5.2), dens_max=None, verbose=True):
+    """Animate a conditional flow transporting N(0,1) into p(z | c).
+
+    The density is tracked in Lagrangian form: a fixed grid of base-space
+    quantiles is integrated forward once while accumulating the divergence, so
+    ``log p_t(z_t) = log p_0(z_0) - int_0^t div v dt'`` comes out of the same
+    single pass that produces the trajectories. That is exact (up to the ODE
+    step) and costs one integration for the whole animation rather than one per
+    frame.
+
+    Parameters
+    ----------
+    model : FlowMatchLY | FlowMatchATime | any subclass
+        Needs ``_apply_context_norm``, ``_prep``, ``_velocity`` and ``_v_and_div``.
+    context : Tensor, shape (context_dim,) or (1, context_dim)
+        The single event/PMT context to condition on.
+    n_particles : int
+        Base-space quantile grid size; sets how smooth the density curve is.
+    n_traj : int
+        How many of those particles to draw as trajectories on the (z, t) plane.
+    save_path : str or None
+        Write a GIF here as well as returning the animation.
+
+    Returns
+    -------
+    matplotlib.animation.FuncAnimation
+        Display with ``HTML(anim.to_jshtml())`` for a play/pause control and a
+        frame slider.
+    """
+    import math
+    from matplotlib import animation
+
+    # _velocity/_v_and_div want the STANDARDISED context; the public API
+    # (log_prob_z, transport_to_base) standardises internally and must be given
+    # the raw one. Passing a pre-normalised context to those double-standardises
+    # it and silently returns a completely different flow.
+    raw = model._prep(context.reshape(1, -1))
+    c1 = model._apply_context_norm(raw)
+    dt = 1.0 / int(n_steps)
+
+    # ---- base-space quantile grid: deterministic, ordered, smooth ----
+    u = (torch.arange(n_particles, dtype=c1.dtype, device=c1.device) + 0.5) / n_particles
+    z0 = math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+    z = z0.reshape(-1, 1)
+    logp = -0.5 * z ** 2 - 0.5 * math.log(2.0 * math.pi)
+    cB = c1.expand(z.shape[0], -1)
+
+    Z = [z.reshape(-1).clone()]
+    LP = [logp.reshape(-1).clone()]
+    for i in range(int(n_steps)):
+        tm = torch.full((z.shape[0],), (i + 0.5) * dt, device=c1.device, dtype=c1.dtype)
+        v, div = model._v_and_div(z, tm, cB)
+        z = z + dt * v
+        logp = logp - dt * div
+        Z.append(z.reshape(-1).clone())
+        LP.append(logp.reshape(-1).clone())
+    Z = [a.detach().cpu().numpy() for a in Z]
+    P = [np.exp(a.detach().cpu().numpy()) for a in LP]
+
+    if verbose:
+        # (i) the tracked density must integrate to 1 at every t -- this checks the
+        #     divergence accumulation on its own terms
+        ii = [0, len(Z) // 2, len(Z) - 1]
+        norms = ' '.join(f'{np.trapezoid(P[j], Z[j]):.4f}' for j in ii)
+        print(f'int p_t dz at t = 0, 0.5, 1: {norms}  (want 1; the deficit is the '
+              f'quantile grid missing the tails)')
+        # (ii) and it must agree with the model's own backward integrator
+        with torch.no_grad():
+            k = np.linspace(0, n_particles - 1, 9).astype(int)
+            zt = torch.as_tensor(Z[-1][k], device=c1.device, dtype=c1.dtype)
+            ref = model.log_prob_z(zt, raw.expand(len(k), -1), n_steps=int(n_steps))
+        err = np.abs(ref.detach().cpu().numpy() - LP[-1].detach().cpu().numpy()[k]).max()
+        print(f'max |log p_1 Lagrangian - log_prob_z| = {err:.2e} nats')
+
+    # ---- velocity field on a fixed (z, t) mesh, for the contour background ----
+    zg = torch.linspace(z_range[0], z_range[1], int(n_z), device=c1.device, dtype=c1.dtype)
+    tg = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=c1.device, dtype=c1.dtype)
+    cZ = c1.expand(int(n_z), -1)
+    with torch.no_grad():
+        V = torch.stack([
+            model._velocity(zg.reshape(-1, 1),
+                            torch.full((int(n_z),), float(tv), device=c1.device,
+                                       dtype=c1.dtype), cZ).reshape(-1)
+            for tv in tg]).detach().cpu().numpy()
+    zg_np, tg_np = zg.detach().cpu().numpy(), tg.detach().cpu().numpy()
+
+    frames = list(range(0, int(n_steps) + 1, max(int(frame_stride), 1)))
+    if frames[-1] != int(n_steps):
+        frames.append(int(n_steps))
+    if dens_max is None:
+        dens_max = 1.15 * max(float(np.nanmax(p)) for p in P)
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=figsize)
+
+    # static reference curves
+    axL.plot(Z[0], P[0], color='0.65', lw=1.4, ls=':', label='t = 0  (Gaussian)')
+    axL.plot(Z[-1], P[-1], color='0.25', lw=1.4, ls='--', label='t = 1  (learned)')
+    (line_d,) = axL.plot([], [], color='C3', lw=2.4, label='p_t(z)')
+    fill_d = [axL.fill_between(Z[0], 0, P[0], color='C3', alpha=.15, lw=0)]
+    axL.set_xlim(*z_range); axL.set_ylim(0, dens_max)
+    axL.set_xlabel(z_label); axL.set_ylabel('density')
+    axL.legend(fontsize=8, loc='upper left'); axL.grid(alpha=.3)
+
+    vmax = float(np.nanmax(np.abs(V))) or 1.0
+    axR.contourf(zg_np, tg_np, V, levels=25, cmap='RdBu_r', vmin=-vmax, vmax=vmax)
+    axR.contour(zg_np, tg_np, V, levels=11, colors='k', linewidths=.4, alpha=.35)
+    sm = cm.ScalarMappable(norm=Normalize(-vmax, vmax), cmap='RdBu_r')
+    fig.colorbar(sm, ax=axR, label='velocity  v(z, t | c)')
+    tr_idx = np.linspace(0, n_particles - 1, min(int(n_traj), n_particles)).astype(int)
+    traj = np.stack([Z[k][tr_idx] for k in range(len(Z))])        # (n_t, n_traj)
+    tr_lines = [axR.plot([], [], color='0.15', lw=.9, alpha=.75)[0]
+                for _ in range(len(tr_idx))]
+    (pts,) = axR.plot([], [], 'o', color='C3', ms=3.5)
+    hline = axR.axhline(0.0, color='C3', lw=1.4, ls='--')
+    axR.set_xlim(*z_range); axR.set_ylim(0, 1)
+    axR.set_xlabel(z_label); axR.set_ylabel('flow time  t')
+    axR.set_title('velocity field and trajectories', fontsize=10)
+
+    def _update(k):
+        line_d.set_data(Z[k], P[k])
+        fill_d[0].remove()
+        fill_d[0] = axL.fill_between(Z[k], 0, P[k], color='C3', alpha=.15, lw=0)
+        axL.set_title(f't = {k * dt:.3f}', fontsize=10)
+        for j, ln in enumerate(tr_lines):
+            ln.set_data(traj[:k + 1, j], tg_np[:k + 1])
+        pts.set_data(Z[k][tr_idx], np.full(len(tr_idx), tg_np[k]))
+        hline.set_ydata([tg_np[k], tg_np[k]])
+        return [line_d, fill_d[0], pts, hline, *tr_lines]
+
+    if title:
+        fig.suptitle(title, y=1.0)
+    plt.tight_layout()
+    anim = animation.FuncAnimation(fig, _update, frames=frames,
+                                   interval=1000 / max(fps, 1), blit=False)
+    if save_path:
+        anim.save(save_path, writer='pillow', fps=fps, dpi=95)
+        if verbose:
+            print(f'GIF -> {save_path}  ({len(frames)} frames)')
+    plt.close(fig)
+    return anim
+
+
+def _nll_axis_values(name, rng, n, true_val):
+    """Grid for one scanned parameter; energy is scanned logarithmically."""
+    if name == 'energy':
+        return np.logspace(np.log10(rng[0]), np.log10(rng[1]), n)
+    return np.linspace(rng[0], rng[1], n)
+
+
+def _draw_nll_landscape(axes, names, NLL, tv, best, title, contour_levels=(0, 1, 4, 9),
+                        cmap='viridis', nll_cbar_max=None, fill_scale='auto',
+                        use_mollweide=False, plot_opposite=False, figsize=(7, 5)):
+    """1-D curve or filled-contour 2-D NLL landscape, in the plot_nll_landscape style."""
+    if len(names) == 1:
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.plot(axes[0], NLL, 'o-', lw=1.8, ms=4)
+        if tv.get(names[0]) is not None:
+            ax.axvline(float(tv[names[0]]), color='red', ls='--', lw=2,
+                       label='True value')
+        ax.axvline(best[names[0]], color='green', ls=':', lw=2, label='Minimum NLL')
+        if names[0] == 'energy':
+            ax.set_xscale('log')
+        for lv in contour_levels:
+            if lv > 0:
+                ax.axhline(lv, color='gray', ls=':', alpha=.5, lw=1)
+        ax.set_xlabel(f'{names[0].capitalize()}', fontsize=12)
+        ax.set_ylabel('Negative Log-Likelihood', fontsize=11)
+        ax.set_title(title, fontsize=14)
+        ax.legend(); ax.grid(True, alpha=0.3)
+    else:
+        # filled contours + labelled white level lines, matching plot_nll_landscape.
+        # These landscapes routinely span 0 -> 1e4+ nats with the well occupying <1%
+        # of the grid, so a linear fill saturates to one colour; 'auto' switches to
+        # log-spaced levels once the range makes that a problem.
+        hi_fill = (float(nll_cbar_max) if nll_cbar_max is not None
+                   else float(np.nanmax(NLL)))
+        scale = fill_scale
+        if scale == 'auto':
+            scale = 'log' if hi_fill > 100.0 else 'linear'
+        cbar_ticks = None
+        if scale == 'log':
+            pos = NLL[NLL > 0]
+            lo_fill = min(float(np.nanmin(pos)) if pos.size else 0.1, 1.0)
+            lo_fill = max(lo_fill, 1e-2)
+            hi_fill = max(hi_fill, lo_fill * 10.0)
+            fill_kw = dict(levels=np.logspace(np.log10(lo_fill), np.log10(hi_fill), 21),
+                           extend='both')
+            cbar_ticks = 10.0 ** np.arange(np.ceil(np.log10(lo_fill)),
+                                           np.floor(np.log10(hi_fill)) + 1)
+        else:
+            fill_kw = dict(levels=np.linspace(0.0, hi_fill, 21), vmin=0.0,
+                           vmax=hi_fill,
+                           extend='max' if nll_cbar_max is not None else 'neither')
+        lines = [lv for lv in contour_levels if np.nanmin(NLL) < lv < np.nanmax(NLL)]
+
+        if use_mollweide and set(names) == {'zenith', 'azimuth'}:
+            iz, ia = names.index('zenith'), names.index('azimuth')
+            Z = NLL if iz == 0 else NLL.T
+            lat = np.pi / 2 - axes[iz]
+            lon = axes[ia] - np.pi
+            fig = plt.figure(figsize=figsize)
+            ax = fig.add_subplot(111, projection='mollweide')
+            cf = ax.contourf(lon, lat, Z, cmap=cmap, alpha=.7, **fill_kw)
+            if lines:
+                cs = ax.contour(lon, lat, Z, levels=lines, colors='white',
+                                linewidths=2, alpha=.8)
+                try:
+                    ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
+                except (IndexError, ValueError):
+                    pass                    # too sparse to label in this projection
+            ax.plot(best['azimuth'] - np.pi, np.pi / 2 - best['zenith'], 'g*',
+                    markersize=20, markeredgecolor='black', markeredgewidth=2,
+                    label='Minimum NLL', zorder=5)
+            ax.plot(float(tv['azimuth']) - np.pi, np.pi / 2 - float(tv['zenith']),
+                    'r*', markersize=20, markeredgecolor='white', markeredgewidth=2,
+                    label='True values', zorder=5)
+            if plot_opposite:
+                ax.plot((float(tv['azimuth']) + np.pi) % (2 * np.pi) - np.pi,
+                        np.pi / 2 - (np.pi - float(tv['zenith'])), 'm*',
+                        markersize=16, markeredgecolor='white', markeredgewidth=1.5,
+                        label='Opposite true direction', zorder=5)
+            # tick labels in degrees, as in plot_nll_landscape
+            ax.set_xlabel('Azimuth (degrees)', fontsize=12)
+            xt = ax.get_xticks()
+            ax.set_xticks(xt)
+            ax.set_xticklabels([f'{int(round((x + np.pi) * 180 / np.pi))}°' for x in xt])
+            ax.set_ylabel('Zenith (degrees)', fontsize=12)
+            yt = ax.get_yticks()
+            ax.set_yticks(yt)
+            ax.set_yticklabels([f'{int(round((np.pi / 2 - y) * 180 / np.pi))}°' for y in yt])
+            ax.set_title(title, fontsize=14)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.07,
+                                fraction=0.046)
+            if cbar_ticks is not None and len(cbar_ticks):
+                cbar.set_ticks(list(cbar_ticks))
+                cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
+            cbar.set_label('Negative Log-Likelihood', fontsize=11)
+        else:
+            fig, ax = plt.subplots(figsize=figsize)
+            cf = ax.contourf(axes[1], axes[0], NLL, cmap=cmap, alpha=.7, **fill_kw)
+            if lines:
+                cs = ax.contour(axes[1], axes[0], NLL, levels=lines,
+                                colors='white', linewidths=2, alpha=.8)
+                try:
+                    ax.clabel(cs, inline=True, fontsize=10, fmt='%.0f')
+                except (IndexError, ValueError):
+                    pass
+            ax.plot(best[names[1]], best[names[0]], 'g*', markersize=20,
+                    markeredgecolor='black', markeredgewidth=2,
+                    label='Minimum NLL', zorder=5)
+            if tv.get(names[0]) is not None and tv.get(names[1]) is not None:
+                ax.plot(float(tv[names[1]]), float(tv[names[0]]), 'r*',
+                        markersize=20, markeredgecolor='white', markeredgewidth=2,
+                        label='True values', zorder=5)
+            if names[0] == 'energy':
+                ax.set_yscale('log')
+            if names[1] == 'energy':
+                ax.set_xscale('log')
+            ax.set_xlabel(f'{names[1].capitalize()}', fontsize=12)
+            ax.set_ylabel(f'{names[0].capitalize()}', fontsize=12)
+            ax.set_title(title, fontsize=14)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            cbar = plt.colorbar(cf, ax=ax)
+            if cbar_ticks is not None and len(cbar_ticks):
+                cbar.set_ticks(list(cbar_ticks))
+                cbar.set_ticklabels([f'{t:g}' for t in cbar_ticks])
+            cbar.set_label('Negative Log-Likelihood', fontsize=11)
+    plt.tight_layout(); plt.show()
+    return fig
+
+
+def plot_model_nll_landscape(
+        model, kind, true_event, points, pmt_directions,
+        hit_mask=None, counts=None, photon_times=None, photon_point_index=None,
+        param_names=('zenith', 'azimuth'), param_ranges=None, n_points=25,
+        n_steps=32, batch_size=262144, d_max=None, max_photons=None,
+        use_mollweide=False, plot_opposite_direction_true_params=False,
+        figsize=(7, 5), contour_levels=(0, 1, 4, 9), cmap='viridis',
+        nll_cbar_max=None, fill_scale='auto',
+        progress_every=None, verbose=True, seed=0):
+    """NLL landscape for ONE of the three surrogates, scanned over event parameters.
+
+    Unlike ``plot_nll_landscape`` this does not sample detector points: the caller
+    supplies the exact set of PMTs the likelihood runs over, which is what the hit
+    term needs (every PMT in the geometry contributes, the unhit ones through
+    ``log(1 - pi)``).
+
+    Parameters
+    ----------
+    kind : {'hit', 'ly', 'atime'}
+        'hit'   -> sum_j [ y_j log pi_j + (1 - y_j) log(1 - pi_j) ] over ALL of
+                   ``points``; needs ``hit_mask``. The unhit PMTs are what make the
+                   landscape close: a wrong hypothesis lights up PMTs that stayed
+                   dark, and every one of those costs log(1 - pi).
+        'ly'    -> sum_j log p_LY(q_j | theta, x_j) over the hit PMTs; needs ``counts``.
+        'atime' -> sum over photons of log p_T(t | theta, x_j); needs
+                   ``photon_times`` and ``photon_point_index``.
+    points, pmt_directions : (N, 3)
+        For 'hit' pass the whole geometry. For 'ly'/'atime' pass only the hit PMTs.
+    d_max : float or None
+        'hit' only. Skip unhit PMTs further than this from the HYPOTHESIS track and
+        treat their log(1 - pi) as 0. Hit PMTs are always evaluated exactly, at any
+        distance -- they are what penalises a wrong hypothesis. None evaluates
+        everything (exact, but ~10x slower). The neglected term is measured at the
+        true event and printed.
+    param_names : 1 or 2 names from {'energy','zenith','azimuth','x','y','z'}
+
+    Returns
+    -------
+    dict with 'axes', 'nll', 'true', 'best', and the raw log-likelihoods.
+    """
+    dev, dt = model.device, model.param_dtype
+    P = torch.as_tensor(np.asarray(points), device=dev, dtype=dt).reshape(-1, 3)
+    D = torch.as_tensor(np.asarray(pmt_directions), device=dev, dtype=dt).reshape(-1, 3)
+    N = P.shape[0]
+    kind = str(kind).lower()
+    if kind not in ('hit', 'ly', 'atime'):
+        raise ValueError("kind must be 'hit', 'ly' or 'atime'")
+
+    # ---- observed data, as device tensors -----------------------------------
+    y = ph_idx = t_obs = cnt = None
+    if kind == 'hit':
+        if hit_mask is None:
+            raise ValueError("kind='hit' needs hit_mask over `points`")
+        y = torch.as_tensor(np.asarray(hit_mask).reshape(-1).astype(np.float64),
+                            device=dev, dtype=dt)
+        if y.shape[0] != N:
+            raise ValueError(f"hit_mask has {y.shape[0]} entries for {N} points")
+    elif kind == 'ly':
+        if counts is None:
+            raise ValueError("kind='ly' needs counts over `points`")
+        cnt = torch.as_tensor(np.asarray(counts).reshape(-1), device=dev, dtype=dt)
+    else:
+        if photon_times is None or photon_point_index is None:
+            raise ValueError("kind='atime' needs photon_times and photon_point_index")
+        t_np = np.asarray(photon_times).reshape(-1)
+        i_np = np.asarray(photon_point_index).reshape(-1).astype(np.int64)
+        if max_photons is not None and len(t_np) > int(max_photons):
+            k = np.random.default_rng(seed).choice(len(t_np), int(max_photons),
+                                                   replace=False)
+            t_np, i_np = t_np[k], i_np[k]
+        t_obs = torch.as_tensor(t_np, device=dev, dtype=dt)
+        ph_idx = torch.as_tensor(i_np, device=dev)
+
+    # ---- the hypothesis -> event-parameter mapping --------------------------
+    tv = dict(true_event)
+    pos0 = np.asarray(tv['position'], dtype=np.float64).reshape(3)
+
+    def _event(vals):
+        e = dict(energy=float(tv['energy']), zenith=float(tv['zenith']),
+                 azimuth=float(tv['azimuth']), position=pos0.copy())
+        for nm, v in vals.items():
+            if nm in ('x', 'y', 'z'):
+                e['position']['xyz'.index(nm)] = float(v)
+            else:
+                e[nm] = float(v)
+        return e
+
+    # ---- arrival-time residuals are FIXED at the true event ------------------
+    # t_res = t_hit - t_geom is computed ONCE, from the true parameters, and then
+    # held constant while the hypothesis varies. The hypothesis therefore enters
+    # only through the context c(theta, x) -- the same convention LLRnet uses via
+    # rel_time. Recomputing t_geom(theta) instead makes the scan measure the bulk
+    # time shift a rotation implies, which for a long lever arm swamps everything
+    # else: at d_long = 2 km the residuals move ~100 ns per degree, far narrower
+    # than any practical grid, so the landscape becomes unreadable. Freezing them
+    # asks the question that is actually wanted -- does the conditional density
+    # SHAPE prefer the true parameters?
+    t_res_fixed = None
+    if kind == 'atime':
+        with torch.no_grad():
+            vt_ = torch.as_tensor(pos0, device=dev, dtype=dt).reshape(1, 3)
+            zt_ = torch.tensor(float(tv['zenith']), device=dev, dtype=dt).reshape(1)
+            at_ = torch.tensor(float(tv['azimuth']), device=dev, dtype=dt).reshape(1)
+            m_ = ph_idx.shape[0]
+            t_res_fixed = model.time_residual(
+                t_obs, P[ph_idx], vt_.expand(m_, 3),
+                zeniths=zt_.expand(m_), azimuths=at_.expand(m_)).detach()
+        if verbose:
+            tnp = t_res_fixed.cpu().numpy()
+            q = np.percentile(tnp, [1, 16, 50, 84, 99])
+            print(f'fixed t_res from the true event: p1/p16/p50/p84/p99 = '
+                  f'{q[0]:.1f} {q[1]:.1f} {q[2]:.1f} {q[3]:.1f} {q[4]:.1f} ns   '
+                  f'frac<0 = {np.mean(tnp < 0):.3f}')
+
+    def _loglik(e, report_far=False):
+        vert = torch.as_tensor(e['position'], device=dev, dtype=dt).reshape(1, 3)
+        en = torch.tensor(e['energy'], device=dev, dtype=dt).reshape(1)
+        zn = torch.tensor(e['zenith'], device=dev, dtype=dt).reshape(1)
+        az = torch.tensor(e['azimuth'], device=dev, dtype=dt).reshape(1)
+
+        sel = torch.arange(N, device=dev)
+        if kind == 'hit' and d_max is not None:
+            # travel direction, mirroring build_context's own convention
+            st, ct = math.sin(e['zenith']), math.cos(e['zenith'])
+            u = np.array([st * math.cos(e['azimuth']), st * math.sin(e['azimuth']), ct])
+            if getattr(model, 'track_dir_is_arrival', False):
+                u = -u
+            ut = torch.as_tensor(u, device=dev, dtype=dt).reshape(1, 3)
+            rel = P - vert
+            dl = (rel * ut).sum(1)
+            dp = torch.linalg.norm(rel - dl.unsqueeze(1) * ut, dim=1)
+            near = dp < float(d_max)
+            sel = torch.nonzero(near | (y > 0.5), as_tuple=True)[0]
+
+        tot = 0.0
+        far = 0.0
+        for s in range(0, sel.shape[0], batch_size):
+            g = sel[s:s + batch_size]
+            n = g.shape[0]
+            c = model.build_context(P[g], vert.expand(n, 3), en.expand(n),
+                                    zn.expand(n), az.expand(n),
+                                    pmt_directions=D[g])
+            if kind == 'hit':
+                lp1, lp0 = model.log_prob_hit(c, calibrated=True)
+                yy = y[g]
+                tot += float((yy * lp1 + (1.0 - yy) * lp0).sum().item())
+            elif kind == 'ly':
+                tot += float(model.log_prob_light_yield(cnt[g], c,
+                                                        n_steps=n_steps).sum().item())
+        if kind == 'atime':
+            # one context per PHOTON, from its parent PMT
+            for s in range(0, ph_idx.shape[0], batch_size):
+                g = ph_idx[s:s + batch_size]
+                n = g.shape[0]
+                c = model.build_context(P[g], vert.expand(n, 3), en.expand(n),
+                                        zn.expand(n), az.expand(n),
+                                        pmt_directions=D[g])
+                tot += float(model.log_prob_time_residual(
+                    t_res_fixed[s:s + batch_size], c,
+                    n_steps=n_steps).sum().item())
+        if report_far and kind == 'hit' and d_max is not None:
+            rest = torch.nonzero(~(near | (y > 0.5)), as_tuple=True)[0]
+            for s in range(0, rest.shape[0], batch_size):
+                g = rest[s:s + batch_size]
+                n = g.shape[0]
+                c = model.build_context(P[g], vert.expand(n, 3), en.expand(n),
+                                        zn.expand(n), az.expand(n),
+                                        pmt_directions=D[g])
+                _, lp0 = model.log_prob_hit(c, calibrated=True)
+                far += float(lp0.sum().item())
+        return tot, far
+
+    # ---- scan ---------------------------------------------------------------
+    names = list(param_names)
+    if not 1 <= len(names) <= 2:
+        raise ValueError("param_names must hold 1 or 2 entries")
+    pr = dict(param_ranges or {})
+    defaults = {'energy': (1e2, 1e6), 'zenith': (0.0, math.pi),
+                'azimuth': (0.0, 2 * math.pi)}
+    axes = []
+    for nm in names:
+        if nm not in pr:
+            if nm in defaults:
+                pr[nm] = defaults[nm]
+            else:
+                c0 = pos0['xyz'.index(nm)] if nm in 'xyz' else 0.0
+                pr[nm] = (c0 - 500.0, c0 + 500.0)
+        axes.append(_nll_axis_values(nm, pr[nm], int(n_points), tv.get(nm)))
+
+    with torch.no_grad():
+        ll_true, far_true = _loglik(_event({}), report_far=True)
+        if verbose:
+            extra = (f'   neglected far-PMT log(1-pi) = {far_true:+.3f} nats'
+                     if (kind == 'hit' and d_max is not None) else '')
+            print(f'kind={kind}  points={N:,}  logL(true) = {ll_true:.3f}{extra}')
+            if kind == 'hit':
+                nh = int(np.asarray(hit_mask).sum())
+                print(f'  {nh:,} hit / {N - nh:,} unhit PMTs contribute')
+
+        if len(names) == 1:
+            LL = np.empty(len(axes[0]))
+            for i, v in enumerate(axes[0]):
+                LL[i], _ = _loglik(_event({names[0]: v}))
+                if progress_every and (i + 1) % progress_every == 0:
+                    print(f'  {i + 1}/{len(axes[0])}', end='\r')
+        else:
+            LL = np.empty((len(axes[0]), len(axes[1])))
+            tot_pts = LL.size
+            done = 0
+            for i, a in enumerate(axes[0]):
+                for j, b in enumerate(axes[1]):
+                    LL[i, j], _ = _loglik(_event({names[0]: a, names[1]: b}))
+                    done += 1
+                    if progress_every and done % progress_every == 0:
+                        print(f'  {done}/{tot_pts}', end='\r')
+
+    # ---- what the residuals actually look like, at the truth and at the minimum --
+    def _atime_report(e, label):
+        """Mean log-density of the FIXED residuals under this hypothesis' context."""
+        with torch.no_grad():
+            vert = torch.as_tensor(e['position'], device=dev, dtype=dt).reshape(1, 3)
+            zn = torch.tensor(e['zenith'], device=dev, dtype=dt).reshape(1)
+            az = torch.tensor(e['azimuth'], device=dev, dtype=dt).reshape(1)
+            en = torch.tensor(e['energy'], device=dev, dtype=dt).reshape(1)
+            m = min(ph_idx.shape[0], 20000)
+            g = ph_idx[:m]
+            c = model.build_context(P[g], vert.expand(m, 3), en.expand(m),
+                                    zn.expand(m), az.expand(m), pmt_directions=D[g])
+            lp = model.log_prob_time_residual(t_res_fixed[:m], c, n_steps=n_steps)
+        print(f'  {label:<22} mean log p per photon = {float(lp.mean()):8.4f}'
+              f'   total over {m:,} photons = {float(lp.sum()):12.1f}')
+
+    NLL = -LL
+    NLL = NLL - np.nanmin(NLL)
+    flat = int(np.nanargmin(NLL))
+    best = ({names[0]: axes[0][flat]} if len(names) == 1 else
+            {names[0]: axes[0][flat // len(axes[1])],
+             names[1]: axes[1][flat % len(axes[1])]})
+
+    if verbose and kind == 'atime':
+        print('\nresiduals are held fixed; only the context varies:')
+        _atime_report(_event({}), 'TRUE event')
+        _atime_report(_event(best), 'located minimum')
+
+    # ---- plot ---------------------------------------------------------------
+    title = {'hit': 'hit probability', 'ly': 'light yield',
+             'atime': 'arrival time'}[kind]
+    if kind == 'atime':
+        n_obs_label = f'{ph_idx.shape[0]:,} photons'
+    elif kind == 'hit':
+        n_obs_label = f'{int(np.asarray(hit_mask).sum()):,} hit PMTs'
+    else:
+        n_obs_label = f'{N:,} PMTs'
+    _draw_nll_landscape(axes, names, NLL, tv, best, f'NLL Landscape ({title}, {n_obs_label})',
+                        contour_levels, cmap, nll_cbar_max, fill_scale, use_mollweide,
+                        plot_opposite_direction_true_params, figsize)
+
+    if verbose:
+        for nm in names:
+            t = tv.get(nm)
+            print(f'  {nm}: true {float(t):.4g}' if t is not None else f'  {nm}:',
+                  f'  minimum {best[nm]:.4g}')
+    return {'axes': axes, 'param_names': names, 'nll': NLL, 'loglik': LL,
+            'true': tv, 'best': best, 'loglik_true': ll_true}
+
+
+def plot_combined_nll_landscape(
+        hit_model, ly_model, atime_model, true_event, points, pmt_directions, hit_mask,
+        counts=None, photon_times=None, photon_point_index=None,
+        terms=('hit', 'ly', 'atime'), param_names=('zenith', 'azimuth'),
+        param_ranges=None, n_points=25, n_steps=32, n_dequant=4, batch_size=262144,
+        d_max=None, max_photons=None, freeze_residuals=True, plot_terms=False,
+        use_mollweide=False, plot_opposite_direction_true_params=False, figsize=(7, 5),
+        contour_levels=(0, 1, 4, 9), cmap='viridis', nll_cbar_max=None,
+        fill_scale='auto', progress_every=None, verbose=True, seed=0):
+    """NLL landscape of the summed hit + light-yield + arrival-time likelihood.
+
+    The same scan as plot_model_nll_landscape, with every requested term added:
+        hit   : sum over ALL ``points`` of y log pi + (1 - y) log(1 - pi)
+        ly    : sum over the hit PMTs of log p(q | c)
+        atime : sum over photons of log p(t_res | c)
+    Each model builds its own contexts, so their feature flags may differ.
+
+    Parameters
+    ----------
+    points, pmt_directions : (N, 3)
+        The whole geometry (the hit term needs every PMT).
+    hit_mask : (N,) bool
+    counts : (N,) or (n_hit,)
+        Photons per PMT; either over the whole geometry or over the hit PMTs in
+        np.flatnonzero(hit_mask) order.
+    photon_times, photon_point_index : (n_photons,)
+        Hit times and the index into ``points`` of each photon's PMT.
+    terms : subset of ('hit', 'ly', 'atime')
+    n_dequant : int
+        Dequantisation draws for log p(q); the same draws are reused at every grid
+        point, so the light-yield landscape is not noisy from point to point.
+    freeze_residuals : bool
+        True holds t_res = t_hit - t_geom at the true event (as plot_model_nll_landscape
+        does), so only the contexts move. False recomputes t_geom per hypothesis, the
+        physical likelihood, which also penalises the bulk time shift of a rotation.
+    plot_terms : bool
+        Also plot each term's landscape on its own.
+
+    Returns
+    -------
+    dict with 'axes', 'nll' (total, minimum at 0), 'loglik' (total), 'loglik_terms',
+    'true', 'best', 'loglik_true' and 'loglik_best' (per term).
+    """
+    terms = tuple(terms)
+    bad = [t for t in terms if t not in ('hit', 'ly', 'atime')]
+    if bad or not terms:
+        raise ValueError(f"terms must be a non-empty subset of ('hit','ly','atime'), got {terms}")
+    pts_np = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    dirs_np = np.asarray(pmt_directions, dtype=np.float64).reshape(-1, 3)
+    N = pts_np.shape[0]
+    y_np = np.asarray(hit_mask).reshape(-1).astype(bool)
+    if y_np.shape[0] != N:
+        raise ValueError(f"hit_mask has {y_np.shape[0]} entries for {N} points")
+    hit_idx = np.flatnonzero(y_np)
+    tv = dict(true_event)
+    pos0 = np.asarray(tv['position'], dtype=np.float64).reshape(3)
+
+    def _t(model, x):
+        return torch.as_tensor(np.asarray(x), device=model.device, dtype=model.param_dtype)
+
+    # ---- observed data, on each model's device -------------------------------
+    if 'hit' in terms:
+        P_h, D_h = _t(hit_model, pts_np), _t(hit_model, dirs_np)
+        y_h = _t(hit_model, y_np.astype(np.float64))
+    if 'ly' in terms:
+        if counts is None:
+            raise ValueError("terms with 'ly' need counts")
+        cnt = np.asarray(counts, dtype=np.float64).reshape(-1)
+        if cnt.shape[0] == N:
+            cnt = cnt[hit_idx]
+        elif cnt.shape[0] != hit_idx.shape[0]:
+            raise ValueError(f"counts has {cnt.shape[0]} entries; expected {N} or "
+                             f"{hit_idx.shape[0]} (the hit PMTs)")
+        P_l, D_l, c_l = (_t(ly_model, pts_np[hit_idx]), _t(ly_model, dirs_np[hit_idx]),
+                         _t(ly_model, cnt))
+    if 'atime' in terms:
+        if photon_times is None or photon_point_index is None:
+            raise ValueError("terms with 'atime' need photon_times and photon_point_index")
+        t_np = np.asarray(photon_times, dtype=np.float64).reshape(-1)
+        i_np = np.asarray(photon_point_index).reshape(-1).astype(np.int64)
+        if max_photons is not None and len(t_np) > int(max_photons):
+            k = np.random.default_rng(seed).choice(len(t_np), int(max_photons), replace=False)
+            t_np, i_np = t_np[k], i_np[k]
+        P_a, D_a, t_a = (_t(atime_model, pts_np[i_np]), _t(atime_model, dirs_np[i_np]),
+                         _t(atime_model, t_np))
+
+    def _event(vals):
+        e = dict(energy=float(tv['energy']), zenith=float(tv['zenith']),
+                 azimuth=float(tv['azimuth']), position=pos0.copy())
+        for nm, v in vals.items():
+            if nm in ('x', 'y', 'z'):
+                e['position']['xyz'.index(nm)] = float(v)
+            else:
+                e[nm] = float(v)
+        return e
+
+    def _ev_tensors(model, e, n):
+        mk = lambda v: torch.tensor(float(v), device=model.device,
+                                    dtype=model.param_dtype).reshape(1).expand(n)
+        vert = torch.as_tensor(e['position'], device=model.device,
+                               dtype=model.param_dtype).reshape(1, 3).expand(n, 3)
+        return vert, mk(e['energy']), mk(e['zenith']), mk(e['azimuth'])
+
+    def _ctx(model, P, D, e):
+        vert, en, zn, az = _ev_tensors(model, e, P.shape[0])
+        return model.build_context(P, vert, en, zn, az, pmt_directions=D)
+
+    def _t_res(e, s, f):
+        vert, _, zn, az = _ev_tensors(atime_model, e, f - s)
+        return atime_model.time_residual(t_a[s:f], P_a[s:f], vert, zeniths=zn, azimuths=az)
+
+    t_res_true = None
+    if 'atime' in terms and freeze_residuals:
+        with torch.no_grad():
+            t_res_true = torch.cat([_t_res(_event({}), s, min(s + batch_size, len(t_np)))
+                                    for s in range(0, len(t_np), batch_size)])
+
+    def _loglik(e):
+        """{term: log L} for one hypothesis."""
+        out = {}
+        if 'hit' in terms:
+            sel = torch.arange(N, device=hit_model.device)
+            if d_max is not None:
+                st, ct = math.sin(e['zenith']), math.cos(e['zenith'])
+                u = np.array([st * math.cos(e['azimuth']), st * math.sin(e['azimuth']), ct])
+                if getattr(hit_model, 'track_dir_is_arrival', False):   # -> travel
+                    u = -u
+                ut = _t(hit_model, u).reshape(1, 3)
+                rel = P_h - _t(hit_model, e['position']).reshape(1, 3)
+                dl = (rel * ut).sum(1)
+                dp = torch.linalg.norm(rel - dl.unsqueeze(1) * ut, dim=1)
+                sel = torch.nonzero((dp < float(d_max)) | (y_h > 0.5), as_tuple=True)[0]
+            tot = 0.0
+            for s in range(0, sel.shape[0], batch_size):
+                g = sel[s:s + batch_size]
+                lp1, lp0 = hit_model.log_prob_hit(_ctx(hit_model, P_h[g], D_h[g], e),
+                                                  calibrated=True)
+                tot += float((y_h[g] * lp1 + (1.0 - y_h[g]) * lp0).sum())
+            out['hit'] = tot
+        if 'ly' in terms:
+            gen = torch.Generator(device=ly_model.device).manual_seed(int(seed))
+            tot = 0.0
+            for s in range(0, c_l.shape[0], batch_size):
+                f = min(s + batch_size, c_l.shape[0])
+                tot += float(ly_model.log_prob_light_yield(
+                    c_l[s:f], _ctx(ly_model, P_l[s:f], D_l[s:f], e), n_steps=n_steps,
+                    n_dequant=n_dequant, generator=gen).sum())
+            out['ly'] = tot
+        if 'atime' in terms:
+            tot = 0.0
+            for s in range(0, t_a.shape[0], batch_size):
+                f = min(s + batch_size, t_a.shape[0])
+                tr = t_res_true[s:f] if freeze_residuals else _t_res(e, s, f)
+                tot += float(atime_model.log_prob_time_residual(
+                    tr, _ctx(atime_model, P_a[s:f], D_a[s:f], e), n_steps=n_steps).sum())
+            out['atime'] = tot
+        return out
+
+    # ---- scan ---------------------------------------------------------------
+    names = list(param_names)
+    if not 1 <= len(names) <= 2:
+        raise ValueError("param_names must hold 1 or 2 entries")
+    pr = dict(param_ranges or {})
+    defaults = {'energy': (1e2, 1e6), 'zenith': (0.0, math.pi),
+                'azimuth': (0.0, 2 * math.pi)}
+    axes = []
+    for nm in names:
+        if nm not in pr:
+            if nm in defaults:
+                pr[nm] = defaults[nm]
+            else:
+                pr[nm] = (pos0['xyz'.index(nm)] - 500.0, pos0['xyz'.index(nm)] + 500.0)
+        axes.append(_nll_axis_values(nm, pr[nm], int(n_points), tv.get(nm)))
+
+    shape = tuple(len(a) for a in axes)
+    LLt = {t: np.empty(shape) for t in terms}
+    with torch.no_grad():
+        ll_true = _loglik(_event({}))
+        if verbose:
+            nh = int(y_np.sum())
+            n_ph = (f', {t_a.shape[0]:,} photons' if 'atime' in terms else '')
+            print(f'terms={"+".join(terms)}  {nh:,} hit / {N:,} PMTs{n_ph}'
+                  f'{"" if freeze_residuals or "atime" not in terms else "  (t_res recomputed per hypothesis)"}')
+        done, total_pts = 0, int(np.prod(shape))
+        for idx in np.ndindex(*shape):
+            ll = _loglik(_event({nm: axes[k][idx[k]] for k, nm in enumerate(names)}))
+            for t in terms:
+                LLt[t][idx] = ll[t]
+            done += 1
+            if progress_every and done % progress_every == 0:
+                print(f'  {done}/{total_pts}', end='\r')
+
+    LL = sum(LLt[t] for t in terms)
+    NLL = -LL
+    NLL = NLL - np.nanmin(NLL)
+    flat = np.unravel_index(int(np.nanargmin(NLL)), shape)
+    best = {nm: axes[k][flat[k]] for k, nm in enumerate(names)}
+    ll_best = {t: float(LLt[t][flat]) for t in terms}
+
+    if verbose:
+        print('\nlog L per term   (located minimum - truth: negative = truth is better)')
+        for t in terms:
+            print(f'  {t:>6}: truth {ll_true[t]:14.2f}   minimum {ll_best[t]:14.2f}   '
+                  f'diff {ll_best[t] - ll_true[t]:+12.2f}')
+        lt, lb = sum(ll_true.values()), sum(ll_best.values())
+        print(f'  {"total":>6}: truth {lt:14.2f}   minimum {lb:14.2f}   diff {lb - lt:+12.2f}')
+        if lt > lb:
+            print('  the truth beats every grid point: the minimum lies between nodes '
+                  '(zoom the ranges or raise n_points)')
+
+    labels = {'hit': 'hit', 'ly': 'light yield', 'atime': 'arrival time'}
+    draw = lambda Z, ttl, b: _draw_nll_landscape(
+        axes, names, Z, tv, b, ttl, contour_levels, cmap, nll_cbar_max, fill_scale,
+        use_mollweide, plot_opposite_direction_true_params, figsize)
+    draw(NLL, f'NLL Landscape ({" + ".join(labels[t] for t in terms)})', best)
+    if plot_terms and len(terms) > 1:
+        for t in terms:
+            Zt = -LLt[t] - np.nanmin(-LLt[t])
+            ft = np.unravel_index(int(np.nanargmin(Zt)), shape)
+            draw(Zt, f'NLL Landscape ({labels[t]} only)',
+                 {nm: axes[k][ft[k]] for k, nm in enumerate(names)})
+
+    if verbose:
+        for nm in names:
+            t = tv.get(nm)
+            print(f'  {nm}: true {float(t):.4g}' if t is not None else f'  {nm}:',
+                  f'  minimum {best[nm]:.4g}')
+    return {'axes': axes, 'param_names': names, 'nll': NLL, 'loglik': LL,
+            'loglik_terms': LLt, 'true': tv, 'best': best,
+            'loglik_true': ll_true, 'loglik_best': ll_best}
+
+
+def _ts_prep(Xa, Xb, standardize=True, max_n=None, seed=0, paired=False):
+    """Stack two sample sets, drop non-finite rows, optionally standardise/subsample.
+
+    paired=True keeps row i of A and row i of B together: they are the same PMT,
+    so filtering and subsampling must hit both or the matching is lost.
+    """
+    A = np.asarray(Xa, dtype=np.float64).reshape(len(Xa), -1)
+    B = np.asarray(Xb, dtype=np.float64).reshape(len(Xb), -1)
+    if A.shape[1] != B.shape[1]:
+        raise ValueError(f"feature mismatch: {A.shape[1]} vs {B.shape[1]}")
+    rng = np.random.default_rng(seed)
+    if paired:
+        if len(A) != len(B):
+            raise ValueError(f"paired needs equal lengths: {len(A)} vs {len(B)}")
+        ok = np.isfinite(A).all(1) & np.isfinite(B).all(1)
+        A, B = A[ok], B[ok]
+        if max_n is not None and len(A) > max_n:
+            k = rng.choice(len(A), max_n, replace=False)
+            A, B = A[k], B[k]
+    else:
+        A = A[np.isfinite(A).all(1)]
+        B = B[np.isfinite(B).all(1)]
+        if max_n is not None:
+            if len(A) > max_n:
+                A = A[rng.choice(len(A), max_n, replace=False)]
+            if len(B) > max_n:
+                B = B[rng.choice(len(B), max_n, replace=False)]
+    if standardize:
+        pool = np.vstack([A, B])
+        mu, sd = pool.mean(0), pool.std(0)
+        sd[sd < 1e-12] = 1.0
+        A, B = (A - mu) / sd, (B - mu) / sd
+    return A, B
+
+
+class _C2STNet(torch.nn.Module):
+    """Plain MLP discriminator for the classifier two-sample test."""
+
+    def __init__(self, in_dim, hidden=(256, 256, 128), dropout=0.1):
+        super().__init__()
+        layers, d = [], in_dim
+        for h in hidden:
+            layers += [torch.nn.Linear(d, h), torch.nn.LayerNorm(h),
+                       torch.nn.GELU(), torch.nn.Dropout(dropout)]
+            d = h
+        layers += [torch.nn.Linear(d, 1)]
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def _fit_mlp_c2st(Xtr, ytr, Xte, hidden=(256, 256, 128), dropout=0.1, lr=1e-3,
+                  weight_decay=1e-4, batch_size=256, max_epochs=300, patience=25,
+                  val_frac=0.2, seed=0, device=None):
+    """Train the MLP discriminator on (Xtr, ytr), return its scores on Xte.
+
+    Early stops on a slice of the TRAINING fold (never the test fold) and restores
+    the best weights; without it the net memorises and loses power.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    g = torch.Generator().manual_seed(seed)
+    torch.manual_seed(seed)
+
+    n = len(Xtr)
+    perm = torch.randperm(n, generator=g).numpy()
+    n_val = max(int(val_frac * n), 1)
+    vi, ti = perm[:n_val], perm[n_val:]
+
+    Xt = torch.as_tensor(Xtr[ti], dtype=torch.float32, device=device)
+    yt = torch.as_tensor(ytr[ti], dtype=torch.float32, device=device)
+    Xv = torch.as_tensor(Xtr[vi], dtype=torch.float32, device=device)
+    yv = ytr[vi]
+
+    # nugget sets torch's default dtype to float64; the discriminator does not
+    # need it and float32 is ~2x faster, so pin it explicitly.
+    net = _C2STNet(Xtr.shape[1], hidden, dropout).to(device=device,
+                                                     dtype=torch.float32)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    lossf = torch.nn.BCEWithLogitsLoss()
+
+    best, best_state, bad = -np.inf, None, 0
+    for _ in range(max_epochs):
+        net.train()
+        order = torch.randperm(len(Xt), generator=g).to(device)
+        for s in range(0, len(Xt), batch_size):
+            idx = order[s:s + batch_size]
+            opt.zero_grad(set_to_none=True)
+            lossf(net(Xt[idx]), yt[idx]).backward()
+            opt.step()
+        net.eval()
+        with torch.no_grad():
+            sv = net(Xv).cpu().numpy()
+        try:
+            auc_v = roc_auc_score(yv, sv)
+        except ValueError:                       # one class only in the val slice
+            auc_v = 0.5
+        if auc_v > best + 1e-4:
+            best, bad = auc_v, 0
+            best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    if best_state is not None:
+        net.load_state_dict(best_state)
+    net.eval()
+    with torch.no_grad():
+        out = net(torch.as_tensor(Xte, dtype=torch.float32,
+                                  device=device)).cpu().numpy()
+    return out
+
+
+def c2st_auc(X_data, X_model, n_folds=5, seed=0, clf=None, standardize=True,
+             max_n=None, return_proba=False, device=None, paired=True, **net_kw):
+    """Classifier two-sample test as one number: the K-fold out-of-fold AUC.
+
+    0.5 = indistinguishable. Null sigma is c2st_null_sigma(n0, n1).
+
+    paired=True (the default) means row i of X_data and row i of X_model are the
+    SAME PMT: identical context, observed value versus modelled value. That is the
+    comparison you want -- it removes context sampling noise entirely, so the only
+    thing left to separate the classes is p(x | c). The two rows are then folded
+    TOGETHER, because splitting a matched pair across folds lets the net memorise
+    one twin's label and predict it for the other, where it is the wrong label; the
+    null drifts to 0.4926 (-2.6 sigma at 20k pairs) if you don't.
+
+    paired=False for two independent sets of rows.
+
+    Discriminator is an MLP; pass `clf` for any sklearn estimator instead, and
+    hidden/dropout/lr/max_epochs/patience through to the net.
+    """
+    import sklearn.base
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
+
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed, paired=paired)
+    X = np.vstack([A, B])
+    y = np.concatenate([np.zeros(len(A)), np.ones(len(B))])
+
+    oof = np.zeros(len(y))
+    if paired:
+        grp = np.tile(np.arange(len(A)), 2)
+        splitter = StratifiedGroupKFold(n_splits=n_folds, shuffle=True,
+                                        random_state=seed)
+        folds = splitter.split(X, y, groups=grp)
+    else:
+        splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        folds = splitter.split(X, y)
+    for k, (tr, te) in enumerate(folds):
+        if clf is None:
+            oof[te] = _fit_mlp_c2st(X[tr], y[tr], X[te], seed=seed + k,
+                                    device=device, **net_kw)
+        else:
+            c = sklearn.base.clone(clf)
+            c.fit(X[tr], y[tr])
+            oof[te] = c.predict_proba(X[te])[:, 1]
+    auc = float(roc_auc_score(y, oof))
+    if return_proba:
+        return auc, oof, y
+    return auc
+
+
+def c2st_null_sigma(n0, n1):
+    """Standard error of the AUC under the null (Mann-Whitney U variance)."""
+    return math.sqrt((n0 + n1 + 1.0) / (12.0 * float(n0) * float(n1)))
+
+
+def mmd2(X_data, X_model, bandwidth=None, standardize=True, max_n=2000, seed=0,
+         paired=True):
+    """Unbiased MMD^2 with an RBF kernel (median-heuristic bandwidth), one number.
+
+    Unbiased, so it goes negative about half the time under the null. With paired
+    rows the cross term drops its diagonal too: k(x_i, y_i) shares a context and so
+    runs systematically high, which would bias MMD^2 negative by O(1/n).
+    Memory is O((n+m)^2), hence max_n.
+    """
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed, paired=paired)
+    n, m = len(A), len(B)
+    Z = np.vstack([A, B])
+    sq = (Z ** 2).sum(1)
+    d2 = np.maximum(sq[:, None] + sq[None, :] - 2.0 * (Z @ Z.T), 0.0)
+    if bandwidth is None:                                   # median heuristic
+        med = np.median(d2[np.triu_indices(len(Z), 1)])
+        bandwidth = math.sqrt(max(med, 1e-12) / 2.0)
+    K = np.exp(-d2 / (2.0 * bandwidth ** 2))
+    Kaa, Kbb, Kab = K[:n, :n], K[n:, n:], K[:n, n:]
+    cross = ((Kab.sum() - np.trace(Kab)) / (n * (m - 1.0)) if paired
+             else Kab.mean())
+    return float((Kaa.sum() - np.trace(Kaa)) / (n * (n - 1.0))
+                 + (Kbb.sum() - np.trace(Kbb)) / (m * (m - 1.0))
+                 - 2.0 * cross)
+
+
+def energy_distance(X_data, X_model, standardize=True, max_n=3000, seed=0,
+                    paired=True):
+    """Szekely-Rizzo energy distance 2 E|X-Y| - E|X-X'| - E|Y-Y'|, one number.
+
+    MMD with the distance kernel, so no bandwidth to choose. U-statistic form, so
+    unbiased and negative about half the time under the null, like mmd2. With
+    paired rows the cross term drops its diagonal for the same reason.
+    """
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed, paired=paired)
+
+    def _md(P, Q, drop_diag=False):
+        sp, sq = (P ** 2).sum(1), (Q ** 2).sum(1)
+        d = np.sqrt(np.maximum(sp[:, None] + sq[None, :] - 2.0 * (P @ Q.T), 0.0))
+        if drop_diag:
+            n, m = len(P), len(Q)
+            return (d.sum() - np.trace(d)) / (n * (m - 1.0))
+        return d.mean()
+
+    return float(2.0 * _md(A, B, paired) - _md(A, A, True) - _md(B, B, True))
+
+
+def two_sample_numbers(X_data, X_model, X_model2=None, label='', seed=0, n_folds=5,
+                       clf=None, c2st_max_n=None, mmd_max_n=3000, paired=True,
+                       verbose=True, device=None, **net_kw):
+    """C2ST AUC, MMD^2 and energy distance for one batch -- numbers, no plots.
+
+    One row is one PMT: context features plus the observable, with row i the same
+    PMT in every array. See c2st_auc for why the folds are grouped.
+
+    X_model2 is a SECOND independent draw from the model at the same contexts. It
+    gives a null with exactly the structure of the real test -- the data side
+    cannot supply one, since each PMT is measured only once -- so it says what "no
+    difference" looks like here. Strongly recommended; cheap to produce.
+    """
+    kw = dict(n_folds=n_folds, seed=seed, clf=clf, max_n=c2st_max_n,
+              paired=paired, device=device, **net_kw)
+    out = {'auc': c2st_auc(X_data, X_model, **kw),
+           'mmd2': mmd2(X_data, X_model, max_n=mmd_max_n, seed=seed, paired=paired),
+           'edist': energy_distance(X_data, X_model, max_n=mmd_max_n, seed=seed,
+                                    paired=paired)}
+    n0 = min(len(X_data), c2st_max_n or len(X_data))
+    n1 = min(len(X_model), c2st_max_n or len(X_model))
+    out['auc_sigma'] = c2st_null_sigma(n0, n1)
+    out['n_sigma'] = (out['auc'] - 0.5) / out['auc_sigma']
+    if X_model2 is not None:
+        out['auc_base'] = c2st_auc(X_model, X_model2, **kw)
+        out['mmd2_base'] = mmd2(X_model, X_model2, max_n=mmd_max_n, seed=seed,
+                                paired=paired)
+        out['edist_base'] = energy_distance(X_model, X_model2, max_n=mmd_max_n,
+                                            seed=seed, paired=paired)
+    has = 'auc_base' in out
+    if verbose:
+        print(f"{label}")
+        b = f"  (null draw {out['auc_base']:.4f})" if has else ''
+        print(f"  C2ST AUC   {out['auc']:.4f}   {out['n_sigma']:+6.1f} sigma "
+              f"[null 0.5 +- {out['auc_sigma']:.4f}]{b}")
+        b = f"  (null draw {out['mmd2_base']:+.3e})" if has else ''
+        print(f"  MMD^2      {out['mmd2']:+.4e}{b}")
+        b = f"  (null draw {out['edist_base']:+.3e})" if has else ''
+        print(f"  energy d.  {out['edist']:+.4e}{b}")
+    return out
+
+
+def classifier_two_sample_test(X_data, X_model, test_frac=0.3, seed=0,
+                               max_n=20000, standardize=True, clf=None,
+                               n_perm=1000):
+    """C2ST: can a classifier tell the model's samples from the data's?
+
+    Under the null (model == data) the held-out AUC is 0.5. Because the feature
+    vector carries the CONTEXT alongside the observable, this tests the conditional
+    p(x | c), not just the marginal -- a model can match every marginal and still be
+    caught here.
+
+    The default classifier is deliberately REGULARISED. An unconstrained booster
+    reaches ~0.95 train AUC on pure noise and its test AUC then sits at chance even
+    when a real difference exists (measured: a genuine 0.11-sigma shift gave test
+    AUC 0.518 unregularised versus 0.544 regularised, against a Bayes limit of
+    0.531). Overfitting costs power, it does not create false positives.
+
+    The p-value permutes the TEST labels against the fitted scores, which is exact
+    under the null (the scores carry no label information there) and needs no
+    normal approximation.
+    """
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import train_test_split
+
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+    X = np.vstack([A, B])
+    y = np.concatenate([np.zeros(len(A)), np.ones(len(B))])
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_frac,
+                                          random_state=seed, stratify=y)
+    if clf is None:
+        clf = HistGradientBoostingClassifier(
+            max_iter=200, max_leaf_nodes=8, l2_regularization=1.0,
+            early_stopping=True, validation_fraction=0.2, random_state=seed)
+    clf.fit(Xtr, ytr)
+    p = clf.predict_proba(Xte)[:, 1]
+    auc = float(roc_auc_score(yte, p))
+    acc = float(((p > 0.5) == (yte > 0.5)).mean())
+    try:
+        tr_auc = float(roc_auc_score(ytr, clf.predict_proba(Xtr)[:, 1]))
+    except Exception:
+        tr_auc = float('nan')
+
+    rng = np.random.default_rng(seed)
+    null = np.array([roc_auc_score(rng.permutation(yte), p) for _ in range(n_perm)])
+    pval = float((1 + (null >= auc).sum()) / (1 + n_perm))
+    return {'auc': auc, 'train_auc': tr_auc, 'accuracy': acc, 'p_value': pval,
+            'z': float((auc - null.mean()) / max(null.std(), 1e-300)),
+            'n_test': len(yte), 'null_auc': null,
+            'proba_data': p[yte == 0], 'proba_model': p[yte == 1]}
+
+
+def mmd_two_sample_test(X_data, X_model, n_perm=200, seed=0, max_n=1500,
+                        standardize=True, bandwidth=None):
+    """Unbiased MMD^2 with an RBF kernel and a permutation p-value.
+
+    Bandwidth defaults to the median pairwise distance of the pooled sample. The
+    estimator is O(n^2) in memory, hence max_n.
+    """
+    A, B = _ts_prep(X_data, X_model, standardize, max_n, seed)
+    n, m = len(A), len(B)
+    Z = np.vstack([A, B])
+    d2 = np.maximum(((Z[:, None, :] - Z[None, :, :]) ** 2).sum(-1), 0.0)
+    if bandwidth is None:                       # median heuristic
+        iu = np.triu_indices(len(Z), 1)
+        med = np.median(d2[iu])
+        bandwidth = math.sqrt(max(med, 1e-12) / 2.0)
+    K = np.exp(-d2 / (2.0 * bandwidth ** 2))
+
+    def _mmd2(idx_a, idx_b):
+        Kaa = K[np.ix_(idx_a, idx_a)]
+        Kbb = K[np.ix_(idx_b, idx_b)]
+        Kab = K[np.ix_(idx_a, idx_b)]
+        na, nb = len(idx_a), len(idx_b)
+        return ((Kaa.sum() - np.trace(Kaa)) / (na * (na - 1))
+                + (Kbb.sum() - np.trace(Kbb)) / (nb * (nb - 1))
+                - 2.0 * Kab.mean())
+
+    ia, ib = np.arange(n), np.arange(n, n + m)
+    obs = _mmd2(ia, ib)
+    rng = np.random.default_rng(seed)
+    null = np.empty(n_perm)
+    allidx = np.arange(n + m)
+    for k in range(n_perm):
+        perm = rng.permutation(allidx)
+        null[k] = _mmd2(perm[:n], perm[n:])
+    p = float((1 + (null >= obs).sum()) / (1 + n_perm))
+    return {'mmd2': float(obs), 'null': null, 'p_value': p,
+            'bandwidth': float(bandwidth), 'n': n, 'm': m,
+            'z': float((obs - null.mean()) / max(null.std(), 1e-300))}
+
+
+def two_sample_report(X_data, X_model, title='', feature_names=None,
+                      seed=0, c2st_max_n=20000, mmd_max_n=1500, n_perm=200,
+                      figsize=(11, 3.8), show=True):
+    """Run the C2ST and the MMD test, print a summary and plot both diagnostics."""
+    c = classifier_two_sample_test(X_data, X_model, seed=seed, max_n=c2st_max_n)
+    m = mmd_two_sample_test(X_data, X_model, seed=seed, max_n=mmd_max_n,
+                            n_perm=n_perm)
+    print(f'{title}')
+    print(f'  C2ST : AUC = {c["auc"]:.4f} (chance 0.5, train {c["train_auc"]:.4f}, '
+          f'n_test {c["n_test"]:,})   z = {c["z"]:+.1f}   p = {c["p_value"]:.4f}')
+    print(f'  MMD  : MMD^2 = {m["mmd2"]:.3e}   permutation p = {m["p_value"]:.4f} '
+          f'({n_perm} perms)   z = {m["z"]:+.1f}   bandwidth = {m["bandwidth"]:.3f}')
+    if feature_names:
+        print(f'  features ({len(feature_names)}): {", ".join(feature_names)}')
+
+    if show:
+        fig, ax = plt.subplots(1, 2, figsize=figsize)
+        b = np.linspace(0, 1, 41)
+        ax[0].hist(c['proba_data'], bins=b, histtype='step', lw=2, density=True,
+                   label='data')
+        ax[0].hist(c['proba_model'], bins=b, histtype='step', lw=2, density=True,
+                   label='model')
+        ax[0].axvline(0.5, color='k', ls=':', lw=1)
+        ax[0].set_xlabel('classifier P(sample is from the model)')
+        ax[0].set_ylabel('density')
+        ax[0].set_title(f'C2ST: AUC = {c["auc"]:.3f} (0.5 = indistinguishable)',
+                        fontsize=10)
+        ax[0].legend(fontsize=8); ax[0].grid(alpha=.3)
+
+        ax[1].hist(m['null'], bins=30, color='C0', alpha=.7,
+                   label='permutation null')
+        ax[1].axvline(m['mmd2'], color='C3', lw=2.5, label='observed')
+        ax[1].set_xlabel('MMD$^2$'); ax[1].set_ylabel('permutations')
+        ax[1].set_title(f'MMD: p = {m["p_value"]:.4f}', fontsize=10)
+        ax[1].legend(fontsize=8); ax[1].grid(alpha=.3)
+        if title:
+            fig.suptitle(title, y=1.02, fontsize=11)
+        plt.tight_layout(); plt.show()
+    return {'c2st': c, 'mmd': m}

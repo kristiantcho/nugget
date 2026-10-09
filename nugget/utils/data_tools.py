@@ -33,6 +33,23 @@ def _validate_signal_events(signal_events: Sequence[Dict]) -> List[str]:
 			)
 	return keys
 
+def add_events_to_device(
+		signal_events: Sequence[Dict],
+		device: torch.device,
+		) -> List[Dict]:
+	"""Move all tensor fields in signal events to the specified device."""
+	new_events = []
+	for event in signal_events:
+		new_event = {}
+		for key, value in event.items():
+			if torch.is_tensor(value):
+				new_event[key] = value.to(device=device)
+			else:
+				new_event[key] = value
+		new_events.append(new_event)
+	return new_events	
+
+
 
 def save_signal_events_parquet(
 	signal_events: Sequence[Dict],
@@ -186,7 +203,7 @@ def _matches_zenith_limit(event_value: Any, limit_value: Any) -> bool | None:
 
 	normalized_limit = limit_value.strip().lower()
 	if "horizontal" in normalized_limit:
-		threshold = 0.2
+		threshold = torch.cos(torch.tensor(70*torch.pi/180.0))  # cos(70°) ≈ 0.342
 		comparison = torch.lt
 	elif "vertical" in normalized_limit:
 		threshold = 0.8

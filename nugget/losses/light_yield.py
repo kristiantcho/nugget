@@ -16,8 +16,6 @@ class LightYieldLoss(LossFunction):
         super().__init__(device)
         self.sharpness = sharpness
 
-
-
     def __call__(self, geom_dict, **kwargs):
         loss = torch.tensor(0.0, device=self.device)
         surrogate_func = kwargs.get('signal_surrogate_func', None)

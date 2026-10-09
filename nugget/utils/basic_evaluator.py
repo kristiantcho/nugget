@@ -52,6 +52,7 @@ class Evaluator:
         make_gif: bool = False,
         vis_kwargs: Optional[Dict[str, Any]] = None,
         update_points: bool = True,
+        clear_cuda_cache: bool = True,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Evaluate all losses once (no gradients).
@@ -102,7 +103,8 @@ class Evaluator:
         vis_kwargs.setdefault("loss_history", [total_loss])
         vis_kwargs.setdefault("iteration", 0)
 
-        
+        if clear_cuda_cache:
+            torch.cuda.empty_cache()
 
         if self.visualizer is not None and visualize:
             vis_kwargs.update({"make_gif": bool(make_gif)})
@@ -138,6 +140,7 @@ class Evaluator:
         vis_kwargs: Optional[Dict[str, Any]] = None,
         vis_kwargs_dicts: Optional[Dict[str, Dict[str, Any]]] = None,
         update_points: bool = True,
+        clear_cuda_cache: bool = True,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Evaluate multiple geometries in one call (no gradients).
@@ -253,6 +256,8 @@ class Evaluator:
                         continue
 
                     losses[loss_name] = float(loss_value.detach().cpu().item())
+                    if clear_cuda_cache:
+                        torch.cuda.empty_cache()
 
             if update_points and self.geometry is not None and hasattr(self.geometry, "update_points"):
                 geom_points = self.geometry.update_points(**geom_points)

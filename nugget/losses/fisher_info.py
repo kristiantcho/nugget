@@ -204,6 +204,7 @@ class WeightedFisherInfoLoss(LossFunction):
         adaptive_grid_retry=True, adaptive_t_max_floor_ns=10.0, uninformative_fisher_value=1e-6,
         precomputed_fisher_per_string_per_event=None, recompute_bad_points=True,
         empty_cache_after_event=False, events_per_batch=1,
+        use_torch_compile=False, torch_compile_kwargs=None,
     ):
         n_strings = len(string_xy)
         # use_rich_features is now stored on the model — read from it if available.
@@ -325,6 +326,8 @@ class WeightedFisherInfoLoss(LossFunction):
                     zero_response_threshold=zero_response_threshold,
                     uninformative_fisher_value=uninformative_fisher_value,
                     detach_fisher_tensors=detach_fisher_tensors,
+                    use_torch_compile=use_torch_compile,
+                    torch_compile_kwargs=torch_compile_kwargs,
                 )  # (b, n_strings, D, D)
                 fisher_per_string_per_event[b_start:b_end] += fisher_batch.to(self.device)
                 del fisher_batch
@@ -770,9 +773,12 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
         recompute_bad_points = kwargs.get('recompute_bad_points', False)
         empty_cache_after_event = kwargs.get('empty_cache_after_event', False)
         events_per_batch = kwargs.get('events_per_batch', None)
+        use_torch_compile = kwargs.get('fisher_info_use_torch_compile', False)
+        torch_compile_kwargs = kwargs.get('fisher_info_torch_compile_kwargs', None)
         # New parameters for batched loading from files
         event_paths = kwargs.get('event_paths', None)
         fisher_info_paths = kwargs.get('fisher_info_paths', None)
+        fisher_res_metric = kwargs.get('fisher_res_metric', 'fom') # 'fom' 'median' 'mean' 
         
         
         # Load and batch events/Fisher info from files or subset precomputed data
@@ -822,7 +828,9 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 precomputed_fisher_per_string_per_event=precomputed_fisher_info_per_string_per_event,
                 recompute_bad_points=recompute_bad_points,
                 empty_cache_after_event=empty_cache_after_event,
-                events_per_batch=events_per_batch
+                events_per_batch=events_per_batch,
+                use_torch_compile=use_torch_compile,
+                torch_compile_kwargs=torch_compile_kwargs,
             )
         else:
             fisher_info_per_string_per_event = precomputed_fisher_info_per_string_per_event.to(self.device)
@@ -862,10 +870,10 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                 # Use traditional zenith/azimuth resolution - need covariance matrix
                 # Vectorized batch inverse
                 n_events = len(signal_event_params)
-                regularized_fisher = total_fisher_info + 1e-5 * torch.eye(
-                    total_fisher_info.shape[1], device=self.device
-                ).unsqueeze(0).expand(n_events, -1, -1)  # Increased regularization for stability
-                
+                # regularized_fisher = total_fisher_info + 1e-20 * torch.eye(
+                #     total_fisher_info.shape[1], device=self.device
+                # ).unsqueeze(0).expand(n_events, -1, -1)  # Increased regularization for stability
+                regularized_fisher = total_fisher_info 
                 try:
                     cov_matrix = torch.inverse(regularized_fisher)
                 except:
@@ -889,26 +897,35 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
                     angular_resolution_rad = torch.sqrt(var_zenith + torch.sin(zenith)*var_azimuth + 2*torch.sin(zenith)*torch.cos(zenith)*covar_zenith_azimuth)
                     resolution_per_event.append(angular_resolution_rad)
                 resolution_per_event = torch.stack(resolution_per_event)
-            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
+            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-15)
             if finite_mask.any():
                 # Replace bad entries with a large sentinel WITHIN the graph (not via
                 # boolean indexing) so their 1/r^2 contribution is ~0 AND no NaN/inf
                 # gradient flows back through string_weights for those events.
+                # nan_to_num FIRST so the torch.where "kept" branch is always finite;
+                # otherwise where's backward leaks 0*NaN = NaN into string_weights.grad
+                # for the sentinel-selected entries even though the forward looks safe.
+                res_clean = torch.nan_to_num(resolution_per_event, nan=1e6, posinf=1e6, neginf=1e6)
                 safe_res = torch.where(
                     finite_mask,
-                    torch.clamp_min(resolution_per_event, 1e-12),
+                    torch.clamp_min(res_clean, 1e-15),
                     torch.full_like(resolution_per_event, 1e6),
                 )
-                total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                if fisher_res_metric == 'fom':
+                    total_resolution = 1 / torch.sqrt(torch.mean(1 / (safe_res ** 2)))
+                elif fisher_res_metric == 'median':
+                    total_resolution = torch.median(safe_res)
+                else:
+                    total_resolution = torch.mean(safe_res)
             else:
                 # Keep optimization stable when all events are invalid/singular.
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
-            return {'angular_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
+            return {'angular_resolution_loss': total_resolution, 'angular_resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
         elif self.resolution_type == 'energy':
             # Compute covariance matrix for energy resolution
             # Vectorized batch inverse
             n_events = len(signal_event_params)
-            regularized_fisher = total_fisher_info + 1e-6 * torch.eye(
+            regularized_fisher = total_fisher_info + 1e-20 * torch.eye(
                 total_fisher_info.shape[1], device=self.device
             ).unsqueeze(0).expand(n_events, -1, -1)
             
@@ -928,23 +945,33 @@ class WeightedResolutionLoss(WeightedFisherInfoLoss):
             # covariance matrix at once, then form the (relative) resolution.
             energy_idx = self.fisher_info_params.index('energy')
             var_energy = cov_matrix[:, energy_idx, energy_idx]                  # (N,)
-            resolution_per_event = torch.sqrt(torch.clamp_min(var_energy, 1e-10))  # (N,)
+            resolution_per_event = torch.sqrt(var_energy)  # (N,)
             if use_relative_energy:
                 energies = torch.stack([
                     params['energy'].to(self.device).reshape(()) for params in signal_event_params
                 ])                                                             # (N,)
-                resolution_per_event = resolution_per_event / energies
-            finite_mask = torch.isfinite(resolution_per_event) & (resolution_per_event > 1e-12)
+                new_resolution_per_event = resolution_per_event / energies
+            else:
+                new_resolution_per_event = resolution_per_event
+            finite_mask = torch.isfinite(new_resolution_per_event) & (new_resolution_per_event > 1e-12)
             if finite_mask.any():
+                # nan_to_num FIRST so torch.where's backward can't leak 0*NaN = NaN
+                # (see the angular branch above for the full rationale).
+                res_clean = torch.nan_to_num(new_resolution_per_event, nan=1e6, posinf=1e6, neginf=1e6)
                 safe_res = torch.where(
                     finite_mask,
-                    torch.clamp_min(resolution_per_event, 1e-12),
-                    torch.full_like(resolution_per_event, 1e6),
+                    torch.clamp_min(res_clean, 1e-12),
+                    torch.full_like(new_resolution_per_event, 1e6),
                 )
-                total_resolution = 1 / torch.sqrt(torch.sum(1 / (safe_res ** 2)))
+                if fisher_res_metric == 'fom':
+                    total_resolution = 1 / torch.sqrt(torch.mean(1 / (safe_res ** 2)))
+                elif fisher_res_metric == 'median':
+                    total_resolution = torch.median(safe_res)
+                else:
+                    total_resolution = torch.mean(safe_res)
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
-            return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
+            return {'energy_resolution_loss': total_resolution, 'energy_resolution_per_event': resolution_per_event, 'resolution_params': signal_event_params}
 
 class ResolutionLoss(FisherInfoLoss):
     def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith'], resolution_type='angular'):
@@ -1112,7 +1139,7 @@ class ResolutionLoss(FisherInfoLoss):
                 total_resolution = 1 / torch.sqrt(torch.sum(1 / safe_res**2))
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
-            return {'angular_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}
+            return {'angular_resolution_loss': total_resolution, 'angular_resolution_per_event': resolution_per_event, 'resolution_params': event_params}
         elif self.resolution_type == 'energy':
             # Compute covariance matrix for energy resolution
             # Vectorized batch inverse
@@ -1156,4 +1183,4 @@ class ResolutionLoss(FisherInfoLoss):
             else:
                 total_resolution = torch.tensor(1.0, device=self.device, requires_grad=True)
 
-            return {'energy_resolution_loss': total_resolution, 'resolution_per_event': resolution_per_event, 'resolution_params': event_params}
+            return {'energy_resolution_loss': total_resolution, 'energy_resolution_per_event': resolution_per_event, 'resolution_params': event_params}

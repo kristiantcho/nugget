@@ -42,12 +42,12 @@ class FreePoints(Geometry):
                 
                 # Convert to tensors if needed
                 if not isinstance(string_weights, torch.Tensor):
-                    string_weights = torch.tensor(string_weights, device=self.device, dtype=torch.float32)
+                    string_weights = torch.tensor(string_weights, device=self.device, dtype=torch.float64)
                 elif string_weights.device != self.device:
                     string_weights = string_weights.to(self.device)
                 
                 if not isinstance(points, torch.Tensor):
-                    points = torch.tensor(points, device=self.device, dtype=torch.float32)
+                    points = torch.tensor(points, device=self.device, dtype=torch.float64)
                 elif points.device != self.device:
                     points = points.to(self.device)
                 
@@ -72,7 +72,7 @@ class FreePoints(Geometry):
             elif 'points_3d' in initial_geometry:
                 points = initial_geometry['points_3d']
                 if not isinstance(points, torch.Tensor):
-                    points = torch.tensor(points, device=self.device, dtype=torch.float32)
+                    points = torch.tensor(points, device=self.device, dtype=torch.float64)
                 elif points.device != self.device:
                     points = points.to(self.device)
             else:

@@ -1,0 +1,141 @@
+---
+factors:
+  - name: "powerlaw"
+    type: "PowerLawFlux"
+    pivot_energy: 1.0E+5
+    baseline_norm: 0.5E-18 # factor 0.5 to factor in per type flux
+    param_mapping:
+      flux_norm: "astro_norm"
+      spectral_index: "astro_index"
+  - name: "conv_norm"
+    type: "FluxNorm"
+    param_mapping:
+      flux_norm: "conv_norm"
+  - name: "CR_intp_conv"
+    type: "ModelInterpolator"
+    baseline_weight: "conv_weight"
+    alternative_weight: "conv_weight_alt"
+  - name: "prompt_norm"
+    type: "FluxNorm"
+    param_mapping:
+      flux_norm: "prompt_norm"
+  - name: "CR_intp_prompt"
+    type: "ModelInterpolator"
+    baseline_weight: "prompt_weight"
+    alternative_weight: "prompt_weight_alt"
+  - name: delta_gamma
+    type: "DeltaGamma"
+    reference_energy: 2617.3148996675773
+  - name: muon_norm
+    type: "FluxNorm"
+    param_mapping:
+      flux_norm: "muon_norm"
+  - name: cringe_norm
+    type: "FluxNorm"
+    param_mapping:
+      flux_norm: "galactic_norm"
+  - name: kra_norm
+    type: "FluxNorm"
+    param_mapping:
+      flux_norm: "kra_norm"
+  # - name: barr_gradients
+  #   type: "GradientReweight"
+  #   gradient_key_mapping:
+  #       barr_h: "barr_h_gradient"
+  #       barr_w: "barr_w_gradient"
+  #       barr_z: "barr_z_gradient"
+  #       barr_y: "barr_y_gradient"
+  #   baseline_weight: "conv_weight"
+  - name: segmented
+    type: "SegmentedPlane"
+    reference_energy: 1.0E+4
+    height: 3.1415
+    segment_edges: [0.]
+    baseline_flux: 1.
+
+
+
+components:
+  - name: "astro"
+    factors: ["powerlaw"]
+  - name: "atmo"
+    factors: ["conv_norm", "delta_gamma", "CR_intp_conv"]
+  - name: "prompt"
+    factors: ["prompt_norm", "delta_gamma", "CR_intp_prompt"]
+
+models:
+  - name: "model"
+    components:
+    - name: "astro"
+      baseline_weight: "baseline_weight"
+    - name: "atmo"
+      baseline_weight: "conv_weight"
+    - name: "prompt"
+      baseline_weight: "prompt_weight"
+
+histograms:
+  - name: IceCubeTracks
+    binning:
+      type: RectangularBinningExtended
+      bin_vars_edges:
+        - ["energy", "linear", [1,2,3]]
+
+    lifetime: 368080041.97655
+    models: [["model","NTS"]]
+
+model_parameters:
+  astro_norm: 1.44
+  astro_index: 2.37
+  conv_norm: 1.0
+  prompt_norm: 1.0
+  delta_gamma: 0.0
+  lambda_int: 1.0
+prior_bounds:
+  astro_norm: [0, .inf]
+  astro_index: [1, 5]
+  conv_norm: [0.0, .inf]
+  prompt_norm: [0.0, .inf]
+  delta_gamma: [-1.0, 1.0]
+  lambda_int: [-1.0, 2.0]
+
+prior_seeds:
+  astro_norm: 1.44
+  astro_index: 2.37
+  conv_norm: 1.0
+  prompt_norm: 1.0
+  delta_gamma: 0.0
+  lambda_int: 1.0
+
+
+datasets:
+  - name: NTS
+    path: ./temp.parquet
+    param_mapping:
+      # log10_reco_energy:
+      #   df_key: energy_truncated
+      #   transform: log10
+      # cos_reco_zenith:
+      #   df_key: zenith_MPEFit
+      #   transform: cos
+      true_energy:
+        df_key: energy
+        transform: null
+      baseline_weight:
+        df_key: fluxless_weight
+        transform: null
+      conv_weight:
+        df_key: mceq_conv_SIBYLL23c_H4a
+        transform: null
+      prompt_weight:
+        df_key: mceq_pr_SIBYLL23c_H4a
+        transform: null
+      conv_weight_alt:
+        df_key: mceq_conv_SIBYLL23c_GSF
+        transform: null
+      prompt_weight_alt:
+        df_key: mceq_pr_SIBYLL23c_GSF
+        transform: null
+      # cringe_diffuse_baseline:
+      #   df_key: cringe_diffuse
+      # cringe_unresolved_baseline:
+      #   df_key: cringe_unresolved

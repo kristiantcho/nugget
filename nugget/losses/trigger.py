@@ -1,6 +1,63 @@
+import gc
+import os
 import torch
 from nugget.losses.base_loss import LossFunction
 from nugget.losses.fisher_info import WeightedResolutionLoss
+
+
+def _trigger_chunk_cleanup(device):
+    """Release Python-side objects between event chunks without forcing CUDA
+    cache flushes.
+
+    """
+    gc.collect()
+    if isinstance(device, torch.device) and device.type == 'cuda' \
+            and os.environ.get('NUGGET_TRIGGER_CUDA_SYNC', '0') == '1':
+        torch.cuda.synchronize(device)
+
+
+# Cache of torch.compile'd surrogate wrappers, keyed by the identity of the raw
+# callable. TriggerLoss's own math (sigmoid gating, sliding-bar logic, softmax
+# aggregation) has no torch.func (vmap/jacfwd/jacrev) transforms in it, so --
+# unlike the Fisher-info Poisson path -- compiling the surrogate call directly
+# is safe here; there's no functorch-transform composition to worry about.
+_TRIGGER_SURROGATE_COMPILE_CACHE = {}
+
+
+def _resolve_batched_surrogate(surrogate_func):
+    """Recover a batched light-yield callable from a (bound) per-event surrogate.
+
+
+    Returns the bound batched callable, or None if the surrogate does not support
+    batching (in which case the caller falls back to the per-event path).
+    """
+    if surrogate_func is None:
+        return None
+    owner = getattr(surrogate_func, '__self__', None)
+    if owner is not None and hasattr(owner, 'light_yield_surrogate_batched'):
+        return owner.light_yield_surrogate_batched
+    # Also handle the case where the surrogate object itself was passed.
+    if hasattr(surrogate_func, 'light_yield_surrogate_batched'):
+        return surrogate_func.light_yield_surrogate_batched
+    return None
+
+
+def _compiled_surrogate(fn, torch_compile_kwargs=None):
+    """Return a torch.compile'd wrapper around `fn`, cached by `fn`'s identity.
+
+
+    """
+    cache_key = id(fn)
+    cached = _TRIGGER_SURROGATE_COMPILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    torch._functorch.config.donated_buffer = False
+    kwargs = dict(torch_compile_kwargs) if torch_compile_kwargs else {}
+    kwargs.setdefault('dynamic', True)
+    compiled = torch.compile(fn, **kwargs)
+    _TRIGGER_SURROGATE_COMPILE_CACHE[cache_key] = compiled
+    return compiled
+
 
 class TriggerLoss(LossFunction):
     """
@@ -23,8 +80,8 @@ class TriggerLoss(LossFunction):
                  t1_temperature=1.0,
                  t3_temperature=1.0,
                  t_temperature=1.0,
+                 in_bar_temperature=5.0,
                  use_hard_cuts=False,
-                 weight_sigmoid_sharpness=1.0,
                  print_loss=False):
         """
         Initialize the trigger loss function.
@@ -48,6 +105,8 @@ class TriggerLoss(LossFunction):
             Temperature for per-bar thresholding sigmoid (higher = sharper transition).
         t_temperature : float
             Temperature for aggregating bar scores (higher = more focus on max).
+        in_bar_temperature : float
+            Temperature for the sigmoid used to determine if a point is inside a bar (higher = sharper transition).
         use_hard_cuts : bool
             If True, use hard thresholds to produce binary trigger outputs (0/1) instead of
             smooth differentiable sigmoid/softmax aggregations.
@@ -63,10 +122,10 @@ class TriggerLoss(LossFunction):
         self.distance_bar_step = distance_bar_step
         self.min_points_threshold = min_points_threshold
         self.t1_temperature = t1_temperature
+        self.in_bar_temperature = in_bar_temperature
         self.t3_temperature = t3_temperature
         self.t_temperature = t_temperature
         self.use_hard_cuts = use_hard_cuts
-        self.weight_sigmoid_sharpness = weight_sigmoid_sharpness
         self.print_loss = print_loss
     
     def map_string_weights_to_points(self, points_3d, string_xy, string_weights):
@@ -111,7 +170,7 @@ class TriggerLoss(LossFunction):
             point_weights[i] = string_weights[closest_string_idx]
         
         # Apply sigmoid to weights (not controlled by temperature)
-        point_weights_sigmoid = torch.sigmoid(self.weight_sigmoid_sharpness * point_weights)
+        point_weights_sigmoid = torch.sigmoid(point_weights)
         
         return point_weights_sigmoid
     
@@ -238,7 +297,10 @@ class TriggerLoss(LossFunction):
 
         # For each bar position, accumulate t1 from points that fall inside the bar.
         point_s = projections.unsqueeze(0)
-        in_bar_mask = (point_s >= bar_starts.unsqueeze(1)) & (point_s <= bar_ends.unsqueeze(1))
+        if self.use_hard_cuts:
+            in_bar_mask = (point_s >= bar_starts.unsqueeze(1)) & (point_s <= bar_ends.unsqueeze(1))
+        else:
+            in_bar_mask = torch.sigmoid(10 * (point_s - bar_starts.unsqueeze(1))) * torch.sigmoid(10 * (bar_ends.unsqueeze(1) - point_s))
         bar_activity = torch.sum(in_bar_mask.float() * t1_values.unsqueeze(0), dim=1)
 
         # Threshold each bar and aggregate.
@@ -247,9 +309,12 @@ class TriggerLoss(LossFunction):
             t_values = torch.max(t3)
         else:
             t3 = torch.sigmoid(self.t3_temperature * (bar_activity - self.min_points_threshold))
-            t_values = torch.sum(t3 * torch.softmax(t3 * self.t_temperature, dim=0))
-            # t_values = torch.logsumexp(self.t_temperature * t3, dim=0) / self.t_temperature
-            # t_values = torch.mean(t3**self.t_temperature) ** (1.0 / self.t_temperature)
+            # Soft-max over bars: an event triggers if ANY bar has enough activity.
+            # Weight by bar_activity (which meaningfully ranks bars) rather than by
+            # t3 itself; t3 saturates at 1, which makes softmax(t3) near-uniform and
+            # dilutes a single strongly-triggering bar by 1/n_bars (capping t_values
+            # well below 1 regardless of geometry).
+            t_values = torch.sum(t3 * torch.softmax(bar_activity * self.t_temperature, dim=0))
 
         return {
             't3_values': t3,
@@ -327,7 +392,8 @@ class TriggerLoss(LossFunction):
             string_weights = torch.ones(n_points, device=points_3d.device, dtype=light_yields.dtype)
         else:
             string_weights = string_weights.to(device=points_3d.device, dtype=light_yields.dtype)
-
+            if self.use_hard_cuts:
+                string_weights = (string_weights >= 0.5).to(string_weights.dtype)
         # t1(e, i): soft (sigmoid) or hard (binary threshold)
         if self.use_hard_cuts:
             t1_values = (light_yields >= self.light_yield_threshold).to(light_yields.dtype) * string_weights.unsqueeze(0)
@@ -401,9 +467,9 @@ class TriggerLoss(LossFunction):
                 t_values = torch.max(t3, dim=1).values
             else:
                 t3 = torch.sigmoid(self.t3_temperature * (bar_activity - self.min_points_threshold))
-                t_values = torch.sum(t3 * torch.softmax(t3 * self.t_temperature, dim=1), dim=1)
-                # t_values = torch.logsumexp(self.t_temperature * t3, dim=1) / self.t_temperature
-                # t_values = torch.max(t3, dim=1).values
+                # Soft-max over bars weighted by bar_activity (not t3): see the
+                # single-event path for why weighting by t3 caps t_values ~1/n_bars.
+                t_values = torch.sum(t3 * torch.softmax(bar_activity * self.t_temperature, dim=1), dim=1)
 
             return {
                 't3_values': t3,
@@ -434,7 +500,10 @@ class TriggerLoss(LossFunction):
 
         # For each event and bar, accumulate t1 from points that fall inside the bar.
         point_s = projections.unsqueeze(1)  # (n_events, 1, n_points)
-        in_bar_mask = (point_s >= bar_starts.unsqueeze(2)) & (point_s <= bar_ends.unsqueeze(2))
+        if self.use_hard_cuts:    
+            in_bar_mask = (point_s >= bar_starts.unsqueeze(2)) & (point_s <= bar_ends.unsqueeze(2))
+        else:
+            in_bar_mask = torch.sigmoid(self.in_bar_temperature * (point_s - bar_starts.unsqueeze(2))) * torch.sigmoid(self.in_bar_temperature * (bar_ends.unsqueeze(2) - point_s))
         bar_activity = torch.sum(in_bar_mask.to(dtype=t1_values.dtype) * t1_values.unsqueeze(1), dim=2)  # (n_events, K)
 
         # Zero out invalid bars (so they don't contribute)
@@ -448,9 +517,15 @@ class TriggerLoss(LossFunction):
             t3 = torch.sigmoid(self.t3_temperature * (bar_activity - self.min_points_threshold))
             t3 = torch.where(valid_bar_bool, t3, torch.zeros_like(t3))
 
-            # One-line masked aggregation; easy to swap to logsumexp if desired.
-            t_values = torch.sum(t3 * torch.softmax(torch.where(valid_bar_bool, t3 * self.t_temperature, torch.full_like(t3, torch.finfo(t3.dtype).min)), dim=1), dim=1)
-            # t_values = torch.logsumexp(torch.where(valid_bar_bool, self.t_temperature * t3, torch.full_like(t3, torch.finfo(t3.dtype).min)), dim=1) / self.t_temperature
+            # Soft-max over bars weighted by bar_activity (not t3): see the
+            # single-event path for why weighting by t3 caps t_values ~1/n_bars.
+            # Invalid (padding) bars get -inf logits so they take zero softmax weight.
+            softmax_logits = torch.where(
+                valid_bar_bool,
+                bar_activity * self.t_temperature,
+                torch.full_like(bar_activity, torch.finfo(bar_activity.dtype).min),
+            )
+            t_values = torch.sum(t3 * torch.softmax(softmax_logits, dim=1), dim=1)
 
         return {
             't3_values': t3,
@@ -527,8 +602,14 @@ class TriggerLoss(LossFunction):
             - batched_surrogate_func : callable, used to compute light yields per chunk when
               precomputed yields are not provided
             - binned_trigger_batch_size : int, max number of events processed per chunk
-              (None processes all events in a single chunk)
+              (None processes all events in a single chunk). Set this to cap peak
+              memory: the batched trigger builds an (chunk, n_bars, n_points)
+              intermediate, so a large single chunk can OOM.
             - detach_light_yields : bool, detach computed light yields from the autograd graph
+            - empty_cache_after_event : bool, force torch.cuda.empty_cache() after each
+              chunk (and after the single-pass computation). Default False: cleanup is
+              just gc.collect() between chunks (see _trigger_chunk_cleanup), matching the
+              Fisher path. Enable to relieve allocator fragmentation at some throughput cost.
             - perfect_efficiency : bool, short-circuits to a trigger value of 1 for every event
 
         Returns:
@@ -546,11 +627,23 @@ class TriggerLoss(LossFunction):
         batched_surrogate_func = kwargs.get('batched_surrogate_func', None)
         chunk_size = kwargs.get('binned_trigger_batch_size', None)
         detach_light_yields = kwargs.get('detach_light_yields', False)
+  
+        empty_cache_after_event = kwargs.get('empty_cache_after_event', False)
 
-        # Optional override: choose computation mode
-        # - None: auto (batched if precomputed yields provided, else single loop)
-        # - True: force batched
-        # - False: force single-event loop
+      
+        if batched_surrogate_func is None and kwargs.get('use_batched_surrogate', True):
+            batched_surrogate_func = _resolve_batched_surrogate(surrogate_func)
+
+
+        use_torch_compile = kwargs.get('trigger_use_torch_compile', False)
+        torch_compile_kwargs = kwargs.get('trigger_torch_compile_kwargs', None)
+        if use_torch_compile:
+            if surrogate_func is not None:
+                surrogate_func = _compiled_surrogate(surrogate_func, torch_compile_kwargs)
+            if batched_surrogate_func is not None:
+                batched_surrogate_func = _compiled_surrogate(batched_surrogate_func, torch_compile_kwargs)
+
+   
         use_batched_trigger = kwargs.get('use_batched_trigger', None)
 
         signal_sampler = kwargs.get('signal_sampler', None)
@@ -611,6 +704,18 @@ class TriggerLoss(LossFunction):
             t_values = self._compute_t_values(
                 points_3d, event_params_list, surrogate_func, point_weights, ly, use_batched_trigger
             )
+            del ly
+            _trigger_chunk_cleanup(self.device if isinstance(self.device, torch.device)
+                                   else torch.device(self.device) if self.device is not None
+                                   else points_3d.device)
+            if empty_cache_after_event and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # NOTE: this single-pass branch builds the full (n_events, n_bars,
+            # n_points) trigger intermediate at once, which is the dominant peak
+            # allocation and can OOM for large event batches. Set
+            # binned_trigger_batch_size (chunk_size) to cap it -- the chunked
+            # branch below bounds peak memory to one chunk at a time and cleans up
+            # between chunks.
         else:
             # Chunked pass — process chunk_size events at a time to cap memory
             t_values = torch.zeros(n_events, device=points_3d.device, dtype=points_3d.dtype)
@@ -633,6 +738,14 @@ class TriggerLoss(LossFunction):
                     points_3d, chunk_events, surrogate_func, point_weights, chunk_ly, use_batched_trigger
                 )
                 t_values[chunk_start:chunk_end] = chunk_t_values
+
+                
+                del chunk_events, chunk_ly, chunk_t_values
+                _trigger_chunk_cleanup(self.device if isinstance(self.device, torch.device)
+                                       else torch.device(self.device) if self.device is not None
+                                       else points_3d.device)
+                if empty_cache_after_event and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Calculate detector efficiency: mean of t3 values
         detector_efficiency = torch.mean(t_values)
@@ -730,10 +843,10 @@ class ResolutionSelectionLoss(LossFunction):
                 fisher_info_params=self.fisher_info_params
             ) 
             loss_stuff = weighted_resolution_loss(geom_dict, **kwargs)
-            resolution_per_event = loss_stuff['resolution_per_event'].squeeze()
+            resolution_per_event = loss_stuff[f'{self.resolution_type}_resolution_per_event'].squeeze()
             signal_event_params = loss_stuff['resolution_params']
         else:
-            resolution_per_event = precalculated_resolution_loss['resolution_per_event'].squeeze()
+            resolution_per_event = precalculated_resolution_loss[f'{self.resolution_type}_resolution_per_event'].squeeze()
             signal_event_params = precalculated_resolution_loss['resolution_params']
         true_params = []
         if self.resolution_type =='angular':
@@ -749,7 +862,7 @@ class ResolutionSelectionLoss(LossFunction):
         else:
             raise ValueError(f"Unsupported resolution type: {self.resolution_type}. Supported types are 'angular' and 'energy'.")
         true_params = torch.stack(true_params).to(device=self.device).squeeze()
-        if kwargs.get('hard_selection', False):
+        if kwargs.get('hard_selection', True):
             # check if the resolution contour around the true parameter intersects the threshold range
             if self.resolution_type =='angular': # take cosine of zenith angle for angular resolution
                 cos_true_params = torch.cos(true_params)
@@ -779,7 +892,7 @@ class ResolutionSelectionLoss(LossFunction):
         return {
             'selection_loss': selection_loss,
             'selection_efficiency': selection_efficiency,
-            'resolution_per_event': resolution_per_event,
+            f'{self.resolution_type}_resolution_per_event': resolution_per_event,
             'resolution_params': signal_event_params,
             'selection_per_event': selection_mask
         }          

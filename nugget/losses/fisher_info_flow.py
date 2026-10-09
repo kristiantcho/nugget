@@ -1,0 +1,804 @@
+import gc
+import math
+
+import numpy as np
+import torch
+
+from nugget.losses.base_loss import LossFunction
+
+
+def _as_t(x, device, dtype):
+    if isinstance(x, torch.Tensor):
+        return x.to(device=device, dtype=dtype)
+    return torch.as_tensor(x, device=device, dtype=dtype)
+
+
+def _free(device):
+    gc.collect()
+    if torch.cuda.is_available() and torch.device(device).type == 'cuda':
+        torch.cuda.empty_cache()
+
+
+def _model_dir(model, zen, azi):
+    """Travel angles -> the unit vector ``model`` expects.
+
+    build_context and geometric_time use the direction in the model's TRAINING
+    convention and flip it internally when track_dir_is_arrival is set, so an
+    arrival-trained model must be handed -travel (see NuSmoothie._dir_for).
+    """
+    st = torch.sin(zen)
+    u = torch.stack([st * torch.cos(azi), st * torch.sin(azi), torch.cos(zen)], dim=-1)
+    return -u if getattr(model, 'track_dir_is_arrival', False) else u
+
+
+def _log_prob_z(model, z, ctx, n_steps, div_eps=None):
+    """log p(z | c), differentiable in ctx.
+
+    div_eps=None uses the model's autograd divergence: exact, and the fastest
+    option measured -- but it needs create_graph=True, and torch.compile refuses
+    ("does not currently support double backward"). Setting div_eps switches to a
+    central difference for dv/dz, which is first-order-only and therefore
+    compilable, at the cost of two extra network evaluations per ODE step.
+    """
+    if div_eps is None:
+        return model.log_prob_z(z, ctx, n_steps=n_steps, differentiable=True)
+    c = model._apply_context_norm(model._prep(ctx))
+    zz = model._prep(z).reshape(-1, 1)
+    B = zz.shape[0]
+    div = torch.zeros_like(zz)
+    dt = 1.0 / n_steps
+    for i in reversed(range(n_steps)):
+        tm = torch.full((B,), (i + 0.5) * dt, device=zz.device, dtype=zz.dtype)
+        v = model._velocity(zz, tm, c)
+        vp = model._velocity(zz + div_eps, tm, c)
+        vm = model._velocity(zz - div_eps, tm, c)
+        zz = zz - dt * v
+        div = div + dt * (vp - vm) / (2.0 * div_eps)
+    return (-0.5 * zz ** 2 - 0.5 * math.log(2.0 * math.pi) - div).reshape(-1)
+
+
+def _log_prob_tres(at, t_res, ctx, n_steps, div_eps=None):
+    """log p(t_res | c) = log p_z(z) + log|dz/dt_res|."""
+    t = at._prep(t_res).reshape(-1)
+    return _log_prob_z(at, at.to_z(t), ctx, n_steps, div_eps) + at.log_det_dz_dq(t)
+
+
+class FlowFisherResolutionLoss(LossFunction):
+    """Angular / energy resolution from the learned combined likelihoods.
+
+    Parameters
+    ----------
+    hit_model : HitClassifier
+    ly_model : FlowMatchLY
+    atime_model : FlowMatchATime or None
+    mode : {'all', 'atime'}
+    fisher_info_params : sequence of str
+        Scanned parameters, from {'energy', 'zenith', 'azimuth'}. 
+    n_quad, z_range : int, (float, float)
+        Quadrature grid in the flow's z. 
+    n_steps : int
+        ODE steps per log-prob. 
+    pmt_directions, geometry_csv_path, n_pmt_per_om
+        The per-OM PMT template; defaults to the geometry the models were trained on.
+    geometry_grads : bool, 'auto' or 'chunked'
+        Keep the Fisher attached to ``points_3d`` (slow: create_graph through every
+        ODE solve). Only happens when ``points_3d`` requires grad; True also warns
+        when it does not, 'auto' switches silently per call. 'chunked' gives the
+        same gradient in bounded memory: F is built without a graph, then
+        dL/d(points_3d) is accumulated one PMT slice at a time inside the call.
+    """
+
+    def __init__(self, hit_model=None, ly_model=None, atime_model=None,
+                 device=None, fisher_info_params=('energy', 'zenith', 'azimuth'),
+                 resolution_type='angular', mode='all',
+                 n_quad=48, z_range=(-5.0, 5.0), n_steps=8,
+                 pmt_directions=None, geometry_csv_path=None, n_pmt_per_om=None,
+                 div_mode='autograd', div_eps=1e-6, use_torch_compile=False,
+                 torch_compile_kwargs=None, sample_hits=False, n_hit_samples=1,
+                 hit_sample_seed=None, geometry_grads=False, print_loss=False):
+        super().__init__(device=device)
+        # The mode controls which terms are included in the Fisher: hit, light-yield, and/or arrival-time.
+        _MODES = {'all':    (True,  True,  True),
+                  'hit_ly': (True,  True,  False),
+                  'atime':  (True, False, True),
+                  'hit':    (True,  False, False)}
+        if mode not in _MODES:
+            raise ValueError(f"mode must be one of {sorted(_MODES)}")
+        self.include_hit, self.include_ly, self.include_atime = _MODES[mode]
+        if resolution_type not in ('angular', 'energy'):
+            raise ValueError("resolution_type must be 'angular' or 'energy'")
+        self.hit_model = hit_model
+        self.ly_model = ly_model
+        self.atime_model = atime_model
+        self.mode = mode
+        self.resolution_type = resolution_type
+        self.fisher_info_params = list(fisher_info_params)
+        self.n_quad = int(n_quad)
+        self.z_range = (float(z_range[0]), float(z_range[1]))
+        self.n_steps = int(n_steps)
+        self.print_loss = bool(print_loss)
+        if div_mode not in ('autograd', 'fd'):
+            raise ValueError("div_mode must be 'autograd' or 'fd'")
+        if use_torch_compile and div_mode != 'fd':
+            div_mode = 'fd'
+            print("FlowFisherResolutionLoss: torch.compile needs div_mode='fd' "
+                  "(the autograd divergence uses double backward, which compile "
+                  "rejects) -- switching to 'fd'.")
+        self.sample_hits = bool(sample_hits)
+        self.n_hit_samples = max(int(n_hit_samples), 1)
+        self.hit_sample_seed = hit_sample_seed
+        self.div_mode = div_mode
+        self.div_eps = float(div_eps) if div_mode == 'fd' else None
+        self.use_torch_compile = bool(use_torch_compile)
+        if geometry_grads not in (True, False, 'auto', 'chunked'):
+            raise ValueError("geometry_grads must be True, False, 'auto' or 'chunked'")
+        self.geometry_grads = geometry_grads
+        self._track = False           # set per call: are we following points_3d?
+        if self.geometry_grads is True and use_torch_compile:
+            raise ValueError(
+                "geometry_grads=True needs create_graph through the score "
+                "computation, which is double backward -- exactly what "
+                "torch.compile rejects. Use one or the other."
+            )
+
+        if hit_model is None or ly_model is None:
+            raise ValueError("a hit model and a light-yield model are both required "
+                             "(pi and qbar weight every term)")
+        if self.include_atime and atime_model is None:
+            raise ValueError(f"mode='{mode}' needs an arrival-time model")
+
+        self.dtype = hit_model.param_dtype
+        self._pmt_dirs = self._resolve_pmt_template(
+            pmt_directions, geometry_csv_path, n_pmt_per_om)
+        if self.use_torch_compile:
+            kw = dict(dynamic=False)
+            kw.update(torch_compile_kwargs or {})
+            for m in (hit_model, ly_model, atime_model):
+                if m is not None and getattr(m, 'net', None) is not None:
+                    m.net = torch.compile(m.net, **kw)
+
+        zs = torch.linspace(self.z_range[0], self.z_range[1], self.n_quad,
+                            device=self.device, dtype=self.dtype)
+        self._zq = zs
+        self._dz = float((self.z_range[1] - self.z_range[0]) / max(self.n_quad - 1, 1))
+
+    # ------------------------------------------------------------------ setup
+
+    def _resolve_pmt_template(self, pmt_directions, geometry_csv_path, n_pmt_per_om):
+        from nugget.surrogates.NuSmoothie import NuSmoothie, DEFAULT_GEOMETRY
+        if pmt_directions is not None:
+            d = torch.as_tensor(pmt_directions, dtype=self.dtype).reshape(-1, 3)
+        else:
+            d = torch.as_tensor(
+                NuSmoothie.pmt_directions_from_geometry(
+                    geometry_csv_path or DEFAULT_GEOMETRY), dtype=self.dtype)
+        if n_pmt_per_om is not None:
+            d = d[:int(n_pmt_per_om)]
+        d = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        return d.to(self.device)
+
+    # ------------------------------------------------------- theta <-> context
+
+    def _theta0(self, ev):
+        """Pack one event's parameters into the scanned theta vector."""
+        vals = []
+        for p in self.fisher_info_params:
+            v = float(_as_t(ev[p], self.device, self.dtype).reshape(-1)[0])
+            vals.append(v)
+        return torch.tensor(vals, device=self.device, dtype=self.dtype)
+
+    def _event_batch(self, evs):
+        """Per-event tensors for a list of events: theta (B, P), vertex (B, 3), angles."""
+        def col(k):
+            return torch.stack([_as_t(e[k], self.device, self.dtype).reshape(-1)[0]
+                                for e in evs])
+        return {'theta': torch.stack([self._theta0(e) for e in evs]),
+                'vertex': torch.stack([_as_t(e['position'], self.device, self.dtype)
+                                       .reshape(3) for e in evs]),
+                'energy': col('energy'), 'zenith': col('zenith'), 'azimuth': col('azimuth')}
+
+    def _ctx_builder(self, model, pts, dirs, rows_ev, eb):
+        """delta (P,) -> (M, context_dim) for rows from any mix of events.
+
+        Every row sits at its own event's theta plus the same delta, and depends on
+        nothing else, so jacfwd w.r.t. delta gives each row its own d ctx / d theta.
+        """
+        idx = {p: i for i, p in enumerate(self.fisher_info_params)}
+        th = eb['theta'][rows_ev]                                  # (M, P)
+        vert = eb['vertex'][rows_ev]
+        fixed = {p: eb[p][rows_ev] for p in ('energy', 'zenith', 'azimuth')}
+
+        def build(delta):
+            t = th + delta
+            e, z, a = (t[:, idx[p]] if p in idx else fixed[p]
+                       for p in ('energy', 'zenith', 'azimuth'))
+            return model.build_context(pts, vert, e, pmt_directions=dirs,
+                                       directions=_model_dir(model, z, a))
+
+        return build
+
+    # ------------------------------------------------------------- score terms
+
+    def _keep(self, t):
+        """Drop the geometry path unless geometry gradients were asked for."""
+        return t if self._track else t.detach()
+
+    def _diff_wrt(self, t):
+        """A tensor ``autograd.grad`` can differentiate with respect to.
+
+        Keeps the history back to points_3d when tracking it and there is one; otherwise a fresh leaf (points_3d not requiring grad has no history).
+        """
+        if self._track and t.requires_grad:
+            return t
+        return t.detach().requires_grad_(True)
+
+    def _scores(self, model, build, theta, z_nodes, chunk):
+        """d log p_z(z_k | c_j) / d theta for every (PMT j, node k).
+
+        One backward gives d log p / d c for all rows -- they are independent -- and
+        the chain to theta goes through jacfwd of build_context.
+
+        Returns (logw, g) with logw the unnormalised log weights (M, K) and
+        g the scores (M, K, P).
+        """
+        M = int(build(theta).shape[0])
+        K = z_nodes.shape[0]
+        P = theta.shape[0]
+        keep = self._track
+        Jc = torch.func.jacfwd(build)(theta)                       # (M, C, P)
+        ctx0 = self._keep(build(theta))
+
+        logw = torch.empty(M, K, device=self.device, dtype=self.dtype)
+        g = torch.empty(M, K, P, device=self.device, dtype=self.dtype)
+        rep = max(int(chunk) // max(K, 1), 1)
+        for s in range(0, M, rep):
+            e = min(s + rep, M)
+            n = e - s
+            c = self._diff_wrt(ctx0[s:e].repeat_interleave(K, 0))
+            zz = z_nodes.repeat(n)
+            lp = _log_prob_z(model, zz, c, self.n_steps, self.div_eps)
+            # create_graph keeps d log p / d c differentiable in its own right, so
+            # the score stays a function of the detector position through both
+            # factors -- the context the flow was evaluated at, and Jc.
+            G = torch.autograd.grad(lp.sum(), c, create_graph=keep)[0].reshape(n, K, -1)
+            logw[s:e] = self._keep(lp).reshape(n, K)
+            g[s:e] = torch.einsum('mkc,mcp->mkp', G, Jc[s:e])
+            del c, lp, G
+        return logw, g
+
+    def _logw_only(self, model, ctx, z_nodes, chunk):
+        """log p_z at the nodes -- all qbar needs.
+
+        ``differentiable`` has to follow self._track. log_prob_z's fast path
+        detaches inside ``_v_and_div``, returning a value with no grad_fn at all,
+        so leaving it off would silently zero the position dependence of qbar --
+        and qbar scales the whole arrival-time term whenever include_ly is False.
+        """
+        M, K = ctx.shape[0], z_nodes.shape[0]
+        out = torch.empty(M, K, device=self.device, dtype=self.dtype)
+        rep = max(int(chunk) // max(K, 1), 1)
+        for s in range(0, M, rep):
+            e = min(s + rep, M)
+            n = e - s
+            lp = model.log_prob_z(z_nodes.repeat(n),
+                                    ctx[s:e].repeat_interleave(K, 0),
+                                    n_steps=self.n_steps,
+                                    differentiable=self._track)
+            out[s:e] = lp.reshape(n, K)
+        return out
+
+    @staticmethod
+    def _weights(logw):
+        """p_z(z_k) dz normalised over the grid -- robust to an imperfect flow norm."""
+        w = torch.softmax(logw, dim=1)
+        return w
+
+    def _outer(self, w, g):
+        """sum_k w_k g_k g_k^T  ->  (M, P, P)."""
+        return torch.einsum('mk,mkp,mkq->mpq', w, g, g)
+
+    # ---------------------------------------------------------- per-event core
+
+    def _fisher_per_pmt(self, pts, dirs, rows_ev, eb, chunk, gen=None, state=None,
+                        state_out=None):
+        """(M, P, P) Fisher contribution of each row, a (PMT, event) pair.
+
+        rows_ev maps rows to events of the batch ``eb`` (see _event_batch). The hit
+        term is always the exact pi(1-pi) grad l grad l^T. sample_hits=True only
+        decides which rows get the flow terms: those that fire in at least one of
+        n_hit_samples draws, weighted by pi / P(selected) so the sum stays unbiased.
+
+        ``state`` (dict of per-row tensors) reuses random draws from an earlier call
+        -- the hit selection 'fired', plus whatever _flow_terms draws -- so a
+        recomputation sees the same F; ``state_out`` (a list) receives this call's.
+        """
+        P = eb['theta'].shape[1]
+        M = pts.shape[0]
+        d0 = torch.zeros(P, device=self.device, dtype=self.dtype)
+        ck = max(int(chunk), 1)
+
+        # ---- pi and grad logit: needed either way (pi weights every term) ----
+        gl_l, ell_l = [], []
+        for s in range(0, M, ck):
+            e = min(s + ck, M)
+            build_h = self._ctx_builder(self.hit_model, pts[s:e], dirs[s:e],
+                                        rows_ev[s:e], eb)
+            Jh = torch.func.jacfwd(build_h)(d0)                    # (n, C, P)
+            ch = self._diff_wrt(build_h(d0))
+            ell = self.hit_model.predict_hit_logit(ch, calibrated=True).reshape(-1)
+            gl_c = torch.autograd.grad(ell.sum(), ch,
+                                       create_graph=self._track)[0]  # (n, C)
+            gl_l.append(torch.einsum('mc,mcp->mp', gl_c, Jh))
+            ell_l.append(self._keep(ell))
+            del Jh, ch, gl_c
+        gl = torch.cat(gl_l)                                       # (M, P)
+        pi = torch.sigmoid(torch.cat(ell_l)).clamp(1e-12, 1 - 1e-12)  # (M,)
+
+        glgl = gl.unsqueeze(2) * gl.unsqueeze(1)                   # (M, P, P)
+        F = torch.zeros(M, P, P, device=self.device, dtype=self.dtype)
+        new_state = {}                                             # this call's draws
+
+        # Exact for every PMT: it is computed for all of them anyway, so sampling
+        # it would add noise and save nothing.
+        if self.include_hit:
+            F = F + (pi * (1.0 - pi)).reshape(M, 1, 1) * glgl
+
+        if self.sample_hits:
+            # Flow terms only for rows that fire in >= 1 of X draws, drawn directly
+            # as one Bernoulli(p_sel): same distribution, O(M) memory, not O(X M).
+            # Horvitz-Thompson weight pi / p_sel = E[K/X | K>=1] keeps it unbiased;
+            # p_sel is detached so the pathwise geometry gradient is unbiased too.
+            X = self.n_hit_samples
+            p_all = -torch.expm1(X * torch.log1p(-pi.detach()))
+            fired = None if state is None else state.get('fired')
+            if fired is None:
+                u = torch.rand(M, device=self.device, dtype=self.dtype, generator=gen)
+                fired = u < p_all
+            new_state['fired'] = fired
+            idx = torch.nonzero(fired, as_tuple=True)[0]
+            wf = pi[idx] / p_all[idx]
+        else:
+            idx = torch.arange(M, device=self.device)
+            wf = pi
+
+        if (self.include_ly or self.include_atime) and idx.numel() > 0:
+            F = self._flow_terms(F, idx, wf, pts, dirs, rows_ev, eb, chunk, d0, gen,
+                                 state, new_state)
+        if state_out is not None:
+            state_out.append(new_state)
+        return F
+
+    def _nodes_per_pmt(self):
+        """Flow evaluations per PMT per likelihood; sizes the chunked pass-2 slices."""
+        return self.n_quad
+
+    def _flow_terms(self, F, idx, wf, pts, dirs, rows_ev, eb, chunk, d0, gen, state,
+                    new_state):
+        """Add the light-yield and arrival-time Fisher of the selected rows ``idx``.
+
+        Quadrature over the fixed z-grid. Subclasses replace this (and may use gen /
+        state / new_state for random draws that a recomputation must reproduce).
+        """
+        sub_pts, sub_dirs, rev = pts[idx], dirs[idx], rows_ev[idx]
+        m = idx.numel()
+
+        # ---- light yield: qbar always (it weights the time term), Fisher on demand
+        build_l = self._ctx_builder(self.ly_model, sub_pts, sub_dirs, rev, eb)
+        if self.include_ly:
+            logw_q, g_q = self._scores(self.ly_model, build_l, d0, self._zq, chunk)
+            w_q = self._weights(logw_q)
+            contrib = wf.reshape(m, 1, 1) * self._outer(w_q, g_q)
+            F = F + torch.zeros_like(F).index_add(0, idx, contrib)
+            del logw_q, g_q, contrib
+        else:
+            w_q = self._weights(
+                self._logw_only(self.ly_model, self._keep(build_l(d0)),
+                                self._zq, chunk))
+        qvals = self.ly_model.from_z(self._zq).reshape(1, -1)
+        qbar = (w_q * qvals).sum(1).clamp_min(1.0)                 # (m,)
+
+        # ---- arrival time ----
+        if self.include_atime:
+            at = self.atime_model
+            build_t = self._ctx_builder(at, sub_pts, sub_dirs, rev, eb)
+            # grid z at the true theta, map to fixed t_hit, then let t_res move with
+            # theta through t_geom -- that dependence is where the timing information
+            # on direction actually lives.
+            # t_hit must carry the same position dependence as the t_geom that
+            # _scores_time subtracts from it. Then at theta = theta_0 the two
+            # cancel exactly, t_res is the fixed z-grid, and d(t_res)/d(pts) is 0
+            # there -- the quadrature nodes stay a numerical device rather than
+            # becoming geometry-dependent. Detaching only tg0 would leave a
+            # spurious one-sided -d(t_geom)/d(pts) in every node.
+            with torch.set_grad_enabled(self._track):
+                tg0 = at.geometric_time(
+                    sub_pts, eb['vertex'][rev],
+                    directions=_model_dir(at, eb['zenith'][rev], eb['azimuth'][rev]),
+                ).reshape(m, 1)
+                t_hit = at.from_z(self._zq).reshape(1, -1) + tg0   # (m, K)
+            logw_t, g_t = self._scores_time(at, build_t, d0, t_hit, sub_pts,
+                                            rev, eb, chunk)
+            w_t = self._weights(logw_t)
+            contrib = (wf * qbar).reshape(m, 1, 1) * self._outer(w_t, g_t)
+            F = F + torch.zeros_like(F).index_add(0, idx, contrib)
+            del logw_t, g_t, contrib
+        return F
+
+    def _scores_time(self, at, build, theta, t_hit, pts, rows_ev, eb, chunk):
+        """Arrival-time scores, including the theta-dependence of t_geom.
+
+        ``theta`` is the shared delta of _ctx_builder, so rows may mix events.
+        """
+        M, K = t_hit.shape
+        P = theta.shape[0]
+        iz = self.fisher_info_params.index('zenith') \
+            if 'zenith' in self.fisher_info_params else None
+        ia = self.fisher_info_params.index('azimuth') \
+            if 'azimuth' in self.fisher_info_params else None
+        th = eb['theta'][rows_ev]
+        vert = eb['vertex'][rows_ev]
+        zf, af = eb['zenith'][rows_ev], eb['azimuth'][rows_ev]
+
+        def t_res_of(delta, sl):
+            z = th[sl, iz] + delta[iz] if iz is not None else zf[sl]
+            a = th[sl, ia] + delta[ia] if ia is not None else af[sl]
+            tg = at.geometric_time(pts[sl], vert[sl],
+                                   directions=_model_dir(at, z, a)).reshape(-1, 1)
+            return (t_hit[sl] - tg).reshape(-1)
+
+        keep = self._track
+        Jc = torch.func.jacfwd(build)(theta)                       # (M, C, P)
+        ctx0 = self._keep(build(theta))
+        logw = torch.empty(M, K, device=self.device, dtype=self.dtype)
+        g = torch.empty(M, K, P, device=self.device, dtype=self.dtype)
+        rep = max(int(chunk) // max(K, 1), 1)
+        for s in range(0, M, rep):
+            e = min(s + rep, M)
+            n = e - s
+            sl = slice(s, e)
+            Jt = torch.func.jacfwd(lambda th: t_res_of(th, sl))(theta)  # (n*K, P)
+            tr = self._diff_wrt(t_res_of(theta, sl))
+            c = self._diff_wrt(ctx0[sl].repeat_interleave(K, 0))
+            lp = _log_prob_tres(at, tr, c, self.n_steps, self.div_eps)
+            gc_, gt_ = torch.autograd.grad(lp.sum(), (c, tr), create_graph=keep)
+            logw[sl] = self._keep(lp).reshape(n, K)
+            g[sl] = (torch.einsum('mkc,mcp->mkp', gc_.reshape(n, K, -1), Jc[sl])
+                     + (gt_.reshape(n, K, 1) * Jt.reshape(n, K, P)))
+            del c, tr, lp, gc_, gt_, Jt
+        return logw, g
+
+    # ------------------------------------------------------------------- driver
+
+    def _om_to_string(self, pts3, string_xy):
+        """(n_pts,) string index of each OM by exact (x, y) match, and n_strings.
+
+        OMs on no string get index n_strings, a slot the callers drop.
+        """
+        n_pts = pts3.shape[0]
+        if string_xy is None:
+            return torch.zeros(n_pts, dtype=torch.long, device=self.device), 1
+        sxy = torch.stack([torch.stack([_as_t(s[0], self.device, self.dtype),
+                                        _as_t(s[1], self.device, self.dtype)])
+                           for s in string_xy]).detach()
+        p = pts3.detach()
+        hit = ((p[:, 0].unsqueeze(0) == sxy[:, 0].unsqueeze(1)) &
+               (p[:, 1].unsqueeze(0) == sxy[:, 1].unsqueeze(1)))       # (n_str, n_pts)
+        n_str = sxy.shape[0]
+        om_str = torch.where(hit.any(0), hit.float().argmax(0),
+                             torch.full((n_pts,), n_str, device=self.device))
+        return om_str.long(), n_str
+
+    def compute_fisher_per_string_per_event(self, string_xy, points_3d,
+                                            signal_event_params, chunk=8192,
+                                            empty_cache_after_event=False,
+                                            verbose=False, events_per_batch=1,
+                                            _state_out=None):
+        """(n_events, n_strings, P, P).
+
+        Every OM in ``points_3d`` is expanded into the PMT template; a point belongs
+        to the string whose (x, y) it matches exactly, as in ``fisher_info.py``.
+        ``events_per_batch`` events share one pass as (event, PMT) rows, which fills
+        the flow batches when few PMTs per event fire. Results do not depend on it.
+
+        With ``geometry_grads`` the result stays attached to ``points_3d``. The
+        string matching is detached, and has to be: it is an exact equality test.
+        The gradient reaches ``string_xy`` (or ``slice_radius``, ...) through
+        ``points_3d`` and the geometry's own graph, not through the lookup.
+        """
+        pts3 = _as_t(points_3d, self.device, self.dtype).reshape(-1, 3)
+        # Follow points_3d only if something upstream (string_xy, z_values, ...)
+        # actually needs it; otherwise the create_graph cost buys nothing.
+        # 'chunked' builds F graph-free here and gets the gradient in _position_grad.
+        self._track = self.geometry_grads in (True, 'auto') and pts3.requires_grad
+        if self._track and self.use_torch_compile:
+            raise ValueError("points_3d requires grad, but position gradients need "
+                             "double backward, which torch.compile rejects.")
+        if self.geometry_grads is True and not pts3.requires_grad \
+                and not getattr(self, '_warned_no_grad', False):
+            print("FlowFisherResolutionLoss: geometry_grads=True but points_3d does "
+                  "not require grad -- no position gradient will exist.")
+            self._warned_no_grad = True
+        n_pts = pts3.shape[0]
+        K_pmt = self._pmt_dirs.shape[0]
+        M = n_pts * K_pmt
+        pts = pts3.repeat_interleave(K_pmt, 0)                     # (M, 3)
+        dirs = self._pmt_dirs.repeat(n_pts, 1)
+        P = len(self.fisher_info_params)
+        n_ev = len(signal_event_params)
+
+        om_str, n_str = self._om_to_string(pts3, string_xy)
+        pmt_str = om_str.repeat_interleave(K_pmt)                  # (M,)
+
+        gen = None
+        if self.hit_sample_seed is not None:        # also seeds subclasses' MC draws
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(int(self.hit_sample_seed))
+
+        epb = max(int(events_per_batch), 1)
+        out = torch.zeros(n_ev * (n_str + 1), P, P, device=self.device, dtype=self.dtype)
+        for b0 in range(0, n_ev, epb):
+            evs = signal_event_params[b0:b0 + epb]
+            B = len(evs)
+            eb = self._event_batch(evs)
+            rows_ev = torch.arange(B, device=self.device).repeat_interleave(M)
+            so = [] if _state_out is not None else None
+            F_rows = self._fisher_per_pmt(pts.repeat(B, 1), dirs.repeat(B, 1), rows_ev,
+                                          eb, chunk, gen, state_out=so)  # (B*M, P, P)
+            key = (b0 + rows_ev) * (n_str + 1) + pmt_str.repeat(B)
+            out = out.index_add(0, key, F_rows)
+            if so is not None:
+                # one dict per event: every per-row draw split back into its event
+                per_ev = [{} for _ in range(B)]
+                for k, v in so[0].items():
+                    for b, vb in enumerate(v.reshape(B, M, *v.shape[1:]).unbind(0)):
+                        per_ev[b][k] = vb
+                _state_out.extend(per_ev)
+            del F_rows
+            if empty_cache_after_event:
+                _free(self.device)
+            if verbose:
+                print(f'  Fisher: event {b0 + B}/{n_ev}', flush=True)
+        return out.reshape(n_ev, n_str + 1, P, P)[:, :n_str]
+
+    def fisher_per_om(self, om_positions, events, event_index, chunk=8192):
+        """(N, P, P) Fisher of each OM (its PMT template summed) for its own event.
+
+        event_index (N,) maps OM n to events[event_index[n]], so OMs of many events
+        share one pass. No geometry graph. With sample_hits=False it is the exact
+        expectation (up to quadrature); used to build OMFisherNet training data.
+        """
+        pts3 = _as_t(om_positions, self.device, self.dtype).reshape(-1, 3).detach()
+        ev_idx = torch.as_tensor(event_index, device=self.device).long().reshape(-1)
+        N, K_pmt = pts3.shape[0], self._pmt_dirs.shape[0]
+        P = len(self.fisher_info_params)
+        self._track = False
+        gen = None
+        if self.hit_sample_seed is not None:
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(int(self.hit_sample_seed))
+        # the scores are autograd derivatives, so this must run with grad on even
+        # when the caller is inside no_grad; the result is detached either way
+        with torch.enable_grad():
+            F = self._fisher_per_pmt(pts3.repeat_interleave(K_pmt, 0),
+                                     self._pmt_dirs.repeat(N, 1),
+                                     ev_idx.repeat_interleave(K_pmt),
+                                     self._event_batch(events), chunk, gen)
+        return F.detach().reshape(N, K_pmt, P, P).sum(1)
+
+    def _position_grad(self, points_3d, string_xy, signal_event_params, A,
+                       row_states, chunk, events_per_batch=1,
+                       empty_cache_after_event=False, verbose=False):
+        """dL/d(points_3d), given A = dL/dF_str (n_events, n_strings, P, P).
+
+        L depends on the geometry only through F, so dL/dx = sum <A, dF_row/dx>
+        over (event, PMT) rows. With A fixed that is a plain sum: each slice is
+        rebuilt with a graph, backpropagated into a detached leaf, and freed.
+        row_states holds pass 1's per-row random draws, one dict per event, so every
+        slice is rebuilt from the same draws A was computed at.
+        """
+        pts_leaf = (_as_t(points_3d, self.device, self.dtype).reshape(-1, 3)
+                    .detach().requires_grad_(True))
+        n_pts = pts_leaf.shape[0]
+        K_pmt = self._pmt_dirs.shape[0]
+        M = n_pts * K_pmt
+        P = A.shape[-1]
+        om_str, n_str = self._om_to_string(pts_leaf, string_xy)
+        pmt_str = om_str.repeat_interleave(K_pmt)
+        # retained graph per slice ~ chunk rows: nodes per PMT per likelihood
+        n_lik = max(int(self.include_ly) + int(self.include_atime), 1)
+        pm = max(int(chunk) // (self._nodes_per_pmt() * n_lik), 1)
+        zero = torch.zeros(1, P, P, device=self.device, dtype=self.dtype)
+        active = [i for i in range(len(signal_event_params)) if bool((A[i] != 0).any())]
+        epb = max(int(events_per_batch), 1)
+
+        G = torch.zeros_like(pts_leaf)
+        self._track = True
+        try:
+            for b0 in range(0, len(active), epb):
+                evi = active[b0:b0 + epb]
+                B = len(evi)
+                eb = self._event_batch([signal_event_params[i] for i in evi])
+                A_flat = torch.cat([torch.cat([A[i].detach(), zero], 0) for i in evi], 0)
+                rows = torch.arange(B * M, device=self.device)
+                rows_ev, pmt = rows // M, rows % M
+                key = rows_ev * (n_str + 1) + pmt_str[pmt]
+                # pass 1's draws for these rows, in row order
+                st = {k: torch.cat([row_states[i][k] for i in evi])
+                      for k in row_states[evi[0]]}
+                if self.sample_hits:
+                    # same selection as pass 1, or A was taken at a different F
+                    f = st['fired']
+                    ids_f = torch.nonzero(f, as_tuple=True)[0]
+                    jobs = [(ids_f[s:s + pm], True) for s in range(0, ids_f.numel(), pm)]
+                    if self.include_hit:        # dark rows: cheap hit term only
+                        ids_d = torch.nonzero(~f, as_tuple=True)[0]
+                        jobs += [(ids_d[s:s + chunk], False)
+                                 for s in range(0, ids_d.numel(), chunk)]
+                else:
+                    jobs = [(rows[s:s + pm], None) for s in range(0, B * M, pm)]
+
+                for ids, flag in jobs:
+                    p_ = pmt[ids]
+                    state = {k: v[ids] for k, v in st.items()}
+                    if flag is not None:
+                        state['fired'] = torch.full((ids.numel(),), flag,
+                                                    dtype=torch.bool, device=self.device)
+                    F_sl = self._fisher_per_pmt(pts_leaf[p_ // K_pmt],
+                                                self._pmt_dirs[p_ % K_pmt],
+                                                rows_ev[ids], eb, chunk, state=state)
+                    s_val = (A_flat[key[ids]] * F_sl).sum()
+                    g, = torch.autograd.grad(s_val, pts_leaf, allow_unused=True)
+                    if g is not None:
+                        G += g
+                    del F_sl, s_val, g
+                if empty_cache_after_event:
+                    _free(self.device)
+                if verbose:
+                    print(f'  position grad: event {b0 + B}/{len(active)}', flush=True)
+        finally:
+            self._track = False
+        return G
+
+    # --------------------------------------------------------------- resolution
+
+    def _resolution(self, F, signal_event_params, use_relative_energy):
+        names = self.fisher_info_params
+        n, P = F.shape[0], F.shape[-1]
+
+        # Invert in scaled units: energy measured in E_true, angles in radians.
+        # theta carries E in GeV, and d log p/dE is ~1/(E ln10) times d log p/dlog10 E,
+        # so the energy entry sits ~1e-11 below the angular ones and the condition
+        # number reaches ~1e15 -- the edge of float64, and enough that the 1e-20
+        # regulariser stops being negligible against it. A diagonal similarity
+        # F' = D F D with D = diag(E_true, 1, 1) is an exact change of units:
+        #     cov = D cov' D,  so  sigma_i = d_i sqrt(cov'_ii)
+        # leaving every resolution unchanged while conditioning the inverse.
+        d = torch.ones(n, P, device=self.device, dtype=self.dtype)
+        if 'energy' in names:
+            E = torch.stack([_as_t(p['energy'], self.device, self.dtype).reshape(())
+                             for p in signal_event_params]).clamp_min(1e-30)
+            d[:, names.index('energy')] = E
+        dd = d.unsqueeze(2) * d.unsqueeze(1)                    # (n, P, P), d_i d_j
+
+        eye = torch.eye(P, device=self.device, dtype=F.dtype)
+        Fs = dd * F
+        try:
+            cov = dd * torch.linalg.inv(Fs + 1e-20 * eye)
+        except Exception:
+            cov = dd * torch.linalg.pinv(Fs + 1e-20 * eye)
+        if self.resolution_type == 'angular':
+            iz, ia = names.index('zenith'), names.index('azimuth')
+            zen = torch.stack([_as_t(p['zenith'], self.device, self.dtype).reshape(())
+                               for p in signal_event_params])
+            var = (cov[:, iz, iz]
+                   + torch.sin(zen) ** 2 * cov[:, ia, ia]
+                   + 2.0 * torch.sin(zen) * cov[:, iz, ia])
+            return torch.sqrt(var.clamp_min(0.0))
+        ie = names.index('energy')
+        # theta carries E in GeV, so sqrt(var) is sigma_E in GeV directly
+        res = torch.sqrt(cov[:, ie, ie].clamp_min(0.0))
+        if use_relative_energy:
+            energies = torch.stack([
+                _as_t(p['energy'], self.device, self.dtype).reshape(())
+                for p in signal_event_params])
+            return res / energies.clamp_min(1e-30)
+        return res
+
+    def __call__(self, geom_dict, **kwargs):
+        """Same contract as ``WeightedResolutionLoss.__call__``.
+
+        geom_dict : 'points_3d', optionally 'string_xy' and 'string_weights'.
+        kwargs    : 'signal_event_params' or ('signal_sampler', 'num_events'),
+                    'fisher_res_metric' ('fom' | 'median' | 'mean'),
+                    'use_relative_energy', 'empty_cache_after_event',
+                    'precomputed_fisher_info_per_string_per_event',
+                    'fisher_info_chunk_size', 'fisher_info_events_per_batch',
+                    'verbose'.
+        """
+        points_3d = geom_dict.get('points_3d', None)
+        string_xy = geom_dict.get('string_xy', None)
+        string_weights = geom_dict.get('string_weights', None)
+
+        params = kwargs.get('signal_event_params', None)
+        sampler = kwargs.get('signal_sampler', None)
+        num_events = int(kwargs.get('num_events', 100))
+        metric = kwargs.get('fisher_res_metric', 'fom')
+        use_rel_e = bool(kwargs.get('use_relative_energy', False))
+        empty_cache = bool(kwargs.get('empty_cache_after_event', False))
+        chunk = int(kwargs.get('fisher_info_chunk_size', 8192))
+        epb = int(kwargs.get('fisher_info_events_per_batch', 1))
+        verbose = bool(kwargs.get('verbose', False))
+        precomp = kwargs.get('precomputed_fisher_info_per_string_per_event', None)
+
+        if params is None:
+            if sampler is None:
+                raise ValueError("provide signal_event_params or a signal_sampler")
+            params = sampler.sample_events(num_events)
+
+        chunked = (self.geometry_grads == 'chunked' and precomp is None
+                   and getattr(points_3d, 'requires_grad', False)
+                   and torch.is_grad_enabled())
+        if chunked and self.use_torch_compile:
+            raise ValueError("points_3d requires grad, but position gradients need "
+                             "double backward, which torch.compile rejects.")
+        row_states = [] if chunked else None                       # pass 1's draws
+
+        if precomp is None:
+            F_str = self.compute_fisher_per_string_per_event(
+                string_xy, points_3d, params, chunk=chunk,
+                empty_cache_after_event=empty_cache, verbose=verbose,
+                events_per_batch=epb, _state_out=row_states)
+        else:
+            if self.geometry_grads and getattr(points_3d, 'requires_grad', False):
+                print("FlowFisherResolutionLoss: points_3d requires grad but a "
+                      "precomputed Fisher tensor was supplied, so it is a "
+                      "constant and no position gradient exists. Drop "
+                      "'precomputed_fisher_info_per_string_per_event' to have it "
+                      "rebuilt from the current geometry each step.")
+            F_str = precomp.to(device=self.device, dtype=self.dtype)
+
+        # chunked: differentiate L w.r.t. a detached copy of F to get A = dL/dF
+        F_in = F_str.detach().requires_grad_(True) if chunked else F_str
+        if string_weights is None:
+            F = F_in.sum(dim=1)
+        else:
+            w = torch.sigmoid(_as_t(string_weights, self.device, self.dtype))
+            F = (w.reshape(1, -1, 1, 1) * F_in).sum(dim=1)
+        if empty_cache:
+            _free(self.device)
+
+        res = self._resolution(F, params, use_rel_e)
+        ok = torch.isfinite(res) & (res > 1e-15)
+        if ok.any():
+            clean = torch.nan_to_num(res, nan=1e6, posinf=1e6, neginf=1e6)
+            safe = torch.where(ok, clean.clamp_min(1e-15),
+                               torch.full_like(res, 1e6))
+            if metric == 'fom':
+                total = 1.0 / torch.sqrt(torch.mean(1.0 / safe ** 2))
+            elif metric == 'median':
+                total = torch.median(safe)
+            else:
+                total = torch.mean(safe)
+        else:
+            total = torch.tensor(1.0, device=self.device, dtype=self.dtype,
+                                 requires_grad=True)
+        if self.print_loss:
+            print(f'FlowFisherResolutionLoss[{self.mode}]: {total.item():.6g} '
+                  f'({int(ok.sum())}/{len(res)} events usable)')
+
+        if chunked:
+            A, = torch.autograd.grad(total, F_in, retain_graph=True, allow_unused=True)
+            if A is not None:
+                G = self._position_grad(points_3d, string_xy, params, A, row_states,
+                                        chunk, epb, empty_cache, verbose)
+                # value unchanged, gradient w.r.t. points_3d is G; the geometry's
+                # own graph then carries it on to string_xy / z_values / ...
+                p3 = _as_t(points_3d, self.device, self.dtype).reshape(-1, 3)
+                corr = (p3 * G).sum()
+                total = total + (corr - corr.detach())
+
+        key = ('angular_resolution' if self.resolution_type == 'angular'
+               else 'energy_resolution')
+        return {f'{key}_loss': total, f'{key}_per_event': res,
+                'resolution_params': params,
+                'fisher_info_per_string_per_event': F_str.detach()}

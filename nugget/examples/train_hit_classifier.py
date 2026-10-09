@@ -1,0 +1,113 @@
+import nugget
+import pickle
+import torch
+import numpy as np
+
+GEOM = '../other/800_40_40_geom.csv'
+TRAIN_PARQUET = 'small_e_accepted.parquet'
+TEST_PARQUET = './flow_models/mc_e_hit_v1R_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_e_hit_model_v1R.pt'
+
+EPOCHS = 500
+
+hit = nugget.surrogates.HitClassifier.HitClassifier(
+    device='cuda:3',
+    domain_size=20000,
+    dim=3,
+
+    # --- network ---
+    width=256,
+    depth=8,
+    dropout=0.0,
+
+    # --- optimisation ---
+    learning_rate=5e-4,
+    lr_schedule='onecycle',
+    warmup_frac=0.1,
+    weight_decay=1e-5,
+    reduce_lr_on_plateau=False,
+    lr_scheduler_patience=30,
+
+    # --- context features: identical to the light-yield / arrival-time flows ---
+    rich_rel_pos_mode=True,
+    include_vertex_position=False,
+    add_vertex_distance=False,
+    add_distance_from_beam=False,
+    add_dist_long=False,
+    track_dir_is_arrival=True,
+    add_pmt_direction=True,
+    add_pmt_cosangle=True,
+    standardize_context=True,
+    include_direction=False,
+    ly_eps=1e-6,
+)
+
+train_dataloader = hit.create_hit_parquet_dataloader(
+    parquet_path=TRAIN_PARQUET,
+    geometry_csv_path=GEOM,
+    num_samples_per_epoch=1_000_000,
+    batch_size=4096,
+    num_workers=0,
+    shuffle=True,
+
+    pos_frac=0.5,
+    uniform_energy_zenith=True,
+    importance_weight=True,
+    n_energy_bins=20,
+    n_coszen_bins=20,
+    n_mult_bins=25,
+    filter_vertex_in_domain=True,
+    test_save_path=TEST_PARQUET,
+    # event_frac=0.2,
+    test_frac=0.1,
+)
+
+val_dataloader = hit.create_hit_parquet_val_dataloader(
+    parquet_path=TEST_PARQUET,
+    geometry_csv_path=GEOM,
+    num_samples_per_epoch=200_000,
+    batch_size=4096,
+    num_workers=0,
+    # seed=0,
+    pos_frac=0.5,
+    uniform_energy_zenith=True,
+    importance_weight=True,
+    n_energy_bins=20,
+    n_coszen_bins=20,
+    n_mult_bins=25,
+    filter_vertex_in_domain=True,
+)
+
+history = hit.train_with_dataloader(
+    train_dataloader=train_dataloader,
+    val_dataloader=val_dataloader,
+    epochs=EPOCHS,
+    # grad_clip=1.0,
+    early_stopping_patience=80,
+    save_every_n_epochs=10,
+    checkpoint_path=CHECKPOINT,
+)
+
+pickle.dump(history, open('./flow_models/mc_e_hit_v1R_training_history.pkl', 'wb'))
+
+
+# ---------------------------------------------------------------------------
+# Calibration check. Accuracy is meaningless here (predicting "never hit" scores
+# 99.99%), so look at the reliability table and AUC instead.
+# ---------------------------------------------------------------------------
+ds = val_dataloader.dataset
+ctx, y = ds.get_batch(range(200_000))
+ctx = ctx.to(hit.device).float()
+
+print(f"\nlog_prior_odds = {hit.log_prior_odds:.4f}  "
+      f"(true occupancy P(hit) = {ds.p_hit:.6g})")
+print("\nreliability on the balanced validation sample (uncalibrated):")
+print(f"  {'mean pred':>10}  {'empirical':>10}  {'n':>8}")
+for pred, emp, n in hit.reliability(ctx, y, n_bins=12, calibrated=False):
+    print(f"  {pred:10.4f}  {emp:10.4f}  {n:8d}")
+
+p_cal = hit.predict_hit_prob(ctx, calibrated=True).detach().cpu().numpy()
+print(f"\ncalibrated P(hit) on the same sample: mean {p_cal.mean():.6f}, "
+      f"max {p_cal.max():.4f}")
+print("  (the mean is far below 0.5 because the calibrated model reports true "
+      "detector occupancy, not the balanced training mix)")
