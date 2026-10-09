@@ -1,4 +1,9 @@
+
+<img src="./nugget_icon_2.png" width="256" height="256" align="right" style="margin-left: 15px;">
+
+
 # *nugget*
+
 
 **NeUtrino experiement Geometry optimization and General Evaluation Tool**
 
@@ -6,11 +11,11 @@
 
 ## Features
 
-- **Geometry Types**: Multiple geometry parameterizations including continuous strings, dynamic strings, evanescent strings, and free points
-- **Loss Functions**: Various loss functions for optimization including Fisher information, light yield, likelihood ratios (LLR), and signal-to-noise ratio (SNR)
-- **Surrogate Models**: Neural network surrogates and symbolic regression models for efficient optimization
+- **Geometry Types**: Multiple geometry parameterizations including continuous strings, dynamic strings, evanescent strings, N-fold strings, and free points
+- **Loss Functions**: Various loss functions for optimization including Fisher information, light yield, effective area, and geometry constraints
+- **Surrogate Models**: Neural network surrogates and analytic models for various neutrino event types
 - **Sampling**: Event sampling tools for neutrino physics simulations
-- **Utilities**: Optimization pipelines and visualization tools
+- **Utilities**: Optimization pipelines and visualization/data tools
 
 ## Installation
 
@@ -42,17 +47,16 @@ pip install -r requirements.txt
 
 For a comprehensive example of NUGGET's capabilities, see the Jupyter notebook:
 
-- **`nugget/examples/example_notebook.ipynb`**: Demonstrates the complete workflow including:
-  - Training neural network surrogates for log-likelihood ratio estimation
-  - Setting up geometry optimization with evanescent and dynamic string configurations
-  - Using various loss functions (Fisher information, light yield, LLR-based losses)
+- **`nugget/examples/new_example_notebook.ipynb`**: Demonstrates the complete workflow including:
+  - Setting up geometry optimization with the dynamic string configuration
+  - Using various loss functions (Fisher information, geometry constraints)
   - Visualization and analysis of optimization results
 
 ## Package Structure
 
-- `geometries/`: Detector geometry types (including base class)
-- `losses/`: Loss functions (including case class)
-- `surrogates/`: Surrogate models (including case class)
-- `samplers/`: Event sampling utilities (including case class)
-- `utils/`: Optimizer pipeline and visualization tools
+- `geometries/`: Detector geometry types
+- `losses/`: Loss functions 
+- `surrogates/`: Surrogate models 
+- `samplers/`: Event sampling utilities
+- `utils/`: Optimizer pipeline and visualization/data tools
 

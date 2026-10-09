@@ -16,6 +16,7 @@ setup(
         "conflictfree>=0.1.8",
         "imageio>=2.37.0",
         "h5py>=3.15.1",
+        "pandas>=1.1.0",
     ],
     python_requires=">=3.8",
 )

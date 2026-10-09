@@ -23,7 +23,7 @@ ENV/
 *.swo
 *.json
 *.parquet
-
+.conda/
 # Agent / assistant context files
 CLAUDE.md
 .claude/
@@ -40,7 +40,6 @@ nn_test_outputs/
 old_notebooks/
 gif_temp/
 # plots and gifs
-*.png
 *.jpg
 *.gif
 *.log
@@ -62,6 +61,7 @@ nugget/examples/rov_uniform_geom*
 nugget/examples/best_ls*
 nugget/examples/*.h5
 nugget/examples/res_test
+nugget/examples/*.png
 nugget/other/geom_2nd_optimization_counts.py
 *800_40_40_geom.csv
 nugget/examples/llrnet_models

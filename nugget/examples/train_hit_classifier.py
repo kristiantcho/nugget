@@ -4,20 +4,20 @@ import torch
 import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
-TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_hit_v1rs_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_hit_model_v1rs.pt'
+TRAIN_PARQUET = 'small_e_accepted.parquet'
+TEST_PARQUET = './flow_models/mc_e_hit_v1R_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_e_hit_model_v1R.pt'
 
 EPOCHS = 500
 
 hit = nugget.surrogates.HitClassifier.HitClassifier(
-    device="cuda:1",
+    device='cuda:3',
     domain_size=20000,
     dim=3,
 
     # --- network ---
-    width=128,
-    depth=6,
+    width=256,
+    depth=8,
     dropout=0.0,
 
     # --- optimisation ---
@@ -32,12 +32,13 @@ hit = nugget.surrogates.HitClassifier.HitClassifier(
     rich_rel_pos_mode=True,
     include_vertex_position=False,
     add_vertex_distance=False,
-    add_distance_from_beam=True,
-    add_dist_long=True,
+    add_distance_from_beam=False,
+    add_dist_long=False,
     track_dir_is_arrival=True,
     add_pmt_direction=True,
     add_pmt_cosangle=True,
     standardize_context=True,
+    include_direction=False,
     ly_eps=1e-6,
 )
 
@@ -57,6 +58,7 @@ train_dataloader = hit.create_hit_parquet_dataloader(
     n_mult_bins=25,
     filter_vertex_in_domain=True,
     test_save_path=TEST_PARQUET,
+    # event_frac=0.2,
     test_frac=0.1,
 )
 
@@ -86,7 +88,7 @@ history = hit.train_with_dataloader(
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_hit_v1rs_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_e_hit_v1R_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------

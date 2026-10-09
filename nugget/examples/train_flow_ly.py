@@ -3,9 +3,9 @@ import pickle
 import torch
 
 GEOM = '../other/800_40_40_geom.csv'
-TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_ly_muon_flow_v1rs_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_ly_muon_flow_model_v1rs.pt'
+TRAIN_PARQUET = 'small_e_accepted.parquet'
+TEST_PARQUET = './flow_models/mc_ly_e_flow_v1R_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_ly_e_flow_model_v1R.pt'
 
 EPOCHS = 500
 
@@ -15,10 +15,10 @@ flow = nugget.surrogates.FlowMatchLY.FlowMatchLY(
     dim=3,
 
     # --- velocity network ---
-    width=128,          # hidden width of the residual trunk
-    depth=5,            # number of residual blocks
+    width=256,          # hidden width of the residual trunk
+    depth=8,            # number of residual blocks
     time_dim=64,        # sinusoidal embedding size for the flow time t
-    cond_width=128,     # width of the context encoder
+    cond_width=256,     # width of the context encoder
     dropout=0.0,
 
     # --- optimisation ---
@@ -34,13 +34,14 @@ flow = nugget.surrogates.FlowMatchLY.FlowMatchLY(
     # --- context features (same conventions as LLRnet) ---
     rich_rel_pos_mode=True,
     include_vertex_position=False,
-    add_vertex_distance=False,
-    add_distance_from_beam=True,
-    add_dist_long=True,
+    add_vertex_distance=True,
+    add_distance_from_beam=False,
+    add_dist_long=False,
     track_dir_is_arrival=True,
     add_pmt_direction=True,
     add_pmt_cosangle=True,
     standardize_context=True,
+    include_direction=False,
     ly_eps=1e-6,
 )
 
@@ -82,7 +83,7 @@ history = flow.train_with_dataloader(
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_ly_muon_flow_v1rs_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_ly_e_flow_v1R_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------

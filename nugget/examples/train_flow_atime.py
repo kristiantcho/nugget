@@ -4,9 +4,9 @@ import torch
 import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
-TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_atime_muon_flow_v1rs_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v1rs.pt'
+TRAIN_PARQUET = 'small_e_accepted.parquet'
+TEST_PARQUET = './flow_models/mc_atime_e_flow_v1R_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_atime_e_flow_model_v1R.pt'
 
 EPOCHS = 700
 
@@ -14,12 +14,12 @@ flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
     device="cuda:1",
     domain_size=20000,
     dim=3,
-
+    particle_mode='cascade',
     # --- velocity network ---
-    width=128,
-    depth=6,
+    width=256,
+    depth=8,
     time_dim=64,        # sinusoidal embedding of the FLOW time t (not the arrival time)
-    cond_width=128,
+    cond_width=256,
     dropout=0.0,
 
     # --- optimisation ---
@@ -44,12 +44,13 @@ flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
     # --- context features (identical to the light-yield model) ---
     rich_rel_pos_mode=True,
     include_vertex_position=False,
-    add_vertex_distance=False,
-    add_distance_from_beam=True,
-    add_dist_long=True,
+    add_vertex_distance=True,
+    add_distance_from_beam=False,
+    add_dist_long=False,
     add_pmt_direction=True,
     add_pmt_cosangle=True,
     standardize_context=True,
+    include_direction=False,
     ly_eps=1e-6,
 )
 
@@ -96,7 +97,7 @@ history = flow.train_with_dataloader(
 )
 
 pickle.dump(history,
-            open('./flow_models/mc_atime_muon_flow_v1rs_training_history.pkl', 'wb'))
+            open('./flow_models/mc_atime_e_flow_v1R_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------
