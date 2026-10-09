@@ -1,7 +1,4 @@
 
-<img src="./nugget_icon_2.png" width="256" height="256" align="right" style="margin-left: 15px;">
-
-
 # *nugget*
 
 
