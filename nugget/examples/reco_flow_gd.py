@@ -1,5 +1,8 @@
 """Gradient-descent maximum-likelihood reconstruction of parquet events with the
-hit / light-yield / arrival-time flows. Saves truth, start and best fit per event."""
+hit / light-yield / arrival-time flows. Saves truth, start and best fit per event.
+
+Events are fitted in batches on each GPU, and sharded over DEVICES (one process each);
+the shard files are merged into OUT and deleted at the end."""
 import os
 import time
 
@@ -13,7 +16,8 @@ from nugget.surrogates.FlowMatchLY import FlowMatchLY
 from nugget.surrogates.FlowMatchATime import FlowMatchATime, _times_to_flat
 from nugget.utils.parquet_io import list_events, read_parquet_columns
 
-DEVICE = 'cuda:1' if torch.cuda.is_available() else 'cpu'
+# one worker process per entry; repeat a device to run several processes on it
+DEVICES = ['cuda:1'] if torch.cuda.is_available() else ['cpu']
 # PARQUET = './flow_models/mc_atime_muon_flow_v1r_test_samples.parquet'  # events held out from the models' training
 PARQUET = './big_mu_accepted.parquet'  # events held out from the models' training
 GEOM = '../other/800_40_40_geom.csv'
@@ -24,7 +28,7 @@ OUT = './reco/gd_reco_v1r.parquet'                  # .parquet or .csv
 
 N_EVENTS = 20000                 # random events drawn from PARQUET
 EVENT_SEED = 0
-MIN_HIT_PMTS = None               # skip events with fewer lit PMTs
+MIN_HIT_PMTS = None               # skip events with fewer lit PMTs (None: no cut)
 FILTER_VERTEX_IN_DOMAIN = True # skip vertices outside the models' training domain
 TERMS = ('hit', 'ly', 'atime') # 'atime' is dropped automatically if the file has no times
 
@@ -37,19 +41,27 @@ HIT_RADIUS = 200            # unhit PMTs within this of a hit OM enter the hit t
 N_STEPS_FIT = 8                # ODE steps per flow evaluation
 LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 10 us
 
+# batching: events are added to a batch while both row budgets hold (an event that
+# alone exceeds them runs on its own). Flow rows (LY PMTs + photons) cost far more
+# than hit rows: they hold n_steps of double backward. Lower these on OOM.
+EVENTS_PER_BATCH = 64
+MAX_FLOW_ROWS = 20_000
+MAX_HIT_ROWS = 2_000_000
+
 # start point and optimiser. Parameters: x, y, z [m], zenith, azimuth [rad, parquet
 # convention], log10 E/GeV, t0 [ns, vertex time on a clock zeroed at the first hit]
 START = 'truth'            # 'truth' or 'perturbed' (truth + SCALE * N(0, 1))
 PARAMS = ['x', 'y', 'z', 'zenith', 'azimuth', 'log10E', 't0']
 SCALE = np.array([20.0, 20.0, 20.0, np.radians(5), np.radians(5), 0.3, 20.0])
 LR = 0.05                      # Adam step in units of SCALE
+BETAS, ADAM_EPS = (0.9, 0.999), 1e-8
 MAX_ITER = 1000
-LR_FACTOR, LR_PATIENCE = 0.5, 30   # ReduceLROnPlateau on the NLL
+LR_FACTOR, LR_PATIENCE = 0.5, 30   # per-event plateau LR decay (as ReduceLROnPlateau)
 PATIENCE = 100                 # stop after this many iterations without a MIN_DELTA gain
 MIN_DELTA = 1e-2               # NLL units
 MIN_LR = 1e-4
 WITHIN = 0.5                   # report iterations to get within this NLL of the best
-SAVE_EVERY = 10
+SAVE_EVERY = 100               # finished events between saves of a worker's file
 
 
 def _kw(m):
@@ -85,8 +97,15 @@ def _dpsi(a, b):
     return np.degrees(np.arccos(np.clip(_unit(*a[3:5]) @ _unit(*b[3:5]), -1, 1)))
 
 
-def load_events(terms):
-    """Random N_EVENTS events: their hit rows joined to the geometry, plus counts/times."""
+def sample_events():
+    ev_all = list_events(PARQUET)
+    rng = np.random.default_rng(EVENT_SEED)
+    return [ev_all[i] for i in rng.choice(len(ev_all), min(N_EVENTS, len(ev_all)),
+                                          replace=False)]
+
+
+def load_events(events, terms):
+    """The given events' hit rows joined to the geometry, plus counts/times."""
     import pyarrow.dataset as pads
     present = set(pads.dataset(PARQUET, format='parquet').schema.names)
     tcol = 'times' if 'times' in present else 'time' if 'time' in present else None
@@ -96,16 +115,12 @@ def load_events(terms):
     if tcol is None and 'count' not in present:
         raise ValueError("parquet needs a 'times', 'time' or 'count' column")
 
-    ev_all = list_events(PARQUET)
-    rng = np.random.default_rng(EVENT_SEED)
-    pick = [ev_all[i] for i in rng.choice(len(ev_all), min(N_EVENTS, len(ev_all)),
-                                          replace=False)]
     cols = ['run_id', 'event_id', 'string', 'om', 'pmt', 'muon_x', 'muon_y', 'muon_z',
             'neutrino_energy', 'zenith', 'azimuth']   # lepton_* is read as muon_*
     extra = [tcol] if tcol else ['count']
     if tcol and 'count' in present:
         extra.append('count')
-    df = read_parquet_columns(PARQUET, cols + extra, events=pick)
+    df = read_parquet_columns(PARQUET, cols + extra, events=events)
 
     key = ['run_id', 'event_id', 'string', 'om', 'pmt']
     if tcol == 'time':                                 # photon mode: one row per photon
@@ -170,76 +185,287 @@ def event_data(g, flat, geo_pos, geo_dir, tree, models, rng):
     d['t_first'] = t_first
     d['truth'] = np.array([r0.muon_x, r0.muon_y, r0.muon_z, r0.zenith, r0.azimuth,
                            np.log10(r0.neutrino_energy), -t_first], dtype=np.float64)
+    d['n_flow_rows'] = len(d['P_l']) + (len(d['P_a']) if 'P_a' in d else 0)
+    d['n_hit_rows'] = len(d['P_h'])
     return d
 
 
-def nll(th, d, models, terms, differentiable=True):
-    """th = [x, y, z, zenith, azimuth, log10 E, t0] -> -log L."""
-    hit, ly, flow = models
-    V, Z, A, E, t0 = th[:3], th[3], th[4], 10.0 ** th[5], th[6]
+_TERM_KEYS = (('h', ('P_h', 'D_h', 'y_h')), ('l', ('P_l', 'D_l', 'z_l')),
+              ('a', ('P_a', 'D_a', 't_rel')))
 
-    def ctx(m, P, D):
-        n = len(P)
-        return m.build_context(P, V.expand(n, 3), E.expand(n), Z.expand(n), A.expand(n),
+
+def build_batch(ds, device):
+    """Concatenate per-event tensors; i_* is each row's event index in the batch."""
+    b = {'B': len(ds)}
+    for key, cols in _TERM_KEYS:
+        if cols[0] not in ds[0]:
+            continue
+        for c in cols:
+            b[c] = torch.cat([d[c] for d in ds])
+        b['i_' + key] = torch.cat([torch.full((len(d[cols[0]]),), j, dtype=torch.long,
+                                              device=b[cols[0]].device)
+                                   for j, d in enumerate(ds)])
+    for w in ('w_l', 'w_a'):
+        if w in ds[0]:
+            b[w] = torch.tensor([d[w] for d in ds], dtype=torch.float64, device=device)
+    return b
+
+
+def nll_batch(th, b, models, terms, differentiable=True):
+    """th (B, 7) = [x, y, z, zenith, azimuth, log10 E, t0] per event -> (B,) -log L."""
+    hit, ly, flow = models
+    out = torch.zeros(b['B'], dtype=torch.float64, device=th.device)
+
+    def ctx(m, P, D, t):
+        return m.build_context(P, t[:, :3], 10.0 ** t[:, 5], t[:, 3], t[:, 4],
                                pmt_directions=D)
 
-    ll = 0.0
     if 'hit' in terms:
-        lp1, lp0 = hit.log_prob_hit(ctx(hit, d['P_h'], d['D_h']), calibrated=True)
-        ll = ll + (d['y_h'] * lp1 + (1 - d['y_h']) * lp0).sum()
+        t = th[b['i_h']]
+        lp1, lp0 = hit.log_prob_hit(ctx(hit, b['P_h'], b['D_h'], t), calibrated=True)
+        out = out.index_add(0, b['i_h'],
+                            (b['y_h'] * lp1 + (1 - b['y_h']) * lp0).to(out.dtype))
     if 'ly' in terms:
-        ll = ll + d['w_l'] * ly.log_prob_z(d['z_l'], ctx(ly, d['P_l'], d['D_l']),
-                                           n_steps=N_STEPS_FIT,
-                                           differentiable=differentiable).sum()
+        t = th[b['i_l']]
+        lp = ly.log_prob_z(b['z_l'], ctx(ly, b['P_l'], b['D_l'], t), n_steps=N_STEPS_FIT,
+                           differentiable=differentiable)
+        out = out.index_add(0, b['i_l'], b['w_l'][b['i_l']] * lp.to(out.dtype))
     if 'atime' in terms:
-        n = len(d['P_a'])
-        tg = flow.geometric_time(d['P_a'], V.expand(n, 3), zeniths=Z.expand(n),
-                                 azimuths=A.expand(n)).reshape(-1)
-        lp = flow.log_prob_time_residual(d['t_rel'] - t0 - tg,
-                                         ctx(flow, d['P_a'], d['D_a']),
+        t = th[b['i_a']]
+        tg = flow.geometric_time(b['P_a'], t[:, :3], zeniths=t[:, 3],
+                                 azimuths=t[:, 4]).reshape(-1)
+        lp = flow.log_prob_time_residual(b['t_rel'] - t[:, 6] - tg,
+                                         ctx(flow, b['P_a'], b['D_a'], t),
                                          n_steps=N_STEPS_FIT,
                                          differentiable=differentiable)
-        ll = ll + d['w_a'] * torch.logaddexp(lp, torch.full_like(lp, LOG_FLOOR)).sum()
-    return -ll
+        lp = torch.logaddexp(lp, torch.full_like(lp, LOG_FLOOR))
+        out = out.index_add(0, b['i_a'], b['w_a'][b['i_a']] * lp.to(out.dtype))
+    return -out
 
 
-def fit(d, start, models, terms):
-    """Adam in SCALE units with plateau LR decay and early stopping. Keeps the best point."""
-    S = torch.as_tensor(SCALE, device=DEVICE, dtype=torch.float64)
-    th0 = torch.as_tensor(start, device=DEVICE, dtype=torch.float64)
-    u = torch.zeros(len(SCALE), device=DEVICE, dtype=torch.float64, requires_grad=True)
-    opt = torch.optim.Adam([u], lr=LR)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, factor=LR_FACTOR, patience=LR_PATIENCE, threshold=MIN_DELTA,
-        threshold_mode='abs')
-    hist, best, best_u, best_it, since, reason = [], np.inf, u.detach().clone(), 0, 0, 'max_iter'
-    for it in range(MAX_ITER):
-        loss = nll(th0 + S * u, d, models, terms)
-        val = loss.item()
-        if not np.isfinite(val):
-            reason = 'non_finite'
+# per-event optimiser state, one row per active event
+_TENSOR_STATE = ('th0', 'u', 'm', 'v', 'best_u')
+_ARRAY_STATE = ('it', 'since', 'best', 'best_it', 'sched_best', 'bad', 'lr', 'sec')
+
+
+def _init_state(entries, device):
+    n = len(entries)
+    th0 = torch.as_tensor(np.stack([e['start'] for e in entries]), device=device,
+                          dtype=torch.float64)
+    z = torch.zeros_like(th0)
+    return dict(th0=th0, u=z, m=z.clone(), v=z.clone(), best_u=z.clone(),
+                it=np.zeros(n, int), since=np.zeros(n, int), best=np.full(n, np.inf),
+                best_it=np.zeros(n, int), sched_best=np.full(n, np.inf),
+                bad=np.zeros(n, int), lr=np.full(n, LR), sec=np.zeros(n),
+                hist=[[] for _ in range(n)])
+
+
+def _cat_state(a, b):
+    if a is None:
+        return b
+    out = {k: torch.cat([a[k], b[k]]) for k in _TENSOR_STATE}
+    out.update({k: np.concatenate([a[k], b[k]]) for k in _ARRAY_STATE})
+    out['hist'] = a['hist'] + b['hist']
+    return out
+
+
+def _keep_state(s, keep):
+    kt = torch.as_tensor(keep, device=s['u'].device)
+    out = {k: s[k][kt] for k in _TENSOR_STATE}
+    out.update({k: s[k][keep] for k in _ARRAY_STATE})
+    out['hist'] = [h for h, k in zip(s['hist'], keep) if k]
+    return out
+
+
+def _step(s, vals, ok, grad):
+    """One Adam + plateau + early-stopping update for every active event (in place).
+    Returns each event's stop reason ('' = keep going)."""
+    b1, b2 = BETAS
+    for j in np.flatnonzero(ok):
+        s['hist'][j].append(float(vals[j]))
+    v = np.where(ok, vals, np.inf)
+    s['since'] = np.where(v < s['best'] - MIN_DELTA, 0, s['since'] + 1)
+    better = v < s['best']
+    s['best_it'] = np.where(better, s['it'], s['best_it'])
+    s['best'] = np.where(better, v, s['best'])
+    bt = torch.as_tensor(better, device=s['u'].device)
+    s['best_u'] = torch.where(bt[:, None], s['u'], s['best_u'])
+
+    step = torch.as_tensor(s['it'] + 1, device=grad.device, dtype=grad.dtype)[:, None]
+    s['m'] = b1 * s['m'] + (1 - b1) * grad
+    s['v'] = b2 * s['v'] + (1 - b2) * grad * grad
+    lr = torch.as_tensor(s['lr'], device=grad.device, dtype=grad.dtype)[:, None]
+    s['u'] = s['u'] - lr * (s['m'] / (1 - b1 ** step)) / (
+        (s['v'] / (1 - b2 ** step)).sqrt() + ADAM_EPS)
+
+    sb = v < s['sched_best'] - MIN_DELTA
+    s['sched_best'] = np.where(sb, v, s['sched_best'])
+    s['bad'] = np.where(sb, 0, s['bad'] + 1)
+    red = s['bad'] > LR_PATIENCE
+    s['lr'] = np.where(red, s['lr'] * LR_FACTOR, s['lr'])
+    s['bad'] = np.where(red, 0, s['bad'])
+    s['it'] = s['it'] + 1
+
+    reason = np.full(len(vals), '', dtype=object)
+    for mask, why in ((~ok, 'non_finite'), (s['since'] >= PATIENCE, 'patience'),
+                      (s['lr'] < MIN_LR, 'min_lr'), (s['it'] >= MAX_ITER, 'max_iter')):
+        reason[(reason == '') & mask] = why
+    return reason
+
+
+def _finish(entries, s, idx, reason, models, terms, device):
+    """Result rows for the events at positions idx of the active batch."""
+    sub = [entries[j] for j in idx]
+    truth = torch.as_tensor(np.stack([e['d']['truth'] for e in sub]), device=device)
+    nll_true = nll_batch(truth, build_batch([e['d'] for e in sub], device), models, terms,
+                         differentiable=False).detach().cpu().numpy()
+    S = torch.as_tensor(SCALE, device=device, dtype=torch.float64)
+    th_best = (s['th0'][idx] + S * s['best_u'][idx]).detach().cpu().numpy()
+    rows = []
+    for k, j in enumerate(idx):
+        e, d = entries[j], entries[j]['d']
+        hist = np.asarray(s['hist'][j])
+        best = float(s['best'][j])
+        th, tr = _canonical(th_best[k]), d['truth']
+        rows.append(dict(
+            run_id=e['run'], event_id=e['evt'], n_hit_pmts=d['n_hit_pmts'],
+            n_photons=d['n_photons'], t_first=d['t_first'],
+            **{f'true_{p}': v for p, v in zip(PARAMS, tr)},
+            **{f'start_{p}': v for p, v in zip(PARAMS, _canonical(e['start']))},
+            **{f'fit_{p}': v for p, v in zip(PARAMS, th)},
+            nll_true=float(nll_true[k]), nll_fit=best,
+            nll_start=hist[0] if len(hist) else np.nan,
+            n_iter=len(hist), best_iter=int(s['best_it'][j]),
+            iter_within=int(np.argmax(hist <= best + WITHIN)) if len(hist) else -1,
+            stop_reason=reason[j], seconds=float(s['sec'][j]),
+            dpsi_start=_dpsi(e['start'], tr), dpsi_fit=_dpsi(th, tr),
+            dvertex_fit=float(np.linalg.norm(th[:3] - tr[:3])),
+            dlog10E_fit=th[5] - tr[5], dt0_fit=th[6] - tr[6]))
+    return rows
+
+
+def _save(rows, path):
+    res = pd.DataFrame(rows)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    (res.to_csv(path, index=False) if path.endswith('.csv') else res.to_parquet(path, index=False))
+    return res
+
+
+def _read(path):
+    return pd.read_csv(path) if path.endswith('.csv') else pd.read_parquet(path)
+
+
+def run_worker(events, device, out_path, tag=''):
+    """Fit the given events on one device, in batches; writes rows to out_path."""
+    if device.startswith('cuda'):
+        torch.cuda.set_device(device)
+    hit = HitClassifier(device=device).load_model(HIT_CKPT)
+    ly = FlowMatchLY(device=device).load_model(LY_CKPT)
+    flow = FlowMatchATime(device=device).load_model(ATIME_CKPT)
+    models = (hit, ly, flow)
+    for m in models:
+        m.net.eval()
+        for p in m.net.parameters():
+            p.requires_grad_(False)
+
+    df, flat, geo_pos, geo_dir, terms = load_events(events, TERMS)
+    tree = cKDTree(geo_pos)
+    half = _half_extent(hit.domain_size)
+    groups = df.groupby(['run_id', 'event_id'], sort=False)
+    print(f'{tag}{groups.ngroups} events on {device}, terms {terms}, '
+          f'atime particle_mode {flow.particle_mode}, start {START!r}')
+    skipped = {'few_hits': 0, 'vertex_outside': 0}
+
+    def prepared():
+        for (run, evt), g in groups:
+            if MIN_HIT_PMTS is not None and len(g) < MIN_HIT_PMTS:
+                skipped['few_hits'] += 1
+                continue
+            if FILTER_VERTEX_IN_DOMAIN and (np.abs(g.iloc[0][['muon_x', 'muon_y', 'muon_z']]
+                                                   .to_numpy(float)) > half).any():
+                skipped['vertex_outside'] += 1
+                continue
+            rng = np.random.default_rng([EVENT_SEED, int(run), int(evt)])  # batch-independent
+            d = event_data(g, flat, geo_pos, geo_dir, tree, models, rng)
+            start = d['truth'] + (SCALE * rng.standard_normal(len(SCALE))
+                                  if START == 'perturbed' else 0.0)
+            yield dict(run=run, evt=evt, d=d, start=start)
+
+    def fits(entries, e):
+        nf = sum(x['d']['n_flow_rows'] for x in entries) + e['d']['n_flow_rows']
+        nh = sum(x['d']['n_hit_rows'] for x in entries) + e['d']['n_hit_rows']
+        return nf <= MAX_FLOW_ROWS and nh <= MAX_HIT_ROWS
+
+    S = torch.as_tensor(SCALE, device=device, dtype=torch.float64)
+    src, waiting, exhausted = prepared(), None, False
+    active, state, batch, rows = [], None, None, []
+    t_wall = time.time()
+    while True:
+        new = []
+        while not exhausted and len(active) + len(new) < EVENTS_PER_BATCH:
+            if waiting is None:
+                waiting = next(src, None)
+                if waiting is None:
+                    exhausted = True
+                    break
+            if (active or new) and not fits(active + new, waiting):
+                break
+            new.append(waiting)
+            waiting = None
+        if new:
+            active += new
+            state = _cat_state(state, _init_state(new, device))
+            batch = None
+        if not active:
             break
-        hist.append(val)
-        since = 0 if val < best - MIN_DELTA else since + 1
-        if val < best:
-            best, best_u, best_it = val, u.detach().clone(), it
-        u.grad, = torch.autograd.grad(loss, u)     # grad w.r.t. th only, not the nets
-        opt.step()
-        sched.step(val)
-        if since >= PATIENCE:
-            reason = 'patience'
-            break
-        if opt.param_groups[0]['lr'] < MIN_LR:
-            reason = 'min_lr'
-            break
-    hist = np.asarray(hist)
-    within = int(np.argmax(hist <= best + WITHIN)) if len(hist) else -1
-    th = (th0 + S * best_u).detach().cpu().numpy()
-    return dict(theta=_canonical(th), nll_fit=best, nll_start=hist[0] if len(hist) else np.nan,
-                n_iter=len(hist), best_iter=best_it, iter_within=within, stop_reason=reason)
+        if batch is None:
+            batch = build_batch([e['d'] for e in active], device)
+
+        t_it = time.time()
+        u = state['u'].detach().requires_grad_(True)
+        loss = nll_batch(state['th0'] + S * u, batch, models, terms)
+        vals = loss.detach().cpu().numpy()
+        ok = np.isfinite(vals)
+        grad, = torch.autograd.grad(loss[torch.as_tensor(ok, device=loss.device)].sum(), u)
+        state['u'] = u.detach()
+        reason = _step(state, vals, ok, grad)
+        state['sec'] = state['sec'] + (time.time() - t_it) / len(active)
+
+        done = reason != ''
+        if done.any():
+            for r in _finish(active, state, np.flatnonzero(done), reason, models, terms, device):
+                rows.append(r)
+                print(f'{tag}[{len(rows):5d}] {r["run_id"]}/{r["event_id"]}: '
+                      f'{r["n_hit_pmts"]} PMTs, {r["n_photons"]} ph | dpsi '
+                      f'{r["dpsi_start"]:.2f} -> {r["dpsi_fit"]:.2f} deg, dvtx '
+                      f'{r["dvertex_fit"]:.1f} m, dlogE {r["dlog10E_fit"]:+.3f} | NLL fit-truth '
+                      f'{r["nll_fit"] - r["nll_true"]:+.2f} | best @ {r["best_iter"]}/'
+                      f'{r["n_iter"]} ({r["stop_reason"]})')
+                if len(rows) % SAVE_EVERY == 0:
+                    _save(rows, out_path)
+            keep = ~done
+            active = [e for e, k in zip(active, keep) if k]
+            state = _keep_state(state, keep) if active else None
+            batch = None
+
+    _save(rows, out_path)
+    wall = time.time() - t_wall
+    print(f'{tag}done: {len(rows)} events in {wall / 60:.1f} min '
+          f'({60 * len(rows) / max(wall, 1e-9):.1f} events/min); skipped {skipped}')
 
 
-def summarize(res):
+def _worker(i, events, device, path):
+    run_worker(events, device, path, tag=f'[shard {i}] ')
+
+
+def _shard_path(i):
+    root, ext = os.path.splitext(OUT)
+    return f'{root}.shard{i}{ext}'
+
+
+def summarize(res, wall=None):
     if res.empty:
         print('no events fitted')
         return
@@ -249,8 +475,9 @@ def summarize(res):
     print(f'iterations run   : p50/p68/p90 {q("n_iter")}  (max {res.n_iter.max()})')
     print(f'iter of best NLL : p50/p68/p90 {q("best_iter")}')
     print(f'iter to within {WITHIN} of best: p50/p68/p90 {q("iter_within")}')
-    print(f'time per event   : median {res.seconds.median():.1f}s, total {res.seconds.sum() / 60:.1f} min, '
-          f'{(res.seconds / res.n_iter).median() * 1e3:.0f} ms/iter')
+    if wall is not None:
+        print(f'wall time        : {wall / 60:.1f} min, {60 * len(res) / wall:.1f} events/min')
+    print(f'GPU time / event : median {res.seconds.median():.2f}s (share of its batches)')
     print(f'dpsi start [deg] : p50/p68/p90 {q("dpsi_start")}')
     print(f'dpsi fit   [deg] : p50/p68/p90 {q("dpsi_fit")}')
     print(f'|d vertex| [m]   : p50/p68/p90 {q("dvertex_fit")}')
@@ -265,73 +492,35 @@ def summarize(res):
         print(f'fit closer than start in direction: {(res.dpsi_fit < res.dpsi_start).mean():.0%}')
 
 
-def save(rows):
-    res = pd.DataFrame(rows)
-    d = os.path.dirname(OUT)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    (res.to_csv(OUT, index=False) if OUT.endswith('.csv') else res.to_parquet(OUT, index=False))
-    return res
-
-
 def main():
-    hit = HitClassifier(device=DEVICE).load_model(HIT_CKPT)
-    ly = FlowMatchLY(device=DEVICE).load_model(LY_CKPT)
-    flow = FlowMatchATime(device=DEVICE).load_model(ATIME_CKPT)
-    models = (hit, ly, flow)
-    for m in models:
-        m.net.eval()
-        for p in m.net.parameters():
-            p.requires_grad_(False)
-    print(f'atime particle_mode: {flow.particle_mode}')
-
-    df, flat, geo_pos, geo_dir, terms = load_events(TERMS)
-    tree = cKDTree(geo_pos)
-    half = _half_extent(hit.domain_size)
-    groups = list(df.groupby(['run_id', 'event_id'], sort=False))
-    print(f'{len(groups)} events loaded, terms {terms}, start {START!r}, device {DEVICE}')
-
-    rows, skipped = [], {'few_hits': 0, 'vertex_outside': 0}
-    for i, ((run, evt), g) in enumerate(groups):
-        if len(g) < MIN_HIT_PMTS:
-            skipped['few_hits'] += 1
-            continue
-        if FILTER_VERTEX_IN_DOMAIN and (np.abs(g.iloc[0][['muon_x', 'muon_y', 'muon_z']]
-                                               .to_numpy(float)) > half).any():
-            skipped['vertex_outside'] += 1
-            continue
-        rng = np.random.default_rng([EVENT_SEED, i])
-        d = event_data(g, flat, geo_pos, geo_dir, tree, models, rng)
-        truth = d['truth']
-        start = truth + (SCALE * rng.standard_normal(len(SCALE)) if START == 'perturbed' else 0.0)
-
-        t = time.time()
-        r = fit(d, start, models, terms)
-        sec = time.time() - t
-        nll_true = nll(torch.as_tensor(truth, device=DEVICE), d, models, terms,
-                       differentiable=False).item()
-        th = r.pop('theta')
-        row = dict(run_id=run, event_id=evt, n_hit_pmts=d['n_hit_pmts'],
-                   n_photons=d['n_photons'], t_first=d['t_first'],
-                   **{f'true_{p}': v for p, v in zip(PARAMS, truth)},
-                   **{f'start_{p}': v for p, v in zip(PARAMS, _canonical(start))},
-                   **{f'fit_{p}': v for p, v in zip(PARAMS, th)},
-                   nll_true=nll_true, **r, seconds=sec,
-                   dpsi_start=_dpsi(start, truth), dpsi_fit=_dpsi(th, truth),
-                   dvertex_fit=float(np.linalg.norm(th[:3] - truth[:3])),
-                   dlog10E_fit=th[5] - truth[5], dt0_fit=th[6] - truth[6])
-        rows.append(row)
-        print(f'[{len(rows):4d}] {run}/{evt}: {d["n_hit_pmts"]} PMTs, {d["n_photons"]} ph | '
-              f'dpsi {row["dpsi_start"]:.2f} -> {row["dpsi_fit"]:.2f} deg, '
-              f'dvtx {row["dvertex_fit"]:.1f} m, dlogE {row["dlog10E_fit"]:+.3f} | '
-              f'NLL fit-truth {row["nll_fit"] - nll_true:+.2f} | best @ {r["best_iter"]}/'
-              f'{r["n_iter"]} ({r["stop_reason"]}), {sec:.1f}s')
-        if len(rows) % SAVE_EVERY == 0:
-            save(rows)
-
-    res = save(rows)
-    print(f'skipped: {skipped}; saved {len(res)} rows -> {OUT}')
-    summarize(res)
+    t0 = time.time()
+    events = sample_events()
+    n = len(DEVICES)
+    if n == 1:
+        run_worker(events, DEVICES[0], OUT)
+    else:
+        ctx = torch.multiprocessing.get_context('spawn')
+        procs = [ctx.Process(target=_worker, args=(i, events[i::n], dev, _shard_path(i)))
+                 for i, dev in enumerate(DEVICES)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join()
+        paths = [_shard_path(i) for i in range(n)]
+        found = [p for p in paths if os.path.exists(p)]
+        if not found:
+            raise RuntimeError('no shard produced any output')
+        res = pd.concat([_read(p) for p in found], ignore_index=True)
+        _save(res, OUT)
+        failed = [i for i, p in enumerate(procs) if p.exitcode != 0]
+        if failed:
+            print(f'shards {failed} failed: merged what exists, kept the shard files')
+        else:
+            for p in found:
+                os.remove(p)
+    res = _read(OUT)
+    print(f'saved {len(res)} rows -> {OUT}')
+    summarize(res, wall=time.time() - t0)
 
 
 if __name__ == '__main__':
