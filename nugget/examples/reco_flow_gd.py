@@ -47,6 +47,7 @@ LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 1
 EVENTS_PER_BATCH = 64
 MAX_FLOW_ROWS = 20_000
 MAX_HIT_ROWS = 2_000_000
+EMPTY_CACHE = True             # torch.cuda.empty_cache() whenever events leave the batch
 
 # start point and optimiser. Parameters: x, y, z [m], zenith, azimuth [rad, parquet
 # convention], log10 E/GeV, t0 [ns, vertex time on a clock zeroed at the first hit]
@@ -449,8 +450,13 @@ def run_worker(events, device, out_path, tag=''):
             active = [e for e, k in zip(active, keep) if k]
             state = _keep_state(state, keep) if active else None
             batch = None
+            if EMPTY_CACHE and device.startswith('cuda'):
+                del loss, grad, u              # drop the last graph before freeing
+                torch.cuda.empty_cache()
 
     _save(rows, out_path)
+    if device.startswith('cuda'):
+        torch.cuda.empty_cache()
     wall = time.time() - t_wall
     print(f'{tag}done: {len(rows)} events in {wall / 60:.1f} min '
           f'({60 * len(rows) / max(wall, 1e-9):.1f} events/min); skipped {skipped}')
