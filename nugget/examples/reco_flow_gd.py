@@ -45,7 +45,8 @@ LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 1
 # alone exceeds them runs on its own). The budgets only set throughput: the gradient
 # is accumulated over row chunks, so peak memory is set by the chunk sizes. Flow rows
 # (LY PMTs + photons) cost far more than hit rows: they hold n_steps of double
-# backward. Lower the chunk sizes on OOM.
+# backward. Lower the chunk sizes on OOM. None means no limit (a None chunk size
+# takes each term in one go).
 EVENTS_PER_BATCH = 64
 MAX_FLOW_ROWS = None
 MAX_HIT_ROWS = None
@@ -222,6 +223,7 @@ def _chunks(b, terms):
                             ('atime', 'a', FLOW_CHUNK_ROWS)):
         if term in terms and 'i_' + key in b:
             n = len(b['i_' + key])
+            size = size or max(n, 1)
             for s in range(0, n, size):
                 yield term, slice(s, min(s + size, n))
 
@@ -436,7 +438,8 @@ def run_worker(events, device, out_path, tag=''):
     def fits(entries, e):
         nf = sum(x['d']['n_flow_rows'] for x in entries) + e['d']['n_flow_rows']
         nh = sum(x['d']['n_hit_rows'] for x in entries) + e['d']['n_hit_rows']
-        return nf <= MAX_FLOW_ROWS and nh <= MAX_HIT_ROWS
+        return ((MAX_FLOW_ROWS is None or nf <= MAX_FLOW_ROWS)
+                and (MAX_HIT_ROWS is None or nh <= MAX_HIT_ROWS))
 
     S = torch.as_tensor(SCALE, device=device, dtype=torch.float64)
     src, waiting, exhausted = prepared(), None, False
@@ -444,7 +447,8 @@ def run_worker(events, device, out_path, tag=''):
     t_wall = time.time()
     while True:
         new = []
-        while not exhausted and len(active) + len(new) < EVENTS_PER_BATCH:
+        while not exhausted and (EVENTS_PER_BATCH is None
+                                 or len(active) + len(new) < EVENTS_PER_BATCH):
             if waiting is None:
                 waiting = next(src, None)
                 if waiting is None:
