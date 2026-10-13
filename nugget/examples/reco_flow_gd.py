@@ -47,8 +47,8 @@ LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 1
 # (LY PMTs + photons) cost far more than hit rows: they hold n_steps of double
 # backward. Lower the chunk sizes on OOM.
 EVENTS_PER_BATCH = 64
-MAX_FLOW_ROWS = 50_000
-MAX_HIT_ROWS = 2_000_000
+MAX_FLOW_ROWS = None
+MAX_HIT_ROWS = None
 FLOW_CHUNK_ROWS = 4096
 HIT_CHUNK_ROWS = 200_000
 EMPTY_CACHE = True             # torch.cuda.empty_cache() whenever events leave the batch
