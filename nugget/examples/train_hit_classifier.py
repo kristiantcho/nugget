@@ -4,14 +4,18 @@ import torch
 import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
-TRAIN_PARQUET = 'small_e_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_e_hit_v1R_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_e_hit_model_v1R.pt'
+# TRAIN_PARQUET = 'small_e_accepted.parquet'
+# TEST_PARQUET = './flow_models/mc_e_hit_v1R_test_samples.parquet'
+# CHECKPOINT = './flow_models/best_mc_e_hit_model_v1R.pt'
 
-EPOCHS = 500
+TRAIN_PARQUET = 'big_mu_accepted.parquet'
+TEST_PARQUET = './flow_models/mc_muon_hit_v1R_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_muon_hit_model_v1R.pt'
+
+EPOCHS = 700
 
 hit = nugget.surrogates.HitClassifier.HitClassifier(
-    device='cuda:3',
+    device='cuda:1',
     domain_size=20000,
     dim=3,
 
@@ -32,8 +36,8 @@ hit = nugget.surrogates.HitClassifier.HitClassifier(
     rich_rel_pos_mode=True,
     include_vertex_position=False,
     add_vertex_distance=False,
-    add_distance_from_beam=False,
-    add_dist_long=False,
+    add_distance_from_beam=True,
+    add_dist_long=True,
     track_dir_is_arrival=True,
     add_pmt_direction=True,
     add_pmt_cosangle=True,
@@ -55,7 +59,7 @@ train_dataloader = hit.create_hit_parquet_dataloader(
     importance_weight=True,
     n_energy_bins=20,
     n_coszen_bins=20,
-    n_mult_bins=25,
+    n_mult_bins=30,
     filter_vertex_in_domain=True,
     test_save_path=TEST_PARQUET,
     # event_frac=0.2,
@@ -74,7 +78,7 @@ val_dataloader = hit.create_hit_parquet_val_dataloader(
     importance_weight=True,
     n_energy_bins=20,
     n_coszen_bins=20,
-    n_mult_bins=25,
+    n_mult_bins=30,
     filter_vertex_in_domain=True,
 )
 
@@ -88,7 +92,7 @@ history = hit.train_with_dataloader(
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_e_hit_v1R_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_muon_hit_v1R_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------

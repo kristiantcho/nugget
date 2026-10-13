@@ -13,8 +13,9 @@ from nugget.surrogates.FlowMatchLY import FlowMatchLY
 from nugget.surrogates.FlowMatchATime import FlowMatchATime, _times_to_flat
 from nugget.utils.parquet_io import list_events, read_parquet_columns
 
-DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-PARQUET = './flow_models/mc_atime_muon_flow_v1r_test_samples.parquet'  # events held out from the models' training
+DEVICE = 'cuda:1' if torch.cuda.is_available() else 'cpu'
+# PARQUET = './flow_models/mc_atime_muon_flow_v1r_test_samples.parquet'  # events held out from the models' training
+PARQUET = './big_mu_accepted.parquet'  # events held out from the models' training
 GEOM = '../other/800_40_40_geom.csv'
 HIT_CKPT = './flow_models/best_mc_hit_model_v1r.pt'
 LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1r.pt'
@@ -23,22 +24,22 @@ OUT = './reco/gd_reco_v1r.parquet'                  # .parquet or .csv
 
 N_EVENTS = 20000                 # random events drawn from PARQUET
 EVENT_SEED = 0
-MIN_HIT_PMTS = 5               # skip events with fewer lit PMTs
+MIN_HIT_PMTS = None               # skip events with fewer lit PMTs
 FILTER_VERTEX_IN_DOMAIN = True # skip vertices outside the models' training domain
 TERMS = ('hit', 'ly', 'atime') # 'atime' is dropped automatically if the file has no times
 
 # likelihood
 # None in any of these three uses every measurement
-N_PH_FIT = 500                 # fixed random photon subset per event, reweighted
-MAX_LY_PMTS = 2000             # fixed random subset of lit PMTs in the LY term, reweighted
-HIT_RADIUS = 150.0             # unhit PMTs within this of a hit OM enter the hit term [m];
+N_PH_FIT = None                 # fixed random photon subset per event, reweighted
+MAX_LY_PMTS = None             # fixed random subset of lit PMTs in the LY term, reweighted
+HIT_RADIUS = 200            # unhit PMTs within this of a hit OM enter the hit term [m];
                                # None puts the whole geometry in the hit term
 N_STEPS_FIT = 8                # ODE steps per flow evaluation
 LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 10 us
 
 # start point and optimiser. Parameters: x, y, z [m], zenith, azimuth [rad, parquet
 # convention], log10 E/GeV, t0 [ns, vertex time on a clock zeroed at the first hit]
-START = 'perturbed'            # 'truth' or 'perturbed' (truth + SCALE * N(0, 1))
+START = 'truth'            # 'truth' or 'perturbed' (truth + SCALE * N(0, 1))
 PARAMS = ['x', 'y', 'z', 'zenith', 'azimuth', 'log10E', 't0']
 SCALE = np.array([20.0, 20.0, 20.0, np.radians(5), np.radians(5), 0.3, 20.0])
 LR = 0.05                      # Adam step in units of SCALE
