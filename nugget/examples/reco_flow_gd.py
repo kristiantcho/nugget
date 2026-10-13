@@ -42,11 +42,15 @@ N_STEPS_FIT = 8                # ODE steps per flow evaluation
 LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 10 us
 
 # batching: events are added to a batch while both row budgets hold (an event that
-# alone exceeds them runs on its own). Flow rows (LY PMTs + photons) cost far more
-# than hit rows: they hold n_steps of double backward. Lower these on OOM.
+# alone exceeds them runs on its own). The budgets only set throughput: the gradient
+# is accumulated over row chunks, so peak memory is set by the chunk sizes. Flow rows
+# (LY PMTs + photons) cost far more than hit rows: they hold n_steps of double
+# backward. Lower the chunk sizes on OOM.
 EVENTS_PER_BATCH = 64
-MAX_FLOW_ROWS = 20_000
+MAX_FLOW_ROWS = 50_000
 MAX_HIT_ROWS = 2_000_000
+FLOW_CHUNK_ROWS = 4096
+HIT_CHUNK_ROWS = 200_000
 EMPTY_CACHE = True             # torch.cuda.empty_cache() whenever events leave the batch
 
 # start point and optimiser. Parameters: x, y, z [m], zenith, azimuth [rad, parquet
@@ -212,36 +216,71 @@ def build_batch(ds, device):
     return b
 
 
-def nll_batch(th, b, models, terms, differentiable=True):
-    """th (B, 7) = [x, y, z, zenith, azimuth, log10 E, t0] per event -> (B,) -log L."""
+def _chunks(b, terms):
+    """(term, row slice) pairs covering every row of every term in the batch."""
+    for term, key, size in (('hit', 'h', HIT_CHUNK_ROWS), ('ly', 'l', FLOW_CHUNK_ROWS),
+                            ('atime', 'a', FLOW_CHUNK_ROWS)):
+        if term in terms and 'i_' + key in b:
+            n = len(b['i_' + key])
+            for s in range(0, n, size):
+                yield term, slice(s, min(s + size, n))
+
+
+def _term_ll(term, th, b, models, sl, differentiable):
+    """Weighted log-likelihood of rows sl of one term, and each row's event index.
+    th (B, 7) = [x, y, z, zenith, azimuth, log10 E, t0] per event."""
     hit, ly, flow = models
-    out = torch.zeros(b['B'], dtype=torch.float64, device=th.device)
 
     def ctx(m, P, D, t):
         return m.build_context(P, t[:, :3], 10.0 ** t[:, 5], t[:, 3], t[:, 4],
                                pmt_directions=D)
 
-    if 'hit' in terms:
-        t = th[b['i_h']]
-        lp1, lp0 = hit.log_prob_hit(ctx(hit, b['P_h'], b['D_h'], t), calibrated=True)
-        out = out.index_add(0, b['i_h'],
-                            (b['y_h'] * lp1 + (1 - b['y_h']) * lp0).to(out.dtype))
-    if 'ly' in terms:
-        t = th[b['i_l']]
-        lp = ly.log_prob_z(b['z_l'], ctx(ly, b['P_l'], b['D_l'], t), n_steps=N_STEPS_FIT,
-                           differentiable=differentiable)
-        out = out.index_add(0, b['i_l'], b['w_l'][b['i_l']] * lp.to(out.dtype))
-    if 'atime' in terms:
-        t = th[b['i_a']]
-        tg = flow.geometric_time(b['P_a'], t[:, :3], zeniths=t[:, 3],
-                                 azimuths=t[:, 4]).reshape(-1)
-        lp = flow.log_prob_time_residual(b['t_rel'] - t[:, 6] - tg,
-                                         ctx(flow, b['P_a'], b['D_a'], t),
-                                         n_steps=N_STEPS_FIT,
-                                         differentiable=differentiable)
-        lp = torch.logaddexp(lp, torch.full_like(lp, LOG_FLOOR))
-        out = out.index_add(0, b['i_a'], b['w_a'][b['i_a']] * lp.to(out.dtype))
-    return -out
+    if term == 'hit':
+        idx = b['i_h'][sl]
+        y = b['y_h'][sl]
+        lp1, lp0 = hit.log_prob_hit(ctx(hit, b['P_h'][sl], b['D_h'][sl], th[idx]),
+                                    calibrated=True)
+        return (y * lp1 + (1 - y) * lp0).double(), idx
+    if term == 'ly':
+        idx = b['i_l'][sl]
+        lp = ly.log_prob_z(b['z_l'][sl], ctx(ly, b['P_l'][sl], b['D_l'][sl], th[idx]),
+                           n_steps=N_STEPS_FIT, differentiable=differentiable)
+        return b['w_l'][idx] * lp.double(), idx
+    idx = b['i_a'][sl]
+    t = th[idx]
+    tg = flow.geometric_time(b['P_a'][sl], t[:, :3], zeniths=t[:, 3],
+                             azimuths=t[:, 4]).reshape(-1)
+    lp = flow.log_prob_time_residual(b['t_rel'][sl] - t[:, 6] - tg,
+                                     ctx(flow, b['P_a'][sl], b['D_a'][sl], t),
+                                     n_steps=N_STEPS_FIT, differentiable=differentiable)
+    lp = torch.logaddexp(lp, torch.full_like(lp, LOG_FLOOR))
+    return b['w_a'][idx] * lp.double(), idx
+
+
+def nll_batch(th, b, models, terms):
+    """(B,) -log L at th (B, 7), no gradient."""
+    out = torch.zeros(b['B'], dtype=torch.float64, device=th.device)
+    for term, sl in _chunks(b, terms):
+        ll, idx = _term_ll(term, th, b, models, sl, differentiable=False)
+        out.index_add_(0, idx, -ll.detach())
+    return out
+
+
+def nll_and_grad(th0, u, S, b, models, terms):
+    """(B,) -log L at th = th0 + S u and its gradient w.r.t. u (B, 7). The NLL is a
+    sum over rows, so the gradient is accumulated chunk by chunk and each chunk's
+    graph is freed before the next: peak memory is set by the chunk size."""
+    vals = torch.zeros(b['B'], dtype=torch.float64, device=u.device)
+    grad = torch.zeros_like(u)
+    for term, sl in _chunks(b, terms):
+        uu = u.detach().requires_grad_(True)
+        ll, idx = _term_ll(term, th0 + S * uu, b, models, sl, differentiable=True)
+        part = torch.zeros_like(vals).index_add(0, idx, -ll)
+        vals += part.detach()
+        # a non-finite event ends its own fit; keep it out of the others' gradients
+        g, = torch.autograd.grad(torch.where(torch.isfinite(part), part, 0.0).sum(), uu)
+        grad += g
+    return vals, grad
 
 
 # per-event optimiser state, one row per active event
@@ -318,8 +357,8 @@ def _finish(entries, s, idx, reason, models, terms, device):
     """Result rows for the events at positions idx of the active batch."""
     sub = [entries[j] for j in idx]
     truth = torch.as_tensor(np.stack([e['d']['truth'] for e in sub]), device=device)
-    nll_true = nll_batch(truth, build_batch([e['d'] for e in sub], device), models, terms,
-                         differentiable=False).detach().cpu().numpy()
+    nll_true = nll_batch(truth, build_batch([e['d'] for e in sub], device), models,
+                         terms).cpu().numpy()
     S = torch.as_tensor(SCALE, device=device, dtype=torch.float64)
     th_best = (s['th0'][idx] + S * s['best_u'][idx]).detach().cpu().numpy()
     rows = []
@@ -425,12 +464,9 @@ def run_worker(events, device, out_path, tag=''):
             batch = build_batch([e['d'] for e in active], device)
 
         t_it = time.time()
-        u = state['u'].detach().requires_grad_(True)
-        loss = nll_batch(state['th0'] + S * u, batch, models, terms)
-        vals = loss.detach().cpu().numpy()
+        vals, grad = nll_and_grad(state['th0'], state['u'], S, batch, models, terms)
+        vals = vals.cpu().numpy()
         ok = np.isfinite(vals)
-        grad, = torch.autograd.grad(loss[torch.as_tensor(ok, device=loss.device)].sum(), u)
-        state['u'] = u.detach()
         reason = _step(state, vals, ok, grad)
         state['sec'] = state['sec'] + (time.time() - t_it) / len(active)
 
@@ -451,7 +487,7 @@ def run_worker(events, device, out_path, tag=''):
             state = _keep_state(state, keep) if active else None
             batch = None
             if EMPTY_CACHE and device.startswith('cuda'):
-                del loss, grad, u              # drop the last graph before freeing
+                del grad
                 torch.cuda.empty_cache()
 
     _save(rows, out_path)
