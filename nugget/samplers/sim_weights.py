@@ -1,6 +1,8 @@
 import math
 import torch
-from nugget.losses.effective_area import neutrino_effective_area, projected_area
+
+# nugget.losses.effective_area is imported inside the functions that use it: importing it here
+# loads nugget.losses, whose analysis_loss imports this module again before it has finished loading.
 
 M2_TO_CM2 = 1e4
 
@@ -54,6 +56,7 @@ def direction_pdf(cos_zenith, cyl_radius, cyl_height, cos_range=(-1.0, 1.0), dir
         d_theta = torch.acos(c_lo) - torch.acos(c_hi)
         return 1.0 / (2 * math.pi * d_theta * torch.sqrt(1 - cos_zenith ** 2))
     if direction_dist == 'projected_area':
+        from nugget.losses.effective_area import projected_area
         norm = 2 * math.pi * (_proj_area_antiderivative(c_hi, cyl_radius, cyl_height)
                               - _proj_area_antiderivative(c_lo, cyl_radius, cyl_height))
         return projected_area(cos_zenith, cyl_radius, cyl_height) / norm
@@ -83,6 +86,8 @@ def get_simulation_weights(
     cos_zenith is in the arrival convention (see event_arrays). cyl_radius/cyl_height may carry gradients.
     returns a (N,) tensor of weights, with the same dtype and device as energy. n_gen is the number of generated events.
     """
+    from nugget.losses.effective_area import neutrino_effective_area
+
     n_gen = energy.numel() if n_gen is None else n_gen
     a_eff = neutrino_effective_area(
         cos_zenith, energy, cyl_radius, cyl_height, xsec, transmission,
