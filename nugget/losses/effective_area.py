@@ -115,155 +115,6 @@ def _extract_energy_and_cos_zenith_batch(event_params_batch, device, dtype):
 
     raise TypeError("event_params_batch must be a dict or a list/tuple of dicts")
 
-
-def neutrino_effective_area_many(
-    cos_theta,
-    energy,
-    cyl_radius,
-    cyl_height,
-    xsec,
-    transmission,
-    flavor="numu",
-    average_nu_nubar=True,
-    *,
-    include_projected_area: bool = True,
-):
-    """Calculate neutrino effective area for many events in a single batched call.
-
-    If ``include_projected_area`` is False, the projected-area factor is omitted
-    (treated as 1) and only ``transmission * interaction_prob`` is returned.
-    """
-    if not isinstance(cos_theta, torch.Tensor):
-        cos_theta = torch.as_tensor(cos_theta)
-    if not isinstance(energy, torch.Tensor):
-        energy = torch.as_tensor(energy, device=cos_theta.device, dtype=cos_theta.dtype)
-    else:
-        energy = energy.to(device=cos_theta.device, dtype=cos_theta.dtype)
-
-    tprob = transmission(cos_theta, energy, flavor=flavor)
-    if not isinstance(tprob, torch.Tensor):
-        tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
-
-    number_density = 33.3679E21  # 1/cm^-3
-    nucleon_density = 18 * number_density
-
-    chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2
-
-    def _int_prob(which, extend_range=False):
-        chord_len_local = chord_len
-        if extend_range:
-            mean_e_mu = xsec.mean_e_lep(energy, which=which)
-            mu_ext = torch.as_tensor(muon_range(mean_e_mu), device=chord_len_local.device, dtype=chord_len_local.dtype)
-            chord_len_local = chord_len_local + mu_ext * 1e2
-
-        lamb = 1 / (xsec.total_xsec(energy, which) * nucleon_density)
-        lamb = torch.as_tensor(lamb, device=chord_len_local.device, dtype=chord_len_local.dtype)
-        return 1 - torch.exp(-chord_len_local / lamb)
-
-    factor = 0.5 if average_nu_nubar else 1.0
-    int_prob_cc = factor * (
-        _int_prob("CC_nu", extend_range=flavor == "numu")
-        + _int_prob("CC_nubar", extend_range=flavor == "numu")
-    )
-    int_prob_nc = factor * (_int_prob("NC_nu") + _int_prob("NC_nubar"))
-    int_prob = int_prob_cc + int_prob_nc
-
-    if not include_projected_area:
-        proj_a = 1.0
-    else:
-        proj_a = projected_area(cos_theta, cyl_radius, cyl_height)
-
-    return tprob * int_prob * proj_a
-
-def cyl_volume(cyl_radius, cyl_height):
-    """Calculate cylinder volume"""
-    return np.pi*cyl_radius**2*cyl_height
-
-
-def interaction_prob(
-    cos_theta,
-    energy,
-    cyl_radius,
-    cyl_height,
-    xsec,
-    which="CC_nu",
-    extend_range=False,
-):
-    """
-    Calculate neutrino interaction probability.
-
-    Parameters:
-    -----------
-    - cos_theta
-    - energy
-    - cyl_radius
-
-    """
-    number_density = 33.3679E21 # 1/cm^-3
-    nucleon_density = 18 * number_density
-
-    chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2  # cm
-
-    if extend_range:
-        #extend by muon range
-        #get muon energy
-        mean_e_mu = xsec.mean_e_lep(energy, which=which)
-
-        mu_ext = torch.as_tensor(muon_range(mean_e_mu), device=chord_len.device, dtype=chord_len.dtype)
-        chord_len += mu_ext * 1E2
-
-    lamb = 1 / (xsec.total_xsec(energy, which) * nucleon_density)
-    lamb = torch.as_tensor(lamb, device=chord_len.device, dtype=chord_len.dtype)
-
-    return 1- torch.exp(-chord_len / lamb)
-
-def neutrino_effective_area(
-    cos_theta,
-    energy,
-    cyl_radius,
-    cyl_height,
-    xsec,
-    transmission,
-    flavor="numu",
-    average_nu_nubar=True,
-    *,
-    include_projected_area: bool = True,
-):
-    """Calculate neutrino effective area.
-
-    If ``include_projected_area`` is False, the projected-area factor is omitted
-    (treated as 1) and only ``transmission * interaction_prob`` is returned.
-    """
-
-    tprob = transmission(cos_theta, energy, flavor=flavor)
-    # Convert transmission probability to torch tensor if needed
-    if not isinstance(tprob, torch.Tensor):
-        if isinstance(cos_theta, torch.Tensor):
-            tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
-        else:
-            tprob = torch.as_tensor(tprob, dtype=torch.float64)
-
-    if average_nu_nubar:
-        factor = 0.5
-    else:
-        factor = 1
-
-    int_prob_CC = factor * (
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nu", extend_range=flavor=="numu") +
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nubar", extend_range=flavor=="numu")
-    )
-    int_prob_NC = factor * (
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nu") +
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nubar")
-    )
-    int_prob = int_prob_CC + int_prob_NC
-    if not include_projected_area:
-        proj_a = 1.0
-    else:
-        proj_a = projected_area(cos_theta, cyl_radius, cyl_height)
-
-    return tprob * int_prob * proj_a
-
 class CrossSection:
     """
     DIS Cross Section
@@ -654,6 +505,159 @@ def get_weighted_min_enclosing_circle(
 
     radius = torch.mean(per_direction_radius)
     return center_xy, radius
+
+def neutrino_effective_area_many(
+    cos_theta,
+    energy,
+    cyl_radius,
+    cyl_height,
+    xsec,
+    transmission,
+    flavor="numu",
+    average_nu_nubar=True,
+    *,
+    include_projected_area: bool = True,
+):
+    """Calculate neutrino effective area for many events in a single batched call.
+
+    If ``include_projected_area`` is False, the projected-area factor is omitted
+    (treated as 1) and only ``transmission * interaction_prob`` is returned.
+    """
+    if not isinstance(cos_theta, torch.Tensor):
+        cos_theta = torch.as_tensor(cos_theta)
+    if not isinstance(energy, torch.Tensor):
+        energy = torch.as_tensor(energy, device=cos_theta.device, dtype=cos_theta.dtype)
+    else:
+        energy = energy.to(device=cos_theta.device, dtype=cos_theta.dtype)
+
+    tprob = transmission(cos_theta, energy, flavor=flavor)
+    if not isinstance(tprob, torch.Tensor):
+        tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
+
+    number_density = 33.3679E21  # 1/cm^-3
+    nucleon_density = 18 * number_density
+
+    chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2
+
+    def _int_prob(which, extend_range=False):
+        chord_len_local = chord_len
+        if extend_range:
+            mean_e_mu = xsec.mean_e_lep(energy, which=which)
+            mu_ext = torch.as_tensor(muon_range(mean_e_mu), device=chord_len_local.device, dtype=chord_len_local.dtype)
+            chord_len_local = chord_len_local + mu_ext * 1e2
+
+        lamb = 1 / (xsec.total_xsec(energy, which) * nucleon_density)
+        lamb = torch.as_tensor(lamb, device=chord_len_local.device, dtype=chord_len_local.dtype)
+        return 1 - torch.exp(-chord_len_local / lamb)
+
+    factor = 0.5 if average_nu_nubar else 1.0
+    int_prob_cc = factor * (
+        _int_prob("CC_nu", extend_range=flavor == "numu")
+        + _int_prob("CC_nubar", extend_range=flavor == "numu")
+    )
+    int_prob_nc = factor * (_int_prob("NC_nu") + _int_prob("NC_nubar"))
+    int_prob = int_prob_cc + int_prob_nc
+
+    if not include_projected_area:
+        proj_a = 1.0
+    else:
+        proj_a = projected_area(cos_theta, cyl_radius, cyl_height)
+
+    return tprob * int_prob * proj_a
+
+def cyl_volume(cyl_radius, cyl_height):
+    """Calculate cylinder volume"""
+    return np.pi*cyl_radius**2*cyl_height
+
+
+def interaction_prob(
+    cos_theta,
+    energy,
+    cyl_radius,
+    cyl_height,
+    xsec,
+    which="CC_nu",
+    extend_range=False,
+):
+    """
+    Calculate neutrino interaction probability.
+
+    Parameters:
+    -----------
+    - cos_theta
+    - energy
+    - cyl_radius
+
+    """
+    number_density = 33.3679E21 # 1/cm^-3
+    nucleon_density = 18 * number_density
+
+    chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2  # cm
+
+    if extend_range:
+        #extend by muon range
+        #get muon energy
+        mean_e_mu = xsec.mean_e_lep(energy, which=which)
+
+        mu_ext = torch.as_tensor(muon_range(mean_e_mu), device=chord_len.device, dtype=chord_len.dtype)
+        chord_len += mu_ext * 1E2
+
+    lamb = 1 / (xsec.total_xsec(energy, which) * nucleon_density)
+    lamb = torch.as_tensor(lamb, device=chord_len.device, dtype=chord_len.dtype)
+
+    return 1- torch.exp(-chord_len / lamb)
+
+def neutrino_effective_area(
+    cos_theta,
+    energy,
+    cyl_radius,
+    cyl_height,
+    xsec = None,
+    transmission=None,
+    flavor="numu",
+    average_nu_nubar=True,
+    *,
+    include_projected_area: bool = True,
+):
+    """Calculate neutrino effective area.
+
+    If ``include_projected_area`` is False, the projected-area factor is omitted
+    (treated as 1) and only ``transmission * interaction_prob`` is returned.
+    """
+    if xsec is None:
+        xsec = CrossSection()
+    if transmission is None:
+        transmission = TransmissionProb()
+    tprob = transmission(cos_theta, energy, flavor=flavor)
+    # Convert transmission probability to torch tensor if needed
+    if not isinstance(tprob, torch.Tensor):
+        if isinstance(cos_theta, torch.Tensor):
+            tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
+        else:
+            tprob = torch.as_tensor(tprob, dtype=torch.float64)
+
+    if average_nu_nubar:
+        factor = 0.5
+    else:
+        factor = 1
+
+    int_prob_CC = factor * (
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nu", extend_range=flavor=="numu") +
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nubar", extend_range=flavor=="numu")
+    )
+    int_prob_NC = factor * (
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nu") +
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nubar")
+    )
+    int_prob = int_prob_CC + int_prob_NC
+    if not include_projected_area:
+        proj_a = 1.0
+    else:
+        proj_a = projected_area(cos_theta, cyl_radius, cyl_height)
+
+    return tprob * int_prob * proj_a
+
+
 
 
 class EffectiveAreaLoss(LossFunction):
