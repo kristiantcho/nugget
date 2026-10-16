@@ -80,8 +80,15 @@ def configure_jax(preallocate=False, mem_fraction=None, x64=True, platform=None,
         jax.config.update("jax_enable_x64", True)
 
     if device is not None:
-        # Once restricted, the requested GPU is the only one JAX lists.
-        target = jax.devices("cuda")[0] if restricted and not already else _select_device(jax, device)
+        gpus = jax.devices("cuda") if gpu_index is not None else []
+        if restricted and len(gpus) == 1:
+            target = gpus[0]  # the restriction worked: the requested GPU is the only one JAX lists
+        else:
+            if restricted:
+                print(f"jax_bridge.configure_jax: JAX still sees {len(gpus)} GPUs, so this JAX "
+                      "version ignores JAX_CUDA_VISIBLE_DEVICES. Set CUDA_VISIBLE_DEVICES "
+                      "before importing torch or JAX to keep it off the other GPUs.")
+            target = _select_device(jax, device)
         jax.config.update("jax_default_device", target)
         if verbose:
             print(f"jax_bridge: JAX default device is {target}")
