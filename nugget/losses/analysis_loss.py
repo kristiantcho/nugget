@@ -172,6 +172,7 @@ class AnalysisLoss(LossFunction):
             'analysis_param_names': param_names,
             'analysis_bin_edges': bin_edges,
             'energy_resolution_per_event' if binning_var_name == 'energy' else 'angular_resolution_per_event': resolutions,
+            'energy_resolution_units': 'log10',  # sigma of log10(E); read by the visualizer's energy_resolution panel
             'detector_efficiency_per_event': detector_effs,
             'selection_efficiency_per_event': selection,
             'analysis_replay': replay,
