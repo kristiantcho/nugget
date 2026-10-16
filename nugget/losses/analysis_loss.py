@@ -54,6 +54,9 @@ class AnalysisLoss(LossFunction):
         grad_weights           = kwargs.get('analysis_grad_flux_weights', None) # :Dict[str, Tensor (N,)]
         live_time              = kwargs.get('live_time', 1.0) # :float, seconds
         perfect_efficiency     = kwargs.get('analysis_perfect_efficiency', False) # :bool, every event detected; skips the trigger
+        energy_res_selection   = kwargs.get('analysis_energy_res_selection', False) # :bool, soft cut on sigma_E / E
+        energy_res_threshold   = kwargs.get('analysis_energy_res_threshold', 1.0) # :float, sigma_E / E where the selection weight is 0.5
+        energy_res_softness    = kwargs.get('analysis_energy_res_softness', 0.1) # :float, width of the cut in ln(sigma_E / E)
         param_overrides        = kwargs.get('analysis_param_overrides', None) # :Dict
         dataset_name           = kwargs.get('analysis_dataset_name', None) # :str
 
@@ -133,10 +136,17 @@ class AnalysisLoss(LossFunction):
         # A singular per-event Fisher gives NaN/inf; such events are smeared out of every bin.
         resolutions = torch.nan_to_num(resolutions, nan=1e3, posinf=1e3).clamp_min(1e-6)
 
-        # could still add selection efficiency here later
+        selection = torch.ones_like(detector_effs)
+        if energy_res_selection:
+            if 'energy_resolution_per_event' not in res_loss_stuff:
+                raise ValueError("analysis_energy_res_selection needs an energy resolution loss (analysis_binning_var_name='energy')")
+            rel_res = res_loss_stuff['energy_resolution_per_event'].reshape(-1) / ev['energy']
+            # A singular per-event Fisher (NaN/inf) counts as unresolved and is cut.
+            rel_res = torch.nan_to_num(rel_res, nan=1e6, posinf=1e6).clamp_min(1e-12)
+            selection = torch.sigmoid((math.log(energy_res_threshold) - torch.log(rel_res)) / energy_res_softness)
 
-        # w_i and dw_i/dphi_j; the flux gradients are constants, geometry enters via sim weights, efficiency and resolution
-        acceptance = live_time * sim_weights * detector_effs
+        # w_i and dw_i/dphi_j; the flux gradients are constants, geometry enters via sim weights, efficiency, selection and resolution
+        acceptance = live_time * sim_weights * detector_effs * selection
         total_weights = acceptance * flux_weights
         param_names = list(grad_weights)
         grad_total_weights = torch.stack([grad_weights[k] for k in param_names]) * acceptance  # (n_params, N)
@@ -163,6 +173,7 @@ class AnalysisLoss(LossFunction):
             'analysis_bin_edges': bin_edges,
             'energy_resolution_per_event' if binning_var_name == 'energy' else 'angular_resolution_per_event': resolutions,
             'detector_efficiency_per_event': detector_effs,
+            'selection_efficiency_per_event': selection,
             'analysis_replay': replay,
         }
 
