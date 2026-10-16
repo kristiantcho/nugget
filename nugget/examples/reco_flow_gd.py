@@ -50,7 +50,7 @@ LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 1
 EVENTS_PER_BATCH = 64
 MAX_FLOW_ROWS = None
 MAX_HIT_ROWS = None
-FLOW_CHUNK_ROWS = 4096
+FLOW_CHUNK_ROWS = 10000
 HIT_CHUNK_ROWS = 200_000
 EMPTY_CACHE = True             # torch.cuda.empty_cache() whenever events leave the batch
 
@@ -483,7 +483,7 @@ def run_worker(events, device, out_path, tag=''):
                       f'{r["dpsi_start"]:.2f} -> {r["dpsi_fit"]:.2f} deg, dvtx '
                       f'{r["dvertex_fit"]:.1f} m, dlogE {r["dlog10E_fit"]:+.3f} | NLL fit-truth '
                       f'{r["nll_fit"] - r["nll_true"]:+.2f} | best @ {r["best_iter"]}/'
-                      f'{r["n_iter"]} ({r["stop_reason"]})')
+                      f'{r["n_iter"]} ({r["stop_reason"]})', flush=True)
                 if len(rows) % SAVE_EVERY == 0:
                     _save(rows, out_path)
             keep = ~done
