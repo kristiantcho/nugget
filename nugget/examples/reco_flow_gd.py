@@ -1,5 +1,6 @@
 """Gradient-descent maximum-likelihood reconstruction of parquet events with the
 hit / light-yield / arrival-time flows. Saves truth, start and best fit per event.
+The events can also be re-simulated once in a new geometry (NEW_GEOMETRY).
 
 Events are fitted in batches on each GPU, and sharded over DEVICES (one process each);
 the shard files are merged into OUT and deleted at the end."""
@@ -24,13 +25,24 @@ GEOM = '../other/800_40_40_geom.csv'
 HIT_CKPT = './flow_models/best_mc_hit_model_v1r.pt'
 LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1r.pt'
 ATIME_CKPT = './flow_models/best_mc_atime_muon_flow_model_v1r.pt'
-OUT = './reco/gd_reco_v1r.parquet'                  # .parquet or .csv
+OUT = './reco/gd_reco_v1r_hex70.parquet'                  # .parquet or .csv
 
 N_EVENTS = 20000                 # random events drawn from PARQUET
 EVENT_SEED = 0
 MIN_HIT_PMTS = None               # skip events with fewer lit PMTs (None: no cut)
 FILTER_VERTEX_IN_DOMAIN = True # skip vertices outside the models' training domain
 TERMS = ('hit', 'ly', 'atime') # 'atime' is dropped automatically if the file has no times
+
+# None fits the parquet's own hits. Otherwise the same events (truth from PARQUET) are
+# simulated once with NuSmoothie in a new geometry and that response is fitted: a dict
+# of DynamicString kwargs, or a CSV with om_x/om_y/om_z. Every OM gets the 16-PMT
+# template of GEOM. The OM positions are saved next to OUT.
+# NEW_GEOMETRY = None
+NEW_GEOMETRY = dict(hex_type='hexagonal', domain_size=1600, n_strings=70,
+                    points_per_string=20, custom_z_spacing=50)
+RESPONSE_SEED = 0
+RESPONSE_EVENTS_PER_BATCH = 16  # events per NuSmoothie call (~ events x PMTs rows)
+RESPONSE_N_STEPS = 64           # ODE steps when sampling the response
 
 # likelihood
 # None in any of these three uses every measurement
@@ -50,7 +62,7 @@ LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 1
 EVENTS_PER_BATCH = 64
 MAX_FLOW_ROWS = None
 MAX_HIT_ROWS = None
-FLOW_CHUNK_ROWS = 10000
+FLOW_CHUNK_ROWS = 20000
 HIT_CHUNK_ROWS = 200_000
 EMPTY_CACHE = True             # torch.cuda.empty_cache() whenever events leave the batch
 
@@ -150,6 +162,63 @@ def load_events(events, terms):
     geo['_gidx'] = np.arange(len(geo))
     df = df.merge(geo[['string', 'om', 'pmt', '_gidx']], on=['string', 'om', 'pmt'])
     return df, flat, geo_pos, geo_dir, terms
+
+
+def new_geometry_positions():
+    """OM positions (N, 3) of NEW_GEOMETRY."""
+    if isinstance(NEW_GEOMETRY, dict):
+        from nugget.geometries.DynamicString import DynamicString
+        g = DynamicString(device='cpu', dim=3, **NEW_GEOMETRY)
+        return g.initialize_points()['points_3d'].detach().cpu().numpy().astype(np.float64)
+    om = pd.read_csv(NEW_GEOMETRY, usecols=['om_x', 'om_y', 'om_z']).drop_duplicates()
+    return om.to_numpy(np.float64)
+
+
+def simulate_events(events, models, om_pos, device):
+    """Sample the events' responses once with NuSmoothie at om_pos. Returns what
+    load_events does, with _gidx indexing the new geometry's PMTs (OM-major)."""
+    from nugget.surrogates.NuSmoothie import NuSmoothie
+    hit, ly, flow = models
+    cols = ['run_id', 'event_id', 'muon_x', 'muon_y', 'muon_z', 'neutrino_energy',
+            'zenith', 'azimuth']
+    truth = (read_parquet_columns(PARQUET, cols, events=events)
+             .groupby(['run_id', 'event_id'], sort=False).first().reset_index())
+
+    tmpl = NuSmoothie.pmt_directions_from_geometry(GEOM)            # (16, 3)
+    geo_pos = np.repeat(om_pos, len(tmpl), axis=0).astype(np.float32)
+    geo_dir = np.tile(tmpl, (len(om_pos), 1)).astype(np.float32)   # 'split' row order
+    smoothie = NuSmoothie(device=device, hit_model=hit, ly_model=ly, atime_model=flow,
+                          pmt_directions=tmpl, pmt_mode='split', patd_keys=('hit_times',),
+                          n_steps=RESPONSE_N_STEPS, verbose=False)
+    gen = torch.Generator(device=device).manual_seed(RESPONSE_SEED)
+    om_t = torch.as_tensor(om_pos, device=device)
+
+    # parquet angles are in the models' convention; NuSmoothie takes the travel direction
+    zen, azi = truth.zenith.to_numpy(float), truth.azimuth.to_numpy(float)
+    d = np.stack([np.sin(zen) * np.cos(azi), np.sin(zen) * np.sin(azi), np.cos(zen)], 1)
+    travel = -d if getattr(hit, 'track_dir_is_arrival', False) else d
+    params = [dict(position=r[['muon_x', 'muon_y', 'muon_z']].to_numpy(float),
+                   energy=float(r.neutrino_energy), direction=travel[i])
+              for i, (_, r) in enumerate(truth.iterrows())]
+
+    parts, times, n_flat = [], [], 0
+    for s in range(0, len(params), RESPONSE_EVENTS_PER_BATCH):
+        with torch.no_grad():
+            resp = smoothie.sample_response_batched(
+                om_t, params[s:s + RESPONSE_EVENTS_PER_BATCH], generator=gen)
+        cnt = resp['counts'].cpu().numpy().astype(np.int64)        # (B, n_pmts)
+        ev, row = np.nonzero(cnt)              # (event, PMT) order = photon order
+        n = cnt[ev, row]
+        p = truth.iloc[s + ev].reset_index(drop=True)
+        parts.append(p.assign(_gidx=row, _n=n, _start=n_flat + np.cumsum(n) - n))
+        times.append(resp['t_hit'].cpu().numpy().astype(np.float32))
+        n_flat += int(n.sum())
+    df = pd.concat(parts, ignore_index=True)
+    flat = np.concatenate(times) if times else np.empty(0, np.float32)
+    n_lit = df.groupby(['run_id', 'event_id']).ngroups if len(df) else 0
+    print(f'simulated {len(params)} events in {len(om_pos)} OMs x {len(tmpl)} PMTs: '
+          f'{len(params) - n_lit} left no hits and are dropped')
+    return df, flat, geo_pos, geo_dir, tuple(TERMS)
 
 
 def event_data(g, flat, geo_pos, geo_dir, tree, models, rng):
@@ -399,7 +468,7 @@ def _read(path):
     return pd.read_csv(path) if path.endswith('.csv') else pd.read_parquet(path)
 
 
-def run_worker(events, device, out_path, tag=''):
+def run_worker(events, device, out_path, tag='', om_pos=None):
     """Fit the given events on one device, in batches; writes rows to out_path."""
     if device.startswith('cuda'):
         torch.cuda.set_device(device)
@@ -412,7 +481,10 @@ def run_worker(events, device, out_path, tag=''):
         for p in m.net.parameters():
             p.requires_grad_(False)
 
-    df, flat, geo_pos, geo_dir, terms = load_events(events, TERMS)
+    if om_pos is None:
+        df, flat, geo_pos, geo_dir, terms = load_events(events, TERMS)
+    else:
+        df, flat, geo_pos, geo_dir, terms = simulate_events(events, models, om_pos, device)
     tree = cKDTree(geo_pos)
     half = _half_extent(hit.domain_size)
     groups = df.groupby(['run_id', 'event_id'], sort=False)
@@ -502,8 +574,8 @@ def run_worker(events, device, out_path, tag=''):
           f'({60 * len(rows) / max(wall, 1e-9):.1f} events/min); skipped {skipped}')
 
 
-def _worker(i, events, device, path):
-    run_worker(events, device, path, tag=f'[shard {i}] ')
+def _worker(i, events, device, path, om_pos):
+    run_worker(events, device, path, tag=f'[shard {i}] ', om_pos=om_pos)
 
 
 def _shard_path(i):
@@ -541,12 +613,20 @@ def summarize(res, wall=None):
 def main():
     t0 = time.time()
     events = sample_events()
+    om_pos = None
+    if NEW_GEOMETRY is not None:
+        om_pos = new_geometry_positions()
+        path = os.path.splitext(OUT)[0] + '.om_positions.npy'
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        np.save(path, om_pos)
+        print(f'new geometry: {len(om_pos)} OMs -> {path}')
     n = len(DEVICES)
     if n == 1:
-        run_worker(events, DEVICES[0], OUT)
+        run_worker(events, DEVICES[0], OUT, om_pos=om_pos)
     else:
         ctx = torch.multiprocessing.get_context('spawn')
-        procs = [ctx.Process(target=_worker, args=(i, events[i::n], dev, _shard_path(i)))
+        procs = [ctx.Process(target=_worker,
+                             args=(i, events[i::n], dev, _shard_path(i), om_pos))
                  for i, dev in enumerate(DEVICES)]
         for p in procs:
             p.start()
