@@ -25,9 +25,9 @@ GEOM = '../other/800_40_40_geom.csv'
 HIT_CKPT = './flow_models/best_mc_hit_model_v1r.pt'
 LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1r.pt'
 ATIME_CKPT = './flow_models/best_mc_atime_muon_flow_model_v1r.pt'
-OUT = './reco/gd_reco_v1r_hex70.parquet'                  # .parquet or .csv
+OUT = './reco/gd_reco_v1r_hex70_pert.parquet'                  # .parquet or .csv
 
-N_EVENTS = 20000                 # random events drawn from PARQUET
+N_EVENTS = 40000                 # random events drawn from PARQUET
 EVENT_SEED = 0
 MIN_HIT_PMTS = None               # skip events with fewer lit PMTs (None: no cut)
 FILTER_VERTEX_IN_DOMAIN = True # skip vertices outside the models' training domain
@@ -68,14 +68,15 @@ EMPTY_CACHE = True             # torch.cuda.empty_cache() whenever events leave 
 
 # start point and optimiser. Parameters: x, y, z [m], zenith, azimuth [rad, parquet
 # convention], log10 E/GeV, t0 [ns, vertex time on a clock zeroed at the first hit]
-START = 'truth'            # 'truth' or 'perturbed' (truth + SCALE * N(0, 1))
+START = 'perturbed'            # 'truth' or 'perturbed' (truth + SCALE * N(0, 1))
 PARAMS = ['x', 'y', 'z', 'zenith', 'azimuth', 'log10E', 't0']
 SCALE = np.array([20.0, 20.0, 20.0, np.radians(5), np.radians(5), 0.3, 20.0])
+PERT_SCALE = np.array([70.0, 70.0, 70.0, np.radians(10), np.radians(10), 1, 50.0])
 LR = 0.05                      # Adam step in units of SCALE
 BETAS, ADAM_EPS = (0.9, 0.999), 1e-8
 MAX_ITER = 1000
-LR_FACTOR, LR_PATIENCE = 0.5, 30   # per-event plateau LR decay (as ReduceLROnPlateau)
-PATIENCE = 100                 # stop after this many iterations without a MIN_DELTA gain
+LR_FACTOR, LR_PATIENCE = 0.5, 20   # per-event plateau LR decay (as ReduceLROnPlateau)
+PATIENCE = 200                 # stop after this many iterations without a MIN_DELTA gain
 MIN_DELTA = 1e-2               # NLL units
 MIN_LR = 1e-4
 WITHIN = 0.5                   # report iterations to get within this NLL of the best
@@ -503,7 +504,7 @@ def run_worker(events, device, out_path, tag='', om_pos=None):
                 continue
             rng = np.random.default_rng([EVENT_SEED, int(run), int(evt)])  # batch-independent
             d = event_data(g, flat, geo_pos, geo_dir, tree, models, rng)
-            start = d['truth'] + (SCALE * rng.standard_normal(len(SCALE))
+            start = d['truth'] + (PERT_SCALE * rng.standard_normal(len(SCALE))
                                   if START == 'perturbed' else 0.0)
             yield dict(run=run, evt=evt, d=d, start=start)
 
