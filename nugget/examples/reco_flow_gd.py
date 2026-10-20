@@ -72,6 +72,11 @@ START = 'perturbed'            # 'truth' or 'perturbed' (truth + SCALE * N(0, 1)
 PARAMS = ['x', 'y', 'z', 'zenith', 'azimuth', 'log10E', 't0']
 SCALE = np.array([20.0, 20.0, 20.0, np.radians(5), np.radians(5), 0.3, 20.0])
 PERT_SCALE = np.array([70.0, 70.0, 70.0, np.radians(10), np.radians(10), 1, 50.0])
+N_STARTS = 4                   # perturbed starts per event (START='perturbed'); the
+                               # lowest-NLL fit is kept
+# bounds: starts and every step are projected back inside them; None = unbounded
+LOG10E_BOUNDS = (2.0, 6.0)     # the models' training range (1e2 .. 1e6 GeV)
+BOUND_VERTEX = True            # keep the vertex inside the models' training domain
 LR = 0.05                      # Adam step in units of SCALE
 BETAS, ADAM_EPS = (0.9, 0.999), 1e-8
 MAX_ITER = 1000
@@ -425,6 +430,35 @@ def _step(s, vals, ok, grad):
     return reason
 
 
+def _bounds(half):
+    """(lo, hi) over the 7 parameters, +-inf where unbounded."""
+    lo, hi = np.full(len(PARAMS), -np.inf), np.full(len(PARAMS), np.inf)
+    if BOUND_VERTEX:
+        lo[:3], hi[:3] = -half, half
+    if LOG10E_BOUNDS is not None:
+        lo[5], hi[5] = LOG10E_BOUNDS
+    return lo, hi
+
+
+def _project(s, S, lo, hi):
+    """Clamp th = th0 + S u into [lo, hi], in place on u (projected gradient descent)."""
+    th = torch.minimum(torch.maximum(s['th0'] + S * s['u'], lo), hi)
+    s['u'] = (th - s['th0']) / S
+
+
+def _combine(rs, lo, hi):
+    """One row per event from its starts' rows: the lowest finite NLL wins."""
+    ok = [r for r in rs if np.isfinite(r['nll_fit'])] or rs
+    best = dict(min(ok, key=lambda r: r['nll_fit']))
+    nll = np.array([r['nll_fit'] for r in rs])
+    fit = np.array([best[f'fit_{p}'] for p in PARAMS])
+    best.update(n_starts=len(rs),
+                n_starts_within=int((nll <= best['nll_fit'] + WITHIN).sum()),
+                seconds=float(sum(r['seconds'] for r in rs)),
+                at_bound=bool((np.isclose(fit, lo) | np.isclose(fit, hi)).any()))
+    return best
+
+
 def _finish(entries, s, idx, reason, models, terms, device):
     """Result rows for the events at positions idx of the active batch."""
     sub = [entries[j] for j in idx]
@@ -440,7 +474,8 @@ def _finish(entries, s, idx, reason, models, terms, device):
         best = float(s['best'][j])
         th, tr = _canonical(th_best[k]), d['truth']
         rows.append(dict(
-            run_id=e['run'], event_id=e['evt'], n_hit_pmts=d['n_hit_pmts'],
+            run_id=e['run'], event_id=e['evt'], start_index=e['k'],
+            n_hit_pmts=d['n_hit_pmts'],
             n_photons=d['n_photons'], t_first=d['t_first'],
             **{f'true_{p}': v for p, v in zip(PARAMS, tr)},
             **{f'start_{p}': v for p, v in zip(PARAMS, _canonical(e['start']))},
@@ -492,6 +527,8 @@ def run_worker(events, device, out_path, tag='', om_pos=None):
     print(f'{tag}{groups.ngroups} events on {device}, terms {terms}, '
           f'atime particle_mode {flow.particle_mode}, start {START!r}')
     skipped = {'few_hits': 0, 'vertex_outside': 0}
+    lo, hi = _bounds(half)
+    n_starts = N_STARTS if START == 'perturbed' else 1
 
     def prepared():
         for (run, evt), g in groups:
@@ -504,9 +541,11 @@ def run_worker(events, device, out_path, tag='', om_pos=None):
                 continue
             rng = np.random.default_rng([EVENT_SEED, int(run), int(evt)])  # batch-independent
             d = event_data(g, flat, geo_pos, geo_dir, tree, models, rng)
-            start = d['truth'] + (PERT_SCALE * rng.standard_normal(len(SCALE))
-                                  if START == 'perturbed' else 0.0)
-            yield dict(run=run, evt=evt, d=d, start=start)
+            pert = (PERT_SCALE * rng.standard_normal((n_starts, len(SCALE)))
+                    if START == 'perturbed' else np.zeros((1, len(SCALE))))
+            for k in range(n_starts):       # the starts share d's tensors
+                yield dict(run=run, evt=evt, d=d, k=k,
+                           start=np.clip(d['truth'] + pert[k], lo, hi))
 
     def fits(entries, e):
         nf = sum(x['d']['n_flow_rows'] for x in entries) + e['d']['n_flow_rows']
@@ -515,8 +554,9 @@ def run_worker(events, device, out_path, tag='', om_pos=None):
                 and (MAX_HIT_ROWS is None or nh <= MAX_HIT_ROWS))
 
     S = torch.as_tensor(SCALE, device=device, dtype=torch.float64)
+    lo_t, hi_t = (torch.as_tensor(x, device=device, dtype=torch.float64) for x in (lo, hi))
     src, waiting, exhausted = prepared(), None, False
-    active, state, batch, rows = [], None, None, []
+    active, state, batch, rows, pending = [], None, None, [], {}
     t_wall = time.time()
     while True:
         new = []
@@ -545,18 +585,26 @@ def run_worker(events, device, out_path, tag='', om_pos=None):
         vals = vals.cpu().numpy()
         ok = np.isfinite(vals)
         reason = _step(state, vals, ok, grad)
+        _project(state, S, lo_t, hi_t)
         state['sec'] = state['sec'] + (time.time() - t_it) / len(active)
 
         done = reason != ''
         if done.any():
             for r in _finish(active, state, np.flatnonzero(done), reason, models, terms, device):
+                key = (r['run_id'], r['event_id'])
+                pending.setdefault(key, []).append(r)
+                if len(pending[key]) < n_starts:
+                    continue
+                r = _combine(pending.pop(key), lo, hi)
                 rows.append(r)
                 print(f'{tag}[{len(rows):5d}] {r["run_id"]}/{r["event_id"]}: '
                       f'{r["n_hit_pmts"]} PMTs, {r["n_photons"]} ph | dpsi '
                       f'{r["dpsi_start"]:.2f} -> {r["dpsi_fit"]:.2f} deg, dvtx '
                       f'{r["dvertex_fit"]:.1f} m, dlogE {r["dlog10E_fit"]:+.3f} | NLL fit-truth '
                       f'{r["nll_fit"] - r["nll_true"]:+.2f} | best @ {r["best_iter"]}/'
-                      f'{r["n_iter"]} ({r["stop_reason"]})', flush=True)
+                      f'{r["n_iter"]} ({r["stop_reason"]}) | start {r["start_index"]}, '
+                      f'{r["n_starts_within"]}/{n_starts} agree'
+                      f'{" | at bound" if r["at_bound"] else ""}', flush=True)
                 if len(rows) % SAVE_EVERY == 0:
                     _save(rows, out_path)
             keep = ~done
@@ -609,6 +657,12 @@ def summarize(res, wall=None):
           f'{(dn <= WITHIN).mean():.0%} of events (else the optimiser stopped short of the truth)')
     if START == 'perturbed':
         print(f'fit closer than start in direction: {(res.dpsi_fit < res.dpsi_start).mean():.0%}')
+    if 'n_starts' in res and res.n_starts.max() > 1:
+        print(f'starts within {WITHIN} NLL of the best: '
+              f'{res.n_starts_within.value_counts().sort_index().to_dict()} '
+              f'(of {res.n_starts.max()}; 1 = only one start found that minimum)')
+    if 'at_bound' in res:
+        print(f'best fit at a bound (vertex / energy): {res.at_bound.mean():.1%}')
 
 
 def main():
