@@ -27,13 +27,29 @@ def poisson_fisher_matrix(mu, grad_mu):
 
 
 class AnalysisLoss(LossFunction):
-    def __init__(self, trigger_loss=None, resolution_loss=None, xsec=None, transmission=None, device=None):
+    def __init__(self, trigger_loss=None, resolution_loss=None, xsec=None, transmission=None, device=None,
+                 energy_resolution_loss=None, angular_resolution_loss=None):
         super().__init__(device=device)
         self.trigger_loss = trigger_loss
-        self.resolution_loss = resolution_loss
+        # Keyed by resolution_type; missing ones default to WeightedResolutionLoss when first needed.
+        # resolution_loss (the older single-loss argument) fills the slot its resolution_type names.
+        self.resolution_losses = {}
+        for loss in (resolution_loss, energy_resolution_loss, angular_resolution_loss):
+            if loss is not None:
+                self.resolution_losses[loss.resolution_type] = loss
         # CrossSection() takes a while to build, so it is made once and kept.
         self.xsec = xsec
         self.transmission = transmission
+
+    def _resolution_per_event(self, kind, geom_dict, eff_kwargs, cache):
+        """(N,) per-event 'energy' (sigma_E, GeV) or 'angular' (rad) resolution, computed at most once per call."""
+        if kind not in cache:
+            if kind not in self.resolution_losses:
+                self.resolution_losses[kind] = WeightedResolutionLoss(
+                    device=self.device, resolution_type=kind, fisher_info_params=['energy', 'zenith', 'azimuth'])
+            out = self.resolution_losses[kind](geom_dict, **eff_kwargs)
+            cache[kind] = out[f'{kind}_resolution_per_event'].reshape(-1)
+        return cache[kind]
 
     def __call__(self, geom_dict, **kwargs):
         hists = self.histograms(geom_dict, **kwargs)
@@ -43,10 +59,10 @@ class AnalysisLoss(LossFunction):
 
     def histograms(self, geom_dict, **kwargs):
         """Additive part of the loss: expected counts mu (n_bins,) and dmu/dphi (n_params, n_bins) for one batch of events."""
-        binning_var_name       = kwargs.get('analysis_binning_var_name', 'energy') # :str, 'energy' or 'zenith'
+        binning_var_name       = kwargs.get('analysis_binning_var_name', 'energy') # :str or List[str], 'energy' / 'zenith' / ['energy', 'zenith'] (2D)
         num_events             = kwargs.get('num_events', 1) # :int
         signal_event_params    = kwargs.get('signal_event_params', None) # :List[Dict]
-        num_bins               = kwargs.get('analysis_num_bins', 50) # :int
+        num_bins               = kwargs.get('analysis_num_bins', 50) # :int, or List[int] per binning variable
         signal_sampler         = kwargs.get('signal_sampler', None) # :CylinderSampler
         sim_weight_kwargs      = kwargs.get('analysis_sim_weight_kwargs', {}) # :Dict, overrides for get_simulation_weights (e.g. geometry-dependent cyl_radius/cyl_height)
         sim_weights            = kwargs.get('analysis_sim_weights', None) # :Tensor (N,), for signal_event_params
@@ -59,6 +75,7 @@ class AnalysisLoss(LossFunction):
         energy_res_softness    = kwargs.get('analysis_energy_res_softness', 0.1) # :float, width of the cut in ln(sigma_E / E)
         param_overrides        = kwargs.get('analysis_param_overrides', None) # :Dict
         dataset_name           = kwargs.get('analysis_dataset_name', None) # :str
+        batched_sim_weights    = kwargs.get('analysis_batched_sim_weights', True) # :bool, sim weights are precomputed for the whole batch and must be sliced to the subsample
 
         friend_config       = kwargs.get('friend_config', None) # :str|dict
         pyff_config         = kwargs.get('pyff_config', None) # :str|dict
@@ -101,46 +118,47 @@ class AnalysisLoss(LossFunction):
             if self.transmission is None:
                 self.transmission = TransmissionProb()
             sim_weights = get_simulation_weights(ev['energy'], ev['cos_zenith'], xsec=self.xsec,
-                                                 transmission=self.transmission, **gen)
+                                                 transmission=self.transmission, batched=batched_sim_weights, **gen)
         if flux_weights is None or grad_weights is None:
             flux_weights, grad_weights = get_flux_weights(ev['energy'], ev['zenith'], ev['azimuth'],
                                                           friend_config, pyff_config, pid=weight_pid,
                                                           dataset=dataset_name, params=param_overrides, device=self.device)
 
-        # prepare the intermediate loss functions
-        if self.resolution_loss is None:
-            self.resolution_loss = WeightedResolutionLoss(device=self.device, 
-                                     resolution_type='energy' if binning_var_name=='energy' else 'angular',
-                                     fisher_info_params=['energy', 'zenith', 'azimuth'])
         if self.trigger_loss is None and not perfect_efficiency:
             self.trigger_loss = TriggerLoss(device=self.device)
-
-        res_loss_stuff = self.resolution_loss(geom_dict, **eff_kwargs)
         if perfect_efficiency:
             detector_effs = torch.ones_like(ev['energy'])
         else:
             detector_effs = self.trigger_loss(geom_dict, **eff_kwargs)['t_per_event'].reshape(-1)
 
-        # depending on the binning variable we bin in log10(E) or cos(zenith), with the resolution in the same units
-        if binning_var_name == 'energy':
-            E_min, E_max = gen.get('E_min', 1e2), gen.get('E_max', 1e8)
-            bin_edges = torch.linspace(math.log10(E_min), math.log10(E_max), num_bins + 1, device=self.device)
-            true_vals = torch.log10(ev['energy'])
-            resolutions = res_loss_stuff['energy_resolution_per_event'].reshape(-1) / (ev['energy'] * math.log(10))
-        else:
-            # cos_range is in the sampler's travel convention, the events are in the arrival one.
-            c_lo, c_hi = gen.get('cos_range', (-1.0, 1.0))
-            bin_edges = torch.linspace(-c_hi, -c_lo, num_bins + 1, device=self.device)
-            true_vals = ev['cos_zenith']
-            resolutions = res_loss_stuff['angular_resolution_per_event'].reshape(-1) * torch.sin(ev['zenith'])
+        # One histogram axis per binning variable: log10(E) smeared by the energy resolution and/or
+        # cos(zenith) smeared by the angular resolution, each in the units of its axis.
+        binning_vars = [binning_var_name] if isinstance(binning_var_name, str) else list(binning_var_name)
+        bins_per_var = [num_bins] * len(binning_vars) if isinstance(num_bins, int) else list(num_bins)
+        res_cache = {}
+        bin_edges, true_vals, widths = {}, [], []
+        for var, n in zip(binning_vars, bins_per_var):
+            if var == 'energy':
+                E_min, E_max = gen.get('E_min', 1e2), gen.get('E_max', 1e8)
+                bin_edges[var] = torch.linspace(math.log10(E_min), math.log10(E_max), n + 1, device=self.device)
+                true_vals.append(torch.log10(ev['energy']))
+                sigma_E = self._resolution_per_event('energy', geom_dict, eff_kwargs, res_cache)
+                widths.append(sigma_E / (ev['energy'] * math.log(10)))
+            elif var == 'zenith':
+                # cos_range is in the sampler's travel convention, the events are in the arrival one.
+                c_lo, c_hi = gen.get('cos_range', (-1.0, 1.0))
+                bin_edges[var] = torch.linspace(-c_hi, -c_lo, n + 1, device=self.device)
+                true_vals.append(ev['cos_zenith'])
+                sigma_psi = self._resolution_per_event('angular', geom_dict, eff_kwargs, res_cache)
+                widths.append(sigma_psi * torch.sin(ev['zenith']))
+            else:
+                raise ValueError(f"Unknown binning variable {var!r}; use 'energy' and/or 'zenith'")
         # A singular per-event Fisher gives NaN/inf; such events are smeared out of every bin.
-        resolutions = torch.nan_to_num(resolutions, nan=1e3, posinf=1e3).clamp_min(1e-6)
+        widths = [torch.nan_to_num(w, nan=1e3, posinf=1e3).clamp_min(1e-6) for w in widths]
 
         selection = torch.ones_like(detector_effs)
         if energy_res_selection:
-            if 'energy_resolution_per_event' not in res_loss_stuff:
-                raise ValueError("analysis_energy_res_selection needs an energy resolution loss (analysis_binning_var_name='energy')")
-            rel_res = res_loss_stuff['energy_resolution_per_event'].reshape(-1) / ev['energy']
+            rel_res = self._resolution_per_event('energy', geom_dict, eff_kwargs, res_cache) / ev['energy']
             # A singular per-event Fisher (NaN/inf) counts as unresolved and is cut.
             rel_res = torch.nan_to_num(rel_res, nan=1e6, posinf=1e6).clamp_min(1e-12)
             selection = torch.sigmoid((math.log(energy_res_threshold) - torch.log(rel_res)) / energy_res_softness)
@@ -151,7 +169,11 @@ class AnalysisLoss(LossFunction):
         param_names = list(grad_weights)
         grad_total_weights = torch.stack([grad_weights[k] for k in param_names]) * acceptance  # (n_params, N)
 
-        indicators = soft_bin_indicators(true_vals, bin_edges, resolutions)  # (N, n_bins)
+        # Joint bin membership is the product over axes, flattened row-major (first variable slowest).
+        indicators = None
+        for var, x, width in zip(binning_vars, true_vals, widths):
+            ind = soft_bin_indicators(x, bin_edges[var], width)                       # (N, n_var)
+            indicators = ind if indicators is None else (indicators.unsqueeze(2) * ind.unsqueeze(1)).reshape(len(x), -1)
         mu = total_weights @ indicators                                    # (n_bins,)
         grad_mu = grad_total_weights @ indicators                          # (n_params, n_bins)
 
@@ -166,17 +188,22 @@ class AnalysisLoss(LossFunction):
         if precomputed_sim_weights is not None:
             replay['analysis_sim_weights'] = precomputed_sim_weights
 
-        return {
+        out = {
             'analysis_mu': mu,
             'analysis_grad_mu': grad_mu,
             'analysis_param_names': param_names,
-            'analysis_bin_edges': bin_edges,
-            'energy_resolution_per_event' if binning_var_name == 'energy' else 'angular_resolution_per_event': resolutions,
-            'energy_resolution_units': 'log10',  # sigma of log10(E); read by the visualizer's energy_resolution panel
+            'analysis_bin_edges': bin_edges,  # {var: edges}
+            'analysis_hist_shape': tuple(len(bin_edges[var]) - 1 for var in binning_vars),  # mu is flattened from this
             'detector_efficiency_per_event': detector_effs,
             'selection_efficiency_per_event': selection,
             'analysis_replay': replay,
         }
+        if 'energy' in binning_vars:
+            out['energy_resolution_per_event'] = widths[binning_vars.index('energy')]
+            out['energy_resolution_units'] = 'log10'  # sigma of log10(E); read by the visualizer's energy panels
+        if 'angular' in res_cache:
+            out['angular_resolution_per_event'] = res_cache['angular']  # radians, as the visualizer's angular panels expect
+        return out
 
     def fisher_head(self, mu, grad_mu, param_names, **kwargs):
         """Nonlinear part of the loss: flux-parameter Fisher matrix from the (pooled) histograms, and the optimality criterion."""

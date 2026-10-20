@@ -80,16 +80,26 @@ def get_simulation_weights(
     n_gen=None,
     flavor='numu',
     average_nu_nubar=True,
+    batched=False,
 ):
     """Fluxless weight A_eff(E, cos; R, H) / (N_gen q(E) p(Omega)), in GeV cm^2 sr.
 
     cos_zenith is in the arrival convention (see event_arrays). cyl_radius/cyl_height may carry gradients.
     returns a (N,) tensor of weights, with the same dtype and device as energy. n_gen is the number of generated events.
+    batched=True uses neutrino_effective_area_many, which gives the same values.
     """
-    from nugget.losses.effective_area import neutrino_effective_area
+    from nugget.losses import effective_area as ea
 
     n_gen = energy.numel() if n_gen is None else n_gen
-    a_eff = neutrino_effective_area(
+    if batched:
+        # neutrino_effective_area_many computes the chord length once for all four interaction
+        # channels, but unlike neutrino_effective_area it has no defaults for xsec/transmission.
+        xsec = ea.CrossSection() if xsec is None else xsec
+        transmission = ea.TransmissionProb() if transmission is None else transmission
+        area_fn = ea.neutrino_effective_area_many
+    else:
+        area_fn = ea.neutrino_effective_area
+    a_eff = area_fn(
         cos_zenith, energy, cyl_radius, cyl_height, xsec, transmission,
         flavor=flavor, average_nu_nubar=average_nu_nubar,
     )
