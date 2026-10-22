@@ -340,6 +340,8 @@ class AnalysisAccumulator(GradientAccumulator):
         extras, pooled = {}, {}
         for k in range(self.repeats):
             params = self._repeat_params(loss_params, k)
+            # Fresh per batch and step, replayed in pass 2 so stochastic parts (e.g. photon draws) match.
+            params = {**params, 'accumulator_seed': int(torch.randint(0, 2 ** 31, (1,)).item())}
             out = self.loss_func.histograms(frozen, **params)
             if param_names is not None and out["analysis_param_names"] != param_names:
                 raise ValueError(f"Flux parameters differ between batches: {param_names} vs {out['analysis_param_names']}")

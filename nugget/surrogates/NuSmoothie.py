@@ -495,7 +495,7 @@ class NuSmoothie(Surrogate):
 
     def __call__(self, track_pos=None, track_dir=None, track_energy=None,
                  om_positions=None, test_points=None, pmt_directions=None,
-                 pmt_mode=None, sample=False, generator=None, grad=False, **kwargs):
+                 pmt_mode=None, sample=False, generator=None, grad=False, fast=None, **kwargs):
         """Expected photons at each position: pi(c) . E[q | c, q>=1].
 
         Mirrors LightSabre.__call__. With ``sample=True`` returns one Bernoulli x
@@ -519,17 +519,23 @@ class NuSmoothie(Surrogate):
         pts, dirs, group, n_out = self._resolve_points(om_positions,
                                                         pmt_directions, pmt_mode)
         q = self._light(self._contexts(pts, dirs, vertex, travel, energy),
-                        sample, generator, grad, **self._grad_kwargs(kwargs))
+                        sample, generator, grad, fast, **self._grad_kwargs(kwargs))
         if n_out != q.shape[0]:
             q = torch.zeros(n_out, dtype=q.dtype,
                             device=q.device).index_add_(0, group, q)
         return q
 
-    def _light_grad(self, ctxs, sample=False, generator=None, n_samples=None, n_steps=None,
+    def _light_fast(self, ctxs, sample=False, generator=None, n_samples=None, n_steps=None,
                     prune_below=None):
-        """Differentiable per-row photons: pi . E[q | hit], or with sample one hit x flow draw."""
+        """Per-row photons pi . E[q | hit] (or with sample one hit x flow draw) from a few flow draws.
+
+        Differentiable when grad is enabled. Uses grad_ly_samples / grad_n_steps and skips the flow for
+        PMTs with pi below ly_prune_below, so it is far cheaper than the graph-free _light estimator.
+        """
         n_samples = self.grad_ly_samples if n_samples is None else int(n_samples)
         prune_below = self.ly_prune_below if prune_below is None else float(prune_below)
+        # Same chunked call with or without a graph (checkpoint just runs under no_grad): pi, the pruning
+        # and so the order of the flow draws then match exactly between a graph-free and a gradient pass.
         p = self.hit_prob(ctxs['hit'], grad=True)
         # PMTs that are almost never hit add ~pi * E[q | hit] ~ 0; skipping their flow solve is most of the saving.
         idx = (p.detach() > prune_below).nonzero().squeeze(1)
@@ -547,13 +553,15 @@ class NuSmoothie(Surrogate):
             out = p * q
         return torch.nan_to_num(out, nan=0.0, posinf=self.poisson_rate_cap, neginf=0.0).clamp(min=0.0)
 
-    def _light(self, ctxs, sample=False, generator=None, grad=False, **grad_kwargs):
+    def _light(self, ctxs, sample=False, generator=None, grad=False, fast=None, **grad_kwargs):
         """Per-row photons: pi . E[q | hit], or one Bernoulli x flow draw if sample.
 
-        grad=True is the differentiable version (see _light_grad); the default is the graph-free one.
+        fast (default: grad) uses the _light_fast estimator, with a graph only if grad; otherwise the
+        graph-free full-precision one (ly_n_samples x n_steps flow evaluations for every PMT).
         """
-        if grad:
-            return self._light_grad(ctxs, sample, generator, **grad_kwargs)
+        if grad or fast:
+            with torch.set_grad_enabled(bool(grad) and torch.is_grad_enabled()):
+                return self._light_fast(ctxs, sample, generator, **grad_kwargs)
         p = self.hit_prob(ctxs['hit'])
         if sample:
             u = torch.rand(p.shape[0], device=self.device, dtype=torch.float64,
@@ -572,14 +580,15 @@ class NuSmoothie(Surrogate):
 
     def call_batched(self, track_pos, track_dir, track_energy, om_positions,
                      pmt_directions=None, pmt_mode=None, sample=False, generator=None,
-                     events_per_batch=None, grad=False, **kwargs):
+                     events_per_batch=None, grad=False, fast=None, **kwargs):
         """(n_events, n_out) photons, vectorised over events.
 
         Rows are (event, PMT) pairs, so every event shares one pass through each
         model; events_per_batch bounds how many go into a pass (memory ~ events x
         PMTs). sample=True draws instead of taking the mean, as in __call__.
-        grad=True makes it differentiable in om_positions; grad_ly_samples, grad_n_steps and
-        ly_prune_below override the constructor's settings for that.
+        grad=True makes it differentiable in om_positions; fast=True (implied by grad) uses the
+        cheap pruned estimator even without a graph. grad_ly_samples, grad_n_steps and
+        ly_prune_below override the constructor's settings for it.
         """
         grad_kwargs = self._grad_kwargs(kwargs)
         self._require_track()
@@ -598,7 +607,7 @@ class NuSmoothie(Surrogate):
             rows_ev, key = self._event_rows(M, B, b0, n_out, group)
             ev = rows_ev + b0
             ctxs = self._contexts(pts.repeat(B, 1), dirs.repeat(B, 1), V[ev], U[ev], E[ev])
-            out = out.index_add(0, key, self._light(ctxs, sample, generator, grad, **grad_kwargs))
+            out = out.index_add(0, key, self._light(ctxs, sample, generator, grad, fast, **grad_kwargs))
         return out.reshape(n_ev, n_out)
 
     @staticmethod

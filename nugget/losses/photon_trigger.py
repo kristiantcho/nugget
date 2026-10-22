@@ -43,13 +43,18 @@ class PhotonCountTrigger(LossFunction):
             return torch.special.gammainc(k, n_tot.clamp_min(0.0))
         return torch.sigmoid(torch.log(n_tot.clamp_min(1e-30) / self.n_photons) / self.softness)
 
-    def _light_yield(self, points_3d, events, surrogate_func, batched_func):
+    def _light_yield(self, points_3d, events, surrogate_func, batched_func, seed=None):
         if batched_func is not None:
             owner = getattr(batched_func, '__self__', None)
             if hasattr(owner, 'hit_model') and hasattr(owner, 'ly_model'):  # NuSmoothie
                 grad = torch.is_grad_enabled() and points_3d.requires_grad
-                return batched_func(om_positions=points_3d, event_params_list=events,
-                                    grad=grad, sample=self.photons == 'sample')
+                generator = None
+                if seed is not None:
+                    generator = torch.Generator(device=owner.device).manual_seed(int(seed))
+                # fast: the same cheap, pruned estimator whether or not a graph is kept, so the
+                # accumulator's graph-free pass and its gradient pass compute the same counts.
+                return batched_func(om_positions=points_3d, event_params_list=events, grad=grad,
+                                    fast=True, sample=self.photons == 'sample', generator=generator)
             return batched_func(om_positions=points_3d, event_params_list=events)
         return torch.stack([surrogate_func(opt_point=points_3d, event_params=ep).reshape(-1) for ep in events])
 
@@ -65,6 +70,8 @@ class PhotonCountTrigger(LossFunction):
             batched_func = _resolve_batched_surrogate(surrogate_func)
         chunk = kwargs.get('binned_trigger_batch_size', None) or len(events)
         detach = kwargs.get('detach_light_yields', False)
+        # Set per batch by AnalysisAccumulator and replayed in its gradient pass: same draws in both passes.
+        seed = kwargs.get('accumulator_seed', None)
         if precomputed is None and surrogate_func is None and batched_func is None:
             raise ValueError("PhotonCountTrigger needs signal_surrogate_func or precomputed_light_yield_per_point_per_event")
 
@@ -77,7 +84,8 @@ class PhotonCountTrigger(LossFunction):
             if precomputed is not None:
                 ly = precomputed[start:start + chunk]
             else:
-                ly = self._light_yield(points_3d, events[start:start + chunk], surrogate_func, batched_func)
+                ly = self._light_yield(points_3d, events[start:start + chunk], surrogate_func, batched_func,
+                                       seed=None if seed is None else seed + start)
             if detach:
                 ly = ly.detach()
             if weights is not None:
