@@ -1,11 +1,13 @@
 import torch
 import math
 import random
+from torch.utils.checkpoint import checkpoint as _checkpoint
 from nugget.losses.base_loss import LossFunction
 from nugget.samplers.sim_weights import event_arrays, generation_params, get_simulation_weights
 from nugget.samplers.flux_weights import get_flux_weights
 from nugget.losses.effective_area import CrossSection, TransmissionProb
 from nugget.losses.fisher_info import WeightedResolutionLoss
+from nugget.losses.fisher_info_om_net import covariance_from_fisher, resolution_from_covariance
 from nugget.losses.trigger import TriggerLoss
 from nugget.losses.photon_trigger import PhotonCountTrigger
 
@@ -24,6 +26,33 @@ def soft_bin_indicators(x, edges, sigma):
     return 0.5 * (torch.tanh(lo) + torch.tanh(hi))
 
 
+def soft_histogram(weights, xs, edges, sigmas):
+    """(P, n_1 * ... * n_D) smeared histograms of P weight rows (P, N) over D axes, flattened row-major.
+
+    Contracts the weights with one axis' (N, n_d) indicators at a time instead of forming the joint
+    (N, n_1 * ... * n_D) indicator matrix.
+    """
+    letters = 'abcdefgh'[:len(xs)]
+    inds = [soft_bin_indicators(x, e, s) for x, e, s in zip(xs, edges, sigmas)]
+    spec = 'pi,' + ','.join(f'i{c}' for c in letters) + '->p' + letters
+    return torch.einsum(spec, weights, *inds).reshape(weights.shape[0], -1)
+
+
+def chunked_soft_histogram(weights, xs, edges, sigmas, chunk_size=None):
+    """soft_histogram summed over chunks of events; each chunk is checkpointed, so its indicators are not kept for backward."""
+    n = weights.shape[1]
+    if chunk_size is None or chunk_size >= n:
+        return soft_histogram(weights, xs, edges, sigmas)
+    total = 0.0
+    for s in range(0, n, chunk_size):
+        sl = slice(s, s + chunk_size)
+        part = [weights[:, sl], *[x[sl] for x in xs], *[w[sl] for w in sigmas]]
+        D = len(xs)
+        total = total + _checkpoint(lambda w, *a: soft_histogram(w, a[:D], edges, a[D:]), *part,
+                                    use_reentrant=False)
+    return total
+
+
 def poisson_fisher_matrix(mu, grad_mu):
     """F_jk = sum_b dmu_b/dj * dmu_b/dk / mu_b, with grad_mu of shape (n_params, n_bins)."""
     g = grad_mu / torch.sqrt(mu.clamp_min(1e-12))
@@ -32,8 +61,15 @@ def poisson_fisher_matrix(mu, grad_mu):
 
 class AnalysisLoss(LossFunction):
     def __init__(self, trigger_loss=None, resolution_loss=None, xsec=None, transmission=None, device=None,
-                 energy_resolution_loss=None, angular_resolution_loss=None):
+                 energy_resolution_loss=None, angular_resolution_loss=None, fisher_loss=None):
         super().__init__(device=device)
+        # A loss with fisher_per_event (e.g. OMFisherNetLoss) over energy, zenith and azimuth: every
+        # resolution then comes from one per-event Fisher matrix, and the resolution losses are unused.
+        self.fisher_loss = fisher_loss
+        if fisher_loss is not None:
+            missing = {'energy', 'zenith', 'azimuth'} - set(fisher_loss.fisher_params)
+            if missing:
+                raise ValueError(f"fisher_loss needs fisher_params with energy, zenith and azimuth; missing {sorted(missing)}")
         # Any trigger: a name in TRIGGERS, a TriggerLoss-like object, or a callable(geom_dict, **kwargs)
         # returning per-event efficiencies (N,) or a dict with 't_per_event'. None -> 'sliding_bar'.
         self.trigger_loss = self._make_trigger(trigger_loss)
@@ -61,9 +97,27 @@ class AnalysisLoss(LossFunction):
             out = out['t_per_event']
         return out.reshape(-1)
 
+    def _fill_from_fisher(self, geom_dict, eff_kwargs, cache):
+        """All resolutions from one per-event covariance: 'energy' (sigma_E, GeV), 'zenith' (sigma_theta, rad),
+        'angular' (rad) and the covariance itself."""
+        F, ev = self.fisher_loss.fisher_per_event(geom_dict, **eff_kwargs)
+        names = list(self.fisher_loss.fisher_params)
+        cov = covariance_from_fisher(F, names, ev['energy'])
+        ie, iz = names.index('energy'), names.index('zenith')
+        cache['covariance'] = cov
+        cache['energy'] = torch.sqrt(cov[:, ie, ie].clamp_min(0.0))
+        cache['zenith'] = torch.sqrt(cov[:, iz, iz].clamp_min(0.0))
+        cache['angular'] = resolution_from_covariance(cov, names, ev['energy'], ev['zenith'], 'angular')
+
     def _resolution_per_event(self, kind, geom_dict, eff_kwargs, cache):
-        """(N,) per-event 'energy' (sigma_E, GeV) or 'angular' (rad) resolution, computed at most once per call."""
+        """(N,) per-event 'energy' (sigma_E, GeV) or 'angular' (rad) resolution, computed at most once per call.
+
+        With a fisher_loss, also 'zenith' (sigma_theta, rad), and all come from a single Fisher evaluation.
+        """
         if kind not in cache:
+            if self.fisher_loss is not None:
+                self._fill_from_fisher(geom_dict, eff_kwargs, cache)
+                return cache[kind]
             if kind not in self.resolution_losses:
                 self.resolution_losses[kind] = WeightedResolutionLoss(
                     device=self.device, resolution_type=kind, fisher_info_params=['energy', 'zenith', 'azimuth'])
@@ -97,6 +151,7 @@ class AnalysisLoss(LossFunction):
         param_overrides        = kwargs.get('analysis_param_overrides', None) # :Dict
         dataset_name           = kwargs.get('analysis_dataset_name', None) # :str
         batched_sim_weights    = kwargs.get('analysis_batched_sim_weights', True) # :bool, sim weights are precomputed for the whole batch and must be sliced to the subsample
+        bin_chunk_size         = kwargs.get('analysis_bin_chunk_size', None) # :int, events per checkpointed chunk of the soft histogram (None = one pass)
 
         friend_config       = kwargs.get('friend_config', None) # :str|dict
         pyff_config         = kwargs.get('pyff_config', None) # :str|dict
@@ -177,8 +232,14 @@ class AnalysisLoss(LossFunction):
                 c_lo, c_hi = gen.get('cos_range', (-1.0, 1.0))
                 bin_edges[var] = torch.linspace(-c_hi, -c_lo, n + 1, device=self.device)
                 true_vals.append(ev['cos_zenith'])
-                sigma_psi = self._resolution_per_event('angular', geom_dict, eff_kwargs, res_cache)
-                widths.append(sigma_psi * torch.sin(ev['zenith']))
+                if self.fisher_loss is not None:
+                    # sigma(cos theta) = |sin theta| sigma_theta, from the zenith entry of the covariance.
+                    sigma_th = self._resolution_per_event('zenith', geom_dict, eff_kwargs, res_cache)
+                    widths.append(sigma_th * torch.sin(ev['zenith']).abs())
+                else:
+                    # Without the covariance, the full angular resolution stands in for sigma_theta.
+                    sigma_psi = self._resolution_per_event('angular', geom_dict, eff_kwargs, res_cache)
+                    widths.append(sigma_psi * torch.sin(ev['zenith']))
             else:
                 raise ValueError(f"Unknown binning variable {var!r}; use 'energy' and/or 'zenith'")
         # A singular per-event Fisher gives NaN/inf; such events are smeared out of every bin.
@@ -198,12 +259,11 @@ class AnalysisLoss(LossFunction):
         grad_total_weights = torch.stack([grad_weights[k] for k in param_names]) * acceptance  # (n_params, N)
 
         # Joint bin membership is the product over axes, flattened row-major (first variable slowest).
-        indicators = None
-        for var, x, width in zip(binning_vars, true_vals, widths):
-            ind = soft_bin_indicators(x, bin_edges[var], width)                       # (N, n_var)
-            indicators = ind if indicators is None else (indicators.unsqueeze(2) * ind.unsqueeze(1)).reshape(len(x), -1)
-        mu = total_weights @ indicators                                    # (n_bins,)
-        grad_mu = grad_total_weights @ indicators                          # (n_params, n_bins)
+        # mu and dmu/dphi are histograms of different weights, so they share one contraction.
+        all_weights = torch.cat([total_weights.unsqueeze(0), grad_total_weights])        # (1 + n_params, N)
+        hists = chunked_soft_histogram(all_weights, true_vals, [bin_edges[v] for v in binning_vars],
+                                       widths, chunk_size=bin_chunk_size)
+        mu, grad_mu = hists[0], hists[1:]                                  # (n_bins,), (n_params, n_bins)
 
         # Everything needed to recompute exactly this batch again (used by AnalysisAccumulator).
         replay = {

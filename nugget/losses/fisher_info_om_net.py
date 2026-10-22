@@ -42,9 +42,8 @@ def _om_to_string(pts3, string_xy, device):
     return om_str.long(), n_str
 
 
-def resolution_from_fisher(F, fisher_params, energy, zenith, resolution_type='angular',
-                           use_relative_energy=False):
-    """Per-event resolution from (n, P, P), inverted in E-scaled units as the Fisher loss does."""
+def covariance_from_fisher(F, fisher_params, energy):
+    """(n, P, P) covariance from (n, P, P) Fisher matrices, inverted in E-scaled units as the Fisher loss does."""
     n, P = F.shape[0], F.shape[-1]
     d = torch.ones(n, P, dtype=F.dtype, device=F.device)
     if 'energy' in fisher_params:
@@ -52,9 +51,21 @@ def resolution_from_fisher(F, fisher_params, energy, zenith, resolution_type='an
     dd = d.unsqueeze(2) * d.unsqueeze(1)
     eye = torch.eye(P, dtype=F.dtype, device=F.device)
     try:
-        cov = dd * torch.linalg.inv(dd * F + 1e-20 * eye)
+        return dd * torch.linalg.inv(dd * F + 1e-20 * eye)
     except RuntimeError:
-        cov = dd * torch.linalg.pinv(dd * F + 1e-20 * eye)
+        return dd * torch.linalg.pinv(dd * F + 1e-20 * eye)
+
+
+def resolution_from_fisher(F, fisher_params, energy, zenith, resolution_type='angular',
+                           use_relative_energy=False):
+    """Per-event resolution from (n, P, P), inverted in E-scaled units as the Fisher loss does."""
+    return resolution_from_covariance(covariance_from_fisher(F, fisher_params, energy), fisher_params,
+                                      energy, zenith, resolution_type, use_relative_energy)
+
+
+def resolution_from_covariance(cov, fisher_params, energy, zenith, resolution_type='angular',
+                               use_relative_energy=False):
+    """Per-event angular (rad) or energy (GeV, or relative) resolution from (n, P, P) covariances."""
     if resolution_type == 'angular':
         iz, ia = fisher_params.index('zenith'), fisher_params.index('azimuth')
         s = torch.sin(zenith)
@@ -622,6 +633,27 @@ class OMFisherNetLoss(LossFunction):
             s = (A[b0:b1].detach() * self._per_string(leaf, om_str, n_str, sub, chunk)).sum()
             G += torch.autograd.grad(s, leaf)[0]
         return G
+
+    def fisher_per_event(self, geom_dict, **kwargs):
+        """-> (F (n_events, P, P) summed over strings, event tensors), for signal_event_params.
+
+        Keeps the full graph to points_3d when it requires grad (as geometry_grads='direct'), so
+        anything computed from F, e.g. both energy and angular resolutions, is differentiable.
+        """
+        if self.net is None:
+            raise ValueError("train (fit) or load_model first")
+        pts3 = _as_t(geom_dict['points_3d'], self.device).reshape(-1, 3)
+        om_str, n_str = _om_to_string(pts3, geom_dict.get('string_xy', None), self.device)
+        ev = self._event_tensors(kwargs['signal_event_params'])
+        track = bool(self.geometry_grads) and pts3.requires_grad and torch.is_grad_enabled()
+        with torch.set_grad_enabled(track):
+            F_str = self._per_string(pts3 if track else pts3.detach(), om_str, n_str, ev,
+                                     int(kwargs.get('fisher_info_chunk_size', 65536)))
+        string_weights = geom_dict.get('string_weights', None)
+        if string_weights is None:
+            return F_str.sum(dim=1), ev
+        w = torch.sigmoid(_as_t(string_weights, self.device))
+        return (w.reshape(1, -1, 1, 1) * F_str).sum(dim=1), ev
 
     def __call__(self, geom_dict, **kwargs):
         """Same contract as FlowFisherResolutionLoss.__call__.
