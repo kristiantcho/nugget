@@ -7,6 +7,10 @@ from nugget.samplers.flux_weights import get_flux_weights
 from nugget.losses.effective_area import CrossSection, TransmissionProb
 from nugget.losses.fisher_info import WeightedResolutionLoss
 from nugget.losses.trigger import TriggerLoss
+from nugget.losses.photon_trigger import PhotonCountTrigger
+
+# Trigger names accepted by AnalysisLoss(trigger_loss=...) and the 'analysis_trigger' loss param.
+TRIGGERS = {'sliding_bar': TriggerLoss, 'photon_count': PhotonCountTrigger}
 
 PRECOMPUTED_PER_EVENT_KEYS = ('precomputed_fisher_info_per_string_per_event', 'precomputed_light_yield_per_point_per_event')
 
@@ -30,7 +34,9 @@ class AnalysisLoss(LossFunction):
     def __init__(self, trigger_loss=None, resolution_loss=None, xsec=None, transmission=None, device=None,
                  energy_resolution_loss=None, angular_resolution_loss=None):
         super().__init__(device=device)
-        self.trigger_loss = trigger_loss
+        # Any trigger: a name in TRIGGERS, a TriggerLoss-like object, or a callable(geom_dict, **kwargs)
+        # returning per-event efficiencies (N,) or a dict with 't_per_event'. None -> 'sliding_bar'.
+        self.trigger_loss = self._make_trigger(trigger_loss)
         # Keyed by resolution_type; missing ones default to WeightedResolutionLoss when first needed.
         # resolution_loss (the older single-loss argument) fills the slot its resolution_type names.
         self.resolution_losses = {}
@@ -40,6 +46,20 @@ class AnalysisLoss(LossFunction):
         # CrossSection() takes a while to build, so it is made once and kept.
         self.xsec = xsec
         self.transmission = transmission
+
+    def _make_trigger(self, trigger):
+        if isinstance(trigger, str):
+            if trigger not in TRIGGERS:
+                raise ValueError(f"Unknown trigger {trigger!r}; use one of {sorted(TRIGGERS)} or pass a trigger object")
+            return TRIGGERS[trigger](device=self.device)
+        return trigger
+
+    def _detector_efficiency(self, trigger, geom_dict, eff_kwargs):
+        """(N,) per-event detection efficiency from any trigger."""
+        out = trigger(geom_dict, **eff_kwargs)
+        if isinstance(out, dict):
+            out = out['t_per_event']
+        return out.reshape(-1)
 
     def _resolution_per_event(self, kind, geom_dict, eff_kwargs, cache):
         """(N,) per-event 'energy' (sigma_E, GeV) or 'angular' (rad) resolution, computed at most once per call."""
@@ -70,6 +90,7 @@ class AnalysisLoss(LossFunction):
         grad_weights           = kwargs.get('analysis_grad_flux_weights', None) # :Dict[str, Tensor (N,)]
         live_time              = kwargs.get('live_time', 1.0) # :float, seconds
         perfect_efficiency     = kwargs.get('analysis_perfect_efficiency', False) # :bool, every event detected; skips the trigger
+        trigger_override       = kwargs.get('analysis_trigger', None) # :str|object|callable, replaces the constructor's trigger for this call
         energy_res_selection   = kwargs.get('analysis_energy_res_selection', False) # :bool, soft cut on sigma_E / E
         energy_res_threshold   = kwargs.get('analysis_energy_res_threshold', 1.0) # :float, sigma_E / E where the selection weight is 0.5
         energy_res_softness    = kwargs.get('analysis_energy_res_softness', 0.1) # :float, width of the cut in ln(sigma_E / E)
@@ -109,9 +130,12 @@ class AnalysisLoss(LossFunction):
 
         gen = {}
         if signal_sampler is not None:
-            gen.update(generation_params(signal_sampler),
-                       cyl_radius=signal_sampler.cylinder.radius, cyl_height=signal_sampler.cylinder.height)
+            gen.update(generation_params(signal_sampler))
+            if hasattr(signal_sampler, 'cylinder'):
+                gen.update(cyl_radius=signal_sampler.cylinder.radius, cyl_height=signal_sampler.cylinder.height)
         gen.update(sim_weight_kwargs)
+        if gen.get('mode') == 'ranged' and 'column_depth' not in gen:
+            gen['column_depth'] = ev.get('column_depth')
         if sim_weights is None:
             if self.xsec is None:
                 self.xsec = CrossSection()
@@ -124,12 +148,16 @@ class AnalysisLoss(LossFunction):
                                                           friend_config, pyff_config, pid=weight_pid,
                                                           dataset=dataset_name, params=param_overrides, device=self.device)
 
-        if self.trigger_loss is None and not perfect_efficiency:
-            self.trigger_loss = TriggerLoss(device=self.device)
         if perfect_efficiency:
             detector_effs = torch.ones_like(ev['energy'])
         else:
-            detector_effs = self.trigger_loss(geom_dict, **eff_kwargs)['t_per_event'].reshape(-1)
+            if trigger_override is not None:
+                trigger = self._make_trigger(trigger_override)
+            else:
+                if self.trigger_loss is None:
+                    self.trigger_loss = TriggerLoss(device=self.device)
+                trigger = self.trigger_loss
+            detector_effs = self._detector_efficiency(trigger, geom_dict, eff_kwargs)
 
         # One histogram axis per binning variable: log10(E) smeared by the energy resolution and/or
         # cos(zenith) smeared by the angular resolution, each in the units of its axis.

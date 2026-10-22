@@ -52,6 +52,20 @@ HIT_RADIUS = 200            # unhit PMTs within this of a hit OM enter the hit t
                                # None puts the whole geometry in the hit term
 N_STEPS_FIT = 8                # ODE steps per flow evaluation
 LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 10 us
+# 'fit': t0 is a free parameter. 'geom': t0 follows from the vertex and direction as
+# the T0_QUANTILE quantile over lit PMTs of (first photon time - t_geom); 0 is the
+# minimum, the latest vertex time at which no PMT sees light before direct light could
+# reach it. 'profile': t0 minimises the arrival-time NLL at the current vertex and
+# direction. That NLL has a ~1-2 ns wide cusp at the optimum and is concave further
+# out, so it is found by a grid search when a fit starts and then followed by a
+# three-point search every iteration. 'geom' and 'profile' fit 6 parameters.
+T0_MODE = 'fit'
+T0_QUANTILE = 0.0
+# (half-width, spacing) [ns] of the start search around the 'geom' anchor, coarse to fine
+T0_PROFILE_GRID = ((60.0, 5.0), (5.0, 1.0), (1.0, 0.25))
+T0_PROFILE_H = 0.5             # per iteration: compare t0 and t0 +- this [ns]; while a
+T0_PROFILE_MAX_STEPS = 8       # side wins, move there and double it, up to this many
+                               # times (3 atime passes if t0 stays, +2 per move)
 
 # batching: events are added to a batch while both row budgets hold (an event that
 # alone exceeds them runs on its own). The budgets only set throughput: the gradient
@@ -257,6 +271,9 @@ def event_data(g, flat, geo_pos, geo_dir, tree, models, rng):
         owner = np.repeat(np.arange(len(gi)), n)
         t_ph = flat[ph].astype(np.float64)
         t_first = t_ph.min()
+        d['P_f'] = torch.as_tensor(geo_pos[gi], **_kw(flow))    # lit PMTs, first photon
+        d['t_f'] = torch.as_tensor(np.minimum.reduceat(t_ph, np.cumsum(n) - n) - t_first,
+                                   **_kw(flow))
         k = _subset(len(ph), N_PH_FIT, rng)
         d['w_a'] = len(ph) / len(k)
         d['P_a'] = torch.as_tensor(geo_pos[gi[owner[k]]], **_kw(flow))
@@ -272,7 +289,7 @@ def event_data(g, flat, geo_pos, geo_dir, tree, models, rng):
 
 
 _TERM_KEYS = (('h', ('P_h', 'D_h', 'y_h')), ('l', ('P_l', 'D_l', 'z_l')),
-              ('a', ('P_a', 'D_a', 't_rel')))
+              ('a', ('P_a', 'D_a', 't_rel')), ('f', ('P_f', 't_f')))
 
 
 def build_batch(ds, device):
@@ -289,7 +306,87 @@ def build_batch(ds, device):
     for w in ('w_l', 'w_a'):
         if w in ds[0]:
             b[w] = torch.tensor([d[w] for d in ds], dtype=torch.float64, device=device)
+    if 'P_f' in ds[0]:                  # (B, max lit PMTs) row indices, padded with n
+        n = np.array([len(d['P_f']) for d in ds])
+        cols = np.arange(n.max())
+        pad = np.where(cols[None] < n[:, None], (np.cumsum(n) - n)[:, None] + cols[None],
+                       n.sum())
+        b['f_pad'] = torch.as_tensor(pad, device=b['P_f'].device)
+        b['f_n'] = torch.as_tensor(n, device=b['P_f'].device)
     return b
+
+
+def _anchor_t0(th, b, flow, q):
+    """(B,) q-quantile over each event's lit PMTs of (first photon time - t_geom),
+    differentiable in vertex and direction."""
+    t = th[b['i_f']]
+    tg = flow.geometric_time(b['P_f'], t[:, :3], zeniths=t[:, 3],
+                             azimuths=t[:, 4]).reshape(-1).to(th.dtype)
+    r = b['t_f'].to(th.dtype) - tg
+    r = torch.cat([r, r.new_full((1,), float('inf'))])[b['f_pad']].sort(dim=1).values
+    pos = q * (b['f_n'] - 1).to(th.dtype)
+    lo = pos.floor().long()
+    hi = torch.minimum(lo + 1, b['f_n'] - 1)
+    w = pos - lo
+    return (r.gather(1, lo[:, None])[:, 0] * (1 - w) + r.gather(1, hi[:, None])[:, 0] * w)
+
+
+def _with_t0(th, b, flow, t0=None):
+    """th with t0 replaced: by the given (B,) values, or by the geometric anchor when
+    T0_MODE == 'geom'."""
+    if t0 is not None:
+        return torch.cat([th[:, :6], t0.to(th.dtype)[:, None]], 1)
+    if T0_MODE != 'geom' or 'i_f' not in b:
+        return th
+    return torch.cat([th[:, :6], _anchor_t0(th, b, flow, T0_QUANTILE)[:, None]], 1)
+
+
+def _atime_nll(th, b, models):
+    """(B,) arrival-time NLL only, no gradient."""
+    out = torch.zeros(b['B'], dtype=torch.float64, device=th.device)
+    for term, sl in _chunks(b, ('atime',)):
+        ll, idx = _term_ll(term, th, b, models, sl, differentiable=False)
+        out.index_add_(0, idx, -ll.detach())
+    return out
+
+
+def _atime_nll_at(th, t0, b, models):
+    return torch.nan_to_num(_atime_nll(_with_t0(th, b, None, t0), b, models),
+                            nan=float('inf'))
+
+
+def _profile_init(th, b, models):
+    """(B,) profiled t0 from scratch: coarse-to-fine grid search around the 'geom' anchor."""
+    th = th.detach()
+    with torch.no_grad():
+        t0 = _anchor_t0(th, b, models[2], T0_QUANTILE)
+    for half, step in T0_PROFILE_GRID:
+        offs = torch.arange(-half, half + 1e-9, step, dtype=t0.dtype, device=t0.device)
+        F = torch.stack([_atime_nll_at(th, t0 + o, b, models) for o in offs])
+        t0 = t0 + offs[F.argmin(0)]
+    return t0
+
+
+def _track_t0(th, t0, b, models):
+    """Follow the minimum as th moves: compare t0 and t0 +- h; while a side wins, move
+    there and double h (up to T0_PROFILE_MAX_STEPS). Once the centre wins everywhere,
+    refine with the parabola through the three points."""
+    th, t0 = th.detach(), t0.detach()
+    h = torch.full_like(t0, T0_PROFILE_H)
+    f0 = _atime_nll_at(th, t0, b, models)
+    for _ in range(T0_PROFILE_MAX_STEPS):
+        fm, fp = _atime_nll_at(th, t0 - h, b, models), _atime_nll_at(th, t0 + h, b, models)
+        down = fm < torch.minimum(f0, fp)
+        up = (fp < f0) & ~down
+        if not (down | up).any():
+            c = fp - 2 * f0 + fm
+            para = torch.where(c > 0, 0.5 * h * (fm - fp) / c.clamp_min(1e-12),
+                               torch.zeros_like(t0))
+            return t0 + torch.nan_to_num(para, nan=0.0).clamp(-h, h)
+        t0 = torch.where(down, t0 - h, torch.where(up, t0 + h, t0))
+        f0 = torch.where(down, fm, torch.where(up, fp, f0))
+        h = torch.where(down | up, 2 * h, h)
+    return t0
 
 
 def _chunks(b, terms):
@@ -334,16 +431,17 @@ def _term_ll(term, th, b, models, sl, differentiable):
     return b['w_a'][idx] * lp.double(), idx
 
 
-def nll_batch(th, b, models, terms):
+def nll_batch(th, b, models, terms, t0=None):
     """(B,) -log L at th (B, 7), no gradient."""
     out = torch.zeros(b['B'], dtype=torch.float64, device=th.device)
+    th = _with_t0(th, b, models[2], t0)
     for term, sl in _chunks(b, terms):
         ll, idx = _term_ll(term, th, b, models, sl, differentiable=False)
         out.index_add_(0, idx, -ll.detach())
     return out
 
 
-def nll_and_grad(th0, u, S, b, models, terms):
+def nll_and_grad(th0, u, S, b, models, terms, t0=None):
     """(B,) -log L at th = th0 + S u and its gradient w.r.t. u (B, 7). The NLL is a
     sum over rows, so the gradient is accumulated chunk by chunk and each chunk's
     graph is freed before the next: peak memory is set by the chunk size."""
@@ -351,7 +449,8 @@ def nll_and_grad(th0, u, S, b, models, terms):
     grad = torch.zeros_like(u)
     for term, sl in _chunks(b, terms):
         uu = u.detach().requires_grad_(True)
-        ll, idx = _term_ll(term, th0 + S * uu, b, models, sl, differentiable=True)
+        th = _with_t0(th0 + S * uu, b, models[2], t0)
+        ll, idx = _term_ll(term, th, b, models, sl, differentiable=True)
         part = torch.zeros_like(vals).index_add(0, idx, -ll)
         vals += part.detach()
         # a non-finite event ends its own fit; keep it out of the others' gradients
@@ -361,7 +460,7 @@ def nll_and_grad(th0, u, S, b, models, terms):
 
 
 # per-event optimiser state, one row per active event
-_TENSOR_STATE = ('th0', 'u', 'm', 'v', 'best_u')
+_TENSOR_STATE = ('th0', 'u', 'm', 'v', 'best_u', 'tp', 'tp0', 'best_tp')  # tp: profiled t0
 _ARRAY_STATE = ('it', 'since', 'best', 'best_it', 'sched_best', 'bad', 'lr', 'sec')
 
 
@@ -371,6 +470,7 @@ def _init_state(entries, device):
                           dtype=torch.float64)
     z = torch.zeros_like(th0)
     return dict(th0=th0, u=z, m=z.clone(), v=z.clone(), best_u=z.clone(),
+                tp=th0[:, 6].clone(), tp0=th0[:, 6].clone(), best_tp=th0[:, 6].clone(),
                 it=np.zeros(n, int), since=np.zeros(n, int), best=np.full(n, np.inf),
                 best_it=np.zeros(n, int), sched_best=np.full(n, np.inf),
                 bad=np.zeros(n, int), lr=np.full(n, LR), sec=np.zeros(n),
@@ -407,6 +507,7 @@ def _step(s, vals, ok, grad):
     s['best'] = np.where(better, v, s['best'])
     bt = torch.as_tensor(better, device=s['u'].device)
     s['best_u'] = torch.where(bt[:, None], s['u'], s['best_u'])
+    s['best_tp'] = torch.where(bt, s['tp'], s['best_tp'])
 
     step = torch.as_tensor(s['it'] + 1, device=grad.device, dtype=grad.dtype)[:, None]
     s['m'] = b1 * s['m'] + (1 - b1) * grad
@@ -463,10 +564,17 @@ def _finish(entries, s, idx, reason, models, terms, device):
     """Result rows for the events at positions idx of the active batch."""
     sub = [entries[j] for j in idx]
     truth = torch.as_tensor(np.stack([e['d']['truth'] for e in sub]), device=device)
-    nll_true = nll_batch(truth, build_batch([e['d'] for e in sub], device), models,
-                         terms).cpu().numpy()
+    b_sub = build_batch([e['d'] for e in sub], device)
+    profile = T0_MODE == 'profile' and 'i_a' in b_sub
+    t0_true = _profile_init(truth, b_sub, models) if profile else None
+    nll_true = nll_batch(truth, b_sub, models, terms, t0_true).cpu().numpy()
     S = torch.as_tensor(SCALE, device=device, dtype=torch.float64)
-    th_best = (s['th0'][idx] + S * s['best_u'][idx]).detach().cpu().numpy()
+    with torch.no_grad():
+        th_best = _with_t0(s['th0'][idx] + S * s['best_u'][idx], b_sub, models[2],
+                           s['best_tp'][idx] if profile else None)
+        th_start = _with_t0(s['th0'][idx], b_sub, models[2],
+                            s['tp0'][idx] if profile else None)
+    th_best, th_start = th_best.detach().cpu().numpy(), th_start.detach().cpu().numpy()
     rows = []
     for k, j in enumerate(idx):
         e, d = entries[j], entries[j]['d']
@@ -478,7 +586,7 @@ def _finish(entries, s, idx, reason, models, terms, device):
             n_hit_pmts=d['n_hit_pmts'],
             n_photons=d['n_photons'], t_first=d['t_first'],
             **{f'true_{p}': v for p, v in zip(PARAMS, tr)},
-            **{f'start_{p}': v for p, v in zip(PARAMS, _canonical(e['start']))},
+            **{f'start_{p}': v for p, v in zip(PARAMS, _canonical(th_start[k]))},
             **{f'fit_{p}': v for p, v in zip(PARAMS, th)},
             nll_true=float(nll_true[k]), nll_fit=best,
             nll_start=hist[0] if len(hist) else np.nan,
@@ -506,6 +614,8 @@ def _read(path):
 
 def run_worker(events, device, out_path, tag='', om_pos=None):
     """Fit the given events on one device, in batches; writes rows to out_path."""
+    if T0_MODE not in ('fit', 'geom', 'profile'):
+        raise ValueError("T0_MODE must be 'fit', 'geom' or 'profile'")
     if device.startswith('cuda'):
         torch.cuda.set_device(device)
     hit = HitClassifier(device=device).load_model(HIT_CKPT)
@@ -529,6 +639,7 @@ def run_worker(events, device, out_path, tag='', om_pos=None):
     skipped = {'few_hits': 0, 'vertex_outside': 0}
     lo, hi = _bounds(half)
     n_starts = N_STARTS if START == 'perturbed' else 1
+    profile = T0_MODE == 'profile' and 'atime' in terms
 
     def prepared():
         for (run, evt), g in groups:
@@ -572,8 +683,13 @@ def run_worker(events, device, out_path, tag='', om_pos=None):
             new.append(waiting)
             waiting = None
         if new:
+            st_new = _init_state(new, device)
+            if profile:
+                b_new = build_batch([e['d'] for e in new], device)
+                st_new['tp'] = _profile_init(st_new['th0'], b_new, models)
+                st_new['tp0'], st_new['best_tp'] = st_new['tp'].clone(), st_new['tp'].clone()
             active += new
-            state = _cat_state(state, _init_state(new, device))
+            state = _cat_state(state, st_new)
             batch = None
         if not active:
             break
@@ -581,7 +697,11 @@ def run_worker(events, device, out_path, tag='', om_pos=None):
             batch = build_batch([e['d'] for e in active], device)
 
         t_it = time.time()
-        vals, grad = nll_and_grad(state['th0'], state['u'], S, batch, models, terms)
+        t0 = None
+        if profile:      # envelope theorem: at the profiled t0 the other gradients hold
+            state['tp'] = _track_t0(state['th0'] + S * state['u'], state['tp'], batch, models)
+            t0 = state['tp']
+        vals, grad = nll_and_grad(state['th0'], state['u'], S, batch, models, terms, t0)
         vals = vals.cpu().numpy()
         ok = np.isfinite(vals)
         reason = _step(state, vals, ok, grad)

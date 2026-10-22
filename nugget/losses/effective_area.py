@@ -506,6 +506,15 @@ def get_weighted_min_enclosing_circle(
     radius = torch.mean(per_direction_radius)
     return center_xy, radius
 
+AVOGADRO = 6.02214076e23  # nucleons per g of target, taking 1 g/mol for nucleons as LeptonWeighter does
+
+
+def interaction_prob_from_column_depth(column_depth, energy, xsec, which="CC_nu"):
+    """1 - exp(-N_A X sigma) for a column depth X in g/cm^2."""
+    sigma = torch.as_tensor(xsec.total_xsec(energy, which), device=column_depth.device, dtype=column_depth.dtype)
+    return -torch.expm1(-AVOGADRO * column_depth * sigma)
+
+
 def neutrino_effective_area_many(
     cos_theta,
     energy,
@@ -517,11 +526,15 @@ def neutrino_effective_area_many(
     average_nu_nubar=True,
     *,
     include_projected_area: bool = True,
+    column_depth=None,
+    include_transmission: bool = True,
 ):
     """Calculate neutrino effective area for many events in a single batched call.
 
     If ``include_projected_area`` is False, the projected-area factor is omitted
     (treated as 1) and only ``transmission * interaction_prob`` is returned.
+    ``column_depth`` (g/cm^2, per event) replaces the cylinder chord and muon-range
+    extension in the interaction probability; ranged-mode events carry it already.
     """
     if not isinstance(cos_theta, torch.Tensor):
         cos_theta = torch.as_tensor(cos_theta)
@@ -530,16 +543,24 @@ def neutrino_effective_area_many(
     else:
         energy = energy.to(device=cos_theta.device, dtype=cos_theta.dtype)
 
-    tprob = transmission(cos_theta, energy, flavor=flavor)
-    if not isinstance(tprob, torch.Tensor):
-        tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
+    if include_transmission:
+        tprob = transmission(cos_theta, energy, flavor=flavor)
+        if not isinstance(tprob, torch.Tensor):
+            tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
+    else:
+        tprob = 1.0
 
     number_density = 33.3679E21  # 1/cm^-3
     nucleon_density = 18 * number_density
 
-    chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2
+    if column_depth is None:
+        chord_len = average_chord_length(cos_theta, cyl_radius, cyl_height) * 1e2
+    else:
+        column_depth = torch.as_tensor(column_depth, device=cos_theta.device, dtype=cos_theta.dtype)
 
     def _int_prob(which, extend_range=False):
+        if column_depth is not None:
+            return interaction_prob_from_column_depth(column_depth, energy, xsec, which)
         chord_len_local = chord_len
         if extend_range:
             mean_e_mu = xsec.mean_e_lep(energy, which=which)
@@ -578,6 +599,7 @@ def interaction_prob(
     xsec,
     which="CC_nu",
     extend_range=False,
+    column_depth=None,
 ):
     """
     Calculate neutrino interaction probability.
@@ -587,8 +609,15 @@ def interaction_prob(
     - cos_theta
     - energy
     - cyl_radius
+    - column_depth: g/cm^2; if given, used instead of the cylinder chord (and its range extension)
 
     """
+    if column_depth is not None:
+        ref = cos_theta if isinstance(cos_theta, torch.Tensor) else None
+        column_depth = torch.as_tensor(column_depth, dtype=torch.float64 if ref is None else ref.dtype,
+                                       device=None if ref is None else ref.device)
+        return interaction_prob_from_column_depth(column_depth, energy, xsec, which)
+
     number_density = 33.3679E21 # 1/cm^-3
     nucleon_density = 18 * number_density
 
@@ -618,23 +647,29 @@ def neutrino_effective_area(
     average_nu_nubar=True,
     *,
     include_projected_area: bool = True,
+    column_depth=None,
+    include_transmission: bool = True,
 ):
     """Calculate neutrino effective area.
 
     If ``include_projected_area`` is False, the projected-area factor is omitted
     (treated as 1) and only ``transmission * interaction_prob`` is returned.
+    ``column_depth`` (g/cm^2) replaces the cylinder chord in the interaction probability.
     """
     if xsec is None:
         xsec = CrossSection()
-    if transmission is None:
-        transmission = TransmissionProb()
-    tprob = transmission(cos_theta, energy, flavor=flavor)
-    # Convert transmission probability to torch tensor if needed
-    if not isinstance(tprob, torch.Tensor):
-        if isinstance(cos_theta, torch.Tensor):
-            tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
-        else:
-            tprob = torch.as_tensor(tprob, dtype=torch.float64)
+    if include_transmission:
+        if transmission is None:
+            transmission = TransmissionProb()
+        tprob = transmission(cos_theta, energy, flavor=flavor)
+        # Convert transmission probability to torch tensor if needed
+        if not isinstance(tprob, torch.Tensor):
+            if isinstance(cos_theta, torch.Tensor):
+                tprob = torch.as_tensor(tprob, device=cos_theta.device, dtype=cos_theta.dtype)
+            else:
+                tprob = torch.as_tensor(tprob, dtype=torch.float64)
+    else:
+        tprob = 1.0
 
     if average_nu_nubar:
         factor = 0.5
@@ -642,12 +677,12 @@ def neutrino_effective_area(
         factor = 1
 
     int_prob_CC = factor * (
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nu", extend_range=flavor=="numu") +
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nubar", extend_range=flavor=="numu")
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nu", extend_range=flavor=="numu", column_depth=column_depth) +
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="CC_nubar", extend_range=flavor=="numu", column_depth=column_depth)
     )
     int_prob_NC = factor * (
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nu") +
-        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nubar")
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nu", column_depth=column_depth) +
+        interaction_prob(cos_theta, energy, cyl_radius, cyl_height, xsec, which="NC_nubar", column_depth=column_depth)
     )
     int_prob = int_prob_CC + int_prob_NC
     if not include_projected_area:

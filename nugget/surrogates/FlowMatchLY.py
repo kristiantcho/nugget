@@ -8,6 +8,21 @@ import torch
 from torch.utils.data import Dataset, DataLoader, BatchSampler, RandomSampler, SequentialSampler
 
 from nugget.surrogates.base_surrogate import Surrogate
+import contextlib
+from torch.utils.checkpoint import checkpoint as _checkpoint
+
+
+@contextlib.contextmanager
+def frozen_params(module):
+    """Temporarily stop autograd from tracking a module's own weights (inputs are still tracked)."""
+    params = [p for p in module.parameters() if p.requires_grad]
+    for p in params:
+        p.requires_grad_(False)
+    try:
+        yield
+    finally:
+        for p in params:
+            p.requires_grad_(True)
 
 LN10 = math.log(10.0)
 
@@ -590,6 +605,32 @@ class FlowMatchLY(Surrogate):
                 z = z + dt * self._velocity(z + 0.5 * dt * k1, tm, c)
         return z
 
+    def _midpoint_step(self, z, c, t0, dt):
+        # Weights frozen inside the step so the checkpoint's backward recompute does not track them either.
+        with frozen_params(self.net):
+            B = z.shape[0]
+            t = torch.full((B,), t0, device=z.device, dtype=z.dtype)
+            tm = torch.full((B,), t0 + 0.5 * dt, device=z.device, dtype=z.dtype)
+            k1 = self._velocity(z, t, c)
+            return z + dt * self._velocity(z + 0.5 * dt * k1, tm, c)
+
+    def sample_z_grad(self, context, n_steps=64, generator=None, checkpoint=True):
+        """Reparameterised draw z(c) from fixed base noise, differentiable in the context.
+
+        checkpoint=True keeps only z per step and recomputes each step in backward, so memory is
+        rows x n_steps numbers rather than every network activation of every step.
+        """
+        c = self._apply_context_norm(self._prep(context))
+        B = c.shape[0]
+        z = torch.randn(B, 1, device=c.device, dtype=c.dtype, generator=generator)
+        dt = 1.0 / n_steps
+        for i in range(n_steps):
+            if checkpoint and torch.is_grad_enabled():
+                z = _checkpoint(self._midpoint_step, z, c, i * dt, dt, use_reentrant=False)
+            else:
+                z = self._midpoint_step(z, c, i * dt, dt)
+        return z
+
     def _v_and_div(self, z, t, c, create_graph=False):
         with torch.enable_grad():
             z = z.detach().requires_grad_(True)
@@ -664,6 +705,11 @@ class FlowMatchLY(Surrogate):
         z = self.sample_z(context, n_steps=n_steps, generator=generator)
         q = self.from_z(z).reshape(-1)
         return torch.floor(q).clamp(min=1.0) if discrete else q
+
+    def sample_light_yield_grad(self, context, n_steps=64, generator=None, checkpoint=True):
+        """One continuous (dequantised) light-yield draw per row, differentiable in the context."""
+        z = self.sample_z_grad(context, n_steps=n_steps, generator=generator, checkpoint=checkpoint)
+        return self.from_z(z).reshape(-1)
 
     def log_prob_light_yield(self, counts, context, n_steps=64, n_dequant=1,
                              generator=None, differentiable=False):
