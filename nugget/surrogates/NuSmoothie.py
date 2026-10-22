@@ -57,7 +57,7 @@ class NuSmoothie(Surrogate):
                  pmt_directions=None, geometry_csv_path=None,
                  n_pmt_per_om=None, pmt_mode='sum',
                  n_steps=64, ly_n_samples=32, batch_size=65536,
-                 verbose=True, **kwargs):
+                 float32=False, verbose=True, **kwargs):
         """
         Parameters
         ----------
@@ -101,6 +101,9 @@ class NuSmoothie(Surrogate):
         ly_n_samples : int
             Monte-Carlo samples for E[q | c, q>=1]. Cost is
             ``n_pmt x ly_n_samples x n_steps`` network evaluations.
+        float32 : bool
+            Cast the three networks to float32 (models passed in are cast in place). Inputs are
+            cast to each model's dtype and outputs back to float64, so only the precision changes.
         """
         if dim != 3:
             raise ValueError("NeuralSabre only supports 3D geometry")
@@ -136,6 +139,12 @@ class NuSmoothie(Surrogate):
 
         if self.hit_model is None or self.ly_model is None:
             raise ValueError("NeuralSabre needs at least a hit model and an LY model")
+        if float32:
+            # nugget's global float64 default means the networks are built in float64, which is
+            # several times slower than float32 for the matmuls on most GPUs.
+            for _, m in self._named_models():
+                if getattr(m, 'net', None) is not None:
+                    m.net.to(torch.float32)
         if self.patd_mode and self.atime_model is None:
             raise ValueError("patd_mode=True requires an arrival-time model")
 
