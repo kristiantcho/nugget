@@ -25,7 +25,7 @@ GEOM = '../other/800_40_40_geom.csv'
 HIT_CKPT = './flow_models/best_mc_hit_model_v1r.pt'
 LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1r.pt'
 ATIME_CKPT = './flow_models/best_mc_atime_muon_flow_model_v1r.pt'
-OUT = './reco/gd_reco_v1r_hex70_pert.parquet'                  # .parquet or .csv
+OUT = './reco/gd_reco_v1r_hex70_pert2.parquet'                  # .parquet or .csv
 
 N_EVENTS = 40000                 # random events drawn from PARQUET
 EVENT_SEED = 0
@@ -38,10 +38,10 @@ TERMS = ('hit', 'ly', 'atime') # 'atime' is dropped automatically if the file ha
 # of DynamicString kwargs, or a CSV with om_x/om_y/om_z. Every OM gets the 16-PMT
 # template of GEOM. The OM positions are saved next to OUT.
 # NEW_GEOMETRY = None
-NEW_GEOMETRY = dict(hex_type='hexagonal', domain_size=1600, n_strings=70,
+NEW_GEOMETRY = dict(hex_type='hexagonal', domain_size=1200, n_strings=70,
                     points_per_string=20, custom_z_spacing=50)
 RESPONSE_SEED = 0
-RESPONSE_EVENTS_PER_BATCH = 16  # events per NuSmoothie call (~ events x PMTs rows)
+RESPONSE_EVENTS_PER_BATCH = 128  # events per NuSmoothie call (~ events x PMTs rows)
 RESPONSE_N_STEPS = 64           # ODE steps when sampling the response
 
 # likelihood
@@ -59,8 +59,8 @@ LOG_FLOOR = np.log(1e-4) - np.log(1e4)   # arrival-time noise floor: 1e-4 over 1
 # direction. That NLL has a ~1-2 ns wide cusp at the optimum and is concave further
 # out, so it is found by a grid search when a fit starts and then followed by a
 # three-point search every iteration. 'geom' and 'profile' fit 6 parameters.
-T0_MODE = 'fit'
-T0_QUANTILE = 0.0
+T0_MODE = 'profile'
+T0_QUANTILE = 0.1
 # (half-width, spacing) [ns] of the start search around the 'geom' anchor, coarse to fine
 T0_PROFILE_GRID = ((60.0, 5.0), (5.0, 1.0), (1.0, 0.25))
 T0_PROFILE_H = 0.5             # per iteration: compare t0 and t0 +- this [ns]; while a
@@ -73,10 +73,10 @@ T0_PROFILE_MAX_STEPS = 8       # side wins, move there and double it, up to this
 # (LY PMTs + photons) cost far more than hit rows: they hold n_steps of double
 # backward. Lower the chunk sizes on OOM. None means no limit (a None chunk size
 # takes each term in one go).
-EVENTS_PER_BATCH = 64
+EVENTS_PER_BATCH = 128
 MAX_FLOW_ROWS = None
 MAX_HIT_ROWS = None
-FLOW_CHUNK_ROWS = 20000
+FLOW_CHUNK_ROWS = 30000
 HIT_CHUNK_ROWS = 200_000
 EMPTY_CACHE = True             # torch.cuda.empty_cache() whenever events leave the batch
 
@@ -86,7 +86,7 @@ START = 'perturbed'            # 'truth' or 'perturbed' (truth + SCALE * N(0, 1)
 PARAMS = ['x', 'y', 'z', 'zenith', 'azimuth', 'log10E', 't0']
 SCALE = np.array([20.0, 20.0, 20.0, np.radians(5), np.radians(5), 0.3, 20.0])
 PERT_SCALE = np.array([70.0, 70.0, 70.0, np.radians(10), np.radians(10), 1, 50.0])
-N_STARTS = 4                   # perturbed starts per event (START='perturbed'); the
+N_STARTS = 1                   # perturbed starts per event (START='perturbed'); the
                                # lowest-NLL fit is kept
 # bounds: starts and every step are projected back inside them; None = unbounded
 LOG10E_BOUNDS = (2.0, 6.0)     # the models' training range (1e2 .. 1e6 GeV)
