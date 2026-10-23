@@ -3,7 +3,8 @@ import math
 import random
 from torch.utils.checkpoint import checkpoint as _checkpoint
 from nugget.losses.base_loss import LossFunction
-from nugget.samplers.sim_weights import event_arrays, generation_params, get_simulation_weights
+from nugget.samplers.sim_weights import (event_arrays, generation_params, get_simulation_weights,
+                                         ranged_generation_density, M2_TO_CM2)
 from nugget.samplers.flux_weights import get_flux_weights
 from nugget.losses.effective_area import CrossSection, TransmissionProb
 from nugget.losses.fisher_info import WeightedResolutionLoss
@@ -51,6 +52,23 @@ def chunked_soft_histogram(weights, xs, edges, sigmas, chunk_size=None):
         total = total + _checkpoint(lambda w, *a: soft_histogram(w, a[:D], edges, a[D:]), *part,
                                     use_reentrant=False)
     return total
+
+
+def fit_injection_radius(points, d, point_weights=None, scale=1.5, softness=20.0):
+    """(n,) injection-disk radius around the geometry for each travel direction d (n, 3); the disk is centred at the origin.
+
+    The radius is scale x a weighted soft maximum of the modules' distances from the line through the
+    origin along d. It is differentiable in the module positions and weights, never exceeds the hard
+    maximum, and a module whose weight goes to 0 drops out.
+    """
+    w = (torch.ones(points.shape[0], dtype=points.dtype, device=points.device) if point_weights is None
+         else point_weights.to(points.dtype))
+    along = points @ d.to(points.dtype).T                                    # (M, n)
+    dist = torch.sqrt(((points * points).sum(1, keepdim=True) - along ** 2).clamp_min(1e-12))
+    # Weighted log-mean-exp: between the weighted mean and the max distance, -> max as softness -> 0.
+    log_w = torch.log(w.clamp_min(1e-30)).unsqueeze(1)
+    soft_max = softness * (torch.logsumexp(dist / softness + log_w, dim=0) - torch.log(w.sum()))
+    return scale * soft_max
 
 
 def poisson_fisher_matrix(mu, grad_mu):
@@ -152,6 +170,10 @@ class AnalysisLoss(LossFunction):
         dataset_name           = kwargs.get('analysis_dataset_name', None) # :str
         batched_sim_weights    = kwargs.get('analysis_batched_sim_weights', True) # :bool, sim weights are precomputed for the whole batch and must be sliced to the subsample
         bin_chunk_size         = kwargs.get('analysis_bin_chunk_size', None) # :int, events per checkpointed chunk of the soft histogram (None = one pass)
+        resample_vertices      = kwargs.get('analysis_resample_vertices', False) # :bool, RangeSampler only: redraw each vertex on a disk fitted around the geometry for its direction
+        injection_scale        = kwargs.get('analysis_injection_scale', 1.5) # :float, disk radius / soft max distance of the modules from the track line
+        injection_softness     = kwargs.get('analysis_injection_softness', 20.0) # :float, m, softness of that maximum
+        vertex_uniforms        = kwargs.get('analysis_vertex_uniforms', None) # :Tensor (N, 3), the vertex draws; set by the replay
 
         friend_config       = kwargs.get('friend_config', None) # :str|dict
         pyff_config         = kwargs.get('pyff_config', None) # :str|dict
@@ -179,6 +201,35 @@ class AnalysisLoss(LossFunction):
                 if eff_kwargs.get(key) is not None:
                     eff_kwargs[key] = eff_kwargs[key][idx]
         eff_kwargs['signal_event_params'] = signal_event_params
+        replay_events = signal_event_params
+
+        # Keep energy and direction, redraw the vertex on a disk fitted around the geometry for each direction.
+        # Only the disk area carries the geometry gradient (through the sim weights); the vertices are graph-free.
+        injection_area = None
+        if resample_vertices:
+            if not hasattr(signal_sampler, 'place_vertices'):
+                raise ValueError("analysis_resample_vertices needs a RangeSampler as signal_sampler")
+            points = geom_dict['points_3d']
+            point_w = None
+            if geom_dict.get('string_weights') is not None and geom_dict.get('string_xy') is not None:
+                point_w = PhotonCountTrigger.point_weights(points, geom_dict['string_xy'], geom_dict['string_weights'])
+            d = torch.stack([torch.as_tensor(e['direction']).reshape(3) for e in signal_event_params]).to(
+                device=points.device, dtype=points.dtype)
+            radius = fit_injection_radius(points, d, point_w, injection_scale, injection_softness)
+            injection_area = (math.pi * radius ** 2).to(self.device)            # m^2
+            n_ev, dev = len(signal_event_params), signal_sampler.device
+            if vertex_uniforms is None:
+                vertex_uniforms = torch.rand(n_ev, 3, dtype=torch.float64, device=dev)
+            energies = torch.stack([torch.as_tensor(e['energy']).reshape(-1)[0] for e in signal_event_params])
+            origin = torch.zeros(n_ev, 3, dtype=torch.float64, device=dev)
+            vertex, x_total = signal_sampler.place_vertices(
+                energies.to(device=dev, dtype=torch.float64), d.to(dev), origin, radius.to(dev), vertex_uniforms)
+            signal_event_params = [{**e, 'position': vertex[i:i + 1], 'column_depth': x_total[i:i + 1]}
+                                   for i, e in enumerate(signal_event_params)]
+            eff_kwargs['signal_event_params'] = signal_event_params
+            for key in PRECOMPUTED_PER_EVENT_KEYS:   # computed for the old vertices
+                eff_kwargs[key] = None
+            sim_weights = None                       # recomputed below for the new vertices and disks
         # Only precomputed sim weights are constants that may be replayed; computed ones can depend on the geometry.
         precomputed_sim_weights = sim_weights
         ev = {k: v.to(self.device) for k, v in event_arrays(signal_event_params, travel_direction=True).items()}
@@ -191,6 +242,9 @@ class AnalysisLoss(LossFunction):
         gen.update(sim_weight_kwargs)
         if gen.get('mode') == 'ranged' and 'column_depth' not in gen:
             gen['column_depth'] = ev.get('column_depth')
+        if injection_area is not None:
+            # Per-event disk instead of the sampler's fixed pi R_inj^2; N_gen is this batch.
+            gen.update(column_depth=ev['column_depth'], include_injection_area=False)
         if sim_weights is None:
             if self.xsec is None:
                 self.xsec = CrossSection()
@@ -198,6 +252,8 @@ class AnalysisLoss(LossFunction):
                 self.transmission = TransmissionProb()
             sim_weights = get_simulation_weights(ev['energy'], ev['cos_zenith'], xsec=self.xsec,
                                                  transmission=self.transmission, batched=batched_sim_weights, **gen)
+            if injection_area is not None:
+                sim_weights = sim_weights * injection_area
         if flux_weights is None or grad_weights is None:
             flux_weights, grad_weights = get_flux_weights(ev['energy'], ev['zenith'], ev['azimuth'],
                                                           friend_config, pyff_config, pid=weight_pid,
@@ -267,14 +323,16 @@ class AnalysisLoss(LossFunction):
 
         # Everything needed to recompute exactly this batch again (used by AnalysisAccumulator).
         replay = {
-            'signal_event_params': signal_event_params,
-            'num_events': len(signal_event_params),
+            'signal_event_params': replay_events,
+            'num_events': len(replay_events),
             'analysis_flux_weights': flux_weights.detach(),
             'analysis_grad_flux_weights': {k: g.detach() for k, g in grad_weights.items()},
             **{key: eff_kwargs.get(key) for key in PRECOMPUTED_PER_EVENT_KEYS},
         }
         if precomputed_sim_weights is not None:
             replay['analysis_sim_weights'] = precomputed_sim_weights
+        if injection_area is not None:
+            replay['analysis_vertex_uniforms'] = vertex_uniforms   # the same vertices again
 
         out = {
             'analysis_mu': mu,
@@ -291,6 +349,13 @@ class AnalysisLoss(LossFunction):
             out['energy_resolution_units'] = 'log10'  # sigma of log10(E); read by the visualizer's energy panels
         if 'angular' in res_cache:
             out['angular_resolution_per_event'] = res_cache['angular']  # radians, as the visualizer's angular panels expect
+        if injection_area is not None:
+            # A_eff = T * P_int * A_inj * efficiency * selection, in m^2: the weight times the generation density.
+            area = sim_weights * ranged_generation_density(ev['energy'], **gen) / M2_TO_CM2
+            out['effective_area_per_event'] = area * detector_effs * selection
+            out['injection_area_per_event'] = injection_area
+            out['effective_area_params'] = [{'energy': e['energy'], 'zenith': e['zenith'], 'azimuth': e['azimuth'],
+                                             'position': e['position']} for e in signal_event_params]
         return out
 
     def fisher_head(self, mu, grad_mu, param_names, **kwargs):

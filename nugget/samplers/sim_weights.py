@@ -162,24 +162,34 @@ def get_ranged_simulation_weights(
     average_nu_nubar=True,
     batched=False,
     include_transmission=True,
+    include_injection_area=True,
 ):
     """LeptonInjector ranged-mode OneWeight T * P_int * pi R_inj^2 / (N_gen q(E) p(Omega)), in GeV cm^2 sr.
 
     P_int = 1 - exp(-N_A X sigma) with X the per-event total column depth (g/cm^2, RangeSampler's
     'column_depth'). Directions are uniform over cos_range x azimuth_range. include_transmission=False
     gives LeptonWeighter's OneWeight, for fluxes already at the detector; True matches the surface fluxes
-    of flux_weights and the cylinder weights.
+    of flux_weights and the cylinder weights. include_injection_area=False leaves out pi R_inj^2, giving
+    the weight per m^2 of injection area, to be multiplied by a per-event area.
     """
     if column_depth is None:
         raise ValueError("Ranged weights need each event's column_depth (from RangeSampler).")
-    n_gen = energy.numel() if n_gen is None else n_gen
     area_fn, xsec, transmission = _effective_area_fn(batched, xsec, transmission)
     t_p_int = area_fn(
         cos_zenith, energy, None, None, xsec, transmission,
         flavor=flavor, average_nu_nubar=average_nu_nubar, include_projected_area=False,
         column_depth=column_depth, include_transmission=include_transmission,
     )
-    q_e = energy_pdf(energy, E_min, E_max, energy_dist, gamma)
+    disk_area = math.pi * injection_radius ** 2 if include_injection_area else 1.0  # m^2
+    density = ranged_generation_density(energy, E_min=E_min, E_max=E_max, energy_dist=energy_dist,
+                                        gamma=gamma, cos_range=cos_range, azimuth_range=azimuth_range,
+                                        n_gen=n_gen)
+    return M2_TO_CM2 * t_p_int * disk_area / density
+
+
+def ranged_generation_density(energy, *, E_min=1e2, E_max=1e7, energy_dist='power_law', gamma=1.5,
+                              cos_range=(-1.0, 1.0), azimuth_range=(0.0, 2 * math.pi), n_gen=None, **_):
+    """N_gen q(E) p(Omega) of ranged generation, in 1/(GeV sr); weight * density / 1e4 is the area in m^2."""
+    n_gen = energy.numel() if n_gen is None else n_gen
     solid_angle = (cos_range[1] - cos_range[0]) * (azimuth_range[1] - azimuth_range[0])
-    disk_area = math.pi * injection_radius ** 2  # m^2
-    return M2_TO_CM2 * t_p_int * disk_area * solid_angle / (n_gen * q_e)
+    return n_gen * energy_pdf(energy, E_min, E_max, energy_dist, gamma) / solid_angle

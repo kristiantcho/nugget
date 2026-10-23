@@ -163,6 +163,39 @@ class RangeSampler(Sampler):
         steps = 0.5 * (rho[:, 1:] + rho[:, :-1]) * (t[1:] - t[:-1]) * M_TO_CM
         return torch.cat([torch.zeros_like(rho[:, :1]), torch.cumsum(steps, dim=1)], dim=1)
 
+    @torch.no_grad()
+    def place_vertices(self, energy, d, center, radius, u=None):
+        """-> (vertex (n, 3), X_total (n,) in g/cm^2) for tracks along the unit travel directions d (n, 3).
+
+        The closest approach is uniform on the disk of `radius` (n,) around `center` (n, 3) perpendicular
+        to d, and the vertex uniform in column depth along the ranged interval. u (n, 3) are the uniforms
+        in [0, 1) driving that (drawn here if None). Graph-free: center and radius enter as numbers only.
+        """
+        n = d.shape[0]
+        if u is None:
+            u = torch.stack([self._rand(n), self._rand(n), self._rand(n)], dim=1)
+        d, center, radius = d.detach(), center.detach(), radius.detach()
+        ref = torch.zeros_like(d)
+        ref[:, 2] = 1.0
+        ref[d[:, 2].abs() > 0.9] = torch.tensor([1.0, 0.0, 0.0], dtype=d.dtype, device=d.device)
+        e1 = torch.linalg.cross(d, ref)
+        e1 = e1 / e1.norm(dim=1, keepdim=True)
+        e2 = torch.linalg.cross(d, e1)
+        rad = radius * torch.sqrt(u[:, 0])
+        psi = 2 * math.pi * u[:, 1]
+        pca = center + rad.unsqueeze(1) * (torch.cos(psi).unsqueeze(1) * e1 + torch.sin(psi).unsqueeze(1) * e2)
+
+        # Column depth measured upstream from the downstream end of the fixed segment.
+        end = pca + self.endcap_length * d
+        C = self._column_depth(end, d)
+        x_fixed = _interp_grid(torch.full_like(energy, 2 * self.endcap_length), self.t_grid, C)
+        # The range extension cannot reach past the edge of the Earth model.
+        x_total = torch.minimum(x_fixed + self.lepton_range_column_depth(energy), C[:, -1])
+
+        # X_trav is uniform in [0, X_total] from the upstream entry point, i.e. X_total - X_trav from the end.
+        t_vertex = _invert_grid(x_total * (1.0 - u[:, 2]), self.t_grid, C)
+        return end - t_vertex.unsqueeze(1) * d, x_total
+
     def _sample_chunk(self, n):
         energy = self.sample_energy(n)
 
@@ -174,28 +207,9 @@ class RangeSampler(Sampler):
         arrival = torch.stack([torch.sin(zen) * torch.cos(az), torch.sin(zen) * torch.sin(az), cos_zen], dim=1)
         d = -arrival
 
-        # Point of closest approach, uniform on the disk perpendicular to d.
-        ref = torch.zeros_like(d)
-        ref[:, 2] = 1.0
-        ref[d[:, 2].abs() > 0.9] = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64, device=self.device)
-        e1 = torch.linalg.cross(d, ref)
-        e1 = e1 / e1.norm(dim=1, keepdim=True)
-        e2 = torch.linalg.cross(d, e1)
-        rad = self.injection_radius * torch.sqrt(self._rand(n))
-        psi = 2 * math.pi * self._rand(n)
-        pca = self.detector_center + rad.unsqueeze(1) * (torch.cos(psi).unsqueeze(1) * e1 + torch.sin(psi).unsqueeze(1) * e2)
-
-        # Column depth measured upstream from the downstream end of the fixed segment.
-        end = pca + self.endcap_length * d
-        C = self._column_depth(end, d)
-        x_fixed = _interp_grid(torch.full_like(energy, 2 * self.endcap_length), self.t_grid, C)
-        # The range extension cannot reach past the edge of the Earth model.
-        x_total = torch.minimum(x_fixed + self.lepton_range_column_depth(energy), C[:, -1])
-
-        # X_trav is uniform in [0, X_total] from the upstream entry point, i.e. X_total - X_trav from the end.
-        x_trav = self._rand(n) * x_total
-        t_vertex = _invert_grid(x_total - x_trav, self.t_grid, C)
-        vertex = end - t_vertex.unsqueeze(1) * d
+        # Point of closest approach on the fixed injection disk around the detector origin.
+        vertex, x_total = self.place_vertices(energy, d, self.detector_center.expand(n, 3),
+                                              torch.full_like(energy, self.injection_radius))
 
         zen_travel = math.pi - zen
         az_travel = torch.remainder(az + math.pi, 2 * math.pi)

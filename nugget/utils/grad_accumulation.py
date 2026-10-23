@@ -106,11 +106,11 @@ def detach_extras(extras, skip=()):
 
 
 def collect_poolable(extras, pooled):
-    """Append the cheap per-event diagnostics (1-D ``*_per_event`` tensors, ``resolution_params``) to `pooled`."""
+    """Append the cheap per-event diagnostics (1-D ``*_per_event`` tensors, event lists) to `pooled`."""
     for key, item in extras.items():
         if key.endswith("_per_event") and torch.is_tensor(item) and item.dim() == 1:
             pooled.setdefault(key, []).append(item)
-        elif key == "resolution_params" and isinstance(item, list):
+        elif key in ("resolution_params", "effective_area_params") and isinstance(item, list):
             pooled.setdefault(key, []).append(item)
 
 
