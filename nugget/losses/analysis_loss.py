@@ -352,7 +352,7 @@ class AnalysisLoss(LossFunction):
         if injection_area is not None:
             # A_eff = T * P_int * A_inj * efficiency * selection, in m^2: the weight times the generation density.
             area = sim_weights * ranged_generation_density(ev['energy'], **gen) / M2_TO_CM2
-            out['effective_area_per_event'] = area * detector_effs * selection
+            out['effective_area_per_event'] = area * detector_effs #* selection
             out['injection_area_per_event'] = injection_area
             out['effective_area_params'] = [{'energy': e['energy'], 'zenith': e['zenith'], 'azimuth': e['azimuth'],
                                              'position': e['position']} for e in signal_event_params]
