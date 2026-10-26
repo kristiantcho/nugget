@@ -27,7 +27,7 @@ __all__ = [
 # ----------------------------------------------------------------------
 
 def configure_jax(preallocate=False, mem_fraction=None, x64=True, platform=None,
-                  device=None, verbose=True):
+                  device=None, restrict_to_device=True, verbose=True):
     """Make JAX safe to run alongside torch in one process.
 
     JAX preallocates ~75% of each visible GPU on first use, which OOMs a process
@@ -40,10 +40,11 @@ def configure_jax(preallocate=False, mem_fraction=None, x64=True, platform=None,
     platform : {'cuda', 'cpu', 'tpu'} or None
         Backend, not a device. Use `device` to pick which GPU.
     device : int, str or None
-        Pin JAX's default device, e.g. ``2`` or ``'cuda:2'``. Does not change
-        what torch sees. To keep JAX off the other GPUs entirely -- it still
-        opens a context on each visible one -- set ``CUDA_VISIBLE_DEVICES``
-        before the process starts instead.
+        Pin JAX's default device, e.g. ``2`` or ``'cuda:2'``, numbered as torch
+        numbers it. Does not change what torch sees.
+    restrict_to_device : bool
+        With a GPU `device`, also hide every other GPU from JAX, which would
+        otherwise open a context (and allocate memory) on each visible one.
     """
     import sys
 
@@ -62,23 +63,48 @@ def configure_jax(preallocate=False, mem_fraction=None, x64=True, platform=None,
     if platform is not None:
         os.environ["JAX_PLATFORMS"] = str(platform)
 
+    gpu_index = _gpu_index(device)
+    restricted = restrict_to_device and gpu_index is not None
+    if restricted:
+        # JAX-only counterpart of CUDA_VISIBLE_DEVICES; indexes into the CUDA-visible
+        # GPUs, as torch's 'cuda:N' does.
+        os.environ["JAX_CUDA_VISIBLE_DEVICES"] = gpu_index
+
     if already:
-        print("jax_bridge.configure_jax: JAX was already imported, so the memory "
-              "environment variables will NOT take effect in this process. Call "
-              "configure_jax() before importing any JAX code.")
+        print("jax_bridge.configure_jax: JAX was already imported, so the memory and "
+              "visible-device environment variables will NOT take effect in this "
+              "process. Call configure_jax() before importing any JAX code.")
 
     import jax
     if x64:
         jax.config.update("jax_enable_x64", True)
 
     if device is not None:
-        target = _select_device(jax, device)
+        gpus = jax.devices("cuda") if gpu_index is not None else []
+        if restricted and len(gpus) == 1:
+            target = gpus[0]  # the restriction worked: the requested GPU is the only one JAX lists
+        else:
+            if restricted:
+                print(f"jax_bridge.configure_jax: JAX still sees {len(gpus)} GPUs, so this JAX "
+                      "version ignores JAX_CUDA_VISIBLE_DEVICES. Set CUDA_VISIBLE_DEVICES "
+                      "before importing torch or JAX to keep it off the other GPUs.")
+            target = _select_device(jax, device)
         jax.config.update("jax_default_device", target)
         if verbose:
             print(f"jax_bridge: JAX default device is {target}")
     elif verbose:
         print(f"jax_bridge: JAX devices {jax.devices()}")
     return jax
+
+
+def _gpu_index(device):
+    """'N' for device N / 'cuda:N' / 'gpu:N', else None (cpu, a jax.Device, or no device)."""
+    if device is None or hasattr(device, "platform"):
+        return None
+    kind, _, index = str(device).rpartition(":")
+    if kind in ("", "cuda", "gpu") and index.isdigit():
+        return index
+    return None
 
 
 def _select_device(jax, device):

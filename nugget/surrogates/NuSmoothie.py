@@ -2,9 +2,24 @@ from nugget.surrogates.base_surrogate import Surrogate
 from nugget.surrogates.HitClassifier import HitClassifier
 from nugget.surrogates.FlowMatchLY import FlowMatchLY
 from nugget.surrogates.FlowMatchATime import FlowMatchATime
+import contextlib
 import torch
+from torch.utils.checkpoint import checkpoint as _checkpoint
 import numpy as np
 from pathlib import Path
+
+
+@contextlib.contextmanager
+def frozen_params(module):
+    """Temporarily stop autograd from tracking a module's own weights (inputs are still tracked)."""
+    params = [p for p in module.parameters() if p.requires_grad]
+    for p in params:
+        p.requires_grad_(False)
+    try:
+        yield
+    finally:
+        for p in params:
+            p.requires_grad_(True)
 
 
 CLIGHT = 0.299792458   # m/ns, vacuum
@@ -42,7 +57,7 @@ class NuSmoothie(Surrogate):
                  pmt_directions=None, geometry_csv_path=None,
                  n_pmt_per_om=None, pmt_mode='sum',
                  n_steps=64, ly_n_samples=32, batch_size=65536,
-                 verbose=True, **kwargs):
+                 float32=False, verbose=True, **kwargs):
         """
         Parameters
         ----------
@@ -86,6 +101,9 @@ class NuSmoothie(Surrogate):
         ly_n_samples : int
             Monte-Carlo samples for E[q | c, q>=1]. Cost is
             ``n_pmt x ly_n_samples x n_steps`` network evaluations.
+        float32 : bool
+            Cast the three networks to float32 (models passed in are cast in place). Inputs are
+            cast to each model's dtype and outputs back to float64, so only the precision changes.
         """
         if dim != 3:
             raise ValueError("NeuralSabre only supports 3D geometry")
@@ -108,6 +126,10 @@ class NuSmoothie(Surrogate):
         self.refractive_index = float(kwargs.get('n_refraction', 1.33))
         self.v_mu = float(kwargs.get('v_mu', CLIGHT))
         self.poisson_rate_cap = float(kwargs.get('poisson_rate_cap', 1e8))
+        # Rows per checkpointed chunk of the differentiable hit probability (hit_prob(grad=True)).
+        self.grad_batch_size = int(kwargs.get('grad_batch_size', 8192))
+        # PMTs with pi at or below this get E[q | hit] = 1 instead of a flow solve (0 = off).
+        self.ly_prune_below = float(kwargs.get('ly_prune_below', 0.0))
 
         ds = domain_size if domain_size is not None else 10000
         self.hit_model = self._load(hit_model, hit_checkpoint, HitClassifier, ds)
@@ -117,6 +139,12 @@ class NuSmoothie(Surrogate):
 
         if self.hit_model is None or self.ly_model is None:
             raise ValueError("NeuralSabre needs at least a hit model and an LY model")
+        if float32:
+            # nugget's global float64 default means the networks are built in float64, which is
+            # several times slower than float32 for the matmuls on most GPUs.
+            for _, m in self._named_models():
+                if getattr(m, 'net', None) is not None:
+                    m.net.to(torch.float32)
         if self.patd_mode and self.atime_model is None:
             raise ValueError("patd_mode=True requires an arrival-time model")
 
@@ -380,11 +408,11 @@ class NuSmoothie(Surrogate):
     # contexts
     # ------------------------------------------------------------------
 
-    def _contexts(self, pts, dirs, vertex, travel_dir, energy):
+    def _contexts(self, pts, dirs, vertex, travel_dir, energy, models=None):
         """-> {model name: context tensor on that model's device/dtype}.
 
         vertex / travel_dir / energy may be one event or one per row, so rows from
-        many events can share a call.
+        many events can share a call. ``models`` limits it to the groups those names are in.
         """
         self._require_track()
         m = pts.shape[0]
@@ -394,6 +422,8 @@ class NuSmoothie(Surrogate):
 
         out = {}
         for _, names in self._ctx_groups:
+            if models is not None and not set(names) & set(models):
+                continue
             ref = getattr(self, f'{names[0]}_model')
             # track_dir_is_arrival is part of the context signature, so every
             # model in a group wants the same convention as `ref`
@@ -413,8 +443,18 @@ class NuSmoothie(Surrogate):
     # the three model calls
     # ------------------------------------------------------------------
 
-    def hit_prob(self, ctx_hit):
-        """pi(c), calibrated to true detector occupancy."""
+    def _hit_prob_chunk(self, ctx_hit):
+        with frozen_params(self.hit_model.net):
+            return self.hit_model.predict_hit_prob(ctx_hit, calibrated=True).to(
+                device=self.device, dtype=torch.float64)
+
+    def hit_prob(self, ctx_hit, grad=False):
+        """pi(c), calibrated to true detector occupancy; grad=True keeps the graph back to the context."""
+        if grad:
+            # Checkpointed per chunk: backward recomputes the classifier instead of storing its activations.
+            b = self.grad_batch_size
+            return torch.cat([_checkpoint(self._hit_prob_chunk, ctx_hit[s:s + b], use_reentrant=False)
+                              for s in range(0, ctx_hit.shape[0], b)])
         out = torch.empty(ctx_hit.shape[0], dtype=torch.float64, device=self.device)
         with torch.no_grad():
             for s, e in self._chunks(ctx_hit.shape[0]):
@@ -468,7 +508,8 @@ class NuSmoothie(Surrogate):
 
     def __call__(self, track_pos=None, track_dir=None, track_energy=None,
                  om_positions=None, test_points=None, pmt_directions=None,
-                 pmt_mode=None, sample=False, generator=None, **kwargs):
+                 pmt_mode=None, sample=False, generator=None, hit_grad=False,
+                 ly_prune_below=None, **kwargs):
         """Expected photons at each position: pi(c) . E[q | c, q>=1].
 
         Mirrors LightSabre.__call__. With ``sample=True`` returns one Bernoulli x
@@ -492,22 +533,34 @@ class NuSmoothie(Surrogate):
         pts, dirs, group, n_out = self._resolve_points(om_positions,
                                                         pmt_directions, pmt_mode)
         q = self._light(self._contexts(pts, dirs, vertex, travel, energy),
-                        sample, generator)
+                        sample, generator, hit_grad, ly_prune_below)
         if n_out != q.shape[0]:
             q = torch.zeros(n_out, dtype=q.dtype,
                             device=q.device).index_add_(0, group, q)
         return q
 
-    def _light(self, ctxs, sample=False, generator=None):
-        """Per-row photons: pi . E[q | hit], or one Bernoulli x flow draw if sample."""
-        p = self.hit_prob(ctxs['hit'])
+    def _light(self, ctxs, sample=False, generator=None, hit_grad=False, prune_below=None):
+        """Per-row photons: pi . E[q | hit], or one Bernoulli x flow draw if sample.
+
+        hit_grad=True keeps the graph through pi; E[q | hit] stays a constant. prune_below
+        (default ly_prune_below) skips the flow for PMTs that are almost never hit.
+        """
+        p = self.hit_prob(ctxs['hit'], grad=hit_grad)
         if sample:
             u = torch.rand(p.shape[0], device=self.device, dtype=torch.float64,
                            generator=generator)
             q = torch.where(u < p, self.sample_ly(ctxs['ly'], generator),
                             torch.zeros_like(p))
         else:
-            q = p * self.expected_ly_given_hit(ctxs['ly'], generator=generator)
+            prune_below = self.ly_prune_below if prune_below is None else float(prune_below)
+            # E[q | hit] >= 1, so pruned PMTs take that lower bound instead of a flow solve: they keep
+            # their gradient through pi and lose at most pi * (E[q | hit] - 1) photons each.
+            keep = p.detach() > prune_below
+            e_q = torch.ones_like(p.detach())
+            if keep.any():
+                e_q[keep] = self.expected_ly_given_hit(ctxs['ly'][keep.to(ctxs['ly'].device)],
+                                                       generator=generator)
+            q = p * e_q
         return torch.nan_to_num(q, nan=0.0, posinf=self.poisson_rate_cap,
                                 neginf=0.0).clamp(min=0.0)
 
@@ -518,12 +571,14 @@ class NuSmoothie(Surrogate):
 
     def call_batched(self, track_pos, track_dir, track_energy, om_positions,
                      pmt_directions=None, pmt_mode=None, sample=False, generator=None,
-                     events_per_batch=None, **kwargs):
+                     events_per_batch=None, hit_grad=False, ly_prune_below=None, **kwargs):
         """(n_events, n_out) photons, vectorised over events.
 
         Rows are (event, PMT) pairs, so every event shares one pass through each
         model; events_per_batch bounds how many go into a pass (memory ~ events x
         PMTs). sample=True draws instead of taking the mean, as in __call__.
+        hit_grad=True makes it differentiable in om_positions through the hit probability.
+        ly_prune_below overrides the constructor's threshold for skipping the flow (see _light).
         """
         self._require_track()
         as_t = lambda x: torch.as_tensor(x).to(device=self.device, dtype=torch.float64)
@@ -541,8 +596,28 @@ class NuSmoothie(Surrogate):
             rows_ev, key = self._event_rows(M, B, b0, n_out, group)
             ev = rows_ev + b0
             ctxs = self._contexts(pts.repeat(B, 1), dirs.repeat(B, 1), V[ev], U[ev], E[ev])
-            out = out.index_add(0, key, self._light(ctxs, sample, generator))
+            out = out.index_add(0, key, self._light(ctxs, sample, generator, hit_grad, ly_prune_below))
         return out.reshape(n_ev, n_out)
+
+    def hit_prob_batched(self, om_positions, event_params_list, pmt_directions=None,
+                         events_per_batch=None, grad=True):
+        """(n_events, n_pmt) hit probability of every PMT, point-major as in pmt_mode='split'.
+
+        Only the hit classifier runs; with grad=True the result is differentiable in om_positions.
+        """
+        self._require_track()
+        V, U, E = self._stack_events(event_params_list)
+        pts, dirs, _, _ = self._resolve_points(om_positions, pmt_directions, 'split')
+        M, n_ev = pts.shape[0], V.shape[0]
+        epb = n_ev if events_per_batch is None else max(int(events_per_batch), 1)
+        out = []
+        for b0 in range(0, n_ev, epb):
+            B = min(epb, n_ev - b0)
+            ev = torch.arange(b0, b0 + B, device=self.device).repeat_interleave(M)
+            ctxs = self._contexts(pts.repeat(B, 1), dirs.repeat(B, 1), V[ev], U[ev], E[ev],
+                                  models=('hit',))
+            out.append(self.hit_prob(ctxs['hit'], grad=grad).reshape(B, M))
+        return torch.cat(out)
 
     def _stack_events(self, event_params_list, gradient_mode=False):
         """List of event dicts -> vertices (B,3), travel directions (B,3), energies (B,)."""

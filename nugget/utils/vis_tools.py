@@ -124,6 +124,7 @@ class Visualizer:
     PLOT_FISHER_INFO_CONTOUR = "fisher_info_contour"
     PLOT_ANGULAR_RESOLUTION = "angular_resolution"
     PLOT_ENERGY_RESOLUTION = "energy_resolution"
+    PLOT_ENERGY_RESOLUTION_HIST = "energy_resolution_hist"
     PLOT_POINTSOURCE_FOM = "pointsource_fom"
     PLOT_ANGULAR_RESOLUTION_HISTORY = "angular_resolution_history"
     PLOT_ENERGY_RESOLUTION_HISTORY = "energy_resolution_history"
@@ -143,6 +144,7 @@ class Visualizer:
     PLOT_DETECTOR_EFFICIENCY_HISTORY = "detector_efficiency_history"
     PLOT_EFFECTIVE_AREA_HISTORY = "effective_area_history"
     PLOT_FLUX_VARIANCE_HISTORY = "flux_variance_history"
+    PLOT_FLUX_LIKELIHOOD_SCAN = "flux_likelihood_scan"
     PLOT_NN_DISTANCE_HISTORY = "nn_distance_history"
 
 
@@ -180,6 +182,8 @@ class Visualizer:
         # resolution_stat), rather than the scalar angular_resolution_loss already
         # tracked in uw_loss_dict. Also keyed by iteration.
         self._angular_resolution_per_event_history = {}
+        # Same for the energy resolution, from energy_resolution_per_event.
+        self._energy_resolution_per_event_history = {}
         # History of the (weighted) average per-string mean distance to its 5 nearest
         # neighbours, accumulated across iterations for the 'nn_distance_history' plot.
         # Keyed by iteration (see the iteration-dict rationale on the detector
@@ -222,6 +226,41 @@ class Visualizer:
         except Exception:
             # Common default.
             return 1.959963984540054
+
+    @staticmethod
+    def _likelihood_scan_inputs(kwargs):
+        """-> (name, theta_hat, has_value, sigma_conditional, sigma_profiled) for the scanned flux parameter, or None.
+
+        Asimov: -2 Delta ln L(theta) = (theta - theta_hat)^T F (theta - theta_hat). Scanning one parameter
+        with the others fixed gives F_ii (Delta theta_i)^2; re-fitting the others at each point (profiling)
+        gives (Delta theta_i)^2 / (F^-1)_ii, whose curvature is the Schur complement F_ii - F_in F_nn^-1 F_ni.
+        """
+        F = kwargs.get('analysis_fisher_matrix', None)
+        names = kwargs.get('analysis_param_names', None)
+        if F is None or not names:
+            return None
+        F = np.asarray(F.detach().cpu().numpy() if isinstance(F, torch.Tensor) else F, dtype=float)
+        name = kwargs.get('likelihood_scan_param', None) or (kwargs.get('flux_param_names', None) or names)[0]
+        if name not in names:
+            return None
+        i = list(names).index(name)
+        sigma_cond = 1.0 / np.sqrt(F[i, i]) if F[i, i] > 0 else np.nan
+        sigma_prof = float(np.sqrt(max(np.linalg.pinv(F)[i, i], 0.0)))
+        values = kwargs.get('analysis_param_values', None) or {}
+        return name, float(values.get(name, 0.0)), name in values, float(sigma_cond), sigma_prof
+
+    @staticmethod
+    def _likelihood_scan_axes(ax, name, has_value, nsigma):
+        """Labels, 68% / 95% lines and y range of a -2 Delta ln L scan."""
+        for level, text in ((1.0, '68.3%'), (3.84, '95%')):
+            ax.axhline(level, color='gray', linestyle=':', linewidth=1)
+            ax.text(1.0, level, f' {text}', transform=ax.get_yaxis_transform(), va='center', fontsize=8,
+                    color='gray', clip_on=False)
+        ax.set_ylim(0.0, max(nsigma ** 2, 4.5))
+        ax.set_title(f'Likelihood scan: {name}')
+        ax.set_xlabel(name if has_value else rf'$\Delta$ {name}')
+        ax.set_ylabel(r'$-2\,\Delta \ln L$')
+        ax.grid(True, alpha=0.3)
 
     @staticmethod
     def _compute_fom_from_resolution(values, min_resolution=1e-12):
@@ -1170,7 +1209,15 @@ class Visualizer:
             - 'signal_light_yield_contour_points': Signal light yield contour plot based on per-point values
             - 'fisher_info_logdet': Log determinant of Fisher Information matrix contour plot
             - 'angular_resolution': Angular resolution from Fisher Information using Cramér-Rao bound
-            - 'energy_resolution': Energy resolution from Fisher Information using Cramér-Rao bound
+            - 'energy_resolution': Energy resolution history, aggregated per iteration from
+              'energy_resolution_per_event' with resolution_stat (fallback: the
+              energy_resolution_loss history). Units follow 'energy_resolution_units'
+              ('log10', shown as sigma_E / E), else use_relative_energy. 'resolution_logy_energy'
+              for a log y axis.
+            - 'energy_resolution_hist': Histogram of the current 'energy_resolution_per_event',
+              in the same units as 'energy_resolution', on log-spaced bins. Optional kwargs:
+              'energy_resolution_hist_bins' (default 50), 'energy_resolution_hist_threshold'
+              (draws a vertical line, e.g. at the analysis selection threshold).
             - 'pointsource_fom': Pointsource FoM history from unweighted loss dictionary
             - 'flux_variance_history': Combined variance/error of the signal flux parameters
               from `AnalysisLoss` over iterations, read from `uw_loss_dict['fisher_analysis_loss']`
@@ -1179,6 +1226,12 @@ class Visualizer:
               curves from the loss's 'flux_param_variances'; 'flux_param_names' to label the
               combined curve; 'flux_variance_as_sigma' (default True) to plot sum-of-sigmas
               rather than its square.
+            - 'flux_likelihood_scan': Asimov -2 Delta ln L parabola of one flux parameter from the
+              analysis Fisher matrix ('analysis_fisher_matrix', 'analysis_param_names', centred on
+              'analysis_param_values'). Solid: profiled over the other parameters (Schur complement,
+              (Delta theta)^2 / (F^-1)_ii); dashed: the others fixed (F_ii (Delta theta)^2). Optional
+              kwargs: 'likelihood_scan_param' (default: first of 'flux_param_names'),
+              'likelihood_scan_nsigma' (default 3), 'likelihood_scan_conditional' (default True).
             - 'angular_resolution_vs_zenith': Binned angular resolution vs zenith
             - 'angular_resolution_vs_energy': Binned angular resolution vs energy
             - 'energy_resolution_vs_energy': Binned energy resolution vs energy
@@ -1608,6 +1661,7 @@ class Visualizer:
             self.PLOT_ENERGY_RESOLUTION,
             self.PLOT_POINTSOURCE_FOM,
             self.PLOT_FLUX_VARIANCE_HISTORY,
+            self.PLOT_FLUX_LIKELIHOOD_SCAN,
             self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH,
             self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
             self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
@@ -1752,6 +1806,18 @@ class Visualizer:
                             shared_bin_edges = np.logspace(np.log10(vmin), np.log10(vmax), n_bins_shared + 1)
                             shared_bin_centers = np.sqrt(shared_bin_edges[:-1] * shared_bin_edges[1:])
 
+                # Likelihood scan: one theta range for all geometries, wide enough for the loosest constraint.
+                scan_meta = {}
+                if plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+                    scan_meta['nsigma'] = float(shared_kwargs.get('likelihood_scan_nsigma', 3.0))
+                    sigmas = []
+                    for _, geom_payload in geom_items:
+                        scan = self._likelihood_scan_inputs({**geom_payload, **shared_kwargs})
+                        if scan is not None and np.isfinite(scan[4]) and scan[4] > 0:
+                            sigmas.append(scan[4])
+                    if sigmas:
+                        scan_meta['halfwidth'] = scan_meta['nsigma'] * max(sigmas)
+
                 # For ratio subplot: store y(x) per geometry.
                 ratio_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
                 for geom_name, payload in geom_items:
@@ -1814,6 +1880,22 @@ class Visualizer:
                                     color=geom_color.get(geom_name_str, None),
                                 )
                                 any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+                        scan = self._likelihood_scan_inputs(payload)
+                        if scan is not None and 'halfwidth' in scan_meta and np.isfinite(scan[4]) and scan[4] > 0:
+                            name, theta_hat, has_value, sigma_cond, sigma_prof = scan
+                            scan_meta.update(name=name, has_value=has_value)
+                            x = np.linspace(theta_hat - scan_meta['halfwidth'], theta_hat + scan_meta['halfwidth'], 401)
+                            x_plot = x if has_value else x - theta_hat
+                            color = geom_color.get(geom_name_str, None)
+                            ax.plot(x_plot, ((x - theta_hat) / sigma_prof) ** 2, color=color, linewidth=2,
+                                    label=rf'{geom_name_str}  $\sigma$ = {sigma_prof:.3g}')
+                            if payload.get('likelihood_scan_conditional', True) and np.isfinite(sigma_cond):
+                                ax.plot(x_plot, ((x - theta_hat) / sigma_cond) ** 2, color=color, linestyle='--',
+                                        linewidth=1.0, alpha=0.7)
+                            any_series = True
                         continue
 
                     if plot_type in (self.PLOT_ANGULAR_RESOLUTION, self.PLOT_ENERGY_RESOLUTION, self.PLOT_POINTSOURCE_FOM, self.PLOT_FLUX_VARIANCE_HISTORY):
@@ -2908,6 +2990,13 @@ class Visualizer:
                     ax.grid(True, alpha=0.3)
                     if payload.get('ps_fom_logy', False):
                         ax.set_yscale('log')
+                elif plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+                    if 'name' in scan_meta:
+                        self._likelihood_scan_axes(ax, scan_meta['name'], scan_meta['has_value'], scan_meta['nsigma'])
+                        ax.plot([], [], color='gray', linestyle='--', label='others fixed')
+                    else:
+                        ax.text(0.5, 0.5, "Likelihood scan not available\n(needs 'analysis_fisher_matrix')",
+                                ha='center', va='center', transform=ax.transAxes)
                 elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
                     ax.set_title('Flux Parameter Variance History')
                     ax.set_xlabel('Iteration')
@@ -5825,31 +5914,127 @@ class Visualizer:
                       ha='center', va='center', transform=ax.transAxes)
         
         elif plot_type == self.PLOT_ENERGY_RESOLUTION:
-            # Energy resolution history from Fisher Information matrix using Cramér-Rao bound
-            loss_dict = kwargs.get('uw_loss_dict', None)
+            # Energy resolution history. As for the angular panel, the preferred source is
+            # energy_resolution_per_event aggregated per iteration with resolution_stat; the
+            # scalar energy_resolution_loss history in uw_loss_dict is the fallback.
+            #
+            # Units of the per-event values: 'energy_resolution_units' if the loss reports it
+            # ('log10' = sigma of log10 E, as AnalysisLoss returns), else sigma_E / E with
+            # use_relative_energy, else sigma_E in GeV. log10 is shown as sigma_E / E = ln(10) sigma.
+            resolution_per_event = kwargs.get('energy_resolution_per_event', None)
+            iteration = kwargs.get('iteration', None)
+            units = kwargs.get('energy_resolution_units', None)
+            if units is None:
+                units = 'relative' if kwargs.get('use_relative_energy', False) else 'absolute'
+            resolution_stat = kwargs.get('resolution_stat', None)
+            if resolution_stat is None and bool(kwargs.get('resolution_use_mean', False)):
+                resolution_stat = 'mean'
+            resolution_stat = str(resolution_stat).lower() if resolution_stat is not None else 'median'
+            if resolution_stat not in ('median', 'mean', 'fom'):
+                resolution_stat = 'median'
+            resolution_use_fom = bool(kwargs.get('resolution_use_fom', False)) or resolution_stat == 'fom'
 
-            if loss_dict is not None:
-                energy_resolution_history = loss_dict.get('energy_resolution_loss', None)
+            if resolution_per_event is not None and iteration is not None:
+                if isinstance(resolution_per_event, torch.Tensor):
+                    res_values = resolution_per_event.detach().cpu().numpy().flatten()
+                else:
+                    res_values = np.array(resolution_per_event, dtype=float).flatten()
+                if units == 'log10':
+                    res_values = res_values * np.log(10.0)
+                res_values = res_values[np.isfinite(res_values)]
+                if res_values.size > 0:
+                    if resolution_use_fom:
+                        agg_val, _ = self._compute_fom_from_resolution(
+                            res_values, min_resolution=kwargs.get('resolution_fom_min_resolution', 1e-12),
+                        )
+                    elif resolution_stat == 'mean':
+                        agg_val = float(np.nanmean(res_values))
+                    else:
+                        agg_val = float(np.nanmedian(res_values))
+                    if np.isfinite(agg_val):
+                        self._energy_resolution_per_event_history[int(iteration)] = float(agg_val)
+
+            energy_resolution_history = None
+            using_per_event_history = len(self._energy_resolution_per_event_history) > 0
+            if using_per_event_history:
+                x_axis = sorted(self._energy_resolution_per_event_history.keys())
+                energy_resolution_history = np.array(
+                    [self._energy_resolution_per_event_history[i] for i in x_axis]
+                )
+            else:
+                loss_dict = kwargs.get('uw_loss_dict', None)
+                if loss_dict is not None and loss_dict.get('energy_resolution_loss'):
+                    energy_resolution_history = np.array(loss_dict['energy_resolution_loss'])
+                    x_axis = range(len(energy_resolution_history))
 
             if energy_resolution_history is not None:
-                energy_resolution_history = np.array(energy_resolution_history)
-                
-                # Plot the history of weighted total energy resolution
-                ax.plot(energy_resolution_history, color='red', linewidth=2, markersize=4)
-                ax.set_title('Energy Resolution History')
+                ax.plot(x_axis, energy_resolution_history, color='red', linewidth=2, markersize=4)
+                title_stat = (
+                    ('FoM' if resolution_use_fom else resolution_stat.capitalize())
+                    if using_per_event_history else 'Total'
+                )
+                ax.set_title(f'Energy Resolution History ({title_stat})')
                 ax.set_xlabel('Iteration')
-                ax.set_ylabel('Energy Resolution [GeV]')
+                if using_per_event_history and resolution_use_fom:
+                    ylabel = 'Energy FoM'
+                elif units == 'absolute':
+                    ylabel = r'$\sigma_E$ [GeV]'
+                else:
+                    ylabel = r'$\sigma_E / E$'
+                ax.set_ylabel(ylabel)
+                if kwargs.get('resolution_logy_energy', False):
+                    ax.set_yscale('log')
                 ax.grid(True, alpha=0.3)
-                
-                # Add current value annotation
-                # if len(energy_resolution_history) > 0:
-                #     current_val = energy_resolution_history[-1]
-                #     ax.annotate(f'Current: {current_val:.4f}', 
-                #               xy=(len(energy_resolution_history)-1, current_val),
-                #               xytext=(10, 10), textcoords='offset points',
-                #               fontsize=10, ha='left')
             else:
-                ax.text(0.5, 0.5, "Energy resolution history not available\n(Pass 'energy_resolution_history' in kwargs)",
+                ax.text(0.5, 0.5, "Energy resolution history not available\n(needs 'energy_resolution_per_event' from a loss,\nor an 'energy_resolution_loss' in loss_func_dict)",
+                      ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_ENERGY_RESOLUTION_HIST:
+            # Distribution of the current per-event energy resolutions, in the units of the
+            # energy_resolution panel ('log10' is shown as sigma_E / E).
+            resolution_per_event = kwargs.get('energy_resolution_per_event', None)
+            units = kwargs.get('energy_resolution_units', None)
+            if units is None:
+                units = 'relative' if kwargs.get('use_relative_energy', False) else 'absolute'
+
+            res_values = None
+            if resolution_per_event is not None:
+                if isinstance(resolution_per_event, torch.Tensor):
+                    res_values = resolution_per_event.detach().cpu().numpy().flatten()
+                else:
+                    res_values = np.array(resolution_per_event, dtype=float).flatten()
+                if units == 'log10':
+                    res_values = res_values * np.log(10.0)
+                res_values = res_values[np.isfinite(res_values) & (res_values > 0)]
+
+            if res_values is not None and res_values.size > 0:
+                n_bins = int(kwargs.get('energy_resolution_hist_bins', 50))
+                log_lo, log_hi = np.log10(res_values.min()), np.log10(res_values.max())
+                if log_hi <= log_lo:
+                    log_lo, log_hi = log_lo - 0.5, log_hi + 0.5
+                bins = np.logspace(log_lo, log_hi, n_bins + 1)
+                ax.hist(res_values, bins=bins, color='red', alpha=0.7, edgecolor='darkred')
+                ax.set_xscale('log')
+
+                median = float(np.median(res_values))
+                ax.axvline(median, color='k', linestyle='--', linewidth=1.2, label=f'median {median:.3g}')
+                threshold = kwargs.get('energy_resolution_hist_threshold', None)
+                if threshold is not None:
+                    frac = float(np.mean(res_values < threshold))
+                    ax.axvline(threshold, color='tab:blue', linestyle=':', linewidth=1.5,
+                               label=f'threshold {threshold:g} ({100 * frac:.0f}% below)')
+
+                iteration = kwargs.get('iteration', None)
+                title = 'Energy Resolution Distribution'
+                if iteration is not None:
+                    title += f' (iteration {iteration})'
+                ax.set_title(title)
+                ax.set_xlabel(r'$\sigma_E$ [GeV]' if units == 'absolute' else r'$\sigma_E / E$')
+                ax.set_ylabel(f'Events (of {res_values.size})')
+                ax.legend(fontsize=8, loc='best')
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, "Energy resolutions not available\n(needs 'energy_resolution_per_event' from a loss)",
                       ha='center', va='center', transform=ax.transAxes)
 
         elif plot_type == self.PLOT_DETECTOR_EFFICIENCY_HISTORY:
@@ -5987,6 +6172,24 @@ class Visualizer:
             else:
                 ax.text(0.5, 0.5, "Nearest-neighbour distance history not available\n(Pass 'string_xy')",
                       ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+            scan = self._likelihood_scan_inputs(kwargs)
+            if scan is None or not np.isfinite(scan[4]) or scan[4] <= 0:
+                ax.text(0.5, 0.5, "Likelihood scan not available\n(needs 'analysis_fisher_matrix' and "
+                        "'analysis_param_names' from AnalysisLoss)", ha='center', va='center', transform=ax.transAxes)
+            else:
+                name, theta_hat, has_value, sigma_cond, sigma_prof = scan
+                nsigma = float(kwargs.get('likelihood_scan_nsigma', 3.0))
+                x = np.linspace(theta_hat - nsigma * sigma_prof, theta_hat + nsigma * sigma_prof, 401)
+                x_plot = x if has_value else x - theta_hat
+                ax.plot(x_plot, ((x - theta_hat) / sigma_prof) ** 2, color='crimson', linewidth=2,
+                        label=rf'profiled  $\sigma$ = {sigma_prof:.3g}')
+                if kwargs.get('likelihood_scan_conditional', True) and np.isfinite(sigma_cond):
+                    ax.plot(x_plot, ((x - theta_hat) / sigma_cond) ** 2, color='crimson', linestyle='--',
+                            linewidth=1.2, label=rf'others fixed  $\sigma$ = {sigma_cond:.3g}')
+                self._likelihood_scan_axes(ax, name, has_value, nsigma)
+                ax.legend(fontsize=8, loc='upper center')
 
         elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
             # Combined variance of the signal flux parameters from AnalysisLoss,

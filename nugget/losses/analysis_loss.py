@@ -1,827 +1,416 @@
 import torch
-import numpy as np
 import math
 import random
-import pandas as pd
-import os
+from torch.utils.checkpoint import checkpoint as _checkpoint
 from nugget.losses.base_loss import LossFunction
-from nugget.losses.trigger import TriggerLoss, ResolutionSelectionLoss
+from nugget.samplers.sim_weights import (event_arrays, generation_params, get_simulation_weights,
+                                         ranged_generation_density, M2_TO_CM2)
+from nugget.samplers.flux_weights import get_flux_weights, model_parameter_values
+from nugget.losses.effective_area import CrossSection, TransmissionProb
 from nugget.losses.fisher_info import WeightedResolutionLoss
-from nugget.losses.effective_area import get_weighted_min_enclosing_circle
-from nugget.samplers.cyl_sampler import CylinderSampler
-from torch.special import ndtr
-from typing import Union, List
-from numpy.typing import ArrayLike as Array
+from nugget.losses.fisher_info_om_net import covariance_from_fisher, resolution_from_covariance
+from nugget.losses.trigger import TriggerLoss
+from nugget.losses.photon_trigger import PhotonCountTrigger
 
-# friEnd / pyForwardFolding are imported at the call site: they pull in JAX,
-# which preallocates most of every visible GPU on first use.
+# Trigger names accepted by AnalysisLoss(trigger_loss=...) and the 'analysis_trigger' loss param.
+TRIGGERS = {'sliding_bar': TriggerLoss, 'photon_count': PhotonCountTrigger}
 
-# ---------------------------------------------------------------------------
-# Flux weighting via friEnd + pyForwardFolding
-# ---------------------------------------------------------------------------
-
-SEP = '::'  # separates base key from component index, e.g. 'position::0'
-
-def to_pandas_jax(data_list, sep=SEP):
-    """List[dict[str, Tensor]] -> pd.DataFrame with flattened columns."""
-  
-
-    keys = data_list[0].keys()
-    stacked = {}
-
-    for k in keys:
-        vals = []
-        for d in data_list:
-            v = d[k]
-            arr = np.asarray(v.detach().cpu().numpy() if torch.is_tensor(v) else v)
-            # drop a leading dim of size 1, e.g. energy (1,) -> (), position (1,3) -> (3,)
-            if arr.ndim >= 1 and arr.shape[0] == 1:
-                arr = arr[0]
-            vals.append(arr)
-        stacked[k] = np.stack(vals)  # (N,) or (N, D)
-
-    df_dict = {}
-    shapes = {}
-    for k, arr in stacked.items():
-        shapes[k] = arr.shape[1:]
-        if arr.ndim == 1:
-            df_dict[k] = arr
-        else:
-            flat = arr.reshape(arr.shape[0], -1)
-            for i in range(flat.shape[1]):
-                df_dict[f'{k}{sep}{i}'] = flat[:, i]
-
-    df = pd.DataFrame(df_dict)
-    df.attrs['shapes'] = shapes
-    return df
+PRECOMPUTED_PER_EVENT_KEYS = ('precomputed_fisher_info_per_string_per_event', 'precomputed_light_yield_per_point_per_event')
 
 
-def from_pandas_jax(df, sep=SEP):
-    """pd.DataFrame -> List[dict[str, torch.Tensor]], reversing to_pandas_jax."""
-  
-
-    groups = {}
-    for col in df.columns:
-        if sep in col:
-            base, idx = col.rsplit(sep, 1)
-            groups.setdefault(base, {})[int(idx)] = df[col].to_numpy()
-        else:
-            groups[col] = df[col].to_numpy()
-
-    full = {}
-    for k, v in groups.items():
-        if isinstance(v, dict):
-            ncols = max(v.keys()) + 1
-            full[k] = np.stack([v[i] for i in range(ncols)], axis=1)  # (N, D)
-        else:
-            full[k] = v[:, None]  # (N, 1)
-
-    shapes = df.attrs.get('shapes', {})
-    n_rows = len(df)
-    data_list = []
-    for row in range(n_rows):
-        d = {}
-        for k, arr in full.items():
-            val = arr[row]  # flat (D,)
-            target_shape = shapes.get(k, val.shape)  # fall back to flat shape if unknown (new key)
-            d[k] = torch.as_tensor(val, dtype=torch.float64).reshape(target_shape)
-        data_list.append(d)
-    return data_list
+def soft_bin_indicators(x, edges, sigma):
+    """(N, n_bins) smooth bin membership of x with width sigma; the hard indicator as sigma -> 0."""
+    # Sum of two tanh steps rather than the poster's 0.5 * (tanh * tanh + 1): that form tends to 0.5 in
+    # every bin once sigma >> bin width, whereas this one telescopes so each event's total over bins is <= 1.
+    lo = (x.unsqueeze(1) - edges[:-1]) / sigma.unsqueeze(1)
+    hi = (edges[1:] - x.unsqueeze(1)) / sigma.unsqueeze(1)
+    return 0.5 * (torch.tanh(lo) + torch.tanh(hi))
 
 
-def _projected_area_np(cos_theta, cyl_radius, cyl_height):
-    """A_proj(theta) = pi R^2 |cos| + 2 R H sin. Mirrors cyl_sampler.projected_area."""
-  
+def soft_histogram(weights, xs, edges, sigmas):
+    """(P, n_1 * ... * n_D) smeared histograms of P weight rows (P, N) over D axes, flattened row-major.
 
-    cos_theta = np.asarray(cos_theta, dtype=float)
-    cap = np.pi * cyl_radius ** 2
-    sides = 2.0 * cyl_radius * cyl_height
-    sin_theta = np.sqrt(np.clip(1.0 - cos_theta ** 2, 0.0, None))
-    return cap * np.abs(cos_theta) + sides * sin_theta
-
-
-def _as_float(x):
-    return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
-
-
-def describe_sampler_generation(signal_sampler):
-    """Read the generation parameters straight off a CylinderSampler.
+    Contracts the weights with one axis' (N, n_d) indicators at a time instead of forming the joint
+    (N, n_1 * ... * n_D) indicator matrix.
     """
-    skw = getattr(signal_sampler, 'kwargs', {}) or {}
-    cyl = getattr(signal_sampler, 'cylinder', None)
-    
-
-    cos_range = skw.get('cos_range', (-1.0, 1.0))
-    if isinstance(cos_range, str):
-        mode = cos_range.strip().lower()
-        # Mirrors _parse_zenith_cos_range / the hardcoded windows in
-        # sample_uniform_ray.
-        if 'horizontal' in mode:
-            cos_window = 'horizontal'
-        elif 'vertical' in mode:
-            cos_window = 'vertical'
-        else:
-            raise ValueError(f"Unsupported cos_range string: {cos_range!r}")
-    else:
-        if torch.is_tensor(cos_range):
-            cos_range = cos_range.detach().cpu().tolist()
-        cos_window = (float(cos_range[0]), float(cos_range[1]))
-
-    return {
-        'cyl_radius': _as_float(cyl.radius),
-        'cyl_height': _as_float(cyl.height),
-        'E_min': float(skw.get('E_min', 0.8)),
-        'E_max': float(skw.get('E_max', 1.0)),
-        'energy_dist': skw.get('energy_dist', 'power_law'),
-        'gamma': float(skw.get('gamma', 2.7 if getattr(signal_sampler, 'event_type', 'signal') == 'signal' else 3.7)),
-        'cos_window': cos_window,
-        'uniform_zenith_sampling': bool(skw.get('uniform_zenith_sampling', False)),
-    }
+    letters = 'abcdefgh'[:len(xs)]
+    inds = [soft_bin_indicators(x, e, s) for x, e, s in zip(xs, edges, sigmas)]
+    spec = 'pi,' + ','.join(f'i{c}' for c in letters) + '->p' + letters
+    return torch.einsum(spec, weights, *inds).reshape(weights.shape[0], -1)
 
 
-def _inv_p_energy(energy, gen):
-    """1 / p_gen(E), in GeV."""
+def chunked_soft_histogram(weights, xs, edges, sigmas, chunk_size=None):
+    """soft_histogram summed over chunks of events; each chunk is checkpointed, so its indicators are not kept for backward."""
+    n = weights.shape[1]
+    if chunk_size is None or chunk_size >= n:
+        return soft_histogram(weights, xs, edges, sigmas)
+    total = 0.0
+    for s in range(0, n, chunk_size):
+        sl = slice(s, s + chunk_size)
+        part = [weights[:, sl], *[x[sl] for x in xs], *[w[sl] for w in sigmas]]
+        D = len(xs)
+        total = total + _checkpoint(lambda w, *a: soft_histogram(w, a[:D], edges, a[D:]), *part,
+                                    use_reentrant=False)
+    return total
 
 
-    E = np.asarray(energy, dtype=float)
-    E_min, E_max = gen['E_min'], gen['E_max']
+def fit_injection_radius(points, d, point_weights=None, scale=1.5, softness=20.0):
+    """(n,) injection-disk radius around the geometry for each travel direction d (n, 3); the disk is centred at the origin.
 
-    if gen['energy_dist'] == 'log_uniform':
-        # p(E) = 1 / (E * ln(E_max/E_min))
-        return E * np.log(E_max / E_min)
-
-    # sample_power_law: p(E) ~ E^-gamma normalised on [E_min, E_max]
-    gamma = gen['gamma']
-    if abs(gamma - 1.0) < 1e-12:
-        norm = np.log(E_max / E_min)
-    else:
-        expo = 1.0 - gamma
-        norm = (E_max ** expo - E_min ** expo) / expo
-    return norm * E ** gamma
-
-
-def _geometric_weight(cos_theta, gen):
-    """Geometric part of the fluxless weight, in m^2 sr.
-
+    The radius is scale x a weighted soft maximum of the modules' distances from the line through the
+    origin along d. It is differentiable in the module positions and weights, never exceeds the hard
+    maximum, and a module whose weight goes to 0 drops out.
     """
-
-    R, H = gen['cyl_radius'], gen['cyl_height']
-    window = gen['cos_window']
-
-    if not gen['uniform_zenith_sampling']:
-        # G = int dOmega A_proj(Omega) = 2 pi int A_proj dcos.
-        # Full sphere closed form: 2 pi^2 R (R + H).
-        if window == 'horizontal':
-            c_lo, c_hi = -math.cos(math.radians(70.0)), math.cos(math.radians(70.0))
-        elif window == 'vertical':
-            # |cos| > 0.9, i.e. two symmetric intervals.
-            c_grid = np.concatenate([
-                np.linspace(-1.0, -0.9, 4001),
-                np.linspace(0.9, 1.0, 4001),
-            ])
-            A = _projected_area_np(c_grid, R, H)
-            G = 2.0 * np.pi * (
-                np.trapezoid(A[:4001], c_grid[:4001])
-                + np.trapezoid(A[4001:], c_grid[4001:])
-            )
-            return float(G), 'const_G(vertical)'
-        else:
-            c_lo, c_hi = window
-
-        c_grid = np.linspace(c_lo, c_hi, 20001)
-        G = 2.0 * np.pi * np.trapezoid(_projected_area_np(c_grid, R, H), c_grid)
-        return float(G), 'const_G'
-
-    # Uniform in theta: A_proj no longer cancels.
-    cos_theta = np.asarray(cos_theta, dtype=float)
-    sin_theta = np.sqrt(np.clip(1.0 - cos_theta ** 2, 0.0, None))
-    A_proj = _projected_area_np(cos_theta, R, H)
-
-    if window == 'horizontal':
-        d_theta = math.radians(110.0 - 70.0)
-        inv_p_omega = 2.0 * np.pi * d_theta * sin_theta
-    elif window == 'vertical':
-        # Mixture of two theta intervals, each chosen with probability 0.5:
-        #   [0, acos(0.9)]  and  [acos(-0.9), pi]
-        theta = np.arccos(np.clip(cos_theta, -1.0, 1.0))
-        t_min = math.acos(0.9)
-        t_mid = math.acos(-0.9)
-        d_lo, d_hi = t_min - 0.0, math.pi - t_mid
-        p_theta = np.where(theta <= 0.5 * (t_min + t_mid), 0.5 / d_lo, 0.5 / d_hi)
-        inv_p_omega = 2.0 * np.pi * sin_theta / p_theta
-    else:
-        c_lo, c_hi = window
-        # theta is uniform on [acos(c_hi), acos(c_lo)]
-        d_theta = math.acos(max(min(c_lo, 1.0), -1.0)) - math.acos(max(min(c_hi, 1.0), -1.0))
-        inv_p_omega = 2.0 * np.pi * d_theta * sin_theta
-
-    return inv_p_omega * A_proj, 'per_event_Aproj'
+    w = (torch.ones(points.shape[0], dtype=points.dtype, device=points.device) if point_weights is None
+         else point_weights.to(points.dtype))
+    along = points @ d.to(points.dtype).T                                    # (M, n)
+    dist = torch.sqrt(((points * points).sum(1, keepdim=True) - along ** 2).clamp_min(1e-12))
+    # Weighted log-mean-exp: between the weighted mean and the max distance, -> max as softness -> 0.
+    log_w = torch.log(w.clamp_min(1e-30)).unsqueeze(1)
+    soft_max = softness * (torch.logsumexp(dist / softness + log_w, dim=0) - torch.log(w.sum()))
+    return scale * soft_max
 
 
-def compute_fluxless_weights(df, gen):
-    """OneWeight-style generation weight, in GeV m^2 sr.
-
-        w_i = (1 / N_gen) * (1 / p(E_i)) * [geometric factor]
-
-    """
-
-
-    N_gen = len(df)
-
-    energy = df['energy'].to_numpy(dtype=float)
-    cos_theta = np.cos(df['zenith'].to_numpy(dtype=float))
-
-    inv_pE = _inv_p_energy(energy, gen)
-    geom, geom_kind = _geometric_weight(cos_theta, gen)
-
-    weights = inv_pE * np.asarray(geom) / N_gen
-    weights = inv_pE * 1e6 * 4*np.pi/ N_gen
-    geom_kind = 'None'
-    #weights *= _M2_TO_CM2  # m^2 -> cm^2
-    return weights, geom_kind
-
-
-def add_weights_to_signal_events(
-    signal_event_params,
-    friend_config,
-    pyff_config,
-    signal_sampler=None,
-    gen=None,
-    pid=14,
-    temp_path=None,
-    clear=True,
-    verbose=False,
-):
-    """Attach ``weights`` and ``grad_weights_*`` to a list of signal events via friEnd and pyff.
-
-    Parameters
-    ----------
-    signal_event_params : list of dict
-        Events as produced by ``CylinderSampler.sample_events``.
-    friend_config : str or dict
-        friEnd step config (path or already-loaded dict).
-    pyff_config : str or dict
-        pyForwardFolding config. Its ``datasets[].path`` must point at
-        ``temp_path``, since that is the file pyFF reads and writes.
-    signal_sampler : CylinderSampler, optional
-        Used to infer the generation parameters (cylinder, energy range,
-        sampling mode) when ``gen`` is not given.
-    gen : dict, optional
-        Explicit generation parameters, as returned by
-        ``describe_sampler_generation``. Overrides ``signal_sampler``.
-    pid : int
-        PDG code written to every event, used by the friEnd MCEq step to pick
-        the flux species. 14 = nu_mu.
-    temp_path : str, optional
-        Scratch parquet path handed to pyFF. Must match the pyFF config.
-
-    Returns
-    -------
-    list of dict
-        The events, with ``weights`` and ``grad_weights_<param>`` added.
-    """
-
-    from friEnd.api import extend_dataframe, load_config
-    from friEnd.pyff_friend import PyFF_Friend
-
-    if gen is None:
-        if signal_sampler is None:
-            raise ValueError("Provide either 'gen' or 'signal_sampler'.")
-        gen = describe_sampler_generation(signal_sampler)
-
-    df = to_pandas_jax(signal_event_params)
-
-    df['fluxless_weight'], geom_kind = compute_fluxless_weights(
-        df, gen
-    )
-    df['pid'] = pid
-
-    if verbose:
-        print(
-            f"[add_weights] N={len(df)} sampling={geom_kind} "
-            f"R={gen['cyl_radius']:.1f}m H={gen['cyl_height']:.1f}m "
-            f"E=[{gen['E_min']:.3g},{gen['E_max']:.3g}]GeV dist={gen['energy_dist']}"
-        )
-
-    if isinstance(friend_config, str):
-        friend_config = load_config(friend_config)
-    df_out = extend_dataframe(df, friend_config)
-
-    if temp_path is None:
-        temp_path = os.path.join('.', 'temp.parquet')
-    os.makedirs(os.path.dirname(os.path.abspath(temp_path)), exist_ok=True)
-
-    df_out.to_parquet(temp_path)
-    PyFF_Friend(pyffconfig=pyff_config, clear=clear).add_weights()
-    df_weighted = pd.read_parquet(temp_path)
-    df_weighted.attrs['shapes'] = df_out.attrs.get('shapes', {})
-
-    return from_pandas_jax(df_weighted)
-
-
-def bKDE(
-    binning_var:Union[float,Array],
-    bins: Array,
-    bandwidth: Union[float,Array],
-    reflect_infinities: bool = False,
-) -> Array:
-    """Differentiable histogram, defined via a binned kernel density estimate (bKDE).
-
-    Parameters
-    ----------
-    data : Array
-        1D array of data to histogram.
-    bins : Array
-        1D array of bin edges.
-    bandwidth : float
-        The bandwidth of the kernel. Bigger == lower gradient variance, but more bias.
-    density : bool
-        Normalise the histogram to unit area.
-    reflect_infinities : bool
-        If True, define bins at +/- infinity, and reflect their mass into the edge bins.
-
-    Returns
-    -------
-    Array
-        1D array of bKDE counts.
-    """
-
-
-    binning_var = torch.as_tensor(binning_var)
-    bins = torch.as_tensor(bins, device=binning_var.device, dtype=binning_var.dtype)
-    if torch.is_tensor(bandwidth):
-        bandwidth = bandwidth.to(device=binning_var.device, dtype=binning_var.dtype)
-
-    if reflect_infinities:
-        inf_edge = torch.tensor([torch.inf], device=bins.device, dtype=bins.dtype)
-        bins = torch.cat([-inf_edge, bins.reshape(-1), inf_edge])
-
-    # get cumulative counts (area under kde) for each set of bin edges
-    z = ((bins.reshape(-1, 1) - binning_var) / (bandwidth + 1e-6))
-
-    cdf = ndtr(z)
-    event_cdf = cdf
-    #cdf /= weights.sum()
-    # sum kde contributions in each bin
-    counts = (event_cdf[1:, :] - event_cdf[:-1, :])
-
-    if reflect_infinities:
-     
-        counts = counts[1:-1].clone()
-        counts[0] = counts[0] + event_cdf[1] - event_cdf[0]
-        counts[-1] = counts[-1] + event_cdf[-1] - event_cdf[-2]
-    return counts
-
-def bKDEnD(
-        binning_vars: list,
-        bins: list,
-        uncerts: list,
-        ):
-    count_list = []
-    for binning_var, uncert, bin1d in zip(binning_vars,uncerts,bins):
-
-        counts = bKDE(binning_var,bin1d,uncert)
-        count_list.append(counts)
-
-    out = count_list[0]
-    for t in count_list[1:]:
-        out = out.unsqueeze(-2) * t
-    
-    return out
-
-def rearrange_matrix(matrix, indices):
-    n = matrix.shape[0]
-    
-    # Create a new order of indices: specified ones first, then the rest
-    new_order = indices + [i for i in range(n) if i not in indices]
-    
-    # Rearrange the rows and columns
-    matrix_rearranged = matrix[new_order, :][:, new_order]
-    return matrix_rearranged
-
-def calc_fisher_matrix(mu,grad_hist,ssq,signal_idx):
-    eps = 1e-8
-
-    #TODO softmasking using ssq
-
-    values = torch.stack(grad_hist).squeeze()      
-    values = values / torch.sqrt(mu + eps)
-
-    fim = torch.einsum('i...,j...->ij', values, values)
-    fim = rearrange_matrix(fim,signal_idx)
-
-    k = len(signal_idx)
-    A = fim[:k,:k]
-    B = fim[:k,k:]
-    C = fim[k:,k:]
-    try:
-        marginalized_fim = A - B @ torch.linalg.inv(C) @ B.T
-    except RuntimeError as e:
-        marginalized_fim = A - B @ torch.linalg.pinv(C) @ B.T
-
-    return marginalized_fim
-
-def calc_cov(fim):
-    fim = fim + 1e-10 * torch.eye(fim.shape[0], device=fim.device, dtype=fim.dtype)
-    print(f"FIM: {fim}")
-    try:
-        cov = torch.linalg.inv(fim)
-    except RuntimeError as e:
-        
-        cov = torch.linalg.pinv(fim)
-    return cov
-
-def calc_weighted_hists(counts,weights):
-    return (counts * weights).sum(dim=-1)
-
-# Optimalities
-
-def A_optimality(fim, **kwargs):
-    cov = calc_cov(fim)
-    diag = torch.diag(cov)
-    return torch.sum(torch.sqrt(diag))
-
+def poisson_fisher_matrix(mu, grad_mu):
+    """F_jk = sum_b dmu_b/dj * dmu_b/dk / mu_b, with grad_mu of shape (n_params, n_bins)."""
+    g = grad_mu / torch.sqrt(mu.clamp_min(1e-12))
+    return g @ g.T
 
 
 class AnalysisLoss(LossFunction):
-    def __init__(self, device=None, print_loss=False, random_seed=None, fisher_info_params=['energy', 'azimuth', 'zenith'], effective_area_loss=None, trigger_loss=None):
+    def __init__(self, trigger_loss=None, resolution_loss=None, xsec=None, transmission=None, device=None,
+                 energy_resolution_loss=None, angular_resolution_loss=None, fisher_loss=None):
+        super().__init__(device=device)
+        # A loss with fisher_per_event (e.g. OMFisherNetLoss) over energy, zenith and azimuth: every
+        # resolution then comes from one per-event Fisher matrix, and the resolution losses are unused.
+        self.fisher_loss = fisher_loss
+        if fisher_loss is not None:
+            missing = {'energy', 'zenith', 'azimuth'} - set(fisher_loss.fisher_params)
+            if missing:
+                raise ValueError(f"fisher_loss needs fisher_params with energy, zenith and azimuth; missing {sorted(missing)}")
+        # Any trigger: a name in TRIGGERS, a TriggerLoss-like object, or a callable(geom_dict, **kwargs)
+        # returning per-event efficiencies (N,) or a dict with 't_per_event'. None -> 'sliding_bar'.
+        self.trigger_loss = self._make_trigger(trigger_loss)
+        # Keyed by resolution_type; missing ones default to WeightedResolutionLoss when first needed.
+        # resolution_loss (the older single-loss argument) fills the slot its resolution_type names.
+        self.resolution_losses = {}
+        for loss in (resolution_loss, energy_resolution_loss, angular_resolution_loss):
+            if loss is not None:
+                self.resolution_losses[loss.resolution_type] = loss
+        # CrossSection() takes a while to build, so it is made once and kept.
+        self.xsec = xsec
+        self.transmission = transmission
+
+    def _make_trigger(self, trigger):
+        if isinstance(trigger, str):
+            if trigger not in TRIGGERS:
+                raise ValueError(f"Unknown trigger {trigger!r}; use one of {sorted(TRIGGERS)} or pass a trigger object")
+            return TRIGGERS[trigger](device=self.device)
+        return trigger
+
+    def _detector_efficiency(self, trigger, geom_dict, eff_kwargs):
+        """(N,) per-event detection efficiency from any trigger."""
+        out = trigger(geom_dict, **eff_kwargs)
+        if isinstance(out, dict):
+            out = out['t_per_event']
+        return out.reshape(-1)
+
+    def _fill_from_fisher(self, geom_dict, eff_kwargs, cache):
+        """All resolutions from one per-event covariance: 'energy' (sigma_E, GeV), 'zenith' (sigma_theta, rad),
+        'angular' (rad) and the covariance itself."""
+        F, ev = self.fisher_loss.fisher_per_event(geom_dict, **eff_kwargs)
+        names = list(self.fisher_loss.fisher_params)
+        cov = covariance_from_fisher(F, names, ev['energy'])
+        ie, iz = names.index('energy'), names.index('zenith')
+        cache['covariance'] = cov
+        cache['energy'] = torch.sqrt(cov[:, ie, ie].clamp_min(0.0))
+        cache['zenith'] = torch.sqrt(cov[:, iz, iz].clamp_min(0.0))
+        cache['angular'] = resolution_from_covariance(cov, names, ev['energy'], ev['zenith'], 'angular')
+
+    def _resolution_per_event(self, kind, geom_dict, eff_kwargs, cache):
+        """(N,) per-event 'energy' (sigma_E, GeV) or 'angular' (rad) resolution, computed at most once per call.
+
+        With a fisher_loss, also 'zenith' (sigma_theta, rad), and all come from a single Fisher evaluation.
         """
-        Initialize the weighted LLR loss function.
-        
-        Parameters:
-        -----------
-        device : torch.device or None
-            Device to use for computations.
-        print_loss : bool
-            Whether to print loss components during computation.
-        signal_surrogate_func : callable or None
-            Function that computes signal light yield from event parameters.
-        background_surrogate_func : callable or None
-            Function that computes background light yield from event parameters.
-        signal_event_params : dict or None
-            Dictionary containing signal event parameters.
-        background_event_params : dict or None
-            Dictionary containing background event parameters.
-        batch_size_per_string : int
-            Number of samples to generate per string for LLR computation.
-        random_seed : int or None
-            Random seed for reproducibility.
-        fisher_info_params : list of str
-            List of event parameters to compute Fisher information for.
-        """
-        super().__init__(device)
-        
-        self.print_loss = print_loss
-        self.random_seed = random_seed
-        self.fisher_info_params = fisher_info_params
-        self.effective_area_loss = effective_area_loss
-        self.trigger_loss = trigger_loss
-
-
-    def _get_geometry_bounding_cylinder(self, geom_dict, temperature, include_height=True, **circle_kwargs):
-        """Fit a cylinder to the current geometry.
-        """
-        string_xy = geom_dict.get("string_xy", None)
-        if string_xy is None:
-            raise ValueError("geom_dict must provide 'string_xy' to adjust the cylinder to geometry")
-        string_weights = geom_dict.get("string_weights", None)
-        string_probs = None
-        if string_weights is not None:
-            string_probs = torch.sigmoid(string_weights)
-
-        center_xy, radius = get_weighted_min_enclosing_circle(
-            string_xy, string_weights=string_probs, temperature=temperature, **circle_kwargs
-        )
-
-        if not include_height:
-            center_z = torch.zeros((), device=self.device, dtype=center_xy.dtype)
-            height = torch.zeros((), device=self.device, dtype=center_xy.dtype)
-        else:
-            points_3d = geom_dict.get("points_3d")
-            z_positions = points_3d[:, 2]
-            z_max = torch.max(z_positions)
-            z_min = torch.min(z_positions)
-            center_z = 0.5 * (z_min + z_max)
-            height = z_max - z_min
-
-        center = torch.stack([center_xy[0], center_xy[1], center_z])
-        return center, radius, height
-
-    _CYLINDER_SAMPLER_RESERVED_KEYS = ("device", "dim", "domain_size", "cylinder_center", "cylinder_height", "cylinder_radius")
-
-    def _get_geometry_adjusted_sampler(self, geom_dict, kwargs):
-        """Clone the configured signal_sampler onto the cylinder derived from the current geometry."""
-        signal_sampler = kwargs.get("signal_sampler", None)
-        temperature = kwargs.get("bounding_cylinder_temperature", 1)
-        include_height = kwargs.get("analysis_adjust_cylinder_height", False)
-
-        circle_kwargs = {
-            "downweight_untriggerable": kwargs.get("downweight_untriggerable", False),
-            "trigger_neighbor_distance": kwargs.get("trigger_neighbor_distance", 550.0),
-            "trigger_min_neighbors": kwargs.get("trigger_min_neighbors", 30.0),
-            "trigger_distance_sharpness": kwargs.get("trigger_distance_sharpness", 0.05),
-            "trigger_count_sharpness": kwargs.get("trigger_count_sharpness", 1.0),
-        }
-        center, radius, height = self._get_geometry_bounding_cylinder(
-            geom_dict, temperature, include_height=include_height, **circle_kwargs
-        )
-        radius = radius + 55.4  #2x attenuation length
-    
-
-        sampler_kwargs = {
-            k: v for k, v in signal_sampler.kwargs.items()
-            if k not in self._CYLINDER_SAMPLER_RESERVED_KEYS
-        }
-
-        return CylinderSampler(
-            device=signal_sampler.device,
-            dim=signal_sampler.dim,
-            domain_size=signal_sampler.domain_size,
-            cylinder_center=center.detach(),
-            cylinder_height=height.detach(),
-            cylinder_radius=radius.detach(),
-            **sampler_kwargs,
-        )
-
-    def _ensure_weights(
-        self,
-        signal_event_params,
-        friend_config=None,
-        pyff_config=None,
-        signal_sampler=None,
-        gen=None,
-        pid=14,
-        temp_path=None,
-    ):
-        """Add ``weights``/``grad_weights_*`` to events that lack them.
-
-        Returns the list unchanged if the events already carry weights
-        """
-        if not signal_event_params:
-            return signal_event_params
-
-        test_event = signal_event_params[0]
-        has_weights = 'weights' in test_event
-        has_grads = any(k.startswith('grad_weights_') for k in test_event)
-        if has_weights and has_grads:
-            return signal_event_params
-
-        
-
-        weighted = add_weights_to_signal_events(
-            signal_event_params,
-            friend_config=friend_config,
-            pyff_config=pyff_config,
-            signal_sampler=signal_sampler,
-            gen=gen,
-            pid=pid,
-            temp_path=temp_path,
-            verbose=self.print_loss,
-        )
-
-        # add_weights_to_signal_events round-trips through pandas, which turns
-        # every field into a plain CPU tensor. Restore the pre-existing fields
-        # from the originals (keeping device and any grad tracking), and move the
-        # newly added weight columns onto self.device so they can be combined
-        # with the acceptance / bKDE tensors later.
-        for original, new in zip(signal_event_params, weighted):
-            for key, value in list(new.items()):
-                if key in original and torch.is_tensor(original[key]):
-                    new[key] = original[key]
-                elif torch.is_tensor(value):
-                    new[key] = value.to(self.device)
-
-        return weighted
+        if kind not in cache:
+            if self.fisher_loss is not None:
+                self._fill_from_fisher(geom_dict, eff_kwargs, cache)
+                return cache[kind]
+            if kind not in self.resolution_losses:
+                self.resolution_losses[kind] = WeightedResolutionLoss(
+                    device=self.device, resolution_type=kind, fisher_info_params=['energy', 'zenith', 'azimuth'])
+            out = self.resolution_losses[kind](geom_dict, **eff_kwargs)
+            cache[kind] = out[f'{kind}_resolution_per_event'].reshape(-1)
+        return cache[kind]
 
     def __call__(self, geom_dict, **kwargs):
-        """
-        - True values
-        - Uncertanties
-        - Acceptance
+        hists = self.histograms(geom_dict, **kwargs)
+        hists.pop('analysis_replay')
+        head = self.fisher_head(hists['analysis_mu'], hists['analysis_grad_mu'], hists['analysis_param_names'], **kwargs)
+        return {**hists, **head}
 
-        """
+    def histograms(self, geom_dict, **kwargs):
+        """Additive part of the loss: expected counts mu (n_bins,) and dmu/dphi (n_params, n_bins) for one batch of events."""
+        binning_var_name       = kwargs.get('analysis_binning_var_name', 'energy') # :str or List[str], 'energy' / 'zenith' / ['energy', 'zenith'] (2D)
+        num_events             = kwargs.get('num_events', 1) # :int
+        signal_event_params    = kwargs.get('signal_event_params', None) # :List[Dict]
+        num_bins               = kwargs.get('analysis_num_bins', 50) # :int, or List[int] per binning variable
+        signal_sampler         = kwargs.get('signal_sampler', None) # :CylinderSampler
+        sim_weight_kwargs      = kwargs.get('analysis_sim_weight_kwargs', {}) # :Dict, overrides for get_simulation_weights (e.g. geometry-dependent cyl_radius/cyl_height)
+        sim_weights            = kwargs.get('analysis_sim_weights', None) # :Tensor (N,), for signal_event_params
+        flux_weights           = kwargs.get('analysis_flux_weights', None) # :Tensor (N,)
+        grad_weights           = kwargs.get('analysis_grad_flux_weights', None) # :Dict[str, Tensor (N,)]
+        live_time              = kwargs.get('live_time', 1.0) # :float, seconds
+        perfect_efficiency     = kwargs.get('analysis_perfect_efficiency', False) # :bool, every event detected; skips the trigger
+        trigger_override       = kwargs.get('analysis_trigger', None) # :str|object|callable, replaces the constructor's trigger for this call
+        energy_res_selection   = kwargs.get('analysis_energy_res_selection', False) # :bool, soft cut on sigma_E / E
+        energy_res_threshold   = kwargs.get('analysis_energy_res_threshold', 1.0) # :float, sigma_E / E where the selection weight is 0.5
+        energy_res_softness    = kwargs.get('analysis_energy_res_softness', 0.1) # :float, width of the cut in ln(sigma_E / E)
+        param_overrides        = kwargs.get('analysis_param_overrides', None) # :Dict
+        dataset_name           = kwargs.get('analysis_dataset_name', None) # :str
+        batched_sim_weights    = kwargs.get('analysis_batched_sim_weights', True) # :bool, sim weights are precomputed for the whole batch and must be sliced to the subsample
+        bin_chunk_size         = kwargs.get('analysis_bin_chunk_size', None) # :int, events per checkpointed chunk of the soft histogram (None = one pass)
+        resample_vertices      = kwargs.get('analysis_resample_vertices', False) # :bool, RangeSampler only: redraw each vertex on a disk fitted around the geometry for its direction
+        injection_scale        = kwargs.get('analysis_injection_scale', 1.5) # :float, disk radius / soft max distance of the modules from the track line
+        injection_softness     = kwargs.get('analysis_injection_softness', 20.0) # :float, m, softness of that maximum
+        vertex_uniforms        = kwargs.get('analysis_vertex_uniforms', None) # :Tensor (N, 3), the vertex draws; set by the replay
 
-        binning_var_names   = kwargs.get('analysis_binning_var_names', ['energy', 'zenith']) # :List[str]
-        num_events           = kwargs.get('num_events', 1) # :int
-        signal_event_params = kwargs.get('signal_event_params', None) #:List[Dict]
-        precomputed_fisher = kwargs.get('precomputed_fisher_info_per_string_per_event', None) # :Tensor
-        precomputed_ly = kwargs.get('precomputed_light_yield_per_point_per_event', None) # :Tensor
-        num_bins       = kwargs.get('analysis_num_bins',50) # :List[Tensor]
-        signal_flux_var_names  = kwargs.get('analysis_signal_flux_var_names', ['astro_norm']) # :List[int]
-        signal_sampler         = kwargs.get('signal_sampler') # :Callable
-        # weights             = kwargs.get('flux_weights') # :Tensor
-        # grad_weights        = kwargs.get('grad_flux_weights') # :List[Tensor]
-        trigger_loss        = self.trigger_loss
-        optimality          = kwargs.get('analysis_optimality','a') # :str
-        live_time           = kwargs.get('live_time', 1.0) # :float
-
-        effective_area_loss =  self.effective_area_loss
-        eff_area_cyl_radius = kwargs.get('eff_area_cyl_radius', None) # :float
-        eff_area_cyl_height = kwargs.get('eff_area_cyl_height', None) # :float
-  
         friend_config       = kwargs.get('friend_config', None) # :str|dict
         pyff_config         = kwargs.get('pyff_config', None) # :str|dict
-        weight_temp_path    = kwargs.get('weight_temp_path', None) # :str
         weight_pid          = kwargs.get('weight_pid', 14) # :int
-    
-        adjust_cylinder_to_geometry = kwargs.get('analysis_adjust_cylinder_to_geometry', False)
         eff_kwargs = kwargs.copy()
 
-        if adjust_cylinder_to_geometry and signal_event_params is None:
-            if signal_sampler is None:
-                raise ValueError(
-                    "analysis_adjust_cylinder_to_geometry=True requires a "
-                    "'signal_sampler' to clone the geometry-adjusted cylinder from."
-                )
-            signal_sampler = self._get_geometry_adjusted_sampler(geom_dict, kwargs)
-            eff_kwargs['signal_sampler'] = signal_sampler
-           
-            eff_area_cyl_radius = None
-            eff_area_cyl_height = None
-
+        # prepare events and get weights
         if signal_event_params is None:
-            
             signal_event_params = signal_sampler.sample_events(num_events)
-            weight_factor = live_time
-
-            signal_event_params = self._ensure_weights(
-                signal_event_params,
-                friend_config=friend_config,
-                pyff_config=pyff_config,
-                signal_sampler=signal_sampler,
-                pid=weight_pid,
-                temp_path=weight_temp_path,
-            )
-            eff_kwargs['signal_event_params'] = signal_event_params
+            # Anything precomputed belongs to some other set of events.
+            sim_weights = flux_weights = grad_weights = None
+            for key in PRECOMPUTED_PER_EVENT_KEYS:
+                eff_kwargs[key] = None
         else:
-            signal_event_params = self._ensure_weights(
-                signal_event_params,
-                friend_config=friend_config,
-                pyff_config=pyff_config,
-                signal_sampler=signal_sampler,
-                pid=weight_pid,
-                temp_path=weight_temp_path,
-            )
+            n_total = len(signal_event_params)
+            idx = sorted(random.sample(range(n_total), num_events)) if n_total > num_events else list(range(n_total))
+            signal_event_params = [signal_event_params[i] for i in idx]
+            if sim_weights is not None:
+                # Precomputed with N_gen = n_total; the subsample has to stand in for all of them.
+                sim_weights = sim_weights[idx] * n_total / len(idx)
+            if flux_weights is not None and grad_weights is not None:
+                flux_weights = flux_weights[idx]
+                grad_weights = {k: g[idx] for k, g in grad_weights.items()}
+            for key in PRECOMPUTED_PER_EVENT_KEYS:
+                if eff_kwargs.get(key) is not None:
+                    eff_kwargs[key] = eff_kwargs[key][idx]
+        eff_kwargs['signal_event_params'] = signal_event_params
+        replay_events = signal_event_params
 
-            if len(signal_event_params) > num_events:
-                weight_factor = live_time*len(signal_event_params) / num_events
-                selected_indices = random.sample(range(len(signal_event_params)), num_events)
-                signal_event_params = [signal_event_params[i] for i in selected_indices]
-                if precomputed_fisher is not None:
-                    precomputed_fisher = precomputed_fisher[selected_indices]
-                if precomputed_ly is not None:
-                    precomputed_ly = precomputed_ly[selected_indices]
-            else:
-                weight_factor = live_time
+        # Keep energy and direction, redraw the vertex on a disk fitted around the geometry for each direction.
+        # Only the disk area carries the geometry gradient (through the sim weights); the vertices are graph-free.
+        injection_area = None
+        if resample_vertices:
+            if not hasattr(signal_sampler, 'place_vertices'):
+                raise ValueError("analysis_resample_vertices needs a RangeSampler as signal_sampler")
+            points = geom_dict['points_3d']
+            point_w = None
+            if geom_dict.get('string_weights') is not None and geom_dict.get('string_xy') is not None:
+                point_w = PhotonCountTrigger.point_weights(points, geom_dict['string_xy'], geom_dict['string_weights'])
+            d = torch.stack([torch.as_tensor(e['direction']).reshape(3) for e in signal_event_params]).to(
+                device=points.device, dtype=points.dtype)
+            radius = fit_injection_radius(points, d, point_w, injection_scale, injection_softness)
+            injection_area = (math.pi * radius ** 2).to(self.device)            # m^2
+            n_ev, dev = len(signal_event_params), signal_sampler.device
+            if vertex_uniforms is None:
+                vertex_uniforms = torch.rand(n_ev, 3, dtype=torch.float64, device=dev)
+            energies = torch.stack([torch.as_tensor(e['energy']).reshape(-1)[0] for e in signal_event_params])
+            origin = torch.zeros(n_ev, 3, dtype=torch.float64, device=dev)
+            vertex, x_total = signal_sampler.place_vertices(
+                energies.to(device=dev, dtype=torch.float64), d.to(dev), origin, radius.to(dev), vertex_uniforms)
+            signal_event_params = [{**e, 'position': vertex[i:i + 1], 'column_depth': x_total[i:i + 1]}
+                                   for i, e in enumerate(signal_event_params)]
             eff_kwargs['signal_event_params'] = signal_event_params
-            eff_kwargs['precomputed_fisher_info_per_string_per_event'] = precomputed_fisher
-            eff_kwargs['precomputed_light_yield_per_point_per_event'] = precomputed_ly
+            for key in PRECOMPUTED_PER_EVENT_KEYS:   # computed for the old vertices
+                eff_kwargs[key] = None
+            sim_weights = None                       # recomputed below for the new vertices and disks
+        # Only precomputed sim weights are constants that may be replayed; computed ones can depend on the geometry.
+        precomputed_sim_weights = sim_weights
+        ev = {k: v.to(self.device) for k, v in event_arrays(signal_event_params, travel_direction=True).items()}
 
-        uncertainties = []
-        angular_res_per_event = None
-        energy_res_per_event = None
-        # make a list of energy bin edges in logspace and zenith bin edges in linear space 
-        for input_name in binning_var_names:
-            if input_name == 'energy':
-                weighted_resolution_loss=WeightedResolutionLoss(
-                        device=self.device,
-                        resolution_type='energy',
-                        fisher_info_params=['energy']
-                )
-            elif input_name == 'zenith':
-                weighted_resolution_loss=WeightedResolutionLoss(
-                        device=self.device,
-                        resolution_type='angular',
-                        fisher_info_params=['direction', 'position']
-                )
-            loss_stuff = weighted_resolution_loss(geom_dict, **eff_kwargs)
-            # uncertainty = loss_stuff['resolution_per_event']
-            if input_name == 'energy':
-                energy_res_per_event = loss_stuff['energy_resolution_per_event']
-                energies = torch.stack([
-                    params['energy'].to(self.device).reshape(())
-                    for params in signal_event_params
-                ])
-                uncertainty = energy_res_per_event / energies
-            elif input_name == 'zenith':
-                angular_res_per_event = loss_stuff['angular_resolution_per_event']
-                eff_kwargs['precalculated_resolution_loss'] = loss_stuff
-                zeniths = torch.stack([
-                    params['zenith'].to(self.device).reshape(())
-                    for params in signal_event_params
-                ])
-                uncertainty = angular_res_per_event * torch.abs(torch.sin(zeniths))
-            uncertainties.append(uncertainty.squeeze())
-            if input_name == 'zenith':
-                selection_loss = ResolutionSelectionLoss(
-                    device=self.device,
-                    resolution_type='angular',
-                    fisher_info_params=self.fisher_info_params
-                )
-                selection_acceptance = selection_loss(geom_dict, **eff_kwargs)['selection_per_event']
-        
+        gen = {}
+        if signal_sampler is not None:
+            gen.update(generation_params(signal_sampler))
+            if hasattr(signal_sampler, 'cylinder'):
+                gen.update(cyl_radius=signal_sampler.cylinder.radius, cyl_height=signal_sampler.cylinder.height)
+        gen.update(sim_weight_kwargs)
+        if gen.get('mode') == 'ranged' and 'column_depth' not in gen:
+            gen['column_depth'] = ev.get('column_depth')
+        if injection_area is not None:
+            # Per-event disk instead of the sampler's fixed pi R_inj^2; N_gen is this batch.
+            gen.update(column_depth=ev['column_depth'], include_injection_area=False)
+        if sim_weights is None:
+            if self.xsec is None:
+                self.xsec = CrossSection()
+            if self.transmission is None:
+                self.transmission = TransmissionProb()
+            sim_weights = get_simulation_weights(ev['energy'], ev['cos_zenith'], xsec=self.xsec,
+                                                 transmission=self.transmission, batched=batched_sim_weights, **gen)
+            if injection_area is not None:
+                sim_weights = sim_weights * injection_area
+        if flux_weights is None or grad_weights is None:
+            flux_weights, grad_weights = get_flux_weights(ev['energy'], ev['zenith'], ev['azimuth'],
+                                                          friend_config, pyff_config, pid=weight_pid,
+                                                          dataset=dataset_name, params=param_overrides, device=self.device)
 
-        acceptance = selection_acceptance.squeeze()
+        if perfect_efficiency:
+            detector_effs = torch.ones_like(ev['energy'])
+        else:
+            if trigger_override is not None:
+                trigger = self._make_trigger(trigger_override)
+            else:
+                if self.trigger_loss is None:
+                    self.trigger_loss = TriggerLoss(device=self.device)
+                trigger = self.trigger_loss
+            detector_effs = self._detector_efficiency(trigger, geom_dict, eff_kwargs)
 
-        if effective_area_loss is not None:
+        # One histogram axis per binning variable: log10(E) smeared by the energy resolution and/or
+        # cos(zenith) smeared by the angular resolution, each in the units of its axis.
+        binning_vars = [binning_var_name] if isinstance(binning_var_name, str) else list(binning_var_name)
+        bins_per_var = [num_bins] * len(binning_vars) if isinstance(num_bins, int) else list(num_bins)
+        res_cache = {}
+        bin_edges, true_vals, widths = {}, [], []
+        for var, n in zip(binning_vars, bins_per_var):
+            if var == 'energy':
+                E_min, E_max = gen.get('E_min', 1e2), gen.get('E_max', 1e8)
+                bin_edges[var] = torch.linspace(math.log10(E_min), math.log10(E_max), n + 1, device=self.device)
+                true_vals.append(torch.log10(ev['energy']))
+                sigma_E = self._resolution_per_event('energy', geom_dict, eff_kwargs, res_cache)
+                widths.append(sigma_E / (ev['energy'] * math.log(10)))
+            elif var == 'zenith':
+                # cos_range is in the sampler's travel convention, the events are in the arrival one.
+                c_lo, c_hi = gen.get('cos_range', (-1.0, 1.0))
+                bin_edges[var] = torch.linspace(-c_hi, -c_lo, n + 1, device=self.device)
+                true_vals.append(ev['cos_zenith'])
+                if self.fisher_loss is not None:
+                    # sigma(cos theta) = |sin theta| sigma_theta, from the zenith entry of the covariance.
+                    sigma_th = self._resolution_per_event('zenith', geom_dict, eff_kwargs, res_cache)
+                    widths.append(sigma_th * torch.sin(ev['zenith']).abs())
+                else:
+                    # Without the covariance, the full angular resolution stands in for sigma_theta.
+                    sigma_psi = self._resolution_per_event('angular', geom_dict, eff_kwargs, res_cache)
+                    widths.append(sigma_psi * torch.sin(ev['zenith']))
+            else:
+                raise ValueError(f"Unknown binning variable {var!r}; use 'energy' and/or 'zenith'")
+        # A singular per-event Fisher gives NaN/inf; such events are smeared out of every bin.
+        widths = [torch.nan_to_num(w, nan=1e3, posinf=1e3).clamp_min(1e-6) for w in widths]
 
-            if eff_area_cyl_radius is None or eff_area_cyl_height is None:
-                if signal_sampler is not None and hasattr(signal_sampler, 'cylinder'):
-                    eff_area_cyl_radius = _as_float(signal_sampler.cylinder.radius)
-                    eff_area_cyl_height = _as_float(signal_sampler.cylinder.height)
+        selection = torch.ones_like(detector_effs)
+        if energy_res_selection:
+            rel_res = self._resolution_per_event('energy', geom_dict, eff_kwargs, res_cache) / ev['energy']
+            # A singular per-event Fisher (NaN/inf) counts as unresolved and is cut.
+            rel_res = torch.nan_to_num(rel_res, nan=1e6, posinf=1e6).clamp_min(1e-12)
+            selection = torch.sigmoid((math.log(energy_res_threshold) - torch.log(rel_res)) / energy_res_softness)
 
-            eff_kwargs.update({
-                'per_event_effective_area_loss': True,
-                'include_projected_area': False,
-                'use_batched_effective_area': True,})
-        
-            if eff_area_cyl_radius is not None and eff_area_cyl_height is not None:
-                eff_kwargs['use_sampler_cyl_for_volume'] = True
-            eff_out = effective_area_loss(geom_dict, **eff_kwargs)
-    
-            acceptance = acceptance * eff_out['effective_area_per_event'].squeeze()
-        elif trigger_loss is not None:
-            acceptance = acceptance * trigger_loss(geom_dict, **eff_kwargs)['t_per_event'].squeeze()
+        # w_i and dw_i/dphi_j; the flux gradients are constants, geometry enters via sim weights, efficiency, selection and resolution
+        acceptance = live_time * sim_weights * detector_effs * selection
+        total_weights = acceptance * flux_weights
+        param_names = list(grad_weights)
+        grad_total_weights = torch.stack([grad_weights[k] for k in param_names]) * acceptance  # (n_params, N)
 
-        weights = []
-        grad_weights = []
-        test_event = signal_event_params[0]
-        energy_bins = torch.linspace(2,8, num_bins, device=self.device)
-        zenith_bins = torch.linspace(-1,1, num_bins, device=self.device)
-        signal_idx = []
-        var_count = 0
-        input_vars = []
-        for input_name in binning_var_names:
-            input_vars.append([])
-        for key in test_event:
-            if key.startswith('grad_weights_'):
-                grad_weights.append([])
-                for flux_var_name in signal_flux_var_names:
-                    if key.endswith(flux_var_name):
-                        signal_idx.append(var_count)
-                var_count += 1
-        for signal_event in signal_event_params:
-            weights.append(signal_event['weights']*weight_factor)
-            count = 0
-            for key in signal_event:
-                if key.startswith('grad_weights_'):
-                    grad_weights[count].append(signal_event[key]*weight_factor)
-                    count += 1
-        weights = torch.stack(weights).squeeze()
-        for i in range(len(grad_weights)):
-            grad_weights[i] = torch.stack(grad_weights[i]).squeeze()
-        bins = []
-        for input_name in binning_var_names:
-            if input_name == 'energy':
-                bins.append(energy_bins)
-            elif input_name == 'zenith':
-                bins.append(zenith_bins)
-        # print(bins)
+        # Joint bin membership is the product over axes, flattened row-major (first variable slowest).
+        # mu and dmu/dphi are histograms of different weights, so they share one contraction.
+        all_weights = torch.cat([total_weights.unsqueeze(0), grad_total_weights])        # (1 + n_params, N)
+        hists = chunked_soft_histogram(all_weights, true_vals, [bin_edges[v] for v in binning_vars],
+                                       widths, chunk_size=bin_chunk_size)
+        mu, grad_mu = hists[0], hists[1:]                                  # (n_bins,), (n_params, n_bins)
 
-        # Build the binning variables WITHOUT mutating signal_event_params: the
-        # caller may reuse the same event dicts across many calls (e.g. a scan
-        # over geometries), and writing log10(energy)/cos(zenith) back into them
-        # compounds the transform on every call --
-        # log10(log10(log10(E))) goes negative, then NaN, poisoning the
-        # cross-section/transmission splines and the whole FIM.
-        for i, input_name in enumerate(binning_var_names):
-            for signal_event in signal_event_params:
-                value = signal_event[input_name]
-                if input_name == 'energy':
-                    value = torch.log10(value)
-                elif input_name == 'zenith':
-                    value = torch.cos(value)
-                input_vars[i].append(value)
-            input_vars[i] = torch.stack(input_vars[i]).squeeze()
-        # print(f"input_vars: {input_vars}")
-        per_event_counts = bKDEnD(input_vars,bins,uncertainties)
+        # Everything needed to recompute exactly this batch again (used by AnalysisAccumulator).
+        replay = {
+            'signal_event_params': replay_events,
+            'num_events': len(replay_events),
+            'analysis_flux_weights': flux_weights.detach(),
+            'analysis_grad_flux_weights': {k: g.detach() for k, g in grad_weights.items()},
+            **{key: eff_kwargs.get(key) for key in PRECOMPUTED_PER_EVENT_KEYS},
+        }
+        if precomputed_sim_weights is not None:
+            replay['analysis_sim_weights'] = precomputed_sim_weights
+        if injection_area is not None:
+            replay['analysis_vertex_uniforms'] = vertex_uniforms   # the same vertices again
 
-        mu = calc_weighted_hists(per_event_counts,weights*acceptance)
-        #ssq = calc_weighted_hist(per_event_counts,weights**2)
-        grad_hist = [calc_weighted_hists(per_event_counts,grad_weight*acceptance) for grad_weight in grad_weights]
+        out = {
+            'analysis_mu': mu,
+            'analysis_grad_mu': grad_mu,
+            'analysis_param_names': param_names,
+            'analysis_bin_edges': bin_edges,  # {var: edges}
+            'analysis_hist_shape': tuple(len(bin_edges[var]) - 1 for var in binning_vars),  # mu is flattened from this
+            'detector_efficiency_per_event': detector_effs,
+            'selection_efficiency_per_event': selection,
+            'analysis_replay': replay,
+        }
+        if 'energy' in binning_vars:
+            out['energy_resolution_per_event'] = widths[binning_vars.index('energy')]
+            out['energy_resolution_units'] = 'log10'  # sigma of log10(E); read by the visualizer's energy panels
+        if 'angular' in res_cache:
+            out['angular_resolution_per_event'] = res_cache['angular']  # radians, as the visualizer's angular panels expect
+        if injection_area is not None:
+            # A_eff = T * P_int * A_inj * efficiency * selection, in m^2: the weight times the generation density.
+            area = sim_weights * ranged_generation_density(ev['energy'], **gen) / M2_TO_CM2
+            out['effective_area_per_event'] = area * detector_effs #* selection
+            out['injection_area_per_event'] = injection_area
+            out['effective_area_params'] = [{'energy': e['energy'], 'zenith': e['zenith'], 'azimuth': e['azimuth'],
+                                             'position': e['position']} for e in signal_event_params]
+        return out
 
-        fim = calc_fisher_matrix(mu,grad_hist,ssq=None,signal_idx=signal_idx)
+    def fisher_head(self, mu, grad_mu, param_names, **kwargs):
+        """Nonlinear part of the loss: flux-parameter Fisher matrix from the (pooled) histograms, and the optimality criterion."""
+        signal_flux_var_names = kwargs.get('analysis_signal_flux_var_names', ['astro_norm']) # :List[str]
+        optimality            = kwargs.get('analysis_optimality', 'a') # :str, 'a' or 'd'
 
-        if optimality == "a":
-            opti = A_optimality
+        fisher = poisson_fisher_matrix(mu, grad_mu)
+        # The signal block of the full inverse is the covariance marginalised over the nuisance parameters.
+        cov = torch.linalg.inv(fisher)
+        signal_idx = [param_names.index(name) for name in signal_flux_var_names]
+        signal_cov = cov[signal_idx][:, signal_idx]
+        if optimality == 'a':
+            loss = torch.sqrt(torch.diagonal(signal_cov)).sum()
+        elif optimality == 'd':
+            loss = torch.logdet(signal_cov)
         else:
             raise NotImplementedError(f"No {optimality} optimality")
-        
-        fisher_loss = opti(fim)
 
-   
-        cov = calc_cov(fim)
-        param_variances = torch.diag(cov)
-
-        if self.print_loss:
-            print(f"Fisher Analysis Info Loss: {fisher_loss.item()}")
-
-        return {
-            'fisher_analysis_loss': fisher_loss,
+        out = {
+            'fisher_analysis_loss': loss,
             'flux_param_names': signal_flux_var_names,
+            'flux_param_variances': torch.diagonal(signal_cov),
             'flux_param_covariance': cov,
-            'flux_param_variances': param_variances,
-            'energy_resolution_per_event': energy_res_per_event,
-            'angular_resolution_per_event': angular_res_per_event,
-            'effective_area_loss_dict': eff_out if effective_area_loss is not None else None,
+            'analysis_fisher_matrix': fisher,
+            'analysis_param_names': param_names,
         }
+        if kwargs.get('pyff_config') is not None:
+            # The assumed true values the Fisher matrix is evaluated at (centre of a likelihood scan).
+            values = model_parameter_values(kwargs['pyff_config'], kwargs.get('analysis_param_overrides'))
+            out['analysis_param_values'] = {name: float(values[name]) for name in param_names if name in values}
+        return out
+
+
+def fisher_constraints(fisher, param_names, names=None):
+    """{name: (sigma_conditional, sigma_profiled)} from a Fisher matrix over param_names.
+
+    conditional: the other parameters fixed at their true values, 1 / sqrt(F_ii).
+    profiled: the others fitted as well, sqrt((F^-1)_ii) = 1 / sqrt(F_ii - F_in F_nn^-1 F_ni), the
+    Schur complement of the other parameters' block. Always >= the conditional one.
+    """
+    F = torch.as_tensor(fisher, dtype=torch.float64)
+    cov = torch.linalg.pinv(F)
+    out = {}
+    for name in (names or param_names):
+        i = param_names.index(name)
+        out[name] = (float(1.0 / torch.sqrt(F[i, i])), float(torch.sqrt(cov[i, i])))
+    return out
+        
+
+        
+
+
+        
+
+        
+        
+            
