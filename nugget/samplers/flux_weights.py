@@ -19,6 +19,16 @@ def _model_for_dataset(conf, dataset_name):
     raise KeyError(f"No model in the pyFF config uses dataset {dataset_name!r}")
 
 
+def model_parameter_values(pyff_config, params=None):
+    """The flux parameters' assumed true values: the pyFF config's model_parameters, with `params` overriding."""
+    conf = pyff_config
+    if isinstance(conf, str):
+        import yaml
+        with open(conf) as f:
+            conf = yaml.safe_load(f)
+    return {**(conf or {}).get('model_parameters', {}), **(params or {})}
+
+
 def get_flux_weights(energy, zenith, azimuth, friend_config, pyff_config, params=None, pid=14, dataset=None, device=None):
     """Per-event flux Phi and dPhi/dparam from friEnd + pyForwardFolding, in GeV^-1 cm^-2 s^-1 sr^-1.
 

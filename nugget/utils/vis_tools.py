@@ -144,6 +144,7 @@ class Visualizer:
     PLOT_DETECTOR_EFFICIENCY_HISTORY = "detector_efficiency_history"
     PLOT_EFFECTIVE_AREA_HISTORY = "effective_area_history"
     PLOT_FLUX_VARIANCE_HISTORY = "flux_variance_history"
+    PLOT_FLUX_LIKELIHOOD_SCAN = "flux_likelihood_scan"
     PLOT_NN_DISTANCE_HISTORY = "nn_distance_history"
 
 
@@ -225,6 +226,41 @@ class Visualizer:
         except Exception:
             # Common default.
             return 1.959963984540054
+
+    @staticmethod
+    def _likelihood_scan_inputs(kwargs):
+        """-> (name, theta_hat, has_value, sigma_conditional, sigma_profiled) for the scanned flux parameter, or None.
+
+        Asimov: -2 Delta ln L(theta) = (theta - theta_hat)^T F (theta - theta_hat). Scanning one parameter
+        with the others fixed gives F_ii (Delta theta_i)^2; re-fitting the others at each point (profiling)
+        gives (Delta theta_i)^2 / (F^-1)_ii, whose curvature is the Schur complement F_ii - F_in F_nn^-1 F_ni.
+        """
+        F = kwargs.get('analysis_fisher_matrix', None)
+        names = kwargs.get('analysis_param_names', None)
+        if F is None or not names:
+            return None
+        F = np.asarray(F.detach().cpu().numpy() if isinstance(F, torch.Tensor) else F, dtype=float)
+        name = kwargs.get('likelihood_scan_param', None) or (kwargs.get('flux_param_names', None) or names)[0]
+        if name not in names:
+            return None
+        i = list(names).index(name)
+        sigma_cond = 1.0 / np.sqrt(F[i, i]) if F[i, i] > 0 else np.nan
+        sigma_prof = float(np.sqrt(max(np.linalg.pinv(F)[i, i], 0.0)))
+        values = kwargs.get('analysis_param_values', None) or {}
+        return name, float(values.get(name, 0.0)), name in values, float(sigma_cond), sigma_prof
+
+    @staticmethod
+    def _likelihood_scan_axes(ax, name, has_value, nsigma):
+        """Labels, 68% / 95% lines and y range of a -2 Delta ln L scan."""
+        for level, text in ((1.0, '68.3%'), (3.84, '95%')):
+            ax.axhline(level, color='gray', linestyle=':', linewidth=1)
+            ax.text(1.0, level, f' {text}', transform=ax.get_yaxis_transform(), va='center', fontsize=8,
+                    color='gray', clip_on=False)
+        ax.set_ylim(0.0, max(nsigma ** 2, 4.5))
+        ax.set_title(f'Likelihood scan: {name}')
+        ax.set_xlabel(name if has_value else rf'$\Delta$ {name}')
+        ax.set_ylabel(r'$-2\,\Delta \ln L$')
+        ax.grid(True, alpha=0.3)
 
     @staticmethod
     def _compute_fom_from_resolution(values, min_resolution=1e-12):
@@ -1190,6 +1226,12 @@ class Visualizer:
               curves from the loss's 'flux_param_variances'; 'flux_param_names' to label the
               combined curve; 'flux_variance_as_sigma' (default True) to plot sum-of-sigmas
               rather than its square.
+            - 'flux_likelihood_scan': Asimov -2 Delta ln L parabola of one flux parameter from the
+              analysis Fisher matrix ('analysis_fisher_matrix', 'analysis_param_names', centred on
+              'analysis_param_values'). Solid: profiled over the other parameters (Schur complement,
+              (Delta theta)^2 / (F^-1)_ii); dashed: the others fixed (F_ii (Delta theta)^2). Optional
+              kwargs: 'likelihood_scan_param' (default: first of 'flux_param_names'),
+              'likelihood_scan_nsigma' (default 3), 'likelihood_scan_conditional' (default True).
             - 'angular_resolution_vs_zenith': Binned angular resolution vs zenith
             - 'angular_resolution_vs_energy': Binned angular resolution vs energy
             - 'energy_resolution_vs_energy': Binned energy resolution vs energy
@@ -1619,6 +1661,7 @@ class Visualizer:
             self.PLOT_ENERGY_RESOLUTION,
             self.PLOT_POINTSOURCE_FOM,
             self.PLOT_FLUX_VARIANCE_HISTORY,
+            self.PLOT_FLUX_LIKELIHOOD_SCAN,
             self.PLOT_ANGULAR_RESOLUTION_VS_ZENITH,
             self.PLOT_ANGULAR_RESOLUTION_VS_ENERGY,
             self.PLOT_ENERGY_RESOLUTION_VS_ENERGY,
@@ -1763,6 +1806,18 @@ class Visualizer:
                             shared_bin_edges = np.logspace(np.log10(vmin), np.log10(vmax), n_bins_shared + 1)
                             shared_bin_centers = np.sqrt(shared_bin_edges[:-1] * shared_bin_edges[1:])
 
+                # Likelihood scan: one theta range for all geometries, wide enough for the loosest constraint.
+                scan_meta = {}
+                if plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+                    scan_meta['nsigma'] = float(shared_kwargs.get('likelihood_scan_nsigma', 3.0))
+                    sigmas = []
+                    for _, geom_payload in geom_items:
+                        scan = self._likelihood_scan_inputs({**geom_payload, **shared_kwargs})
+                        if scan is not None and np.isfinite(scan[4]) and scan[4] > 0:
+                            sigmas.append(scan[4])
+                    if sigmas:
+                        scan_meta['halfwidth'] = scan_meta['nsigma'] * max(sigmas)
+
                 # For ratio subplot: store y(x) per geometry.
                 ratio_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
                 for geom_name, payload in geom_items:
@@ -1825,6 +1880,22 @@ class Visualizer:
                                     color=geom_color.get(geom_name_str, None),
                                 )
                                 any_series = True
+                        continue
+
+                    if plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+                        scan = self._likelihood_scan_inputs(payload)
+                        if scan is not None and 'halfwidth' in scan_meta and np.isfinite(scan[4]) and scan[4] > 0:
+                            name, theta_hat, has_value, sigma_cond, sigma_prof = scan
+                            scan_meta.update(name=name, has_value=has_value)
+                            x = np.linspace(theta_hat - scan_meta['halfwidth'], theta_hat + scan_meta['halfwidth'], 401)
+                            x_plot = x if has_value else x - theta_hat
+                            color = geom_color.get(geom_name_str, None)
+                            ax.plot(x_plot, ((x - theta_hat) / sigma_prof) ** 2, color=color, linewidth=2,
+                                    label=rf'{geom_name_str}  $\sigma$ = {sigma_prof:.3g}')
+                            if payload.get('likelihood_scan_conditional', True) and np.isfinite(sigma_cond):
+                                ax.plot(x_plot, ((x - theta_hat) / sigma_cond) ** 2, color=color, linestyle='--',
+                                        linewidth=1.0, alpha=0.7)
+                            any_series = True
                         continue
 
                     if plot_type in (self.PLOT_ANGULAR_RESOLUTION, self.PLOT_ENERGY_RESOLUTION, self.PLOT_POINTSOURCE_FOM, self.PLOT_FLUX_VARIANCE_HISTORY):
@@ -2919,6 +2990,13 @@ class Visualizer:
                     ax.grid(True, alpha=0.3)
                     if payload.get('ps_fom_logy', False):
                         ax.set_yscale('log')
+                elif plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+                    if 'name' in scan_meta:
+                        self._likelihood_scan_axes(ax, scan_meta['name'], scan_meta['has_value'], scan_meta['nsigma'])
+                        ax.plot([], [], color='gray', linestyle='--', label='others fixed')
+                    else:
+                        ax.text(0.5, 0.5, "Likelihood scan not available\n(needs 'analysis_fisher_matrix')",
+                                ha='center', va='center', transform=ax.transAxes)
                 elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
                     ax.set_title('Flux Parameter Variance History')
                     ax.set_xlabel('Iteration')
@@ -6094,6 +6172,24 @@ class Visualizer:
             else:
                 ax.text(0.5, 0.5, "Nearest-neighbour distance history not available\n(Pass 'string_xy')",
                       ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+            scan = self._likelihood_scan_inputs(kwargs)
+            if scan is None or not np.isfinite(scan[4]) or scan[4] <= 0:
+                ax.text(0.5, 0.5, "Likelihood scan not available\n(needs 'analysis_fisher_matrix' and "
+                        "'analysis_param_names' from AnalysisLoss)", ha='center', va='center', transform=ax.transAxes)
+            else:
+                name, theta_hat, has_value, sigma_cond, sigma_prof = scan
+                nsigma = float(kwargs.get('likelihood_scan_nsigma', 3.0))
+                x = np.linspace(theta_hat - nsigma * sigma_prof, theta_hat + nsigma * sigma_prof, 401)
+                x_plot = x if has_value else x - theta_hat
+                ax.plot(x_plot, ((x - theta_hat) / sigma_prof) ** 2, color='crimson', linewidth=2,
+                        label=rf'profiled  $\sigma$ = {sigma_prof:.3g}')
+                if kwargs.get('likelihood_scan_conditional', True) and np.isfinite(sigma_cond):
+                    ax.plot(x_plot, ((x - theta_hat) / sigma_cond) ** 2, color='crimson', linestyle='--',
+                            linewidth=1.2, label=rf'others fixed  $\sigma$ = {sigma_cond:.3g}')
+                self._likelihood_scan_axes(ax, name, has_value, nsigma)
+                ax.legend(fontsize=8, loc='upper center')
 
         elif plot_type == self.PLOT_FLUX_VARIANCE_HISTORY:
             # Combined variance of the signal flux parameters from AnalysisLoss,

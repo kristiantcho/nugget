@@ -5,7 +5,7 @@ from torch.utils.checkpoint import checkpoint as _checkpoint
 from nugget.losses.base_loss import LossFunction
 from nugget.samplers.sim_weights import (event_arrays, generation_params, get_simulation_weights,
                                          ranged_generation_density, M2_TO_CM2)
-from nugget.samplers.flux_weights import get_flux_weights
+from nugget.samplers.flux_weights import get_flux_weights, model_parameter_values
 from nugget.losses.effective_area import CrossSection, TransmissionProb
 from nugget.losses.fisher_info import WeightedResolutionLoss
 from nugget.losses.fisher_info_om_net import covariance_from_fisher, resolution_from_covariance
@@ -375,13 +375,35 @@ class AnalysisLoss(LossFunction):
         else:
             raise NotImplementedError(f"No {optimality} optimality")
 
-        return {
+        out = {
             'fisher_analysis_loss': loss,
             'flux_param_names': signal_flux_var_names,
             'flux_param_variances': torch.diagonal(signal_cov),
             'flux_param_covariance': cov,
             'analysis_fisher_matrix': fisher,
+            'analysis_param_names': param_names,
         }
+        if kwargs.get('pyff_config') is not None:
+            # The assumed true values the Fisher matrix is evaluated at (centre of a likelihood scan).
+            values = model_parameter_values(kwargs['pyff_config'], kwargs.get('analysis_param_overrides'))
+            out['analysis_param_values'] = {name: float(values[name]) for name in param_names if name in values}
+        return out
+
+
+def fisher_constraints(fisher, param_names, names=None):
+    """{name: (sigma_conditional, sigma_profiled)} from a Fisher matrix over param_names.
+
+    conditional: the other parameters fixed at their true values, 1 / sqrt(F_ii).
+    profiled: the others fitted as well, sqrt((F^-1)_ii) = 1 / sqrt(F_ii - F_in F_nn^-1 F_ni), the
+    Schur complement of the other parameters' block. Always >= the conditional one.
+    """
+    F = torch.as_tensor(fisher, dtype=torch.float64)
+    cov = torch.linalg.pinv(F)
+    out = {}
+    for name in (names or param_names):
+        i = param_names.index(name)
+        out[name] = (float(1.0 / torch.sqrt(F[i, i])), float(torch.sqrt(cov[i, i])))
+    return out
         
 
         

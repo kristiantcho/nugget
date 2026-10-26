@@ -50,7 +50,7 @@ from nugget.utils.grad_accumulation import GradientAccumulator, resolve_accumula
 # Old name, kept so existing imports keep working.
 AccumulatingLoss = GradientAccumulator
 
-__all__ = ["AccumulatingLoss", "JaxLossAdapter", "HybridOptimizer"]
+__all__ = ["AccumulatingLoss", "JaxLossAdapter", "HybridOptimizer", "wrap_losses"]
 
 
 class JaxLossAdapter:
@@ -112,6 +112,68 @@ class JaxLossAdapter:
         return result
 
 
+def _is_jax_loss(obj):
+    """True for a loss that returns JAX arrays (marked by `backend`)."""
+    return getattr(obj, "backend", None) == "jax"
+
+
+def wrap_losses(loss_func_dict, loss_params_dict, owner, verbose=True, label="HybridOptimizer"):
+    """Adapt pure-JAX losses, then wrap whatever asked for repeats/a device/an accumulator.
+
+    -> (wrapped loss_func_dict, {loss_name: accumulator}). `owner` provides the primary device.
+    """
+    repeats_map = loss_params_dict.get("loss_repeats", {}) or {}
+    devices_map = loss_params_dict.get("loss_devices", {}) or {}
+    reduction_map = loss_params_dict.get("loss_reduction", {}) or {}
+    on_repeat_map = loss_params_dict.get("on_repeat", {}) or {}
+    accumulator_map = loss_params_dict.get("loss_accumulators", {}) or {}
+    empty_cache = loss_params_dict.get("empty_cache_per_repeat", True)
+
+    unknown = (set(repeats_map) | set(devices_map) | set(accumulator_map)) - set(loss_func_dict)
+    if unknown:
+        raise KeyError(
+            f"loss_repeats / loss_devices / loss_accumulators name losses that are not in "
+            f"loss_func_dict: {sorted(unknown)}"
+        )
+
+    wrapped = {}
+    accumulators = {}
+    for loss_name, loss_func in loss_func_dict.items():
+        # A pure-JAX loss is adapted first, so everything downstream --
+        # including AccumulatingLoss -- sees an ordinary torch loss.
+        if _is_jax_loss(loss_func):
+            loss_func = JaxLossAdapter(loss_func, loss_name, device=owner.device)
+
+        repeats = int(repeats_map.get(loss_name, 1))
+        device = devices_map.get(loss_name, None)
+        if repeats <= 1 and device is None and loss_name not in accumulator_map:
+            wrapped[loss_name] = loss_func
+            continue
+
+        hook = on_repeat_map.get(loss_name) if isinstance(on_repeat_map, dict) else on_repeat_map
+        accumulator_cls = resolve_accumulator(accumulator_map.get(loss_name))
+        accumulating = accumulator_cls(
+            loss_func,
+            loss_name,
+            repeats=repeats,
+            device=device,
+            reduction=reduction_map.get(loss_name, "mean"),
+            owner=owner,
+            on_repeat=hook,
+            empty_cache=empty_cache,
+        )
+        wrapped[loss_name] = accumulating
+        accumulators[loss_name] = accumulating
+
+    if verbose and accumulators:
+        print(f"{label}: gradient accumulation plan")
+        for loss_name, acc in accumulators.items():
+            where = acc.device if acc.device is not None else f"{owner.device} (primary)"
+            print(f"  {loss_name}: {type(acc).__name__}, {acc.repeats}x on {where} "
+                  f"[{acc.reduction}]")
+    return wrapped, accumulators
+
+
 class HybridOptimizer(_BaseOptimizer):
     """`Optimizer` with per-loss gradient accumulation and per-loss devices.
 
@@ -136,59 +198,12 @@ class HybridOptimizer(_BaseOptimizer):
     @staticmethod
     def _is_jax_loss(obj):
         """True for a loss that returns JAX arrays (marked by `backend`)."""
-        return getattr(obj, "backend", None) == "jax"
+        return _is_jax_loss(obj)
 
     def _wrap_losses(self, loss_func_dict, loss_params_dict):
         """Adapt pure-JAX losses, then wrap whatever asked for repeats/a device."""
-        repeats_map = loss_params_dict.get("loss_repeats", {}) or {}
-        devices_map = loss_params_dict.get("loss_devices", {}) or {}
-        reduction_map = loss_params_dict.get("loss_reduction", {}) or {}
-        on_repeat_map = loss_params_dict.get("on_repeat", {}) or {}
-        accumulator_map = loss_params_dict.get("loss_accumulators", {}) or {}
-        empty_cache = loss_params_dict.get("empty_cache_per_repeat", True)
-
-        unknown = (set(repeats_map) | set(devices_map) | set(accumulator_map)) - set(loss_func_dict)
-        if unknown:
-            raise KeyError(
-                f"loss_repeats / loss_devices / loss_accumulators name losses that are not in "
-                f"loss_func_dict: {sorted(unknown)}"
-            )
-
-        wrapped = {}
-        self._wrapped_losses = {}
-        for loss_name, loss_func in loss_func_dict.items():
-            # A pure-JAX loss is adapted first, so everything downstream --
-            # including AccumulatingLoss -- sees an ordinary torch loss.
-            if self._is_jax_loss(loss_func):
-                loss_func = JaxLossAdapter(loss_func, loss_name, device=self.device)
-
-            repeats = int(repeats_map.get(loss_name, 1))
-            device = devices_map.get(loss_name, None)
-            if repeats <= 1 and device is None and loss_name not in accumulator_map:
-                wrapped[loss_name] = loss_func
-                continue
-
-            hook = on_repeat_map.get(loss_name) if isinstance(on_repeat_map, dict) else on_repeat_map
-            accumulator_cls = resolve_accumulator(accumulator_map.get(loss_name))
-            accumulating = accumulator_cls(
-                loss_func,
-                loss_name,
-                repeats=repeats,
-                device=device,
-                reduction=reduction_map.get(loss_name, "mean"),
-                owner=self,
-                on_repeat=hook,
-                empty_cache=empty_cache,
-            )
-            wrapped[loss_name] = accumulating
-            self._wrapped_losses[loss_name] = accumulating
-
-        if self.verbose and self._wrapped_losses:
-            print("HybridOptimizer: gradient accumulation plan")
-            for loss_name, acc in self._wrapped_losses.items():
-                where = acc.device if acc.device is not None else f"{self.device} (primary)"
-                print(f"  {loss_name}: {type(acc).__name__}, {acc.repeats}x on {where} "
-                      f"[{acc.reduction}]")
+        wrapped, self._wrapped_losses = wrap_losses(loss_func_dict, loss_params_dict, owner=self,
+                                                    verbose=self.verbose)
         return wrapped
 
     def optimize(self, loss_func_dict, loss_dict=None, uw_loss_dict=None,

@@ -5,5 +5,6 @@ from . import basic_evaluator
 from . import jax_bridge
 from . import grad_accumulation
 from . import hybrid_optimizer
+from . import hybrid_evaluator
 from . import data_tools
 from . import parquet_io

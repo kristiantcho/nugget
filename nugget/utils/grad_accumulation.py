@@ -224,14 +224,24 @@ class GradientAccumulator:
 
     # -- shared steps --------------------------------------------------
 
-    def _prepare(self, geom_dict):
-        """-> (owner_device, work_device, replica_geom, real_inputs, replica_inputs)."""
+    def _devices(self, geom_dict):
+        """-> (owner_device, work_device)."""
         owner_device = getattr(self.owner, "device", None)
         if owner_device is None:
             owner_device = geom_dict_device(geom_dict)
         owner_device = torch.device(owner_device)
         work_device = torch.device(self.device) if self.device is not None else owner_device
+        return owner_device, work_device
 
+    @staticmethod
+    def _frozen(geom_dict, work_device):
+        """Detached copy of the geometry on `work_device`."""
+        return {key: (value.detach().to(work_device) if torch.is_tensor(value) else value)
+                for key, value in geom_dict.items()}
+
+    def _prepare(self, geom_dict):
+        """-> (owner_device, work_device, replica_geom, real_inputs, replica_inputs)."""
+        owner_device, work_device = self._devices(geom_dict)
         geom, real_inputs, replica_inputs = detached_replica(geom_dict, work_device)
         if not replica_inputs:
             raise RuntimeError(
@@ -262,7 +272,36 @@ class GradientAccumulator:
 
     # -- the loss interface --------------------------------------------
 
+    @torch.no_grad()
+    def evaluate(self, geom_dict, **loss_params):
+        """Graph-free counterpart of __call__ (used under no_grad): the loss reduced over the repeats."""
+        owner_device, work_device = self._devices(geom_dict)
+        geom = self._frozen(geom_dict, work_device)
+        scale = self._scale()
+        total_value, evaluated = 0.0, 0
+        extras, pooled = {}, {}
+        for k in range(self.repeats):
+            value, chunk_extras = unpack_loss(self.loss_func(geom, **self._repeat_params(loss_params, k)),
+                                              self.loss_name)
+            if value is None:
+                print(f"Warning: {self.loss_name} did not return a valid loss value.")
+                continue
+            total_value += scale * float(value.detach().cpu().item())
+            evaluated += 1
+            extras = detach_extras(chunk_extras, skip=(self.loss_name,))
+            if self.pool_extras:
+                collect_poolable(extras, pooled)
+            del chunk_extras
+            self._free(work_device)
+        if evaluated == 0:
+            return {self.loss_name: None}
+        if self.reduction == "mean" and evaluated != self.repeats:
+            total_value *= self.repeats / evaluated
+        return {self.loss_name: torch.tensor(total_value, device=owner_device), **merge_pooled(extras, pooled)}
+
     def __call__(self, geom_dict, **loss_params):
+        if not torch.is_grad_enabled():
+            return self.evaluate(geom_dict, **loss_params)
         owner_device, work_device, geom, real_inputs, replica_inputs = self._prepare(geom_dict)
         scale = self._scale()
 
@@ -326,21 +365,22 @@ class AnalysisAccumulator(GradientAccumulator):
 
     state_keys = ("analysis_mu", "analysis_grad_mu")
 
-    def __call__(self, geom_dict, **loss_params):
-        owner_device, work_device, geom, real_inputs, replica_inputs = self._prepare(geom_dict)
+    def _pool_histograms(self, frozen, loss_params, work_device):
+        """Pass 1: the histograms summed over the repeats without a geometry graph.
+
+        -> (state, param_names, batch_params, extras, pooled); batch_params are each batch's replay
+        kwargs, so a later pass sees exactly the same events (and does not recompute flux weights).
+        """
         scale = self._scale()
         skip = (*self.state_keys, "analysis_replay")
-
-        # Pass 1: pool the histograms without a geometry graph, keeping each batch's replay
-        # kwargs so pass 2 sees exactly the same events (and does not recompute flux weights).
-        frozen = {key: (value.detach() if torch.is_tensor(value) else value) for key, value in geom.items()}
         state = [None] * len(self.state_keys)
         batch_params = []
         param_names = None
         extras, pooled = {}, {}
         for k in range(self.repeats):
             params = self._repeat_params(loss_params, k)
-            out = self.loss_func.histograms(frozen, **params)
+            with torch.no_grad():
+                out = self.loss_func.histograms(frozen, **params)
             if param_names is not None and out["analysis_param_names"] != param_names:
                 raise ValueError(f"Flux parameters differ between batches: {param_names} vs {out['analysis_param_names']}")
             param_names = out["analysis_param_names"]
@@ -352,6 +392,28 @@ class AnalysisAccumulator(GradientAccumulator):
                 collect_poolable(extras, pooled)
             del out
             self._free(work_device)
+        return state, param_names, batch_params, extras, pooled
+
+    @torch.no_grad()
+    def evaluate(self, geom_dict, **loss_params):
+        """Graph-free counterpart of __call__ (used under no_grad): the head on the pooled histograms."""
+        owner_device, work_device = self._devices(geom_dict)
+        state, param_names, _, extras, pooled = self._pool_histograms(
+            self._frozen(geom_dict, work_device), loss_params, work_device)
+        head = self.loss_func.fisher_head(*state, param_names, **loss_params)
+        extras = merge_pooled(extras, pooled)
+        extras.update(detach_extras(head, skip=(self.loss_name,)))
+        for key, s in zip(self.state_keys, state):
+            extras[key] = s
+        return {self.loss_name: head[self.loss_name].detach().to(owner_device), **extras}
+
+    def __call__(self, geom_dict, **loss_params):
+        if not torch.is_grad_enabled():
+            return self.evaluate(geom_dict, **loss_params)
+        owner_device, work_device, geom, real_inputs, replica_inputs = self._prepare(geom_dict)
+        scale = self._scale()
+        frozen = {key: (value.detach() if torch.is_tensor(value) else value) for key, value in geom.items()}
+        state, param_names, batch_params, extras, pooled = self._pool_histograms(frozen, loss_params, work_device)
 
         # Head: differentiated once, on the pooled histograms.
         state = [s.requires_grad_(True) for s in state]
