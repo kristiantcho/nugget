@@ -343,6 +343,10 @@ class AnalysisLoss(LossFunction):
             'detector_efficiency_per_event': detector_effs,
             'selection_efficiency_per_event': selection,
             'analysis_replay': replay,
+            # The events the *_per_event values belong to (the visualizer's vs-energy / vs-zenith plots
+            # read them); the accumulator concatenates them over batches like the per-event values.
+            'resolution_params': [{'energy': e['energy'], 'zenith': e['zenith'], 'azimuth': e['azimuth']}
+                                  for e in signal_event_params],
         }
         if 'energy' in binning_vars:
             out['energy_resolution_per_event'] = widths[binning_vars.index('energy')]

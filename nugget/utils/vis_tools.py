@@ -1820,6 +1820,7 @@ class Visualizer:
 
                 # For ratio subplot: store y(x) per geometry.
                 ratio_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+                energy_res_relative = False  # set when a geometry's energy resolution is sigma(log10 E)
                 for geom_name, payload in geom_items:
                     payload = dict(payload)
                     payload.update(shared_kwargs)
@@ -2451,6 +2452,10 @@ class Visualizer:
                                 res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
                             except Exception:
                                 res_values = np.array(resolution_per_event).flatten()
+                            if payload.get('energy_resolution_units', None) == 'log10':
+                                # sigma of log10 E (AnalysisLoss), shown as the relative resolution sigma_E / E
+                                res_values = res_values * np.log(10.0)
+                                energy_res_relative = True
 
                             energy_values = []
                             for event_params in resolution_params:
@@ -3039,7 +3044,10 @@ class Visualizer:
                 elif plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
                     ax.set_title('Energy FOM vs Energy' if any_fom_series else 'Energy Resolution vs Energy')
                     ax.set_xlabel('Energy (GeV)')
-                    ax.set_ylabel('FOM (resolution$^{-1}$)' if any_fom_series else 'Energy Resolution (GeV)')
+                    if any_fom_series:
+                        ax.set_ylabel('FOM (resolution$^{-1}$)')
+                    else:
+                        ax.set_ylabel(r'$\sigma_E / E$' if energy_res_relative else 'Energy Resolution (GeV)')
                     ax.grid(True, alpha=0.3, which='both')
                     ax.set_xscale('log')
                     if overlay_resolution_logy:
@@ -7283,7 +7291,11 @@ class Visualizer:
                     res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
                 else:
                     res_values = np.array(resolution_per_event).flatten()
-                
+                if kwargs.get('energy_resolution_units', None) == 'log10':
+                    # sigma of log10 E (AnalysisLoss), shown as the relative resolution sigma_E / E
+                    res_values = res_values * np.log(10.0)
+                    use_relative_energy = True
+
                 # Extract energy values from event parameters
                 energy_values = []
                 for event_params in signal_event_params:
