@@ -174,6 +174,7 @@ class AnalysisLoss(LossFunction):
         injection_scale        = kwargs.get('analysis_injection_scale', 1.5) # :float, disk radius / soft max distance of the modules from the track line
         injection_softness     = kwargs.get('analysis_injection_softness', 20.0) # :float, m, softness of that maximum
         vertex_uniforms        = kwargs.get('analysis_vertex_uniforms', None) # :Tensor (N, 3), the vertex draws; set by the replay
+        exclude_flux_params    = kwargs.get('analysis_exclude_flux_params', None) or [] # :List[str], fixed at their true values: left out of the Fisher matrix (so neither constrained nor profiled over)
 
         friend_config       = kwargs.get('friend_config', None) # :str|dict
         pyff_config         = kwargs.get('pyff_config', None) # :str|dict
@@ -311,7 +312,13 @@ class AnalysisLoss(LossFunction):
         # w_i and dw_i/dphi_j; the flux gradients are constants, geometry enters via sim weights, efficiency, selection and resolution
         acceptance = live_time * sim_weights * detector_effs * selection
         total_weights = acceptance * flux_weights
-        param_names = list(grad_weights)
+        # Excluded parameters get no dmu/dphi row: they are treated as known, so they drop out of the
+        # Fisher matrix and of the nuisance block its Schur complement profiles over. mu itself still
+        # contains their flux component, at the true values.
+        excluded_signal = set(exclude_flux_params) & set(kwargs.get('analysis_signal_flux_var_names', ['astro_norm']))
+        if excluded_signal:
+            raise ValueError(f"analysis_exclude_flux_params contains signal parameters: {sorted(excluded_signal)}")
+        param_names = [k for k in grad_weights if k not in exclude_flux_params]
         grad_total_weights = torch.stack([grad_weights[k] for k in param_names]) * acceptance  # (n_params, N)
 
         # Joint bin membership is the product over axes, flattened row-major (first variable slowest).
