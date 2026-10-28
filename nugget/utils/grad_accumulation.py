@@ -160,6 +160,8 @@ def disjoint_batches(per_event, batch_size, rescale_keys=(), generator=None):
                 params[key] = params[key] * (n_total / batch_size)
         # So the loss does not subsample the batch again.
         params['num_events'] = batch_size
+        # Positions of this batch in the full sample, for per-event inputs indexed by event (e.g. analysis_resolutions).
+        params['event_index'] = idx
         return params
 
     return hook
