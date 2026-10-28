@@ -227,9 +227,23 @@ class Visualizer:
             # Common default.
             return 1.959963984540054
 
+    def _expand_likelihood_scans(self, plot_types, params):
+        """'flux_likelihood_scan' -> one 'flux_likelihood_scan:<param>' entry per name when params is a list."""
+        if plot_types is None or not isinstance(params, (list, tuple)):
+            return plot_types
+        out = []
+        for plot_type in plot_types:
+            if plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+                out.extend(f'{self.PLOT_FLUX_LIKELIHOOD_SCAN}:{p}' for p in params)
+            else:
+                out.append(plot_type)
+        return out
+
     @staticmethod
-    def _likelihood_scan_inputs(kwargs):
+    def _likelihood_scan_inputs(kwargs, param=None):
         """-> (name, theta_hat, has_value, sigma_conditional, sigma_profiled) for the scanned flux parameter, or None.
+
+        param (e.g. from 'flux_likelihood_scan:<param>') overrides 'likelihood_scan_param'; a list there means its first.
 
         Asimov: -2 Delta ln L(theta) = (theta - theta_hat)^T F (theta - theta_hat). Scanning one parameter
         with the others fixed gives F_ii (Delta theta_i)^2; re-fitting the others at each point (profiling)
@@ -240,7 +254,10 @@ class Visualizer:
         if F is None or not names:
             return None
         F = np.asarray(F.detach().cpu().numpy() if isinstance(F, torch.Tensor) else F, dtype=float)
-        name = kwargs.get('likelihood_scan_param', None) or (kwargs.get('flux_param_names', None) or names)[0]
+        name = param or kwargs.get('likelihood_scan_param', None)
+        if isinstance(name, (list, tuple)):
+            name = name[0] if name else None
+        name = name or (kwargs.get('flux_param_names', None) or names)[0]
         if name not in names:
             return None
         i = list(names).index(name)
@@ -1230,7 +1247,8 @@ class Visualizer:
               analysis Fisher matrix ('analysis_fisher_matrix', 'analysis_param_names', centred on
               'analysis_param_values'). Solid: profiled over the other parameters (Schur complement,
               (Delta theta)^2 / (F^-1)_ii); dashed: the others fixed (F_ii (Delta theta)^2). Optional
-              kwargs: 'likelihood_scan_param' (default: first of 'flux_param_names'),
+              kwargs: 'likelihood_scan_param' (default: first of 'flux_param_names'; a list gives one
+              panel per parameter, as does 'flux_likelihood_scan:<param>' in plot_types),
               'likelihood_scan_nsigma' (default 3), 'likelihood_scan_conditional' (default True).
             - 'angular_resolution_vs_zenith': Binned angular resolution vs zenith
             - 'angular_resolution_vs_energy': Binned angular resolution vs energy
@@ -1381,7 +1399,8 @@ class Visualizer:
             
             current_gif_plot_types = []
             if gif_plot_selection is not None:
-                current_gif_plot_types = gif_plot_selection
+                current_gif_plot_types = self._expand_likelihood_scans(
+                    gif_plot_selection, kwargs.get('likelihood_scan_param', None))
             else:
                 # Default plot types for GIF: Loss and 3D points if available
                 if hasattr(self, 'PLOT_LOSS'):
@@ -1559,6 +1578,8 @@ class Visualizer:
                     self.PLOT_LLR_HISTOGRAM
                 ]
         
+        plot_types = self._expand_likelihood_scans(plot_types, kwargs.get('likelihood_scan_param', None))
+
         # Create figure with proper layout based on number of plots
         num_plots = len(plot_types)
         # Keep up to 3 plots per row; don't allocate empty 3rd column for 1-2 plots.
@@ -1646,6 +1667,9 @@ class Visualizer:
             plot_types = first_payload.get('plot_types', None)
         if plot_types is None:
             plot_types = [self.PLOT_LOSS]
+        scan_params = shared_kwargs.get('likelihood_scan_param',
+                                        next(iter(geom_vis_kwargs.values())).get('likelihood_scan_param', None))
+        plot_types = self._expand_likelihood_scans(plot_types, scan_params)
 
         # Clear output once for the whole multi-geometry rendering.
         clear_output(wait=True)
@@ -1714,6 +1738,9 @@ class Visualizer:
             return baseline if baseline in geom_color else None
 
         for plot_type in plot_types:
+            scan_param = None
+            if isinstance(plot_type, str) and plot_type.startswith(self.PLOT_FLUX_LIKELIHOOD_SCAN + ':'):
+                plot_type, scan_param = plot_type.split(':', 1)
             if plot_type in overlay_plot_types:
                 baseline = _baseline_name() if plot_type in ratio_plot_types else None
                 if baseline is not None and n_geoms >= 2:
@@ -1812,7 +1839,7 @@ class Visualizer:
                     scan_meta['nsigma'] = float(shared_kwargs.get('likelihood_scan_nsigma', 3.0))
                     sigmas = []
                     for _, geom_payload in geom_items:
-                        scan = self._likelihood_scan_inputs({**geom_payload, **shared_kwargs})
+                        scan = self._likelihood_scan_inputs({**geom_payload, **shared_kwargs}, scan_param)
                         if scan is not None and np.isfinite(scan[4]) and scan[4] > 0:
                             sigmas.append(scan[4])
                     if sigmas:
@@ -1820,6 +1847,7 @@ class Visualizer:
 
                 # For ratio subplot: store y(x) per geometry.
                 ratio_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+                energy_res_relative = False  # set when a geometry's energy resolution is sigma(log10 E)
                 for geom_name, payload in geom_items:
                     payload = dict(payload)
                     payload.update(shared_kwargs)
@@ -1883,7 +1911,7 @@ class Visualizer:
                         continue
 
                     if plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
-                        scan = self._likelihood_scan_inputs(payload)
+                        scan = self._likelihood_scan_inputs(payload, scan_param)
                         if scan is not None and 'halfwidth' in scan_meta and np.isfinite(scan[4]) and scan[4] > 0:
                             name, theta_hat, has_value, sigma_cond, sigma_prof = scan
                             scan_meta.update(name=name, has_value=has_value)
@@ -2451,6 +2479,10 @@ class Visualizer:
                                 res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
                             except Exception:
                                 res_values = np.array(resolution_per_event).flatten()
+                            if payload.get('energy_resolution_units', None) == 'log10':
+                                # sigma of log10 E (AnalysisLoss), shown as the relative resolution sigma_E / E
+                                res_values = res_values * np.log(10.0)
+                                energy_res_relative = True
 
                             energy_values = []
                             for event_params in resolution_params:
@@ -3039,7 +3071,10 @@ class Visualizer:
                 elif plot_type == self.PLOT_ENERGY_RESOLUTION_VS_ENERGY:
                     ax.set_title('Energy FOM vs Energy' if any_fom_series else 'Energy Resolution vs Energy')
                     ax.set_xlabel('Energy (GeV)')
-                    ax.set_ylabel('FOM (resolution$^{-1}$)' if any_fom_series else 'Energy Resolution (GeV)')
+                    if any_fom_series:
+                        ax.set_ylabel('FOM (resolution$^{-1}$)')
+                    else:
+                        ax.set_ylabel(r'$\sigma_E / E$' if energy_res_relative else 'Energy Resolution (GeV)')
                     ax.grid(True, alpha=0.3, which='both')
                     ax.set_xscale('log')
                     if overlay_resolution_logy:
@@ -6173,8 +6208,8 @@ class Visualizer:
                 ax.text(0.5, 0.5, "Nearest-neighbour distance history not available\n(Pass 'string_xy')",
                       ha='center', va='center', transform=ax.transAxes)
 
-        elif plot_type == self.PLOT_FLUX_LIKELIHOOD_SCAN:
-            scan = self._likelihood_scan_inputs(kwargs)
+        elif isinstance(plot_type, str) and plot_type.split(':', 1)[0] == self.PLOT_FLUX_LIKELIHOOD_SCAN:
+            scan = self._likelihood_scan_inputs(kwargs, plot_type.split(':', 1)[1] if ':' in plot_type else None)
             if scan is None or not np.isfinite(scan[4]) or scan[4] <= 0:
                 ax.text(0.5, 0.5, "Likelihood scan not available\n(needs 'analysis_fisher_matrix' and "
                         "'analysis_param_names' from AnalysisLoss)", ha='center', va='center', transform=ax.transAxes)
@@ -7283,7 +7318,11 @@ class Visualizer:
                     res_values = resolution_per_event.clone().detach().cpu().numpy().flatten()
                 else:
                     res_values = np.array(resolution_per_event).flatten()
-                
+                if kwargs.get('energy_resolution_units', None) == 'log10':
+                    # sigma of log10 E (AnalysisLoss), shown as the relative resolution sigma_E / E
+                    res_values = res_values * np.log(10.0)
+                    use_relative_energy = True
+
                 # Extract energy values from event parameters
                 energy_values = []
                 for event_params in signal_event_params:

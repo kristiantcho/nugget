@@ -174,6 +174,9 @@ class AnalysisLoss(LossFunction):
         injection_scale        = kwargs.get('analysis_injection_scale', 1.5) # :float, disk radius / soft max distance of the modules from the track line
         injection_softness     = kwargs.get('analysis_injection_softness', 20.0) # :float, m, softness of that maximum
         vertex_uniforms        = kwargs.get('analysis_vertex_uniforms', None) # :Tensor (N, 3), the vertex draws; set by the replay
+        exclude_flux_params    = kwargs.get('analysis_exclude_flux_params', None) or [] # :List[str], fixed at their true values: left out of the Fisher matrix (so neither constrained nor profiled over)
+        precomputed_res        = kwargs.get('analysis_resolutions', None) # :Dict[str, Tensor (N_total,)], 'energy' (sigma_E, GeV) / 'zenith' (sigma_theta, rad) / 'angular' (rad) for the full event sample, e.g. from resolutions_by_event; skips the resolution computation
+        event_index            = kwargs.get('event_index', None) # :Tensor (N,), positions of signal_event_params in the full sample; set by disjoint_batches
 
         friend_config       = kwargs.get('friend_config', None) # :str|dict
         pyff_config         = kwargs.get('pyff_config', None) # :str|dict
@@ -185,12 +188,14 @@ class AnalysisLoss(LossFunction):
             signal_event_params = signal_sampler.sample_events(num_events)
             # Anything precomputed belongs to some other set of events.
             sim_weights = flux_weights = grad_weights = None
+            precomputed_res = event_index = None
             for key in PRECOMPUTED_PER_EVENT_KEYS:
                 eff_kwargs[key] = None
         else:
             n_total = len(signal_event_params)
             idx = sorted(random.sample(range(n_total), num_events)) if n_total > num_events else list(range(n_total))
             signal_event_params = [signal_event_params[i] for i in idx]
+            event_index = torch.as_tensor(idx) if event_index is None else torch.as_tensor(event_index)[idx]
             if sim_weights is not None:
                 # Precomputed with N_gen = n_total; the subsample has to stand in for all of them.
                 sim_weights = sim_weights[idx] * n_total / len(idx)
@@ -229,6 +234,7 @@ class AnalysisLoss(LossFunction):
             eff_kwargs['signal_event_params'] = signal_event_params
             for key in PRECOMPUTED_PER_EVENT_KEYS:   # computed for the old vertices
                 eff_kwargs[key] = None
+            precomputed_res = None
             sim_weights = None                       # recomputed below for the new vertices and disks
         # Only precomputed sim weights are constants that may be replayed; computed ones can depend on the geometry.
         precomputed_sim_weights = sim_weights
@@ -274,7 +280,9 @@ class AnalysisLoss(LossFunction):
         # cos(zenith) smeared by the angular resolution, each in the units of its axis.
         binning_vars = [binning_var_name] if isinstance(binning_var_name, str) else list(binning_var_name)
         bins_per_var = [num_bins] * len(binning_vars) if isinstance(num_bins, int) else list(num_bins)
-        res_cache = {}
+        # Precomputed resolutions are constants: no geometry gradient flows through them.
+        res_cache = {kind: torch.as_tensor(r)[event_index.to(torch.as_tensor(r).device)].to(self.device)
+                     for kind, r in (precomputed_res or {}).items()}
         bin_edges, true_vals, widths = {}, [], []
         for var, n in zip(binning_vars, bins_per_var):
             if var == 'energy':
@@ -311,7 +319,13 @@ class AnalysisLoss(LossFunction):
         # w_i and dw_i/dphi_j; the flux gradients are constants, geometry enters via sim weights, efficiency, selection and resolution
         acceptance = live_time * sim_weights * detector_effs * selection
         total_weights = acceptance * flux_weights
-        param_names = list(grad_weights)
+        # Excluded parameters get no dmu/dphi row: they are treated as known, so they drop out of the
+        # Fisher matrix and of the nuisance block its Schur complement profiles over. mu itself still
+        # contains their flux component, at the true values.
+        excluded_signal = set(exclude_flux_params) & set(kwargs.get('analysis_signal_flux_var_names', ['astro_norm']))
+        if excluded_signal:
+            raise ValueError(f"analysis_exclude_flux_params contains signal parameters: {sorted(excluded_signal)}")
+        param_names = [k for k in grad_weights if k not in exclude_flux_params]
         grad_total_weights = torch.stack([grad_weights[k] for k in param_names]) * acceptance  # (n_params, N)
 
         # Joint bin membership is the product over axes, flattened row-major (first variable slowest).
@@ -331,6 +345,8 @@ class AnalysisLoss(LossFunction):
         }
         if precomputed_sim_weights is not None:
             replay['analysis_sim_weights'] = precomputed_sim_weights
+        if event_index is not None:
+            replay['event_index'] = event_index
         if injection_area is not None:
             replay['analysis_vertex_uniforms'] = vertex_uniforms   # the same vertices again
 
@@ -343,12 +359,22 @@ class AnalysisLoss(LossFunction):
             'detector_efficiency_per_event': detector_effs,
             'selection_efficiency_per_event': selection,
             'analysis_replay': replay,
+            # The events the *_per_event values belong to (the visualizer's vs-energy / vs-zenith plots
+            # read them); the accumulator concatenates them over batches like the per-event values.
+            'resolution_params': [{'energy': e['energy'], 'zenith': e['zenith'], 'azimuth': e['azimuth']}
+                                  for e in signal_event_params],
         }
         if 'energy' in binning_vars:
             out['energy_resolution_per_event'] = widths[binning_vars.index('energy')]
             out['energy_resolution_units'] = 'log10'  # sigma of log10(E); read by the visualizer's energy panels
         if 'angular' in res_cache:
             out['angular_resolution_per_event'] = res_cache['angular']  # radians, as the visualizer's angular panels expect
+        if 'energy' in res_cache:
+            out['sigma_energy_per_event'] = res_cache['energy']        # GeV
+        if 'zenith' in res_cache:
+            out['sigma_zenith_per_event'] = res_cache['zenith']        # radians
+        if event_index is not None:
+            out['event_index_per_event'] = event_index                 # for resolutions_by_event
         if injection_area is not None:
             # A_eff = T * P_int * A_inj * efficiency * selection, in m^2: the weight times the generation density.
             area = sim_weights * ranged_generation_density(ev['energy'], **gen) / M2_TO_CM2
@@ -404,6 +430,20 @@ def fisher_constraints(fisher, param_names, names=None):
         i = param_names.index(name)
         out[name] = (float(1.0 / torch.sqrt(F[i, i])), float(torch.sqrt(cov[i, i])))
     return out
+
+
+def resolutions_by_event(out, n_events):
+    """{kind: (n_events,)} per-event resolutions from a (pooled) analysis-loss output, in the order of the
+    full event sample, to feed back as analysis_resolutions. Events that were not evaluated are NaN."""
+    index = out['event_index_per_event'].long().cpu()
+    res = {}
+    for kind, key in (('energy', 'sigma_energy_per_event'), ('zenith', 'sigma_zenith_per_event'),
+                      ('angular', 'angular_resolution_per_event')):
+        if key in out:
+            full = torch.full((n_events,), float('nan'), dtype=torch.float64)
+            full[index] = out[key].detach().cpu().to(torch.float64)
+            res[kind] = full
+    return res
         
 
         
