@@ -3,19 +3,19 @@ import pickle
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_reco_muon_flow_v1_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_reco_muon_flow_model_v1.pt'
+TEST_PARQUET = './flow_models/mc_reco_muon_flow_v2ns_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_reco_muon_flow_model_v2ns.pt'
 
-EPOCHS = 100
+EPOCHS = 1000
 
 flow = nugget.surrogates.FlowMatchReco.FlowMatchReco(
     device="cuda:0",
     # 'essential': relative position, PMT orientation, q_tot, t_first, t50 (+ token flags);
     # 'thesis': all 27 features of Bas 2026, Table 8.1
-    feature_set='essential',
+    feature_set='thesis',
     # --- PMT transformer encoder (token/pooling layout of Bas 2026, Sec. 8.1-8.2) ---
     d_model=96,
-    encoder_depth=20,
+    encoder_depth=10,
     n_heads=4,
     ffn_dim=512,
     cond_dim=256,
@@ -23,15 +23,15 @@ flow = nugget.surrogates.FlowMatchReco.FlowMatchReco(
 
     # --- adaLN-Zero vector field on R x S^2 ---
     width=256,
-    depth=8,
+    depth=12,
     time_dim=64,
-    mlp_ratio=2,
+    mlp_ratio=1,
     dropout=0.0,
 
     # --- token transforms (thesis Eq. 8.2); 'asinh' keeps ns-level timing visible ---
     length_scale=500.0,
     time_scale=1e4,
-    time_transform='linear',
+    time_transform='linear',  # 'asinh' or 'linear'
 
     # --- flow ---
     sigma_min=1e-4,
@@ -54,20 +54,20 @@ data_kw = dict(
     use_pulses=True,
     pulse_params=None,
     # >= 3 PMTs of one OM within 10 ns, evaluated after masking
-    require_trigger=True,
+    require_trigger=False,
     # every event is seen in its own random sub-geometry of the 1378-string grid: 10-150
     # strings drawn around a random string with a Gaussian width log-uniform in 40-1000 m
     # (compact 40 m cluster ... scattered), then in half the events up to 50% of the OMs
     # dropped. ~14% of (event, geometry) draws trigger; the rest are redrawn.
-    n_strings_range=(10, 150),
-    string_spread_range=(40.0, 1000.0),
+    n_strings_range=(10, 500),
+    # string_spread_range=(1000.0, 1000.0),
     om_drop_prob=0.5,
     om_drop_range=(0.0, 0.5),
     # one token per active silent OM on a hit string and per active silent string, so the
     # whole sub-geometry is seen: ~250 tokens/event median, ~1.4k p99. max_tokens is only a
     # guard against rare huge events; lower batch_size first if memory runs out.
-    silent_tokens=True,
-    max_tokens=4096,
+    silent_tokens=False,
+    max_tokens=20000,
     batch_size=64,
     num_workers=8,
 )
@@ -100,7 +100,7 @@ history = flow.train_with_dataloader(
 )
 
 pickle.dump(history,
-            open('./flow_models/mc_reco_muon_flow_v1_training_history.pkl', 'wb'))
+            open('./flow_models/mc_reco_muon_flow_v2ns_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +110,9 @@ pickle.dump(history,
 # ---------------------------------------------------------------------------
 eval_kw = {**data_kw, 'num_workers': 0, 'om_drop_prob': 0.0}
 for name, mask in [('compact 100', dict(n_strings_range=(100, 100),
-                                        string_spread_range=(40.0, 40.0))),
+                                        )),
                    ('scattered 50', dict(n_strings_range=(50, 50),
-                                         string_spread_range=(3000.0, 3000.0)))]:
+                                         ))]:
     loader = flow.create_reco_parquet_val_dataloader(
         parquet_path=TEST_PARQUET, num_events_per_epoch=5_000, **{**eval_kw, **mask})
     m = flow.evaluate(loader, max_batches=40, n_samples=128, n_steps=32)
