@@ -24,8 +24,8 @@ LOG_2PI = math.log(2.0 * math.pi)
 
 # Thesis Table 8.1 (times relative to the event's first pulse, positions to its pulse-count
 # weighted centre), the charge within 100/500 ns of the PMT's first pulse, then the token
-# type and the silent-string description. Hit PMTs have hit=1; a silent OM on a hit string
-# has hit=string_token=0 and no orientation; a silent string sits at (x, y, mean z) of its
+# type and the silent-string description. Hit PMTs have hit=1; a silent OM has
+# hit=string_token=0 and no orientation; a silent string sits at (x, y, mean z) of its
 # active OMs with their count and vertical extent.
 THESIS_FEATURES = (
     'x', 'y', 'z', 'dx', 'dy', 'dz', 'ux', 'uy', 'uz',
@@ -261,40 +261,34 @@ class DetectorGeometry:
         idx[(o < 0) | (o >= self._m_om) | (p < 0) | (p >= self._m_pmt)] = -1
         return idx
 
-    def sample_active(self, rng, n_strings_range=(10, 150), spread_range=(40.0, 1000.0),
-                      om_drop_prob=0.0, om_drop_range=(0.0, 0.5)):
-        """Random sub-geometry as a bool mask over OMs.
-
-        n strings (uniform in n_strings_range, None = all) are drawn without replacement with
-        weight exp(-d^2 / 2s^2) around a random string, s log-uniform in spread_range m: small
-        s gives a compact cluster, large s scattered strings. With probability om_drop_prob
-        each OM is then dropped with a probability drawn from om_drop_range.
-        """
+    def sample_active(self, rng, n_strings_range=(10, 150), om_drop_prob=0.0,
+                      om_drop_range=(0.0, 0.5)):
+        """Random sub-geometry as a bool mask over OMs: n strings (uniform in n_strings_range,
+        None = all) chosen uniformly at random, then with probability om_drop_prob each OM
+        dropped with a probability drawn from om_drop_range."""
         keep = np.ones(self.n_strings, dtype=bool)
         if n_strings_range is not None:
             n = min(int(rng.integers(n_strings_range[0], n_strings_range[1] + 1)),
                     self.n_strings)
-            s = math.exp(rng.uniform(math.log(spread_range[0]), math.log(spread_range[1])))
-            c = self.str_xy[rng.integers(self.n_strings)]
-            # Gumbel top-k = weighted sampling without replacement; done on log weights so
-            # far strings keep a tiny but nonzero chance
-            key = (-((self.str_xy - c) ** 2).sum(1) / (2.0 * s * s)
-                   - np.log(-np.log(rng.random(self.n_strings))))
             keep[:] = False
-            keep[np.argpartition(-key, n - 1)[:n]] = True
+            keep[rng.choice(self.n_strings, n, replace=False)] = True
         act = keep[self.om_string]
         if om_drop_prob > 0 and rng.random() < om_drop_prob:
             act &= rng.random(self.n_om) >= rng.uniform(*om_drop_range)
         return act
 
-    def silent_tokens(self, hit, center, om_active=None):
-        """Token rows for the active silent OMs on hit strings and for the silent strings,
-        each group ordered by distance to `center`. `hit` are the hit PMT indices."""
+    def silent_tokens(self, hit, center, om_active=None, mode='strings'):
+        """Token rows for the active silent OMs and silent strings, each group ordered by
+        distance to `center`. mode='strings': the silent OMs on hit strings and one token per
+        silent string; 'oms': every silent OM, no string tokens. `hit` are hit PMT indices."""
         act = np.ones(self.n_om, dtype=bool) if om_active is None else om_active
         hit_om = np.unique(self.pmt_om[hit])
         hit_str = np.unique(self.om_string[hit_om])
 
-        oms = _ragged_indices(self.str_om_start[hit_str], self.str_om_count[hit_str])
+        if mode == 'oms':
+            oms = np.arange(self.n_om)
+        else:
+            oms = _ragged_indices(self.str_om_start[hit_str], self.str_om_count[hit_str])
         lit = np.zeros(self.n_om, dtype=bool)
         lit[hit_om] = True
         oms = oms[act[oms] & ~lit[oms]]
@@ -302,6 +296,8 @@ class DetectorGeometry:
         om_rows = np.zeros((len(oms), len(FEATURE_NAMES)), dtype=np.float32)
         om_rows[:, 0:3] = self.om_pos[oms]
         om_rows[:, 3:6] = self.om_pos[oms] - center
+        if mode == 'oms':
+            return om_rows, np.zeros((0, len(FEATURE_NAMES)), dtype=np.float32)
 
         z = self.om_pos[:, 2]
         n = np.add.reduceat(act.astype(np.float64), self.str_om_start)
@@ -321,15 +317,28 @@ class DetectorGeometry:
         return om_rows, str_rows
 
 
+def _silent_mode(silent_tokens):
+    """False/None -> None, True -> 'strings'; else 'strings' or 'oms'."""
+    if silent_tokens is True:
+        return 'strings'
+    if not silent_tokens:
+        return None
+    if silent_tokens not in ('strings', 'oms'):
+        raise ValueError("silent_tokens must be False, True, 'strings' or 'oms'")
+    return silent_tokens
+
+
 def event_tokens(tok, t, q, geometry, max_tokens=None, feature_set='essential',
                  silent_tokens=False, om_active=None):
     """One event's pulses -> (n_tokens, n_columns) tokens of `feature_set` and (3,) globals.
 
-    tok indexes geometry PMTs. silent_tokens adds a token per active silent OM on a hit
-    string and per active silent string (om_active: bool per geometry OM, None = all).
-    Over max_tokens the brightest hits win, then the silent OMs, then the silent strings,
-    the silent ones nearest the event's pulse-weighted centre first.
+    tok indexes geometry PMTs. silent_tokens='strings' (or True) adds a token per active
+    silent OM on a hit string and per active silent string, 'oms' a token per active silent
+    OM (om_active: bool per geometry OM, None = all). Over max_tokens the brightest hits
+    win, then the silent OMs, then the silent strings, the silent ones nearest the event's
+    pulse-weighted centre first.
     """
+    mode = _silent_mode(silent_tokens)
     tok = np.asarray(tok, dtype=np.int64)
     t = np.asarray(t, dtype=np.float64)
     q = np.asarray(q, dtype=np.float64)
@@ -342,9 +351,9 @@ def event_tokens(tok, t, q, geometry, max_tokens=None, feature_set='essential',
     rows[:, COLUMN['hit']] = 1.0
     if max_tokens is not None and len(rows) > max_tokens:
         rows = rows[np.argsort(-rows[:, COLUMN['q_tot']], kind='stable')[:max_tokens]]
-    if silent_tokens:
+    if mode is not None:
         center = (feats[0, 0:3] - feats[0, 3:6]).astype(np.float64)
-        rows = np.concatenate([rows, *geometry.silent_tokens(used, center, om_active)])
+        rows = np.concatenate([rows, *geometry.silent_tokens(used, center, om_active, mode)])
         if max_tokens is not None:
             rows = rows[:max_tokens]
     cols = [COLUMN[c] for c in FEATURE_SETS[feature_set]['columns']]
@@ -582,8 +591,7 @@ class RecoFlowDataset(Dataset):
     def __init__(self, parquet_path, geometry_csv_path, num_events_per_epoch=None, seed=None,
                  energy_column='neutrino_energy', use_pulses=True, pulse_params=None,
                  require_trigger=False, trigger_window=10.0, trigger_min_pmts=3,
-                 n_strings_range=(10, 150), string_spread_range=(40.0, 1000.0),
-                 om_drop_prob=0.5, om_drop_range=(0.0, 0.5),
+                 n_strings_range=(10, 150), om_drop_prob=0.5, om_drop_range=(0.0, 0.5),
                  max_tokens=None, feature_set='essential', silent_tokens=False,
                  uniform_energy_zenith=False, n_energy_bins=20, n_coszen_bins=20,
                  event_filter=None, max_redraws=1000, verbose=True):
@@ -601,10 +609,9 @@ class RecoFlowDataset(Dataset):
         self.trigger_window, self.trigger_min_pmts = float(trigger_window), int(trigger_min_pmts)
         self.masking = dict(
             n_strings_range=None if n_strings_range is None else tuple(map(int, n_strings_range)),
-            spread_range=tuple(map(float, string_spread_range)),
             om_drop_prob=float(om_drop_prob), om_drop_range=tuple(map(float, om_drop_range)))
         self.max_tokens = None if max_tokens is None else int(max_tokens)
-        self.feature_set, self.silent_tokens = feature_set, bool(silent_tokens)
+        self.feature_set, self.silent_tokens = feature_set, _silent_mode(silent_tokens)
         self.max_redraws = int(max_redraws)
         self.config = dict(
             energy_column=energy_column, use_pulses=bool(use_pulses),
@@ -706,11 +713,10 @@ class RecoFlowDataset(Dataset):
             print(f"  pulses={'on' if self.pulses is not None else 'off (photons)'}, "
                   f"trigger={'on' if self.require_trigger else 'off'}, "
                   f"features={self.feature_set}, "
-                  f"silent tokens={'on' if self.silent_tokens else 'off'}, "
+                  f"silent tokens={self.silent_tokens or 'off'}, "
                   f"max_tokens={self.max_tokens}")
             print(f"  geometry: {self.geometry.n_strings} strings; per event "
-                  f"{self.masking['n_strings_range'] or 'all'} strings, spread "
-                  f"{self.masking['spread_range']} m, OM dropout "
+                  f"{self.masking['n_strings_range'] or 'all'} random strings, OM dropout "
                   f"{self.masking['om_drop_range']} with prob {self.masking['om_drop_prob']}")
 
     def _build_bins(self, n_e, n_c):
@@ -787,8 +793,7 @@ class RecoFlowDataset(Dataset):
                 e = self._sample_events(1)[0]
             else:
                 raise RuntimeError(f"no event survived masking/trigger in "
-                                   f"{self.max_redraws} draws; use more strings or a "
-                                   f"wider string_spread_range")
+                                   f"{self.max_redraws} draws; use more strings")
             out.append(tok)
             evs.append(e)
         feats, mask, glob = pad_events(out)
@@ -1194,7 +1199,6 @@ class FlowMatchReco(Surrogate):
                                        pulse_params=None, require_trigger=False,
                                        trigger_window=10.0, trigger_min_pmts=3,
                                        n_strings_range=(10, 150),
-                                       string_spread_range=(40.0, 1000.0),
                                        om_drop_prob=0.5, om_drop_range=(0.0, 0.5),
                                        max_tokens=None, silent_tokens=False,
                                        uniform_energy_zenith=False, n_energy_bins=20,
@@ -1202,8 +1206,9 @@ class FlowMatchReco(Surrogate):
                                        split_seed=None, pin_memory=None, event_frac=None):
         """Event-level loader. Each event is seen in its own random sub-geometry (see
         DetectorGeometry.sample_active); n_strings_range=None with om_drop_prob=0 keeps the
-        whole geometry CSV. silent_tokens adds the active silent OMs on hit strings and the
-        silent strings. uniform_energy_zenith flattens the implied prior in (log10 E, cos zen)."""
+        whole geometry CSV. silent_tokens='strings' (or True) adds the active silent OMs on hit
+        strings and the silent strings, 'oms' every active silent OM. uniform_energy_zenith
+        flattens the implied prior in (log10 E, cos zen)."""
         train_filter = _event_split(parquet_path, event_frac, test_save_path, test_frac,
                                     split_seed if split_seed is not None else seed)
         ds = RecoFlowDataset(
@@ -1211,8 +1216,8 @@ class FlowMatchReco(Surrogate):
             seed=seed, energy_column=energy_column, use_pulses=use_pulses,
             pulse_params=pulse_params, require_trigger=require_trigger,
             trigger_window=trigger_window, trigger_min_pmts=trigger_min_pmts,
-            n_strings_range=n_strings_range, string_spread_range=string_spread_range,
-            om_drop_prob=om_drop_prob, om_drop_range=om_drop_range, max_tokens=max_tokens,
+            n_strings_range=n_strings_range, om_drop_prob=om_drop_prob,
+            om_drop_range=om_drop_range, max_tokens=max_tokens,
             feature_set=self.feature_set, silent_tokens=silent_tokens,
             uniform_energy_zenith=uniform_energy_zenith, n_energy_bins=n_energy_bins,
             n_coszen_bins=n_coszen_bins, event_filter=train_filter)
