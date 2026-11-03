@@ -3,19 +3,19 @@ import pickle
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_reco_muon_flow_v2ns_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_reco_muon_flow_model_v2ns.pt'
+TEST_PARQUET = './flow_models/mc_reco_muon_flow_v1ns_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_reco_muon_flow_model_v1ns.pt'
 
-EPOCHS = 1000
+EPOCHS = 300
 
 flow = nugget.surrogates.FlowMatchReco.FlowMatchReco(
-    device="cuda:0",
+    device="cuda:1",
     # 'essential': relative position, PMT orientation, q_tot, t_first, t50 (+ token flags);
     # 'thesis': all 27 features of Bas 2026, Table 8.1
     feature_set='thesis',
     # --- PMT transformer encoder (token/pooling layout of Bas 2026, Sec. 8.1-8.2) ---
     d_model=96,
-    encoder_depth=10,
+    encoder_depth=12,
     n_heads=4,
     ffn_dim=512,
     cond_dim=256,
@@ -59,7 +59,7 @@ data_kw = dict(
     # strings drawn around a random string with a Gaussian width log-uniform in 40-1000 m
     # (compact 40 m cluster ... scattered), then in half the events up to 50% of the OMs
     # dropped. ~14% of (event, geometry) draws trigger; the rest are redrawn.
-    n_strings_range=(10, 500),
+    n_strings_range=(10, 300),
     # string_spread_range=(1000.0, 1000.0),
     om_drop_prob=0.5,
     om_drop_range=(0.0, 0.5),
@@ -69,7 +69,8 @@ data_kw = dict(
     silent_tokens=False,
     max_tokens=20000,
     batch_size=64,
-    num_workers=8,
+    num_workers=4,
+    uniform_energy_zenith=True,
 )
 
 train_dataloader = flow.create_reco_parquet_dataloader(
@@ -92,7 +93,7 @@ history = flow.train_with_dataloader(
     val_dataloader=val_dataloader,
     epochs=EPOCHS,
     grad_clip=3.0,
-    early_stopping_patience=20,
+    early_stopping_patience=50,
     metrics_every_n_epochs=5,
     metrics_batches=20,
     save_every_n_epochs=5,
@@ -100,7 +101,7 @@ history = flow.train_with_dataloader(
 )
 
 pickle.dump(history,
-            open('./flow_models/mc_reco_muon_flow_v2ns_training_history.pkl', 'wb'))
+            open('./flow_models/mc_reco_muon_flow_v1ns_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------
