@@ -622,7 +622,9 @@ class RecoFlowDataset(Dataset):
             silent_tokens=self.silent_tokens,
             uniform_energy_zenith=bool(uniform_energy_zenith))
 
-        self.geometry = DetectorGeometry.from_csv(geometry_csv_path)
+        # a DetectorGeometry may stand in for the path, so several datasets can share one
+        self.geometry = (geometry_csv_path if isinstance(geometry_csv_path, DetectorGeometry)
+                         else DetectorGeometry.from_csv(geometry_csv_path))
 
         names = _schema(parquet_path).names
         ecol = (energy_column if energy_column in names
