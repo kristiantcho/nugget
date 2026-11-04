@@ -23,9 +23,10 @@ from nugget.surrogates.FlowMatchATime import _ragged_indices
 LOG_4PI = math.log(4.0 * math.pi)
 LOG_2PI = math.log(2.0 * math.pi)
 
-# Thesis Table 8.1 (times relative to the event's first pulse, positions to its pulse-count
-# weighted centre), the charge within 100/500 ns of the PMT's first pulse, then the token
-# type and the silent-string description. Hit PMTs have hit=1; a silent OM has
+# Thesis Table 8.1 (times relative to the event's first pulse, positions to its charge
+# weighted centre), the charge within 100/500 ns of the PMT's first pulse, the cosine u_c
+# between the PMT's pointing direction and the direction from its OM to that centre (+1 =
+# facing the centre), then the token type and the silent-string description. Hit PMTs have hit=1; a silent OM has
 # hit=string_token=0 and no orientation; a silent string sits at (x, y, mean z) of its
 # active OMs with their count and vertical extent.
 THESIS_FEATURES = (
@@ -35,23 +36,29 @@ THESIS_FEATURES = (
     't_first', 't10', 't20', 't50', 't80', 't90', 't_mean_q', 't_std_q', 't_span',
 )
 TOKEN_FLAGS = ('hit', 'string_token', 'n_om', 'z_span')
-FEATURE_NAMES = THESIS_FEATURES + ('q_100', 'q_500') + TOKEN_FLAGS
+FEATURE_NAMES = THESIS_FEATURES + ('q_100', 'q_500', 'u_c') + TOKEN_FLAGS
 COLUMN = {n: i for i, n in enumerate(FEATURE_NAMES)}
 GLOBAL_NAMES = ('n_pmt', 'q_event', 'n_pulses_event')
 
-# x, y, z lead every set because the position encoding reads them; the input layer sees the
-# columns from `linear_from` on. 'essential' drops what is collinear or noise on the muon
+# x, y, z lead every set. With the encoder's positions='relative' the position encoding reads
+# dx, dy, dz and x, y, z are dropped, so nothing depends on where the event sits in the
+# detector; with 'absolute' (checkpoints from before the option) the position encoding reads
+# x, y, z, the input layer sees the columns from `linear_from` on and u_c is dropped. 'essential' drops what is collinear or noise on the muon
 # parquet: 64% of hit PMTs carry one pulse, the per-pulse charge spread is SPE noise,
 # t10/t20 equal t_first, and t_std/t_span are dominated by afterpulses > 1 us late. For the
 # energy it keeps q_max and n_pulses (merging/saturation in bright PMTs) and the prompt
 # charges q_100/q_500, which exclude afterpulses.
 FEATURE_SETS = {
-    'essential': dict(columns=('x', 'y', 'z', 'dx', 'dy', 'dz', 'ux', 'uy', 'uz',
+    'essential': dict(columns=('x', 'y', 'z', 'dx', 'dy', 'dz', 'ux', 'uy', 'uz', 'u_c',
                                'q_tot', 'q_max', 'q_100', 'q_500', 'n_pulses',
                                't_first', 't50') + TOKEN_FLAGS,
                       linear_from=3),
-    'thesis': dict(columns=THESIS_FEATURES + TOKEN_FLAGS, linear_from=0),
+    'thesis': dict(columns=THESIS_FEATURES[:9] + ('u_c',) + THESIS_FEATURES[9:] + TOKEN_FLAGS,
+                   linear_from=0),
 }
+POSITIONS = ('relative', 'absolute')
+_ABSOLUTE_COLS = {'x', 'y', 'z'}   # used only with positions='absolute'
+_RELATIVE_COLS = {'u_c'}           # used only with positions='relative'
 _LENGTH_COLS = {'x', 'y', 'z', 'dx', 'dy', 'dz', 'z_span'}
 _CHARGE_COLS = {'q_tot', 'q_max', 'q_mean', 'q_std', 'q10', 'q50', 'q90', 'q_100', 'q_500'}
 _COUNT_COLS = {'n_pulses', 'n_om'}
@@ -168,8 +175,9 @@ def om_triggered(om, pmt, t, window=10.0, min_pmts=3, chunk=200_000):
 
 
 def pmt_features(tok, t, q, pos, dirs):
-    """Pulses sorted by (tok, t), tok covering 0..n-1 -> (n, 29) raw PMT features
-    (THESIS_FEATURES, q_100, q_500) and the (3,) globals (n_pmt, total charge, n_pulses)."""
+    """Pulses sorted by (tok, t), tok covering 0..n-1 -> (n, 30) raw PMT features
+    (THESIS_FEATURES, q_100, q_500, u_c) and the (3,) globals (n_pmt, total charge, n_pulses).
+    Positions are taken relative to the charge-weighted centre."""
     n = len(pos)
     t = np.asarray(t, dtype=np.float64)
     q = np.asarray(q, dtype=np.float64)
@@ -203,7 +211,9 @@ def pmt_features(tok, t, q, pos, dirs):
     q_100 = np.add.reduceat(q * (dtf <= 100.0), starts)
     q_500 = np.add.reduceat(q * (dtf <= 500.0), starts)
 
-    center = (npl[:, None] * pos).sum(0) / npl.sum()
+    center = (q_tot[:, None] * pos).sum(0) / Q
+    to_c = center - pos
+    u_c = (dirs * to_c).sum(1) / np.maximum(np.linalg.norm(to_c, axis=1), 1e-9)
     t0 = t.min()
 
     feats = np.column_stack([
@@ -212,13 +222,14 @@ def pmt_features(tok, t, q, pos, dirs):
         q_tot / Q, npl,
         t_first - t0, *[t_quantile(p) - t0 for p in (0.1, 0.2, 0.5, 0.8, 0.9)],
         t_first + m1 - t0, t_std, t[last] - t_first,
-        q_100, q_500,
+        q_100, q_500, u_c,
     ])
     return feats.astype(np.float32), np.array([n, Q, len(t)], dtype=np.float32)
 
 
 class DetectorGeometry:
-    """PMT table sorted by (string, om, pmt), with its OM and string structure."""
+    """PMT table sorted by (string, om, pmt), with its OM and string structure. The CSV's
+    om_x/om_y/om_z are per-PMT positions (~0.27 m off the OM centre); om_pos is their mean."""
 
     def __init__(self, string, om, pmt, pmt_pos, pmt_dir):
         import pandas as pd
@@ -345,8 +356,9 @@ def event_tokens(tok, t, q, geometry, max_tokens=None, feature_set='essential',
     q = np.asarray(q, dtype=np.float64)
     order = np.lexsort((t, tok))
     used, lab = np.unique(tok[order], return_inverse=True)
+    # A hit PMT sits at its OM's centre; its orientation tells the PMTs of an OM apart.
     feats, glob = pmt_features(lab.reshape(-1), t[order], q[order],
-                               geometry.pmt_pos[used], geometry.pmt_dir[used])
+                               geometry.om_pos[geometry.pmt_om[used]], geometry.pmt_dir[used])
     rows = np.zeros((len(feats), len(FEATURE_NAMES)), dtype=np.float32)
     rows[:, :feats.shape[1]] = feats
     rows[:, COLUMN['hit']] = 1.0
@@ -473,15 +485,24 @@ class PMTEncoder(torch.nn.Module):
 
     def __init__(self, feature_set='essential', d_model=96, depth=20, n_heads=4, ffn_dim=512,
                  cond_dim=256, dropout=0.0, length_scale=500.0, time_scale=1e4,
-                 time_transform='linear'):
+                 time_transform='linear', positions='absolute'):
         super().__init__()
         if d_model % n_heads:
             raise ValueError("d_model must be divisible by n_heads")
+        if positions not in POSITIONS:
+            raise ValueError(f"positions must be one of {POSITIONS}")
         self.d_model, self.length_scale, self.time_scale = d_model, length_scale, time_scale
         cols = FEATURE_SETS[feature_set]['columns']
-        self.linear_from = FEATURE_SETS[feature_set]['linear_from']
         self.hit_col = cols.index('hit')
-        lin = cols[self.linear_from:]
+        rel = positions == 'relative'
+        self.pos_cols = [cols.index(c) for c in (('dx', 'dy', 'dz') if rel else ('x', 'y', 'z'))]
+        if rel:
+            self.lin_cols = [i for i, c in enumerate(cols) if c not in _ABSOLUTE_COLS]
+        else:
+            self.lin_cols = [i for i, c in enumerate(cols)
+                             if i >= FEATURE_SETS[feature_set]['linear_from']
+                             and c not in _RELATIVE_COLS]
+        lin = [cols[i] for i in self.lin_cols]
         asinh = time_transform == 'asinh'
         self.register_buffer('scale', torch.tensor(
             [1.0 / length_scale if c in _LENGTH_COLS
@@ -500,7 +521,7 @@ class PMTEncoder(torch.nn.Module):
 
     def transform(self, f):
         """Fixed feature-wise transforms of thesis Eq. 8.2 (times optionally asinh)."""
-        f = f[..., self.linear_from:]
+        f = f[..., self.lin_cols]
         x = f * self.scale
         x = torch.where(self.log_q, 0.2 * torch.log1p(f.clamp(min=0.0)), x)
         x = torch.where(self.log_n, torch.log1p(f.clamp(min=0.0)) / 5.0, x)
@@ -509,7 +530,7 @@ class PMTEncoder(torch.nn.Module):
     def forward(self, feats, mask, glob, return_tokens=False):
         """-> (B, cond_dim) condition, and the (B, N, d_model) token embeddings if return_tokens."""
         h = self.inp(self.transform(feats)) + sinusoidal_position_encoding(
-            feats[..., 0:3], self.d_model, self.length_scale)
+            feats[..., self.pos_cols], self.d_model, self.length_scale)
         attn_mask = mask[:, None, None, :]
         for blk in self.blocks:
             h = blk(h, attn_mask)
@@ -956,14 +977,14 @@ class FlowMatchReco(Surrogate):
     """
 
     TARGETS = ('energy_direction', 'direction', 'energy')
-    _CONFIG_KEYS = ('feature_set', 'targets', 'd_model', 'encoder_depth', 'n_heads', 'ffn_dim',
+    _CONFIG_KEYS = ('feature_set', 'positions', 'targets', 'd_model', 'encoder_depth', 'n_heads', 'ffn_dim',
                     'cond_dim', 'encoder_dropout', 'width', 'depth', 'time_dim', 'mlp_ratio',
                     'dropout', 'field', 'xattn_layers', 'xattn_heads', 'xattn_bias',
                     'length_scale', 'time_scale', 'time_transform', 'sigma_min',
                     'direction_loss_weight', 'n_flow_samples')
 
-    def __init__(self, device=None, feature_set='essential', targets='energy_direction',
-                 d_model=96, encoder_depth=20,
+    def __init__(self, device=None, feature_set='essential', positions='relative',
+                 targets='energy_direction', d_model=96, encoder_depth=20,
                  n_heads=4, ffn_dim=512, cond_dim=256, encoder_dropout=0.0, width=256,
                  depth=8, time_dim=64, mlp_ratio=2, dropout=0.0, field='mlp', xattn_layers=4,
                  xattn_heads=4, xattn_bias=True, length_scale=500.0,
@@ -983,7 +1004,9 @@ class FlowMatchReco(Surrogate):
                              "(also cross-attends to the PMT tokens)")
         if targets not in self.TARGETS:
             raise ValueError(f"targets must be one of {self.TARGETS}")
-        self.feature_set, self.targets = feature_set, targets
+        if positions not in POSITIONS:
+            raise ValueError(f"positions must be one of {POSITIONS}")
+        self.feature_set, self.positions, self.targets = feature_set, positions, targets
         self.d_model, self.encoder_depth, self.n_heads = d_model, encoder_depth, n_heads
         self.ffn_dim, self.cond_dim, self.encoder_dropout = ffn_dim, cond_dim, encoder_dropout
         self.width, self.depth, self.time_dim = width, depth, time_dim
@@ -1042,7 +1065,8 @@ class FlowMatchReco(Surrogate):
     def build_network(self):
         encoder = PMTEncoder(self.feature_set, self.d_model, self.encoder_depth, self.n_heads,
                              self.ffn_dim, self.cond_dim, self.encoder_dropout,
-                             self.length_scale, self.time_scale, self.time_transform)
+                             self.length_scale, self.time_scale, self.time_transform,
+                             self.positions)
         field = SphereVectorField(
             self.cond_dim, self.width, self.depth, self.time_dim, self.mlp_ratio, self.dropout,
             token_dim=self.d_model,
@@ -1059,7 +1083,7 @@ class FlowMatchReco(Surrogate):
               f"{' with track-fit bias' if field.bias is not None else ''}"
               if self.field == 'xattn' else '')
         print(f"FlowMatchReco: targets {self.targets}, "
-              f"{self.feature_set} features, encoder d_model={self.d_model} "
+              f"{self.feature_set} features ({self.positions} positions), encoder d_model={self.d_model} "
               f"depth={self.encoder_depth} ({n_enc:,} params), field width={self.width} "
               f"depth={self.depth}{xa} ({n_fld:,} params)")
 
@@ -1408,8 +1432,10 @@ class FlowMatchReco(Surrogate):
 
     def load_model(self, filepath):
         ck = torch.load(filepath, map_location=self.device, weights_only=False)
-        # checkpoints from before these options are MLP fields for energy and direction
-        for k, v in {'field': 'mlp', 'targets': 'energy_direction', **ck['config']}.items():
+        # checkpoints from before these options are MLP fields for energy and direction on
+        # absolute positions
+        for k, v in {'field': 'mlp', 'targets': 'energy_direction', 'positions': 'absolute',
+                     **ck['config']}.items():
             setattr(self, k, v)
         for k in ('target_mu', 'target_sigma', 'data_config', 'train_losses', 'val_losses',
                   'metrics'):
