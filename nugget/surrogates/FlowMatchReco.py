@@ -7,6 +7,7 @@ Sec. 5.4-5.5 and Sec. 8.1, which in turn follow P-ONE Offline.
 import math
 import os
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -505,7 +506,8 @@ class PMTEncoder(torch.nn.Module):
         x = torch.where(self.log_n, torch.log1p(f.clamp(min=0.0)) / 5.0, x)
         return torch.where(self.asinh_t, torch.asinh(f / self.time_scale), x)
 
-    def forward(self, feats, mask, glob):
+    def forward(self, feats, mask, glob, return_tokens=False):
+        """-> (B, cond_dim) condition, and the (B, N, d_model) token embeddings if return_tokens."""
         h = self.inp(self.transform(feats)) + sinusoidal_position_encoding(
             feats[..., 0:3], self.d_model, self.length_scale)
         attn_mask = mask[:, None, None, :]
@@ -525,7 +527,8 @@ class PMTEncoder(torch.nn.Module):
         # energy needs
         g = torch.cat([torch.log1p(glob[:, 0:1]) / 5.0, 0.2 * torch.log1p(glob[:, 1:2]),
                        torch.log1p(glob[:, 2:3]) / 5.0], dim=-1).to(h.dtype)
-        return self.head(torch.cat([mean, var, mean_sil, g], dim=-1))
+        c = self.head(torch.cat([mean, var, mean_sil, g], dim=-1))
+        return (c, h) if return_tokens else c
 
 
 class AdaLNBlock(torch.nn.Module):
@@ -546,39 +549,168 @@ class AdaLNBlock(torch.nn.Module):
         return h + gate * self.mlp(self.norm(h) * (1.0 + scale) + shift)
 
 
-class SphereVectorField(torch.nn.Module):
-    """v(z, d, t | c) on R x S^2; the S^2 part is projected onto T_d S^2."""
+class CrossAttnBlock(torch.nn.Module):
+    """State rows attend to their event's token embeddings, adaLN-Zero gated."""
 
-    def __init__(self, cond_dim, width=256, depth=8, time_dim=64, mlp_ratio=2, dropout=0.0):
+    def __init__(self, width, token_dim, cond_dim, n_heads=4):
         super().__init__()
+        if width % n_heads:
+            raise ValueError("width must be divisible by xattn_heads")
+        self.n_heads = n_heads
+        self.norm = torch.nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.q = torch.nn.Linear(width, width)
+        self.kv = torch.nn.Linear(token_dim, 2 * width)
+        self.out = torch.nn.Linear(width, width)
+        self.mod = torch.nn.Linear(cond_dim, 3 * width)
+        torch.nn.init.zeros_(self.mod.weight)
+        torch.nn.init.zeros_(self.mod.bias)
+
+    def keys_values(self, tokens):
+        """(B, N, token_dim) -> keys and values, each (B, heads, N, head_dim)."""
+        B, N, _ = tokens.shape
+        return self.kv(tokens).view(B, N, 2, self.n_heads, -1).permute(2, 0, 3, 1, 4).unbind(0)
+
+    def forward(self, h, c, kv, attn_mask):
+        """h (B * S, width): S rows per event, event-major."""
+        k, v = kv
+        B, H, _, dh = k.shape
+        shift, scale, gate = self.mod(c).chunk(3, dim=-1)
+        q = self.q(self.norm(h) * (1.0 + scale) + shift).view(B, -1, H, dh).transpose(1, 2)
+        if attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask.to(q.dtype)
+        a = F.scaled_dot_product_attention(q, k.to(q.dtype), v.to(q.dtype), attn_mask=attn_mask)
+        return h + gate * self.out(a.transpose(1, 2).reshape(h.shape))
+
+
+C_LIGHT = 0.299792458   # m/ns
+# (n_g / sin(theta_c) - 1 / tan(theta_c)) for seawater (n ~ 1.35, n_g ~ 1.38): direct light at
+# distance rho from a track arrives rho * CHERENKOV_DELAY / c after the muon passes
+CHERENKOV_DELAY = 0.95
+
+
+def _track_features(geo, hit, d, length_scale=500.0):
+    """(B, N, 4) token (dx, dy, dz, t_first), (B, N) hit flags and (B, S, 3) arrival directions
+    -> (B, S, N, 4) token features for a track along -d through the event centre: asinh of the
+    direct-light time residual / 10 ns centred over the hits (0 for silent tokens), the
+    distances along and from the track, and the hit flag."""
+    u = -d
+    r, t = geo[..., :3], geo[..., 3]
+    along = torch.einsum('bnk,bsk->bsn', r, u)
+    # +1 m^2 keeps the gradient finite for a token on the track axis
+    perp = torch.sqrt(((r * r).sum(-1).unsqueeze(1) - along ** 2).clamp(min=0.0) + 1.0)
+    res = t.unsqueeze(1) - (along + CHERENKOV_DELAY * perp) / C_LIGHT
+    w = hit.unsqueeze(1).expand_as(res)
+    res = res - (res * w).sum(-1, keepdim=True) / w.sum(-1, keepdim=True).clamp(min=1.0)
+    return torch.stack([torch.asinh(res / 10.0) * w, along / length_scale, perp / length_scale, w],
+                       dim=-1)
+
+
+class SphereVectorField(torch.nn.Module):
+    """v(z, d, t | c) on R x S^2, or on R (energy only) or S^2 (direction only); the S^2 part
+    is projected onto T_d S^2. With xattn_layers > 0 the state also cross-attends to its
+    event's token embeddings, with xattn_bias (needs the direction) biased by each token's fit
+    to a track along the candidate direction."""
+
+    def __init__(self, cond_dim, width=256, depth=8, time_dim=64, mlp_ratio=2, dropout=0.0,
+                 token_dim=96, xattn_layers=0, xattn_heads=4, xattn_bias=True,
+                 length_scale=500.0, energy=True, direction=True):
+        super().__init__()
+        if xattn_layers > depth:
+            raise ValueError("xattn_layers must be <= depth")
+        if not (energy or direction):
+            raise ValueError("the field needs the energy, the direction or both")
+        self.energy, self.direction = energy, direction
+        n_state = int(energy) + 3 * int(direction)
         self.time_emb = TimeEmbedding(time_dim)
         self.t_mlp = torch.nn.Sequential(
             torch.nn.Linear(time_dim, cond_dim), torch.nn.SiLU(),
             torch.nn.Linear(cond_dim, cond_dim))
-        self.inp = torch.nn.Linear(4, width)
+        self.inp = torch.nn.Linear(n_state, width)
         self.blocks = torch.nn.ModuleList(
             [AdaLNBlock(width, cond_dim, mlp_ratio, dropout) for _ in range(depth)])
+        self.xattn = torch.nn.ModuleList(
+            [CrossAttnBlock(width, token_dim, cond_dim, xattn_heads) for _ in range(xattn_layers)])
+        # block index -> cross-attention block placed in front of it, evenly spread
+        self.xattn_at = {round(k * depth / xattn_layers): k for k in range(xattn_layers)}
+        self.xattn_heads, self.length_scale = xattn_heads, length_scale
+        self.bias = None
+        if xattn_layers and xattn_bias and direction:
+            self.bias = torch.nn.Sequential(
+                torch.nn.Linear(4, 16), torch.nn.SiLU(),
+                torch.nn.Linear(16, xattn_layers * xattn_heads))
+            torch.nn.init.zeros_(self.bias[-1].weight)
+            torch.nn.init.zeros_(self.bias[-1].bias)
         self.norm = torch.nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
         self.final_mod = torch.nn.Linear(cond_dim, 2 * width)
-        self.out = torch.nn.Linear(width, 4)
+        self.out = torch.nn.Linear(width, n_state)
         for lin in (self.final_mod, self.out):
             torch.nn.init.zeros_(lin.weight)
             torch.nn.init.zeros_(lin.bias)
 
-    def forward(self, z, d, t, cond):
+    def keys_values(self, tokens):
+        return [blk.keys_values(tokens) for blk in self.xattn]
+
+    def _attn_masks(self, d, ctx):
+        """Per cross-attention block: key-padding mask, plus the track-fit bias if enabled."""
+        _, key_mask, geo, hit = ctx
+        B = key_mask.shape[0]
+        pad = key_mask[:, None, None, :]
+        if self.bias is None:
+            return [pad] * len(self.xattn)
+        # fp32 even under autocast: the residuals need ns resolution at us times
+        with torch.autocast(d.device.type, enabled=False):
+            f = _track_features(geo.float(), hit.float(), d.float().reshape(B, -1, 3),
+                                self.length_scale)
+            b = self.bias(f)
+        S, N = f.shape[1], f.shape[2]
+        b = b.view(B, S, N, len(self.xattn), self.xattn_heads).permute(3, 0, 4, 1, 2)
+        return list(b.masked_fill(~pad, float('-inf')))
+
+    def forward(self, z, d, t, cond, ctx=None):
+        """ctx (cross-attention only): (keys_values, (B, N) mask, (B, N, 4) geometry, (B, N) hit
+        flags) of B events, the rows being S per event, event-major. A part the field does not
+        model is ignored on input (pass None) and returned as None."""
         c = F.silu(cond + self.t_mlp(self.time_emb(t)))
-        h = self.inp(torch.cat([z, d], dim=-1))
-        for blk in self.blocks:
+        h = self.inp(torch.cat([x for x, on in ((z, self.energy), (d, self.direction)) if on],
+                               dim=-1))
+        masks = self._attn_masks(d, ctx) if len(self.xattn) else None
+        for i, blk in enumerate(self.blocks):
+            k = self.xattn_at.get(i)
+            if k is not None:
+                h = self.xattn[k](h, c, ctx[0][k], masks[k])
             h = blk(h, c)
         shift, scale = self.final_mod(c).chunk(2, dim=-1)
         o = self.out(self.norm(h) * (1.0 + scale) + shift)
-        return o[:, :1], _project(d, o[:, 1:])
+        vz = o[:, :1] if self.energy else None
+        vd = _project(d, o[:, int(self.energy):]) if self.direction else None
+        return vz, vd
 
 
 class RecoNet(torch.nn.Module):
     def __init__(self, encoder, field):
         super().__init__()
         self.encoder, self.field = encoder, field
+
+
+@dataclass
+class EventCondition:
+    """encode() output for field='xattn': pooled condition, token embeddings, padding mask,
+    raw token (dx, dy, dz, t_first) and hit flags. Slice it to select events."""
+    vec: torch.Tensor
+    tokens: torch.Tensor
+    mask: torch.Tensor
+    geo: torch.Tensor
+    hit: torch.Tensor
+
+    def __len__(self):
+        return self.vec.shape[0]
+
+    def __getitem__(self, i):
+        return EventCondition(self.vec[i], self.tokens[i], self.mask[i], self.geo[i], self.hit[i])
+
+    def to(self, dtype):
+        return EventCondition(self.vec.to(dtype), self.tokens.to(dtype), self.mask, self.geo,
+                              self.hit)
 
 
 # --------------------------------------------------------------------------- #
@@ -816,20 +948,25 @@ class RecoFlowDataset(Dataset):
 # --------------------------------------------------------------------------- #
 
 class FlowMatchReco(Surrogate):
-    """Riemannian flow matching posterior p(log10 E, direction | PMT pulses) on R x S^2.
+    """Riemannian flow matching posterior p(log10 E, direction | PMT pulses) on R x S^2, or
+    with targets='direction' / 'energy' p(direction | pulses) on S^2 / p(log10 E | pulses).
 
     The direction is the unit vector of the parquet (zenith, azimuth), i.e. the arrival
     direction for these files.
     """
 
-    _CONFIG_KEYS = ('feature_set', 'd_model', 'encoder_depth', 'n_heads', 'ffn_dim',
+    TARGETS = ('energy_direction', 'direction', 'energy')
+    _CONFIG_KEYS = ('feature_set', 'targets', 'd_model', 'encoder_depth', 'n_heads', 'ffn_dim',
                     'cond_dim', 'encoder_dropout', 'width', 'depth', 'time_dim', 'mlp_ratio',
-                    'dropout', 'length_scale', 'time_scale', 'time_transform', 'sigma_min',
+                    'dropout', 'field', 'xattn_layers', 'xattn_heads', 'xattn_bias',
+                    'length_scale', 'time_scale', 'time_transform', 'sigma_min',
                     'direction_loss_weight', 'n_flow_samples')
 
-    def __init__(self, device=None, feature_set='essential', d_model=96, encoder_depth=20,
+    def __init__(self, device=None, feature_set='essential', targets='energy_direction',
+                 d_model=96, encoder_depth=20,
                  n_heads=4, ffn_dim=512, cond_dim=256, encoder_dropout=0.0, width=256,
-                 depth=8, time_dim=64, mlp_ratio=2, dropout=0.0, length_scale=500.0,
+                 depth=8, time_dim=64, mlp_ratio=2, dropout=0.0, field='mlp', xattn_layers=4,
+                 xattn_heads=4, xattn_bias=True, length_scale=500.0,
                  time_scale=1e4, time_transform='linear', sigma_min=1e-4,
                  direction_loss_weight=1.0, n_flow_samples=4, learning_rate=2e-4,
                  weight_decay=1e-5, lr_schedule='warmup_cosine', warmup_steps=2000,
@@ -841,11 +978,18 @@ class FlowMatchReco(Surrogate):
             raise ValueError("time_transform must be 'linear' (thesis) or 'asinh'")
         if lr_schedule not in ('warmup_cosine', 'onecycle', 'constant'):
             raise ValueError("lr_schedule must be 'warmup_cosine', 'onecycle' or 'constant'")
-        self.feature_set = feature_set
+        if field not in ('mlp', 'xattn'):
+            raise ValueError("field must be 'mlp' (pooled condition only) or 'xattn' "
+                             "(also cross-attends to the PMT tokens)")
+        if targets not in self.TARGETS:
+            raise ValueError(f"targets must be one of {self.TARGETS}")
+        self.feature_set, self.targets = feature_set, targets
         self.d_model, self.encoder_depth, self.n_heads = d_model, encoder_depth, n_heads
         self.ffn_dim, self.cond_dim, self.encoder_dropout = ffn_dim, cond_dim, encoder_dropout
         self.width, self.depth, self.time_dim = width, depth, time_dim
         self.mlp_ratio, self.dropout = mlp_ratio, dropout
+        self.field, self.xattn_layers = field, int(xattn_layers)
+        self.xattn_heads, self.xattn_bias = int(xattn_heads), bool(xattn_bias)
         self.length_scale, self.time_scale = length_scale, time_scale
         self.time_transform = time_transform
         self.sigma_min = sigma_min
@@ -867,6 +1011,14 @@ class FlowMatchReco(Surrogate):
         self.is_trained = False
 
     # ---------------- dtype / device plumbing ----------------
+
+    @property
+    def energy(self):
+        return self.targets != 'direction'
+
+    @property
+    def direction(self):
+        return self.targets != 'energy'
 
     @property
     def param_dtype(self):
@@ -891,17 +1043,25 @@ class FlowMatchReco(Surrogate):
         encoder = PMTEncoder(self.feature_set, self.d_model, self.encoder_depth, self.n_heads,
                              self.ffn_dim, self.cond_dim, self.encoder_dropout,
                              self.length_scale, self.time_scale, self.time_transform)
-        field = SphereVectorField(self.cond_dim, self.width, self.depth, self.time_dim,
-                                  self.mlp_ratio, self.dropout)
+        field = SphereVectorField(
+            self.cond_dim, self.width, self.depth, self.time_dim, self.mlp_ratio, self.dropout,
+            token_dim=self.d_model,
+            xattn_layers=self.xattn_layers if self.field == 'xattn' else 0,
+            xattn_heads=self.xattn_heads, xattn_bias=self.xattn_bias,
+            length_scale=self.length_scale, energy=self.energy, direction=self.direction)
         # explicit float32: nugget sets a float64 default dtype, far too slow for this
         self.net = RecoNet(encoder, field).to(device=self.device, dtype=torch.float32)
         self.optimizer = torch.optim.AdamW(self.net.parameters(), lr=self.learning_rate,
                                            weight_decay=self.weight_decay)
         n_enc = sum(p.numel() for p in encoder.parameters())
         n_fld = sum(p.numel() for p in field.parameters())
-        print(f"FlowMatchReco: {self.feature_set} features, encoder d_model={self.d_model} "
+        xa = (f", {self.xattn_layers} cross-attention layers"
+              f"{' with track-fit bias' if field.bias is not None else ''}"
+              if self.field == 'xattn' else '')
+        print(f"FlowMatchReco: targets {self.targets}, "
+              f"{self.feature_set} features, encoder d_model={self.d_model} "
               f"depth={self.encoder_depth} ({n_enc:,} params), field width={self.width} "
-              f"depth={self.depth} ({n_fld:,} params)")
+              f"depth={self.depth}{xa} ({n_fld:,} params)")
 
     def _build_scheduler(self, total_steps):
         if self.lr_schedule == 'onecycle':
@@ -938,129 +1098,195 @@ class FlowMatchReco(Surrogate):
                          cfg.get('silent_tokens', False), om_active)
             for tok, t, q in events])
 
+    def _encoder(self, feats, mask, glob):
+        feats, mask = self._prep(feats), mask.to(self.device)
+        if self.field != 'xattn':
+            return self.net.encoder(feats, mask, self._prep(glob))
+        vec, tokens = self.net.encoder(feats, mask, self._prep(glob), return_tokens=True)
+        cols = FEATURE_SETS[self.feature_set]['columns']
+        geo = feats[..., [cols.index(k) for k in ('dx', 'dy', 'dz', 't_first')]]
+        return EventCondition(vec, tokens, mask, geo, feats[..., cols.index('hit')])
+
     def encode(self, feats, mask, glob):
-        """(B, N, C) tokens, (B, N) mask, (B, 3) globals -> (B, cond_dim) condition."""
+        """(B, N, C) tokens, (B, N) mask, (B, 3) globals -> the condition: a (B, cond_dim)
+        tensor, or an EventCondition for field='xattn'."""
         with self._autocast():
-            c = self.net.encoder(self._prep(feats), mask.to(self.device), self._prep(glob))
+            c = self._encoder(feats, mask, glob)
         return c.to(self.param_dtype)
+
+    def _condition(self, feats, mask, glob, cond):
+        if cond is None:
+            return self.encode(feats, mask, glob)
+        return cond if isinstance(cond, EventCondition) else self._prep(cond)
+
+    def _field_inputs(self, c, k):
+        """Per-event condition -> per-row vector, each event repeated k times (event-major),
+        and the field's cross-attention context."""
+        if isinstance(c, EventCondition):
+            ctx = (self.net.field.keys_values(c.tokens), c.mask, c.geo, c.hit)
+            return c.vec.repeat_interleave(k, dim=0), ctx
+        if self.field == 'xattn':
+            raise ValueError("field='xattn' needs the token embeddings: pass feats, mask, glob "
+                             "or cond=encode(...)")
+        return c.repeat_interleave(k, dim=0), None
 
     # ---------------- flow matching loss ----------------
 
     def fm_loss(self, feats, mask, glob, log10_energy, directions, generator=None):
-        """Riemannian CFM loss; returns (total, (energy part, direction part))."""
-        z1 = self.to_z(self._prep(log10_energy).reshape(-1, 1))
-        d1 = _normalize(self._prep(directions).reshape(-1, 3))
-        with self._autocast():
-            c = self.net.encoder(self._prep(feats), mask.to(self.device), self._prep(glob))
+        """Riemannian CFM loss; returns (total, (energy part, direction part)). A part that is
+        not among the targets is 0."""
         k = self.n_flow_samples
-        if k > 1:
-            c, z1, d1 = (x.repeat_interleave(k, dim=0) for x in (c, z1, d1))
-        n, dev, dt = z1.shape[0], z1.device, z1.dtype
-        z0 = torch.randn(n, 1, device=dev, dtype=dt, generator=generator)
-        d0 = _uniform_sphere(n, dev, dt, generator)
-        t = torch.rand(n, device=dev, dtype=dt, generator=generator)
-
-        zt = (1.0 - (1.0 - self.sigma_min) * t.unsqueeze(1)) * z0 + t.unsqueeze(1) * z1
-        uz = z1 - (1.0 - self.sigma_min) * z0
-        dtt, ud, ok = _geodesic(d0, d1, t)
         with self._autocast():
-            vz, vd = self.net.field(zt, dtt, t, c)
-        le = ((vz.float() - uz) ** 2).mean()
-        ld = (((vd.float() - ud) ** 2).sum(-1) * ok).sum() / ok.sum().clamp(min=1)
+            c, ctx = self._field_inputs(self._encoder(feats, mask, glob), k)
+        n, dev, dt = c.shape[0], c.device, self.param_dtype
+        zt = dtt = None
+        le = ld = torch.zeros((), device=dev)
+        if self.energy:
+            z1 = self.to_z(self._prep(log10_energy).reshape(-1, 1)).repeat_interleave(k, dim=0)
+            z0 = torch.randn(n, 1, device=dev, dtype=dt, generator=generator)
+        if self.direction:
+            d1 = _normalize(self._prep(directions).reshape(-1, 3)).repeat_interleave(k, dim=0)
+            d0 = _uniform_sphere(n, dev, dt, generator)
+        t = torch.rand(n, device=dev, dtype=dt, generator=generator)
+        if self.energy:
+            zt = (1.0 - (1.0 - self.sigma_min) * t.unsqueeze(1)) * z0 + t.unsqueeze(1) * z1
+            uz = z1 - (1.0 - self.sigma_min) * z0
+        if self.direction:
+            dtt, ud, ok = _geodesic(d0, d1, t)
+        with self._autocast():
+            vz, vd = self.net.field(zt, dtt, t, c, ctx)
+        if self.energy:
+            le = ((vz.float() - uz) ** 2).mean()
+        if self.direction:
+            ld = (((vd.float() - ud) ** 2).sum(-1) * ok).sum() / ok.sum().clamp(min=1)
         return le + self.direction_loss_weight * ld, (le.detach(), ld.detach())
 
     # ---------------- ODE integration ----------------
 
-    def _v_and_div(self, z, d, t, c):
-        """Velocity and its Riemannian divergence on R x S^2."""
+    def _v_and_div(self, z, d, t, c, ctx=None):
+        """Velocity and its Riemannian divergence on R x S^2, R or S^2 (absent parts None)."""
         with torch.enable_grad():
-            z = z.detach().requires_grad_(True)
-            d = d.detach().requires_grad_(True)
-            vz, vd = self.net.field(z, d, t, c)
-            div = torch.autograd.grad(vz.sum(), z, retain_graph=True)[0].squeeze(-1)
-            e1, e2 = _tangent_basis(d.detach())
-            # the tangential trace of the ambient Jacobian of the projected field is its
-            # surface divergence; autograd includes the derivative of the projection
-            for e, keep in ((e1, True), (e2, False)):
-                g = torch.autograd.grad((vd * e).sum(), d, retain_graph=keep)[0]
-                div = div + (g * e).sum(-1)
-        return vz.detach(), vd.detach(), div.detach()
+            z = None if z is None else z.detach().requires_grad_(True)
+            d = None if d is None else d.detach().requires_grad_(True)
+            vz, vd = self.net.field(z, d, t, c, ctx)
+            div = torch.zeros_like(t)
+            if vz is not None:
+                div = div + torch.autograd.grad(vz.sum(), z, retain_graph=vd is not None)[0] \
+                    .squeeze(-1)
+            if vd is not None:
+                e1, e2 = _tangent_basis(d.detach())
+                # the tangential trace of the ambient Jacobian of the projected field is its
+                # surface divergence; autograd includes the derivative of the projection
+                for e, keep in ((e1, True), (e2, False)):
+                    g = torch.autograd.grad((vd * e).sum(), d, retain_graph=keep)[0]
+                    div = div + (g * e).sum(-1)
+        return (None if vz is None else vz.detach(), None if vd is None else vd.detach(),
+                div.detach())
+
+    @staticmethod
+    def _step(z, v, h):
+        return None if z is None else z + h * v
+
+    @staticmethod
+    def _sphere_step(d, v, h, dm=None):
+        """Exp-map step of size h from d; with the midpoint dm, v is transported from dm to d."""
+        if d is None:
+            return None
+        return _exp(d, h * (v if dm is None else _transport(dm, d, v)))
 
     @torch.no_grad()
     def sample(self, feats=None, mask=None, glob=None, n_samples=1, n_steps=32,
                generator=None, cond=None):
-        """(B, S) log10 E and (B, S, 3) direction samples (midpoint, exp-map steps)."""
+        """(B, S) log10 E and (B, S, 3) direction samples (midpoint, exp-map steps); a part
+        that is not among the targets is None."""
         self.net.eval()
-        c = self.encode(feats, mask, glob) if cond is None else self._prep(cond)
-        B = c.shape[0]
-        c = c.repeat_interleave(n_samples, dim=0)
+        c = self._condition(feats, mask, glob, cond)
+        B = len(c)
+        c, ctx = self._field_inputs(c, n_samples)
         n, dev, dt_ = c.shape[0], c.device, c.dtype
-        z = torch.randn(n, 1, device=dev, dtype=dt_, generator=generator)
-        d = _uniform_sphere(n, dev, dt_, generator)
+        z = torch.randn(n, 1, device=dev, dtype=dt_, generator=generator) if self.energy else None
+        d = _uniform_sphere(n, dev, dt_, generator) if self.direction else None
         h = 1.0 / n_steps
         for i in range(n_steps):
             t0 = torch.full((n,), i * h, device=dev, dtype=dt_)
-            vz, vd = self.net.field(z, d, t0, c)
-            zm, dm = z + 0.5 * h * vz, _exp(d, 0.5 * h * vd)
-            vz, vd = self.net.field(zm, dm, t0 + 0.5 * h, c)
-            z, d = z + h * vz, _exp(d, h * _transport(dm, d, vd))
-        return self.from_z(z).reshape(B, n_samples), d.reshape(B, n_samples, 3)
+            vz, vd = self.net.field(z, d, t0, c, ctx)
+            zm, dm = self._step(z, vz, 0.5 * h), self._sphere_step(d, vd, 0.5 * h)
+            vz, vd = self.net.field(zm, dm, t0 + 0.5 * h, c, ctx)
+            z, d = self._step(z, vz, h), self._sphere_step(d, vd, h, dm)
+        return (None if z is None else self.from_z(z).reshape(B, n_samples),
+                None if d is None else d.reshape(B, n_samples, 3))
 
     def log_prob(self, feats=None, mask=None, glob=None, log10_energy=None, directions=None,
                  n_steps=32, cond=None):
-        """log p(log10 E, direction | event) per unit log10 E per steradian. Not differentiable.
+        """log p(log10 E, direction | event) per unit log10 E per steradian, or of the
+        direction (per sr) or log10 E alone for the other targets, whose other input is
+        ignored. Not differentiable.
 
-        Add log(sin(zenith)) for a density in (log10 E, zenith, azimuth).
+        The points may be a multiple S of the events, S per event, event-major. Add
+        log(sin(zenith)) for a density in zenith and azimuth.
         """
         self.net.eval()
+        d = _normalize(self._prep(directions).reshape(-1, 3)) if self.direction else None
+        z = self.to_z(self._prep(log10_energy).reshape(-1, 1)) if self.energy else None
+        x = d if d is not None else z
+        n, dev, dt_ = x.shape[0], x.device, x.dtype
         with torch.no_grad():
-            c = self.encode(feats, mask, glob) if cond is None else self._prep(cond)
-        z = self.to_z(self._prep(log10_energy).reshape(-1, 1))
-        d = _normalize(self._prep(directions).reshape(-1, 3))
-        n, dev, dt_ = z.shape[0], z.device, z.dtype
-        if c.shape[0] != n:
-            raise ValueError(f"{c.shape[0]} conditions for {n} (energy, direction) points")
+            c = self._condition(feats, mask, glob, cond)
+            if n % len(c):
+                raise ValueError(f"{n} (energy, direction) points for {len(c)} events; need a "
+                                 "multiple, event-major")
+            c, ctx = self._field_inputs(c, n // len(c))
         acc = torch.zeros(n, device=dev, dtype=dt_)
         h = 1.0 / n_steps
         for i in reversed(range(n_steps)):
             t1 = torch.full((n,), (i + 1) * h, device=dev, dtype=dt_)
             with torch.no_grad():
-                vz, vd = self.net.field(z, d, t1, c)
-            zm, dm = z - 0.5 * h * vz, _exp(d, -0.5 * h * vd)
-            vz, vd, div = self._v_and_div(zm, dm, t1 - 0.5 * h, c)
-            z, d = z - h * vz, _exp(d, -h * _transport(dm, d, vd))
+                vz, vd = self.net.field(z, d, t1, c, ctx)
+            zm, dm = self._step(z, vz, -0.5 * h), self._sphere_step(d, vd, -0.5 * h)
+            vz, vd, div = self._v_and_div(zm, dm, t1 - 0.5 * h, c, ctx)
+            z, d = self._step(z, vz, -h), self._sphere_step(d, vd, -h, dm)
             acc = acc + h * div
-        log_p0 = -0.5 * z.squeeze(-1) ** 2 - 0.5 * LOG_2PI - LOG_4PI
-        return log_p0 - acc - math.log(self.target_sigma)
+        log_p = -acc
+        if self.direction:
+            log_p = log_p - LOG_4PI
+        if self.energy:
+            log_p = log_p - 0.5 * z.squeeze(-1) ** 2 - 0.5 * LOG_2PI - math.log(self.target_sigma)
+        return log_p
 
     @torch.no_grad()
     def reconstruct(self, feats, mask, glob, n_samples=128, n_steps=32, generator=None):
         """Point estimates: normalised mean sampled direction (thesis Eq. 8.12) and the
-        median sampled log10 E."""
+        median sampled log10 E; None for a part that is not among the targets."""
         le, d = self.sample(feats, mask, glob, n_samples, n_steps, generator)
-        direction = _normalize(d.mean(1))
+        direction = None if d is None else _normalize(d.mean(1))
         return {
-            'log10_energy': le.median(dim=1).values,
+            'log10_energy': None if le is None else le.median(dim=1).values,
             'direction': direction,
-            'zenith': torch.acos(direction[:, 2].clamp(-1.0, 1.0)),
-            'azimuth': torch.remainder(torch.atan2(direction[:, 1], direction[:, 0]),
-                                       2.0 * math.pi),
+            'zenith': None if d is None else torch.acos(direction[:, 2].clamp(-1.0, 1.0)),
+            'azimuth': None if d is None else torch.remainder(
+                torch.atan2(direction[:, 1], direction[:, 0]), 2.0 * math.pi),
             'log10_energy_samples': le,
             'direction_samples': d,
         }
 
     @torch.no_grad()
     def evaluate(self, dataloader, max_batches=10, n_samples=64, n_steps=32):
-        """Median opening angle (deg), its mean over half-decade energy bins, and log10 E error."""
+        """Median opening angle (deg), its mean over half-decade energy bins, and log10 E error;
+        NaN for a part that is not among the targets."""
         ang, dle, le_true = [], [], []
         for i, (feats, mask, glob, le, d) in enumerate(dataloader):
             if i >= max_batches:
                 break
             rec = self.reconstruct(feats, mask, glob, n_samples, n_steps)
-            cos = (rec['direction'] * self._prep(d)).sum(-1).clamp(-1.0, 1.0)
-            ang.append(torch.rad2deg(torch.acos(cos)).cpu())
-            dle.append((rec['log10_energy'] - self._prep(le)).cpu())
-            le_true.append(le.reshape(-1).cpu())
+            le = self._prep(le).reshape(-1)
+            nan = torch.full_like(le, float('nan'))
+            if rec['direction'] is None:
+                ang.append(nan.cpu())
+            else:
+                cos = (rec['direction'] * self._prep(d)).sum(-1).clamp(-1.0, 1.0)
+                ang.append(torch.rad2deg(torch.acos(cos)).cpu())
+            dle.append((nan if rec['log10_energy'] is None else rec['log10_energy'] - le).cpu())
+            le_true.append(le.cpu())
         ang, dle, le_true = (torch.cat(x).double().numpy() for x in (ang, dle, le_true))
         edges = np.arange(np.floor(2 * le_true.min()) / 2, le_true.max() + 0.5, 0.5)
         b = np.digitize(le_true, edges)
@@ -1182,7 +1408,8 @@ class FlowMatchReco(Surrogate):
 
     def load_model(self, filepath):
         ck = torch.load(filepath, map_location=self.device, weights_only=False)
-        for k, v in ck['config'].items():
+        # checkpoints from before these options are MLP fields for energy and direction
+        for k, v in {'field': 'mlp', 'targets': 'energy_direction', **ck['config']}.items():
             setattr(self, k, v)
         for k in ('target_mu', 'target_sigma', 'data_config', 'train_losses', 'val_losses',
                   'metrics'):
