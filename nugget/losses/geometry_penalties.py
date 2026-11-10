@@ -297,9 +297,9 @@ class LocalStringRepulsionPenalty(LossFunction):
         """
         super().__init__(device)
 
-    @staticmethod
-    def _repulsion_core(string_xy, string_weights, max_radius, beta, ignore_border, domain_size):
-        """Pure-tensor repulsion core. Returns (repulsion, repulsion_per_string).
+    @staticmethod #doesnt use self, so can be static
+    def _repulsion_core(entity_xy, entity_probs, max_radius, beta, ignore_border, domain_size): #entity=contains the coordinates of all strings and CJbs concentrated together, entity_probs=contains the probabilities of all strings and CJbs concentrated together
+        """Pure-tensor repulsion core. Returns (repulsion, repulsion_per_entity).
 
         Soft quadratic hinge: penalty per pair grows as strings get closer than
         max_radius and is ~0 once they are beyond it. Unlike the previous
@@ -316,37 +316,36 @@ class LocalStringRepulsionPenalty(LossFunction):
         the term stays differentiable there; `beta` controls how sharp that corner is
         and how quickly the penalty decays to ~0 beyond max_radius.
         """
-        n = string_xy.shape[0]
+        n = entity_xy.shape[0]
         # Compute pairwise squared distances
-        diff = string_xy.unsqueeze(1) - string_xy.unsqueeze(0)  # (n, n, 2)
+        diff = entity_xy.unsqueeze(1) - entity_xy.unsqueeze(0)  # (n, n, 2) 
         dist_sq = torch.sum(diff ** 2, dim=-1)  # (n, n)
         dist = torch.sqrt(dist_sq + 1e-10)  # Add small epsilon for numerical stability
 
-        self_mask = torch.eye(n, dtype=torch.bool, device=string_xy.device)
+        self_mask = torch.eye(n, dtype=torch.bool, device=entity_xy.device)
         h = 1.0 - dist / max_radius
         hinge = F.softplus(beta * h) / beta
         radius_weight = hinge ** 2
         radius_weight = radius_weight * (~self_mask).double()  # Zero out self-pairs
 
         if ignore_border:
-            clamped_string_xy = torch.clamp(torch.abs(string_xy) - domain_size / 2, min=0.0) ** 2
-            clamped_string_xy = torch.sqrt(torch.sum(clamped_string_xy, dim=1))
-            border_mask = (clamped_string_xy < 1e-3).unsqueeze(1) | (clamped_string_xy < 1e-3).unsqueeze(0)
+            clamped_entity_xy = torch.clamp(torch.abs(entity_xy) - domain_size / 2, min=0.0) ** 2
+            clamped_entity_xy = torch.sqrt(torch.sum(clamped_entity_xy, dim=1))
+            border_mask = (clamped_entity_xy < 1e-3).unsqueeze(1) | (clamped_entity_xy < 1e-3).unsqueeze(0)
             radius_weight = radius_weight * (~border_mask).double()
 
-        if string_weights is not None:
-            string_probs = torch.sigmoid(string_weights)
+        if entity_probs is not None:
             # Outer product for all pairs
-            weight_matrix = string_probs.unsqueeze(1) * string_probs.unsqueeze(0)  # (n, n)
+            weight_matrix = entity_probs.unsqueeze(1) * entity_probs.unsqueeze(0)  # (n, n)
             repulsion_matrix = weight_matrix * radius_weight
-            repulsion_per_string = repulsion_matrix.sum(dim=1)  # Total repulsion for each string
-            repulsion = repulsion_per_string.mean()
+            repulsion_per_entity = repulsion_matrix.sum(dim=1) #sum each entitys pair penalties to get a per-entity value
+            repulsion = repulsion_per_entity.mean()
         else:
             # Mirror weighted behavior with implicit unit weights.
-            repulsion_per_string = radius_weight.sum(dim=1)
-            repulsion = repulsion_per_string.mean()
+            repulsion_per_entity = radius_weight.sum(dim=1)
+            repulsion = repulsion_per_entity.mean()
 
-        return repulsion, repulsion_per_string
+        return repulsion, repulsion_per_entity
 
     def __call__(self, geom_dict, **kwargs):
         """
@@ -355,17 +354,21 @@ class LocalStringRepulsionPenalty(LossFunction):
         Parameters:
         -----------
         geom_dict : dict
-            Geometry dictionary containing 'string_xy' and optional 'string_weights' keys.
+            Geometry dictionary containing string coordinates and optional weights:
+            'string_xy', 'string_weights', 'cjb_xy', and 'cjb_weights'.
         **kwargs
-            Additional keyword arguments including 'max_radius' and 'min_dist'.
+            Additional keyword arguments including 'max_radius' and 'ignore_border'.
 
         Returns:
         --------
-        torch.Tensor
-            The local string repulsion penalty value (weighted).
+        dict
+            Total repulsion penalty and per-string/per-CJB repulsion tensors.
         """
+        #read input
         string_xy = geom_dict.get('string_xy', None)
         string_weights = geom_dict.get('string_weights', None)
+        cjb_xy = geom_dict.get('cjb_xy', None)
+        cjb_weights = geom_dict.get('cjb_weights', None)
         max_radius = kwargs.get('max_radius', 0.1)
         min_dist = kwargs.get('min_dist', 1e-3)
         # Softness of the hinge corner at max_radius (dimensionless, on the normalized
@@ -375,20 +378,59 @@ class LocalStringRepulsionPenalty(LossFunction):
         ignore_border = kwargs.get('ignore_border', False)
         domain_size = kwargs.get('boundary_range', 2.0)
 
-        if string_xy is None:
-            return {'local_string_repulsion_penalty': torch.tensor(0.0)}
-        n = string_xy.shape[0]
-        if n == 0:
-            return {'local_string_repulsion_penalty': torch.tensor(0.0)}
-
         beta = max(float(sharpness), 1e-6)
 
-        repulsion, repulsion_per_string = self._repulsion_core(
-            string_xy, string_weights, max_radius, beta, ignore_border, domain_size,
+        n_strings = 0 if string_xy is None else string_xy.shape[0] #counts the entities
+        n_cjbs = 0 if cjb_xy is None else cjb_xy.shape[0]
+        entity_xy_parts = []
+        entity_prob_parts = []
+
+#add probabilities (sigmoid()) to the strings and cjbs if they exist, otherwise use uniform weights
+        if n_strings:
+            entity_xy_parts.append(string_xy)
+            if string_weights is None:
+                entity_prob_parts.append(
+                    torch.ones(n_strings, device=string_xy.device, dtype=string_xy.dtype)
+                )
+            else:
+                entity_prob_parts.append(
+                    torch.sigmoid(string_weights).to(
+                        device=string_xy.device, dtype=string_xy.dtype
+                    )
+                )
+
+        if n_cjbs:
+            if entity_xy_parts:
+                cjb_xy = cjb_xy.to(
+                    device=entity_xy_parts[0].device, dtype=entity_xy_parts[0].dtype
+                )
+            entity_xy_parts.append(cjb_xy)
+            if cjb_weights is None:
+                entity_prob_parts.append(
+                    torch.ones(n_cjbs, device=cjb_xy.device, dtype=cjb_xy.dtype)
+                )
+            else:
+                entity_prob_parts.append(
+                    cjb_weights.to(device=cjb_xy.device, dtype=cjb_xy.dtype)
+                )
+
+        if not entity_xy_parts:
+            zero = torch.tensor(0.0) #handle the case where there are no strings or cjbs
+            return {
+                'local_string_repulsion_penalty': zero,
+                'local_string_repulsion_penalty_per_string': torch.empty(0),
+                'local_string_repulsion_penalty_per_cjb': torch.empty(0),
+            }
+
+        entity_xy = torch.cat(entity_xy_parts, dim=0)
+        entity_probs = torch.cat(entity_prob_parts, dim=0)
+        repulsion, repulsion_per_entity = self._repulsion_core(
+            entity_xy, entity_probs, max_radius, beta, ignore_border, domain_size,
         )
         return {
             'local_string_repulsion_penalty': repulsion,
-            'local_string_repulsion_penalty_per_string': repulsion_per_string,
+            'local_string_repulsion_penalty_per_string': repulsion_per_entity[:n_strings],
+            'local_string_repulsion_penalty_per_cjb': repulsion_per_entity[n_strings:],
         }
     
 
@@ -1397,5 +1439,4 @@ class DiversityPenalty(LossFunction):
             'diversity_score': diversity_score,
             'diversity_min_distance_to_others': pairwise_distances,
         }
-
 
