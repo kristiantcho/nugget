@@ -1,8 +1,8 @@
 """Cable and junction-box cost penalty."""
 
 from nugget.losses.base_loss import LossFunction
+from nugget.losses.geometry_penalties import capacity_penalty
 import torch
-import torch.nn.functional as F
 
 
 class CostLoss(LossFunction):
@@ -11,6 +11,9 @@ class CostLoss(LossFunction):
 	``geom_dict`` is expected to contain fixed string coordinates, CJB
 	coordinates, and string-to-CJB assignment logits. Cost coefficients can be set at
 	construction or overridden for an individual call.
+
+	The returned ``estimated_total_cost`` is the unnormalized cable and CJB cost;
+	``cost_loss`` also includes the capacity-overuse penalty and is normalized.
 	"""
 
 	def __init__(
@@ -18,7 +21,7 @@ class CostLoss(LossFunction):
 		C_cable=200,
 		C_cjb=150e3,
 		cjb_capacity=10,
-		C_capacity_penalty=50_000_000,
+		C_capacity_penalty=50,
 		normalization=1_000_000,
 		capacity_beta=5,
 		device=None,
@@ -54,15 +57,13 @@ class CostLoss(LossFunction):
 
 		cjb_usage = torch.sum(assignment_weights, dim=0)
 		cjb_count_cost = parameters["C_cjb"] * torch.sum(torch.sigmoid(cjb_usage*6))
-		excess_usage = F.softplus(
-			cjb_usage - parameters["cjb_capacity"],
-			beta=parameters["capacity_beta"],
+		estimated_total_cost = cable_cost + cjb_count_cost
+		capacity_overuse_penalty = capacity_penalty(
+			cjb_usage,
+			parameters["cjb_capacity"],
+			parameters["C_capacity_penalty"],
+			parameters["capacity_beta"],
 		)
-		capacity_cost = parameters["C_capacity_penalty"] * torch.sum(
-			excess_usage.square()
-		)
-
-		loss = (cable_cost + cjb_count_cost + capacity_cost) / parameters[
-			"normalization"
-		]
-		return {"cost_loss": loss}
+		loss = estimated_total_cost + capacity_overuse_penalty
+		loss = loss / parameters["normalization"]
+		return {"cost_loss": loss, "estimated_total_cost": estimated_total_cost}

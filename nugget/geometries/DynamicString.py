@@ -60,6 +60,7 @@ class DynamicString(Geometry):
         weights = assignment_logits
         cjb_usage = torch.sum(weights, dim=0)
         return (
+            weights,
             torch.sigmoid(cjb_usage*6).to(dtype=cjb_xy.dtype),
         )
 
@@ -499,7 +500,7 @@ class DynamicString(Geometry):
             dtype=torch.float64,
         ).fill_(1.0).requires_grad_()
         cjbs_string_connections, cjb_weights = self._calculate_cjb_weights(
-            string_xy, cjb_xy, assignment_logits
+            cjb_xy, assignment_logits
         )
 
         points_3d = torch.zeros(self.total_points, 3, device=self.device)
@@ -612,7 +613,7 @@ class DynamicString(Geometry):
         # loop (which called int(points_per_string_list[s]) every string, forcing
         # a device sync per string per step on GPU) -- see _point_to_string_index.
         cjbs_string_connections, cjb_weights = self._calculate_cjb_weights(
-            string_xy, cjb_xy, assignment_logits
+            cjb_xy, assignment_logits
         )
 
         if z_values.shape[0] > 0:

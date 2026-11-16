@@ -12,6 +12,11 @@ except ImportError:
 from nugget.losses.base_loss import LossFunction
 
 
+def capacity_penalty(cjb_usage, cjb_capacity, C_capacity_penalty, beta):
+    excess_usage = F.softplus(cjb_usage - cjb_capacity, beta=beta)
+    return C_capacity_penalty * torch.sum(excess_usage.square())
+
+
 class BoundaryPenalty(LossFunction):
     """Loss function for boundary penalties."""
     def __init__(self, device=None):
