@@ -7,11 +7,13 @@ class DynamicString(Geometry):
     
     def __init__(self, device=None, dim=3, domain_size=2,
                 total_points = 150, n_strings = 30,
+                n_cjbs = 10,
                 random_xy = False,
                 custom_z_spacing = None, points_per_string = None,
                 custom_string_spacing = None, hex_type='hexagonal', hybrid_mix_init=0.5):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         self.n_strings = n_strings
+        self.n_cjbs = n_cjbs
         self.points_per_string = points_per_string
         self.total_points = int(self.n_strings * self.points_per_string) if self.points_per_string is not None else total_points
         self.random_xy = random_xy
@@ -33,6 +35,11 @@ class DynamicString(Geometry):
             optimal_spacing=self.custom_string_spacing,
             hybrid_mix=self.hybrid_mix,
         )
+        self.cjb_hex_grid = (
+            self.create_uniform_hexagonal_grid(n_points=self.n_cjbs)
+            if self.n_cjbs > 0
+            else torch.empty(0, 2, device=self.device, dtype=torch.float64)
+        )
         self.dim = original_dim
 
     def _make_z_segment(self, n_points):
@@ -49,7 +56,13 @@ class DynamicString(Geometry):
         if self.points_per_string is not None:
             self.total_points = int(self.n_strings * self.points_per_string)
             
-    
+    def _calculate_cjb_weights(self, cjb_xy, assignment_logits):
+        weights = torch.sigmoid(assignment_logits)
+        cjb_usage = torch.sum(weights, dim=0)
+        return (
+            torch.sigmoid((cjb_usage-0.9)*6).to(dtype=cjb_xy.dtype),
+        )
+
     def initialize_points(self, initial_geometry=None, **kwargs):
         """
         Initialize points in a dynamic string configuration.
@@ -125,6 +138,38 @@ class DynamicString(Geometry):
                 if self.random_xy:
                     string_xy = torch.rand(self.n_strings, 2, device=self.device) * self.domain_size - self.half_domain
                 result['string_xy'] = string_xy
+
+            if initial_geometry.get('cjb_xy') is not None:
+                cjb_xy = initial_geometry['cjb_xy']
+                if not isinstance(cjb_xy, torch.Tensor):
+                    cjb_xy = torch.tensor(cjb_xy, device=self.device, dtype=torch.float64)
+                else:
+                    cjb_xy = cjb_xy.to(device=self.device, dtype=torch.float64)
+                self.n_cjbs = int(cjb_xy.shape[0])
+            else:
+                cjb_xy = self.cjb_hex_grid.clone()
+            result['cjb_xy'] = cjb_xy
+
+            if initial_geometry.get('assignment_logits') is not None:
+                assignment_logits = torch.as_tensor(
+                    initial_geometry['assignment_logits'],
+                    device=self.device,
+                    dtype=torch.float64,
+                ).detach().clone().requires_grad_()
+            else:
+                assignment_logits = torch.full(
+                    (result['string_xy'].shape[0], result['cjb_xy'].shape[0]),
+                    1.0,
+                    device=self.device,
+                    dtype=torch.float64,
+                    requires_grad=True,
+                )
+            cjb_weights = self._calculate_cjb_weights(
+                result['cjb_xy'], assignment_logits
+            )
+            result['assignment_logits'] = assignment_logits
+           
+            result['cjb_weights'] = cjb_weights
             
             # Process z_values if available
             if 'z_values' in initial_geometry:
@@ -447,6 +492,15 @@ class DynamicString(Geometry):
         string_xy = self.hex_grid.clone()
         if self.random_xy:
             string_xy = torch.rand(self.n_strings, 2, device=self.device) * self.domain_size - self.half_domain
+        cjb_xy = self.cjb_hex_grid.clone()
+        assignment_logits = torch.empty(
+            (string_xy.shape[0], cjb_xy.shape[0]),
+            device=self.device,
+            dtype=torch.float64,
+        ).fill_(1.0).requires_grad_()
+        cjb_weights = self._calculate_cjb_weights(
+            cjb_xy, assignment_logits
+        )
 
         points_3d = torch.zeros(self.total_points, 3, device=self.device)
         z_values_final = None
@@ -481,6 +535,10 @@ class DynamicString(Geometry):
             "points_3d": points_3d,
             "z_values": z_values_final,
             "string_xy": string_xy,
+            "cjb_xy": cjb_xy,
+            "assignment_logits": assignment_logits,
+            "cjbs_string_connections": cjbs_string_connections,
+            "cjb_weights": cjb_weights,
             "string_indices": string_indices_final,
             "points_per_string_list": points_per_string_list_final,
         }
@@ -527,7 +585,8 @@ class DynamicString(Geometry):
         self._p2s_cache = (key, idx)
         return idx
 
-    def update_points(self, z_values, string_xy, points_per_string_list, string_indices, **kwargs):
+    def update_points(self, z_values, string_xy, points_per_string_list, string_indices,
+                      cjb_xy, assignment_logits, **kwargs):
         """Update the points based on current optimization state.
         Parameters:
         -----------
@@ -552,6 +611,10 @@ class DynamicString(Geometry):
         # z comes straight from z_values. This replaces the old per-string Python
         # loop (which called int(points_per_string_list[s]) every string, forcing
         # a device sync per string per step on GPU) -- see _point_to_string_index.
+        cjb_weights = self._calculate_cjb_weights(
+            cjb_xy, assignment_logits
+        )
+
         if z_values.shape[0] > 0:
             p2s = self._point_to_string_index(points_per_string_list)  # (n_points,)
             xy = string_xy[p2s]                                        # (n_points, 2), differentiable gather
@@ -564,6 +627,9 @@ class DynamicString(Geometry):
             "points_3d": points_3d, 
             "z_values": z_values, 
             "string_xy": string_xy,
+            "cjb_xy": cjb_xy,
+            "assignment_logits": assignment_logits,
+            "cjb_weights": cjb_weights,
             "string_indices": string_indices, 
             "points_per_string_list": points_per_string_list,
         }
