@@ -12,9 +12,54 @@ except ImportError:
 from nugget.losses.base_loss import LossFunction
 
 
-def capacity_penalty(cjb_usage, cjb_capacity, C_capacity_penalty, beta):
-    excess_usage = F.softplus(cjb_usage - cjb_capacity, beta=beta)
-    return C_capacity_penalty * torch.sum(excess_usage.square())
+class CapacityPenalty(LossFunction):
+    """Penalize cable junction box capacity overuse."""
+
+    def __init__(
+        self,
+        C_capacity_penalty=50,
+        cjb_capacity=10,
+        beta=5,
+        device=None,
+        **kwargs,
+    ):
+        super().__init__(device)
+        self.parameters = {
+            "C_capacity_penalty": C_capacity_penalty,
+            "cjb_capacity": cjb_capacity,
+            "beta": beta,
+        }
+        self.parameters.update(kwargs)
+
+    def __call__(self, geom_dict, **kwargs):
+        parameters = {**self.parameters, **kwargs}
+        assignment_logits = geom_dict.get("assignment_logits", None)
+        weights = torch.sigmoid(assignment_logits)
+        cjb_usage = torch.sum(weights, dim=0)
+        excess_usage = F.softplus(
+            cjb_usage - parameters["cjb_capacity"], beta=parameters["beta"]
+        )
+        penalty = parameters["C_capacity_penalty"] * torch.sum(excess_usage.square())
+        return {"capacity_penalty": penalty, "capacity_excess_usage": excess_usage}
+
+class StringConnectionPenalty(LossFunction):
+
+    def __init__(
+        self,
+        device=None,
+        **kwargs,
+    ):
+        super().__init__(device)
+        
+
+    def __call__(self, geom_dict, **kwargs):
+    
+        assignment_logits=geom_dict.get("assignment_logits", None)
+        weights=torch.sigmoid(assignment_logits)
+        string_usage=torch.sum(weights, dim=1)
+        string_connections=torch.sigmoid((string_usage-0.9)*60)
+        string_connection_penalty=torch.sum(1-string_connections)
+        return {"string_connection_penalty": string_connection_penalty, "string_connections": string_connections}
 
 
 class BoundaryPenalty(LossFunction):

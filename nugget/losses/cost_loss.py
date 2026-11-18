@@ -1,7 +1,7 @@
 """Cable and junction-box cost penalty."""
 
 from nugget.losses.base_loss import LossFunction
-from nugget.losses.geometry_penalties import capacity_penalty
+from nugget.losses.geometry_penalties import CapacityPenalty
 import torch
 
 
@@ -20,21 +20,18 @@ class CostLoss(LossFunction):
 		self,
 		C_cable=200,
 		C_cjb=150e3,
-		cjb_capacity=10,
-		C_capacity_penalty=50,
+		C_connection=20e3,
 		normalization=1_000_000,
-		capacity_beta=5,
 		device=None,
 		**kwargs,
 	):
 		super().__init__(device)
+		self.capacity_penalty = CapacityPenalty(device=device)
 		self.parameters = {
 			"C_cable": C_cable,
 			"C_cjb": C_cjb,
-			"cjb_capacity": cjb_capacity,
-			"C_capacity_penalty": C_capacity_penalty,
 			"normalization": normalization,
-			"capacity_beta": capacity_beta,
+			"C_connection": C_connection,
 		}
 		self.parameters.update(kwargs)
 
@@ -43,27 +40,19 @@ class CostLoss(LossFunction):
 		strings = geom_dict.get("string_xy", None)
 		cjbs = geom_dict.get("cjb_xy", None)
 		assignment_logits = geom_dict.get("assignment_logits", None)
+		cjb_weights= geom_dict.get("cjb_weights", None)
 
-		strings = torch.as_tensor(strings).detach()
-		cjbs = torch.as_tensor(cjbs, dtype=strings.dtype, device=strings.device)
-		assignment_logits = torch.as_tensor(
-			assignment_logits, dtype=strings.dtype, device=strings.device
-		)
-		assignment_weights = assignment_logits
-
+		assignment_weights = torch.sigmoid(assignment_logits)
 		distances = torch.cdist(strings, cjbs)
 		expected_cable_lengths = torch.sum(assignment_weights * distances, dim=1)
 		cable_cost = parameters["C_cable"] * torch.sum(expected_cable_lengths)
 
 		cjb_usage = torch.sum(assignment_weights, dim=0)
-		cjb_count_cost = parameters["C_cjb"] * torch.sum(torch.sigmoid(cjb_usage*6))
-		estimated_total_cost = cable_cost + cjb_count_cost
-		capacity_overuse_penalty = capacity_penalty(
-			cjb_usage,
-			parameters["cjb_capacity"],
-			parameters["C_capacity_penalty"],
-			parameters["capacity_beta"],
-		)
-		loss = estimated_total_cost + capacity_overuse_penalty
+		connection_cost= torch.sum(cjb_usage) * parameters["C_connection"]
+
+		cjb_count_cost = parameters["C_cjb"] * cjb_weights #<-- soft_active_cjbs
+		estimated_total_cost = cable_cost + cjb_count_cost + connection_cost
+
+		loss = estimated_total_cost
 		loss = loss / parameters["normalization"]
 		return {"cost_loss": loss, "estimated_total_cost": estimated_total_cost}

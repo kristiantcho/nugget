@@ -57,11 +57,10 @@ class DynamicString(Geometry):
             self.total_points = int(self.n_strings * self.points_per_string)
             
     def _calculate_cjb_weights(self, cjb_xy, assignment_logits):
-        weights = assignment_logits
+        weights = torch.sigmoid(assignment_logits)
         cjb_usage = torch.sum(weights, dim=0)
         return (
-            weights,
-            torch.sigmoid(cjb_usage*6).to(dtype=cjb_xy.dtype),
+            torch.sigmoid((cjb_usage-0.9)*6).to(dtype=cjb_xy.dtype),
         )
 
     def initialize_points(self, initial_geometry=None, **kwargs):
@@ -165,11 +164,11 @@ class DynamicString(Geometry):
                     dtype=torch.float64,
                     requires_grad=True,
                 )
-            cjbs_string_connections, cjb_weights = self._calculate_cjb_weights(
+            cjb_weights = self._calculate_cjb_weights(
                 result['cjb_xy'], assignment_logits
             )
             result['assignment_logits'] = assignment_logits
-            result['cjbs_string_connections'] = cjbs_string_connections
+           
             result['cjb_weights'] = cjb_weights
             
             # Process z_values if available
@@ -499,7 +498,7 @@ class DynamicString(Geometry):
             device=self.device,
             dtype=torch.float64,
         ).fill_(1.0).requires_grad_()
-        cjbs_string_connections, cjb_weights = self._calculate_cjb_weights(
+        cjb_weights = self._calculate_cjb_weights(
             cjb_xy, assignment_logits
         )
 
@@ -612,7 +611,7 @@ class DynamicString(Geometry):
         # z comes straight from z_values. This replaces the old per-string Python
         # loop (which called int(points_per_string_list[s]) every string, forcing
         # a device sync per string per step on GPU) -- see _point_to_string_index.
-        cjbs_string_connections, cjb_weights = self._calculate_cjb_weights(
+        cjb_weights = self._calculate_cjb_weights(
             cjb_xy, assignment_logits
         )
 
@@ -630,7 +629,6 @@ class DynamicString(Geometry):
             "string_xy": string_xy,
             "cjb_xy": cjb_xy,
             "assignment_logits": assignment_logits,
-            "cjbs_string_connections": cjbs_string_connections,
             "cjb_weights": cjb_weights,
             "string_indices": string_indices, 
             "points_per_string_list": points_per_string_list,
