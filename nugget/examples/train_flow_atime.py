@@ -5,10 +5,10 @@ import numpy as np
 
 GEOM = '../other/800_40_40_geom.csv'
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_atime_muon_flow_v2R_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v2R.pt'
+TEST_PARQUET = './flow_models/mc_atime_muon_flow_v1rlg_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_atime_muon_flow_model_v1rlg.pt'
 
-EPOCHS = 1000
+EPOCHS = 300
 
 flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
     device="cuda:0",
@@ -17,7 +17,7 @@ flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
     particle_mode='track',
     # --- velocity network ---
     width=256,
-    depth=15,
+    depth=12,
     time_dim=64,        # sinusoidal embedding of the FLOW time t (not the arrival time)
     cond_width=256,
     dropout=0.0,
@@ -33,12 +33,12 @@ flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
     sigma_min=1e-6,
 
     # --- arrival-time target ---
-    refractive_index=1.33,   # water; sets the Cherenkov angle in t_geom
-    time_scale=1.5,         # ns; asinh(t/scale). ~ the width of the direct peak
-    time_transform='asinh',  # 'signlog' reproduces the LLRnet PATD convention
-    # zenith/azimuth in this parquet are the ARRIVAL direction, so the muon travels
-    # along -direction. Verified on the data: median |t_res| is 6.9 ns with this
-    # convention versus 2769 ns with the other.
+    refractive_index=1.35,   # phase index: sets the Cherenkov angle in t_geom
+    group_index=1.38,        # photon-speed index in t_geom (None = refractive_index). On the
+                             # muon parquet 1.35 / 1.38 puts the prompt edge at ~0 ns for every
+                             # d_perp (1.33 / 1.33 drifts 0.26 ns/m); retrain under a new name
+    time_scale=2.0,        # ns; asinh(t/scale). ~ the width of the direct peak
+    time_transform='asinh',  
     track_dir_is_arrival=True,
 
     # --- context features (identical to the light-yield model) ---
@@ -50,7 +50,12 @@ flow = nugget.surrogates.FlowMatchATime.FlowMatchATime(
     add_pmt_direction=True,
     add_pmt_cosangle=True,
     standardize_context=True,
-    include_direction=False,
+    include_direction=True,
+    # True: infinite-track features (no vertex) and only samples whose emission point
+    # is through_min_upstream m past the vertex; set it the same in all three scripts
+    through_going=False,
+    through_min_upstream=50.0,
+    energy_type='lepton',     # 'neutrino' or 'lepton' energy feature; same in all three
     ly_eps=1e-6,
 )
 
@@ -58,7 +63,7 @@ train_dataloader = flow.create_atime_parquet_dataloader(
     parquet_path=TRAIN_PARQUET,
     geometry_csv_path=GEOM,
     num_samples_per_epoch=1000_000,
-    batch_size=4096,
+    batch_size=10000,
     num_workers=0,
     shuffle=True,
     uniform_energy_zenith=True,
@@ -67,7 +72,7 @@ train_dataloader = flow.create_atime_parquet_dataloader(
     n_count_bins=30,
     filter_vertex_in_domain=True,
     # A few PMTs record >1000 photons; capping keeps them from dominating an epoch.
-    max_photons_per_row=100,
+    max_photons_per_row=None,
     test_save_path=TEST_PARQUET,
     test_frac=0.1,
 )
@@ -76,7 +81,7 @@ val_dataloader = flow.create_atime_parquet_val_dataloader(
     parquet_path=TEST_PARQUET,
     geometry_csv_path=GEOM,
     num_samples_per_epoch=100_000,
-    batch_size=4096,
+    batch_size=10000,
     num_workers=0,
     # seed=0,
 
@@ -98,7 +103,7 @@ history = flow.train_with_dataloader(
 )
 
 pickle.dump(history,
-            open('./flow_models/mc_atime_muon_flow_v2R_training_history.pkl', 'wb'))
+            open('./flow_models/mc_atime_muon_flow_v1rlg_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------

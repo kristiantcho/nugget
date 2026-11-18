@@ -10,6 +10,7 @@ from . import FlowMatchLY
 from . import FlowMatchATime
 from . import HitClassifier
 from . import NuSmoothie
+from . import NuSmoothieThrough
 from . import FlowMatchReco
 # from . import HitFlowNet
 # from . import HitFlow

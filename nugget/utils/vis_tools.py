@@ -745,6 +745,50 @@ class Visualizer:
         rng = np.random.default_rng(int(idx))
         return plt.cm.rainbow(float(rng.random()))
 
+    # Offset added to a CJB's index when picking its per-space color, so CJB
+    # corridors never share a color key with a string's.
+    _CJB_COLOR_INDEX_OFFSET = 1_000_003
+
+    @staticmethod
+    def _to_numpy_or_none(value):
+        """Detach/convert a tensor or array-like to a numpy array (None passes through)."""
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    @classmethod
+    def _get_cjb_plot_data(cls, kwargs):
+        """Return `(cjb_xy_np, cjb_probs_np)` from the plot kwargs, or `(None, None)`.
+
+        `cjb_weights` is expected to already be a probability in [0, 1] (sigmoided
+        in the geometry), matching ROVPenalty, so no sigmoid is applied here. If CJB
+        positions are given without weights, every CJB gets probability 1.
+        """
+        cjb_xy_np = cls._to_numpy_or_none(kwargs.get('cjb_xy', None))
+        if cjb_xy_np is None or cjb_xy_np.size == 0:
+            return None, None
+        cjb_xy_np = cjb_xy_np.reshape(-1, 2).astype(float)
+        cjb_probs_np = cls._to_numpy_or_none(kwargs.get('cjb_weights', None))
+        if cjb_probs_np is not None:
+            cjb_probs_np = cjb_probs_np.reshape(-1).astype(float)
+        else:
+            cjb_probs_np = np.ones(cjb_xy_np.shape[0], dtype=float)
+        return cjb_xy_np, cjb_probs_np
+
+    @staticmethod
+    def _add_string_cjb_legend(ax, loc='upper right'):
+        """Legend distinguishing strings (circles) from CJBs (squares)."""
+        from matplotlib.lines import Line2D
+        handles = [
+            Line2D([], [], marker='o', linestyle='None', markerfacecolor='lightgray',
+                   markeredgecolor='black', markersize=6, label='Strings'),
+            Line2D([], [], marker='s', linestyle='None', markerfacecolor='lightgray',
+                   markeredgecolor='black', markersize=7, label='CJBs'),
+        ]
+        ax.legend(handles=handles, loc=loc, fontsize=8, framealpha=0.8)
+
     @staticmethod
     def _weighted_mean_nn_distance(string_xy, string_weights=None, num_neighbours=5, nn_tau=None):
         """Weighted average of each string's mean distance to its 5 nearest neighbours.
@@ -3330,7 +3374,9 @@ class Visualizer:
         tensor_kwargs = ['string_weights', 'signal_funcs', 'background_funcs', 'test_points', 
                         'llr_per_string', 'signal_llr_per_string', 'background_llr_per_string',
                         'signal_yield_per_string', 'snr_per_string', 'fisher_info_per_string',
-                        'local_string_repulsion_penalty_per_string']
+                        'local_string_repulsion_penalty_per_string',
+                        'local_string_repulsion_penalty_per_cjb',
+                        'cjb_rov_penalty_per_string', 'cjb_rov_least_blocked_angle_per_string']
         for key in tensor_kwargs:
             if key in kwargs and kwargs.get(key) is not None:
                 kwargs[key] = self._safe_tensor_convert(kwargs[key])
@@ -3352,6 +3398,9 @@ class Visualizer:
         effective_half_domain = self.half_domain
         if zoom_range is None and string_xy is not None:
             string_xy_np = string_xy.detach().cpu().numpy() if torch.is_tensor(string_xy) else np.asarray(string_xy)
+            cjb_xy_for_domain, _ = self._get_cjb_plot_data(kwargs)
+            if cjb_xy_for_domain is not None:
+                string_xy_np = np.concatenate([string_xy_np.reshape(-1, 2), cjb_xy_for_domain], axis=0)
             if string_xy_np.size > 0:
                 max_abs_coord = float(np.max(np.abs(string_xy_np)))
                 if np.isfinite(max_abs_coord) and max_abs_coord > self.half_domain:
@@ -3686,7 +3735,31 @@ class Visualizer:
                         rov_penalty_np = rov_penalty_per_string.clone().detach().cpu().numpy()
                     else:
                         rov_penalty_np = np.array(rov_penalty_per_string)
-                    rov_penalty_np*= len(xy_np)
+                    # Optional CJBs (treated like strings by ROVPenalty). The loss
+                    # normalises per-object values by the TOTAL count (strings + CJBs),
+                    # so undo that normalisation with the same total here.
+                    cjb_xy_np, cjb_probs_np = self._get_cjb_plot_data(kwargs)
+                    n_cjbs = 0 if cjb_xy_np is None else cjb_xy_np.shape[0]
+                    n_total = len(xy_np) + n_cjbs
+                    rov_penalty_np = np.asarray(rov_penalty_np, dtype=float) * n_total
+
+                    cjb_rov_penalty_np = None
+                    cjb_rov_angles_np = None
+                    cjb_active_mask = None
+                    if n_cjbs > 0:
+                        cjb_active_mask = cjb_probs_np >= weight_threshold
+                        cjb_rov_penalty_np = self._to_numpy_or_none(kwargs.get('cjb_rov_penalty_per_string', None))
+                        if cjb_rov_penalty_np is not None:
+                            cjb_rov_penalty_np = cjb_rov_penalty_np.reshape(-1).astype(float)
+                            if cjb_rov_penalty_np.shape[0] != n_cjbs:
+                                cjb_rov_penalty_np = None
+                            else:
+                                cjb_rov_penalty_np = cjb_rov_penalty_np * n_total
+                        cjb_rov_angles_np = self._to_numpy_or_none(kwargs.get('cjb_rov_least_blocked_angle_per_string', None))
+                        if cjb_rov_angles_np is not None:
+                            cjb_rov_angles_np = cjb_rov_angles_np.reshape(-1).astype(float)
+                            if cjb_rov_angles_np.shape[0] != n_cjbs:
+                                cjb_rov_angles_np = None
 
                     # Active-string mask (weight >= threshold), matching the
                     # convention used by the other string_xy plots.
@@ -3732,18 +3805,43 @@ class Visualizer:
                                     zorder=1,
                                 )
 
+                        # CJB corridors: same violation rule. CJBs are not part of
+                        # the string fold structure, so they are never fold-tiled.
+                        if (rov_penalty_func is not None and cjb_rov_penalty_np is not None
+                                and cjb_rov_angles_np is not None):
+                            cjb_viol_mask = cjb_rov_penalty_np >= weight_threshold
+                            if draw_rov_safe_space_active_only:
+                                cjb_viol_mask = cjb_viol_mask & cjb_active_mask
+                            for origin_xy, angle_rad in zip(cjb_xy_np[cjb_viol_mask], cjb_rov_angles_np[cjb_viol_mask]):
+                                self._draw_rov_safe_space_at_string(
+                                    ax,
+                                    origin_xy=origin_xy,
+                                    angle_rad=angle_rad,
+                                    rov_penalty=rov_penalty_func,
+                                    zorder=1,
+                                )
+
                     # Optionally draw the unioned shape of all (active) strings'
-                    # best (least-blocked-angle) ROV safe spaces.
+                    # (and CJBs') best (least-blocked-angle) ROV safe spaces.
                     if draw_rov_safe_space_union:
                         if rov_penalty_func is not None and rov_angles_np is not None:
                             union_idx_mask = active_mask if active_mask is not None else np.ones(len(xy_np), dtype=bool)
                             union_idx = np.where(union_idx_mask)[0]
-                            if union_idx.size > 0:
-                                union_origins, union_angles, union_idx_expanded = xy_np[union_idx], rov_angles_np[union_idx], union_idx
-                                if rov_safe_space_one_fold_only:
-                                    union_origins, union_angles, union_idx_expanded = self._tile_rov_safe_spaces_across_folds(
-                                        union_origins, union_angles, union_idx_expanded, kwargs,
-                                    )
+                            union_origins, union_angles, union_idx_expanded = xy_np[union_idx], rov_angles_np[union_idx], union_idx
+                            if rov_safe_space_one_fold_only and union_idx.size > 0:
+                                union_origins, union_angles, union_idx_expanded = self._tile_rov_safe_spaces_across_folds(
+                                    union_origins, union_angles, union_idx_expanded, kwargs,
+                                )
+                            if cjb_rov_angles_np is not None and np.any(cjb_active_mask):
+                                cjb_union_idx = np.where(cjb_active_mask)[0]
+                                union_origins = np.concatenate(
+                                    [np.asarray(union_origins, dtype=float).reshape(-1, 2), cjb_xy_np[cjb_union_idx]], axis=0)
+                                union_angles = np.concatenate(
+                                    [np.asarray(union_angles, dtype=float).reshape(-1), cjb_rov_angles_np[cjb_union_idx]], axis=0)
+                                union_idx_expanded = np.concatenate(
+                                    [np.asarray(union_idx_expanded, dtype=np.int64).reshape(-1),
+                                     cjb_union_idx.astype(np.int64) + self._CJB_COLOR_INDEX_OFFSET], axis=0)
+                            if len(union_origins) > 0:
                                 self._draw_rov_safe_space_union(
                                     ax,
                                     origins_xy=union_origins,
@@ -3765,16 +3863,20 @@ class Visualizer:
                     # Create colormap for ROV penalty
                     cmap = plt.cm.RdYlGn_r  # Red for high penalty, green for low penalty
                     
-                    # Normalize penalties for colormap
-                    vmin = np.min(rov_penalty_np)
-                    vmax = max(np.max(rov_penalty_np), 1.0)
+                    # Normalize penalties for colormap (shared by strings and CJBs)
+                    all_rov_vals = rov_penalty_np
+                    if cjb_rov_penalty_np is not None:
+                        all_rov_vals = np.concatenate([rov_penalty_np, cjb_rov_penalty_np])
+                    vmin = np.min(all_rov_vals)
+                    vmax = max(np.max(all_rov_vals), 1.0)
                     norm = Normalize(vmin=vmin, vmax=vmax)
-                    
+
                     # Plot strings colored by ROV penalty with alpha based on weights
+                    string_marker_size = min([30, 50 * 200 / len(xy_np)]) * string_size_scale
                     sc = ax.scatter(
                         xy_np[:, 0],
                         xy_np[:, 1],
-                        s=min([30, 50 * 200 / len(xy_np)]) * string_size_scale,
+                        s=string_marker_size,
                         c=rov_penalty_np,
                         cmap=cmap,
                         norm=norm,
@@ -3782,17 +3884,34 @@ class Visualizer:
                         edgecolors='black',
                         linewidths=0.1
                     )
-                    
+
+                    # CJBs as squares, same colormap/norm; alpha from CJB probabilities.
+                    if n_cjbs > 0:
+                        cjb_scatter_kwargs = dict(
+                            s=1.5 * string_marker_size,
+                            marker='s',
+                            alpha=np.clip(cjb_probs_np, 0.05, 1.0),
+                            edgecolors='black',
+                            linewidths=0.4,
+                            zorder=3,
+                        )
+                        if cjb_rov_penalty_np is not None:
+                            ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c=cjb_rov_penalty_np,
+                                       cmap=cmap, norm=norm, **cjb_scatter_kwargs)
+                        else:
+                            ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c='lightgray', **cjb_scatter_kwargs)
+                        self._add_string_cjb_legend(ax)
+
                     # Add colorbar
                     cbar = fig.colorbar(sc, ax=ax)
                     cbar.set_label('ROV Penalty')
-                    
+
                     rov_penalty = kwargs.get('rov_penalty_func', None) or kwargs.get('rov_penalty', None)
                     if rov_penalty is not None:
                         self._draw_rov_safe_space(ax, rov_penalty, zoom_range=zoom_range, half_domain=effective_half_domain)
-                    
+
                     set_axis_limits(ax)
-                    ax.set_title('ROV Penalty per String')
+                    ax.set_title('ROV Penalty per String / CJB' if n_cjbs > 0 else 'ROV Penalty per String')
                     ax.set_xlabel('X')
                     ax.set_ylabel('Y')
                     self._draw_slice_lines(ax, xy_np, **kwargs)
@@ -3826,15 +3945,31 @@ class Visualizer:
                         else:
                             alpha_vals = 0.8
 
+                        # Optional CJBs (squares), colored by their own per-CJB repulsion.
+                        cjb_xy_np, cjb_probs_np = self._get_cjb_plot_data(kwargs)
+                        n_cjbs = 0 if cjb_xy_np is None else cjb_xy_np.shape[0]
+                        cjb_repulsion_np = None
+                        if n_cjbs > 0:
+                            cjb_repulsion_np = self._to_numpy_or_none(
+                                kwargs.get('local_string_repulsion_penalty_per_cjb', None))
+                            if cjb_repulsion_np is not None:
+                                cjb_repulsion_np = cjb_repulsion_np.reshape(-1).astype(float)
+                                if cjb_repulsion_np.shape[0] != n_cjbs:
+                                    cjb_repulsion_np = None
+
                         cmap = plt.cm.RdYlGn_r  # Red for high penalty, green for low penalty
+                        all_rep_vals = local_repulsion_np
+                        if cjb_repulsion_np is not None:
+                            all_rep_vals = np.concatenate([np.asarray(local_repulsion_np, dtype=float), cjb_repulsion_np])
                         vmin = 0
-                        vmax = max(np.max(local_repulsion_np), 1.0) if np.max(local_repulsion_np) > 0 else 1.0
+                        vmax = max(np.max(all_rep_vals), 1.0) if np.max(all_rep_vals) > 0 else 1.0
                         norm = Normalize(vmin=vmin, vmax=vmax)
 
+                        string_marker_size = min([30, 50 * 200 / len(xy_np)]) * string_size_scale
                         sc = ax.scatter(
                             xy_np[:, 0],
                             xy_np[:, 1],
-                            s=min([30, 50 * 200 / len(xy_np)]) * string_size_scale,
+                            s=string_marker_size,
                             c=local_repulsion_np,
                             cmap=cmap,
                             norm=norm,
@@ -3843,11 +3978,28 @@ class Visualizer:
                             linewidths=0.1
                         )
 
+                        if n_cjbs > 0:
+                            cjb_scatter_kwargs = dict(
+                                s=1.5 * string_marker_size,
+                                marker='s',
+                                alpha=np.clip(cjb_probs_np, 0.05, 1.0),
+                                edgecolors='black',
+                                linewidths=0.4,
+                                zorder=3,
+                            )
+                            if cjb_repulsion_np is not None:
+                                ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c=cjb_repulsion_np,
+                                           cmap=cmap, norm=norm, **cjb_scatter_kwargs)
+                            else:
+                                ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c='lightgray', **cjb_scatter_kwargs)
+                            self._add_string_cjb_legend(ax)
+
                         cbar = fig.colorbar(sc, ax=ax)
                         cbar.set_label('Local String Repulsion Penalty')
 
                         set_axis_limits(ax)
-                        ax.set_title('Local String Repulsion per String')
+                        ax.set_title('Local String Repulsion per String / CJB' if n_cjbs > 0
+                                     else 'Local String Repulsion per String')
                         ax.set_xlabel('X')
                         ax.set_ylabel('Y')
                         self._draw_slice_lines(ax, xy_np, **kwargs)

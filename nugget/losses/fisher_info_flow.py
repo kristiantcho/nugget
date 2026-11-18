@@ -63,6 +63,32 @@ def _log_prob_tres(at, t_res, ctx, n_steps, div_eps=None):
     return _log_prob_z(at, at.to_z(t), ctx, n_steps, div_eps) + at.log_det_dz_dq(t)
 
 
+# the event's 'position' (the interaction vertex) as three scalar parameters, in m
+_VERTEX = ('x', 'y', 'z')
+# 'direction': the Cartesian travel direction from zenith and azimuth, a unit vector
+_DIRECTION = ('dir_x', 'dir_y', 'dir_z')
+_EXPAND = {'position': _VERTEX, 'direction': _DIRECTION}
+_NAMES = ('energy', 'zenith', 'azimuth') + _VERTEX + tuple(_EXPAND)
+
+
+def _unit(zen, azi):
+    st = torch.sin(zen)
+    return torch.stack([st * torch.cos(azi), st * torch.sin(azi), torch.cos(zen)], dim=-1)
+
+
+def _tangent_basis(n):
+    """(N, 3, 2) orthonormal basis of the plane perpendicular to each unit n (N, 3), built
+    as directional_resolution in fisher_info_helpers builds it."""
+    ref = torch.zeros_like(n)
+    ref[:, 2] = 1.0
+    alt = torch.zeros_like(n)
+    alt[:, 0] = 1.0
+    ref = torch.where((n[:, 2].abs() > 0.9).unsqueeze(1), alt, ref)
+    b1 = torch.linalg.cross(n, ref)
+    b1 = b1 / b1.norm(dim=1, keepdim=True)
+    return torch.stack([b1, torch.linalg.cross(n, b1)], dim=2)
+
+
 class FlowFisherResolutionLoss(LossFunction):
     """Angular / energy resolution from the learned combined likelihoods.
 
@@ -73,7 +99,18 @@ class FlowFisherResolutionLoss(LossFunction):
     atime_model : FlowMatchATime or None
     mode : {'all', 'atime'}
     fisher_info_params : sequence of str
-        Scanned parameters, from {'energy', 'zenith', 'azimuth'}. 
+        Scanned parameters, from {'energy', 'zenith', 'azimuth', 'direction', 'position',
+        'x', 'y', 'z'}. 'position' (the vertex) stands for 'x', 'y', 'z' in its place,
+        'direction' for 'dir_x', 'dir_y', 'dir_z': the Cartesian travel direction from
+        zenith and azimuth, normalised before it reaches the flows, so the Fisher has no
+        information along it and every inverse is taken in the plane perpendicular to
+        it. theta_names holds the order of the Fisher's rows. The interaction time is
+        known (t = 0, as in NuSmoothie and the parquets), so the arrival times also fix
+        the vertex along the track.
+    resolution_type : {'angular', 'energy', 'vertex'}
+        'angular' with 'direction': the 68% containment radius 1.515 sigma_eff, as
+        directional_resolution in fisher_info_helpers; with zenith / azimuth as before.
+        'vertex': sqrt of the summed variances of the scanned vertex components, in m.
     n_quad, z_range : int, (float, float)
         Quadrature grid in the flow's z. 
     n_steps : int
@@ -105,14 +142,29 @@ class FlowFisherResolutionLoss(LossFunction):
         if mode not in _MODES:
             raise ValueError(f"mode must be one of {sorted(_MODES)}")
         self.include_hit, self.include_ly, self.include_atime = _MODES[mode]
-        if resolution_type not in ('angular', 'energy'):
-            raise ValueError("resolution_type must be 'angular' or 'energy'")
+        if resolution_type not in ('angular', 'energy', 'vertex'):
+            raise ValueError("resolution_type must be 'angular', 'energy' or 'vertex'")
         self.hit_model = hit_model
         self.ly_model = ly_model
         self.atime_model = atime_model
         self.mode = mode
         self.resolution_type = resolution_type
         self.fisher_info_params = list(fisher_info_params)
+        # 'position' and 'direction' stand for their three components, in place
+        self.theta_names = [c for p in self.fisher_info_params for c in _EXPAND.get(p, (p,))]
+        if (set(self.fisher_info_params) - set(_NAMES)
+                or len(set(self.theta_names)) != len(self.theta_names)):
+            raise ValueError(f"fisher_info_params must be distinct entries of {_NAMES}, "
+                             f"got {self.fisher_info_params}")
+        if 'direction' in self.fisher_info_params and {'zenith', 'azimuth'} & set(self.theta_names):
+            raise ValueError("'direction' already holds zenith and azimuth; scan one or the other")
+        if resolution_type == 'vertex' and not set(_VERTEX) & set(self.theta_names):
+            raise ValueError("resolution_type='vertex' needs 'position' (or one of 'x', "
+                             "'y', 'z') in fisher_info_params")
+        if (resolution_type == 'angular' and 'direction' not in self.fisher_info_params
+                and not {'zenith', 'azimuth'} <= set(self.theta_names)):
+            raise ValueError("resolution_type='angular' needs 'direction' or both "
+                             "'zenith' and 'azimuth' in fisher_info_params")
         self.n_quad = int(n_quad)
         self.z_range = (float(z_range[0]), float(z_range[1]))
         self.n_steps = int(n_steps)
@@ -181,10 +233,17 @@ class FlowFisherResolutionLoss(LossFunction):
 
     def _theta0(self, ev):
         """Pack one event's parameters into the scanned theta vector."""
+        travel = _unit(*(_as_t(ev[k], self.device, self.dtype).reshape(-1)[0]
+                         for k in ('zenith', 'azimuth')))
         vals = []
-        for p in self.fisher_info_params:
-            v = float(_as_t(ev[p], self.device, self.dtype).reshape(-1)[0])
-            vals.append(v)
+        for p in self.theta_names:
+            if p in _VERTEX:
+                v = _as_t(ev['position'], self.device, self.dtype).reshape(-1)[_VERTEX.index(p)]
+            elif p in _DIRECTION:
+                v = travel[_DIRECTION.index(p)]
+            else:
+                v = _as_t(ev[p], self.device, self.dtype).reshape(-1)[0]
+            vals.append(float(v))
         return torch.tensor(vals, device=self.device, dtype=self.dtype)
 
     def _event_batch(self, evs):
@@ -203,19 +262,42 @@ class FlowFisherResolutionLoss(LossFunction):
         Every row sits at its own event's theta plus the same delta, and depends on
         nothing else, so jacfwd w.r.t. delta gives each row its own d ctx / d theta.
         """
-        idx = {p: i for i, p in enumerate(self.fisher_info_params)}
+        idx = {p: i for i, p in enumerate(self.theta_names)}
         th = eb['theta'][rows_ev]                                  # (M, P)
         vert = eb['vertex'][rows_ev]
         fixed = {p: eb[p][rows_ev] for p in ('energy', 'zenith', 'azimuth')}
 
         def build(delta):
             t = th + delta
-            e, z, a = (t[:, idx[p]] if p in idx else fixed[p]
-                       for p in ('energy', 'zenith', 'azimuth'))
-            return model.build_context(pts, vert, e, pmt_directions=dirs,
-                                       directions=_model_dir(model, z, a))
+            e = t[:, idx['energy']] if 'energy' in idx else fixed['energy']
+            return model.build_context(
+                pts, self._vertex(t, vert, idx), e, pmt_directions=dirs,
+                directions=self._model_direction(model, t, fixed['zenith'],
+                                                 fixed['azimuth'], idx))
 
         return build
+
+    @staticmethod
+    def _model_direction(model, t, zen, azi, idx):
+        """(M, 3) direction in ``model``'s convention from the theta rows t: the scanned
+        Cartesian direction, normalised, or the scanned / fixed zenith and azimuth."""
+        if _DIRECTION[0] in idx:
+            u = torch.stack([t[:, idx[c]] for c in _DIRECTION], dim=1)
+            # a unit vector: only the two components across the track carry information
+            u = u / u.norm(dim=1, keepdim=True)
+            return -u if getattr(model, 'track_dir_is_arrival', False) else u
+        z = t[:, idx['zenith']] if 'zenith' in idx else zen
+        a = t[:, idx['azimuth']] if 'azimuth' in idx else azi
+        return _model_dir(model, z, a)
+
+    @staticmethod
+    def _vertex(t, vert, idx):
+        """(M, 3) vertex: the scanned components from the theta rows t, the rest from vert."""
+        if not any(c in idx for c in _VERTEX):
+            return vert
+        # stacked, not written in place: jacfwd cannot batch into a plain tensor
+        return torch.stack([t[:, idx[c]] if c in idx else vert[:, k]
+                            for k, c in enumerate(_VERTEX)], dim=1)
 
     # ------------------------------------------------------------- score terms
 
@@ -425,25 +507,23 @@ class FlowFisherResolutionLoss(LossFunction):
         return F
 
     def _scores_time(self, at, build, theta, t_hit, pts, rows_ev, eb, chunk):
-        """Arrival-time scores, including the theta-dependence of t_geom.
+        """Arrival-time scores, including the theta-dependence of t_geom (direction and
+        vertex).
 
         ``theta`` is the shared delta of _ctx_builder, so rows may mix events.
         """
         M, K = t_hit.shape
         P = theta.shape[0]
-        iz = self.fisher_info_params.index('zenith') \
-            if 'zenith' in self.fisher_info_params else None
-        ia = self.fisher_info_params.index('azimuth') \
-            if 'azimuth' in self.fisher_info_params else None
+        idx = {p: i for i, p in enumerate(self.theta_names)}
         th = eb['theta'][rows_ev]
         vert = eb['vertex'][rows_ev]
         zf, af = eb['zenith'][rows_ev], eb['azimuth'][rows_ev]
 
         def t_res_of(delta, sl):
-            z = th[sl, iz] + delta[iz] if iz is not None else zf[sl]
-            a = th[sl, ia] + delta[ia] if ia is not None else af[sl]
-            tg = at.geometric_time(pts[sl], vert[sl],
-                                   directions=_model_dir(at, z, a)).reshape(-1, 1)
+            t = th[sl] + delta
+            tg = at.geometric_time(
+                pts[sl], self._vertex(t, vert[sl], idx),
+                directions=self._model_direction(at, t, zf[sl], af[sl], idx)).reshape(-1, 1)
             return (t_hit[sl] - tg).reshape(-1)
 
         keep = self._track
@@ -523,7 +603,7 @@ class FlowFisherResolutionLoss(LossFunction):
         M = n_pts * K_pmt
         pts = pts3.repeat_interleave(K_pmt, 0)                     # (M, 3)
         dirs = self._pmt_dirs.repeat(n_pts, 1)
-        P = len(self.fisher_info_params)
+        P = len(self.theta_names)
         n_ev = len(signal_event_params)
 
         om_str, n_str = self._om_to_string(pts3, string_xy)
@@ -570,7 +650,7 @@ class FlowFisherResolutionLoss(LossFunction):
         pts3 = _as_t(om_positions, self.device, self.dtype).reshape(-1, 3).detach()
         ev_idx = torch.as_tensor(event_index, device=self.device).long().reshape(-1)
         N, K_pmt = pts3.shape[0], self._pmt_dirs.shape[0]
-        P = len(self.fisher_info_params)
+        P = len(self.theta_names)
         self._track = False
         gen = None
         if self.hit_sample_seed is not None:
@@ -662,7 +742,7 @@ class FlowFisherResolutionLoss(LossFunction):
     # --------------------------------------------------------------- resolution
 
     def _resolution(self, F, signal_event_params, use_relative_energy):
-        names = self.fisher_info_params
+        names = self.theta_names
         n, P = F.shape[0], F.shape[-1]
 
         # Invert in scaled units: energy measured in E_true, angles in radians.
@@ -680,12 +760,34 @@ class FlowFisherResolutionLoss(LossFunction):
             d[:, names.index('energy')] = E
         dd = d.unsqueeze(2) * d.unsqueeze(1)                    # (n, P, P), d_i d_j
 
-        eye = torch.eye(P, device=self.device, dtype=F.dtype)
         Fs = dd * F
+        idir = [names.index(c) for c in _DIRECTION if c in names]
+        T = None
+        if idir:
+            # F is singular along the track for a unit-vector direction: invert in the
+            # (P - 1) coordinates with the direction in the plane across the track,
+            # cov = T (T^T F T)^-1 T^T, which is still the exact marginal covariance
+            other = [i for i in range(P) if i not in idir]
+            travel = _unit(*(torch.stack([_as_t(p[k], self.device, self.dtype).reshape(())
+                                          for p in signal_event_params])
+                             for k in ('zenith', 'azimuth')))
+            T = torch.zeros(n, P, P - 1, device=self.device, dtype=F.dtype)
+            T[:, other, torch.arange(len(other))] = 1.0
+            T[:, idir, len(other):] = _tangent_basis(travel)
+            Fs = T.transpose(1, 2) @ Fs @ T
+        eye = torch.eye(Fs.shape[-1], device=self.device, dtype=F.dtype)
         try:
-            cov = dd * torch.linalg.inv(Fs + 1e-20 * eye)
+            inner = torch.linalg.inv(Fs + 1e-20 * eye)
         except Exception:
-            cov = dd * torch.linalg.pinv(Fs + 1e-20 * eye)
+            inner = torch.linalg.pinv(Fs + 1e-20 * eye)
+        cov = dd * (inner if T is None else T @ inner @ T.transpose(1, 2))
+        if self.resolution_type == 'vertex':
+            iv = [names.index(c) for c in _VERTEX if c in names]
+            return torch.sqrt(cov[:, iv, iv].sum(1).clamp_min(0.0))
+        if self.resolution_type == 'angular' and idir:
+            # 68% containment of the Gaussian across the track, as directional_resolution
+            c2 = inner[:, -2:, -2:].diagonal(dim1=1, dim2=2).sum(1)
+            return 1.515 * torch.sqrt((0.5 * c2).clamp_min(0.0))
         if self.resolution_type == 'angular':
             iz, ia = names.index('zenith'), names.index('azimuth')
             zen = torch.stack([_as_t(p['zenith'], self.device, self.dtype).reshape(())
@@ -797,8 +899,7 @@ class FlowFisherResolutionLoss(LossFunction):
                 corr = (p3 * G).sum()
                 total = total + (corr - corr.detach())
 
-        key = ('angular_resolution' if self.resolution_type == 'angular'
-               else 'energy_resolution')
+        key = f'{self.resolution_type}_resolution'
         return {f'{key}_loss': total, f'{key}_per_event': res,
                 'resolution_params': params,
                 'fisher_info_per_string_per_event': F_str.detach()}

@@ -8,7 +8,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader, BatchSampler, RandomSampler, SequentialSampler
 
 from nugget.surrogates.FlowMatchLY import (FlowMatchLY, _reseed_dataset_rng_in_worker,
-                                           _event_split)
+                                           _event_split, through_going_mask,
+                                           _resolve_pin_memory)
 
 
 # --------------------------------------------------------------------------- #
@@ -77,10 +78,10 @@ class HitLabelDataset(Dataset):
         self._n_geo = len(geo)
 
         from nugget.utils.parquet_io import read_parquet_columns    # lepton_* -> muon_*
+        ecol = model.energy_column
         df = read_parquet_columns(parquet_path,
                                   ['run_id', 'event_id', 'string', 'om', 'pmt',
-                                   'muon_x', 'muon_y', 'muon_z',
-                                   'neutrino_energy', 'zenith', 'azimuth'],
+                                   'muon_x', 'muon_y', 'muon_z', ecol, 'zenith', 'azimuth'],
                                   events=event_filter)
 
         half = self._domain_half_extent()
@@ -108,7 +109,7 @@ class HitLabelDataset(Dataset):
         first[codes[::-1]] = np.arange(len(codes) - 1, -1, -1)   # first row per event
         self._ev_vertex = np.ascontiguousarray(
             df[['muon_x', 'muon_y', 'muon_z']].to_numpy(np.float32)[first])
-        self._ev_energy = df.neutrino_energy.to_numpy(np.float32)[first]
+        self._ev_energy = df[ecol].to_numpy(np.float32)[first]
         self._ev_zenith = df.zenith.to_numpy(np.float32)[first]
         self._ev_azimuth = df.azimuth.to_numpy(np.float32)[first]
 
@@ -116,6 +117,15 @@ class HitLabelDataset(Dataset):
         # searchsorted on this beats a Python set both in memory and in speed, and
         # 10.2e9 candidate cells makes enumeration impossible.
         gidx = df['_gidx'].to_numpy(np.int64)
+        # through-going: only (event, PMT) cells passing the cut exist, for both classes;
+        # the events still come from every row so their valid unlit PMTs stay negatives
+        self._through = bool(getattr(model, 'through_going', False))
+        if self._through:
+            ok = self._valid(codes, gidx)
+            if verbose:
+                print(f"HitLabelDataset: through-going cut kept {ok.sum():,}/{len(ok):,} hits "
+                      f"(emission point >= {model.through_min_upstream:g} m past the vertex)")
+            codes, gidx = codes[ok], gidx[ok]
         self._hit_key = np.sort(codes * self._n_geo + gidx)
         self._n_hits = len(self._hit_key)
         # hits per event: the stratification axis, and identical to _ev_hit_count
@@ -123,6 +133,12 @@ class HitLabelDataset(Dataset):
                                     minlength=self._n_events).astype(np.int64)
 
         cells = self._n_events * self._n_geo
+        if self._through:
+            # valid share of all cells, by Monte Carlo (enumerating them is impossible)
+            m = 2_000_000
+            frac = self._valid(self._rng.integers(0, self._n_events, size=m),
+                               self._rng.integers(0, self._n_geo, size=m)).mean()
+            cells = max(int(round(frac * cells)), self._n_hits + 1)
         self.p_hit = self._n_hits / cells
         self.log_prior_odds = float(np.log(self._n_hits / max(cells - self._n_hits, 1)))
 
@@ -152,7 +168,7 @@ class HitLabelDataset(Dataset):
 
         if verbose:
             print(f"HitLabelDataset: {self._n_hits:,} hits, {self._n_events:,} events, "
-                  f"{self._n_geo:,} PMTs")
+                  f"{self._n_geo:,} PMTs; energy from '{ecol}'")
             print(f"  {cells:,} (event, PMT) cells -> occupancy "
                   f"P(hit) = {self.p_hit:.6g} ({100*self.p_hit:.4f}%)")
             if self.uniform_energy_zenith:
@@ -213,6 +229,16 @@ class HitLabelDataset(Dataset):
             return self._bin_flat[self._bin_starts[b] + offs]
         return self._rng.integers(0, self._n_events, size=n)
 
+    def _valid(self, ev, gidx):
+        """True where (event, PMT) passes the through-going cut (always, without it)."""
+        if not getattr(self, '_through', False):
+            return np.ones(len(ev), dtype=bool)
+        m = self.model
+        return through_going_mask(self._geo_pos[gidx], self._ev_vertex[ev],
+                                  self._ev_zenith[ev], self._ev_azimuth[ev],
+                                  m.track_dir_is_arrival, m.through_min_upstream,
+                                  getattr(m, 'refractive_index', 1.33))
+
     def _is_hit(self, ev, gidx):
         key = ev * self._n_geo + gidx
         pos = np.searchsorted(self._hit_key, key)
@@ -231,6 +257,14 @@ class HitLabelDataset(Dataset):
         if self.importance_weight:
             # stratified event, then one of ITS hits, so both classes share g(ev)
             ev_p = self._sample_events(n_pos)
+            # the through-going cut can leave an event without hits; it has no positives
+            for _ in range(100):
+                empty = self._ev_hit_count[ev_p] == 0
+                if not empty.any():
+                    break
+                ev_p[empty] = self._sample_events(int(empty.sum()))
+            ev_p = ev_p[self._ev_hit_count[ev_p] > 0]
+            n_pos = len(ev_p)
             k = (self._rng.random(n_pos) * self._ev_hit_count[ev_p]).astype(np.int64)
             np.minimum(k, self._ev_hit_count[ev_p] - 1, out=k)
             hk = self._hit_key[self._ev_hit_start[ev_p] + k]
@@ -241,14 +275,18 @@ class HitLabelDataset(Dataset):
         # --- negatives: (event, PMT) pairs that are not hits ---
         ev_n = self._sample_events(n_neg)
         gi_n = self._rng.integers(0, self._n_geo, size=n_neg)
-        bad = self._is_hit(ev_n, gi_n)
-        for _ in range(20):                      # occupancy ~1e-4: converges at once
+        bad = self._is_hit(ev_n, gi_n) | ~self._valid(ev_n, gi_n)
+        # occupancy ~1e-4 converges at once; the through-going cut rejects more
+        for _ in range(100 if self._through else 20):
             k = int(bad.sum())
             if k == 0:
                 break
             ev_n[bad] = self._sample_events(k)
             gi_n[bad] = self._rng.integers(0, self._n_geo, size=k)
-            bad = self._is_hit(ev_n, gi_n)
+            bad = self._is_hit(ev_n, gi_n) | ~self._valid(ev_n, gi_n)
+        if self._through and bad.any():
+            ev_n, gi_n = ev_n[~bad], gi_n[~bad]
+            n_neg = len(ev_n)
 
         ev = np.concatenate([ev_p, ev_n])
         gi = np.concatenate([gi_p, gi_n])
@@ -555,10 +593,7 @@ class HitClassifier(FlowMatchLY):
             filter_vertex_in_domain=filter_vertex_in_domain,
             event_filter=train_filter)
 
-        if pin_memory is None:
-            # pinning targets the current CUDA device (cuda:0 unless set), so only
-            # pin when the model is on a GPU
-            pin_memory = torch.device(self.device).type == 'cuda'
+        pin_memory = _resolve_pin_memory(self.device, pin_memory)
         base = RandomSampler(ds) if shuffle else SequentialSampler(ds)
         kw = dict(dataset=ds, batch_size=None,
                   sampler=BatchSampler(base, batch_size=batch_size, drop_last=False),

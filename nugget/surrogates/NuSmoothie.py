@@ -43,7 +43,8 @@ class NuSmoothie(Surrogate):
     _CTX_FLAGS = ('rich_rel_pos_mode', 'include_vertex_position',
                   'add_vertex_distance', 'add_distance_from_beam',
                   'add_dist_long', 'track_dir_is_arrival',
-                  'add_pmt_direction', 'add_pmt_cosangle', 'include_direction')
+                  'add_pmt_direction', 'add_pmt_cosangle', 'include_direction',
+                  'through_going')
 
     # every key of a PATD dict (LightSabrePATD layout)
     _PATD_KEYS = ('hit_times', 'num_photons', 'expected_photons', 'residual_times',
@@ -147,10 +148,19 @@ class NuSmoothie(Surrogate):
                     m.net.to(torch.float32)
         if self.patd_mode and self.atime_model is None:
             raise ValueError("patd_mode=True requires an arrival-time model")
+        # event_params['energy'] feeds all three models, so it must mean the same energy
+        etypes = {n: getattr(m, 'energy_type', 'neutrino') for n, m in self._named_models()}
+        if len(set(etypes.values())) > 1:
+            raise ValueError(f"the models were trained on different energies {etypes}")
+        self.energy_type = next(iter(etypes.values()))
 
-        # refractive index follows the arrival-time model, whose t_geom defines it
+        # refractive indices follow the arrival-time model, whose t_geom defines them:
+        # phase (Cherenkov angle, emission point) and group (photon speed)
+        self.group_index = self.refractive_index
         if self.atime_model is not None:
             self.refractive_index = float(self.atime_model.refractive_index)
+            self.group_index = float(getattr(self.atime_model, 'group_index',
+                                             self.refractive_index))
 
         self._pmt_template_src = 'explicit'
         if pmt_directions is not None:
@@ -211,7 +221,7 @@ class NuSmoothie(Surrogate):
     def _report(self):
         print(f"NeuralSabre: particle_mode={self.particle_mode}, "
               f"patd_mode={self.patd_mode}, pmt_mode={self.pmt_mode}, "
-              f"n={self.refractive_index}")
+              f"n={self.refractive_index}, n_g={self.group_index}, energy={self.energy_type}")
         for name, m in self._named_models():
             print(f"  {name:6s} context_dim={m.context_dim:3d} "
                   f"device={m.device} dtype={m.param_dtype}")
@@ -379,8 +389,8 @@ class NuSmoothie(Surrogate):
     def _track_geometry(self, pts, vertex, travel_dir):
         """Direct-Cherenkov geometry, consistent with FlowMatchATime.geometric_time.
 
-        t_geom = [d_along + d_perp (n - cos_c)/sin_c] / c
-               = s_emit / c + d_geom . n / c
+        t_geom = [d_along + d_perp (n_g - cos_c)/sin_c] / c,  cos_c = 1/n
+               = s_emit / c + d_geom . n_g / c
         so s_emit and d_geom below are exactly the emission point and photon path
         length the arrival-time model's t_geom implies. vertex / travel_dir may be
         one event (3,) or one per row (M, 3).

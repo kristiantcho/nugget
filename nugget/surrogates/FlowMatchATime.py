@@ -6,7 +6,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader, BatchSampler, RandomSampler, SequentialSampler
 
 from nugget.surrogates.FlowMatchLY import (
-    FlowMatchLY, _reseed_dataset_rng_in_worker, _event_split,
+    FlowMatchLY, _reseed_dataset_rng_in_worker, _event_split, _through_cut,
+    _resolve_pin_memory,
 )
 
 C_VAC = 0.299792458          # speed of light in vacuum, m/ns
@@ -128,9 +129,9 @@ class ArrivalTimeFlowDataset(Dataset):
                           usecols=['string', 'om', 'pmt', 'om_x', 'om_y', 'om_z',
                                    'pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z'])
 
+        ecol = model.energy_column
         scalar_cols = ['run_id', 'event_id', 'string', 'om', 'pmt',
-                       'muon_x', 'muon_y', 'muon_z', 'neutrino_energy',
-                       'zenith', 'azimuth']
+                       'muon_x', 'muon_y', 'muon_z', ecol, 'zenith', 'azimuth']
         from nugget.utils.parquet_io import read_parquet_columns    # lepton_* -> muon_*
         df = read_parquet_columns(parquet_path, scalar_cols + ['times'],
                                   events=event_filter)
@@ -148,7 +149,8 @@ class ArrivalTimeFlowDataset(Dataset):
             kind = ('scalar (1 photon/row)' if counts_all.max() <= 1
                     else 'ragged list per row')
             print(f"ArrivalTimeFlowDataset: 'times' layout = {kind}; "
-                  f"{flat_all.size:,} photons over {len(counts_all):,} rows")
+                  f"{flat_all.size:,} photons over {len(counts_all):,} rows; energy from "
+                  f"'{ecol}'")
         starts_all = np.concatenate([[0], np.cumsum(counts_all)[:-1]]).astype(np.int64)
         df = df.drop(columns=['times'])
         df['_orig'] = np.arange(len(df), dtype=np.int64)
@@ -163,6 +165,8 @@ class ArrivalTimeFlowDataset(Dataset):
                       f"muon vertex outside {half.tolist()}")
 
         df = df.merge(geo, on=['string', 'om', 'pmt'], how='inner', copy=False)
+        if getattr(model, 'through_going', False):
+            df = _through_cut(model, df, verbose, 'ArrivalTimeFlowDataset')
         if len(df) == 0:
             raise ValueError("No usable rows: parquet and geometry CSV do not overlap "
                              "(or every vertex fell outside the domain).")
@@ -176,7 +180,7 @@ class ArrivalTimeFlowDataset(Dataset):
             df[['pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z']].to_numpy(np.float32))
         self._muon_pos = np.ascontiguousarray(
             df[['muon_x', 'muon_y', 'muon_z']].to_numpy(np.float32))
-        self._energy = df.neutrino_energy.to_numpy(np.float32)
+        self._energy = df[ecol].to_numpy(np.float32)
         self._zenith = df.zenith.to_numpy(np.float32)
         self._azimuth = df.azimuth.to_numpy(np.float32)
         codes, _ = pd.factorize(
@@ -409,7 +413,7 @@ class FlowMatchATime(FlowMatchLY):
     _PARTICLE_MODES = {'track': 'track', 'muon': 'track',
                        'cascade': 'cascade', 'electron': 'cascade'}
 
-    def __init__(self, *args, refractive_index=1.33, time_scale=10.0,
+    def __init__(self, *args, refractive_index=1.33, group_index=None, time_scale=10.0,
                  time_transform='asinh', particle_mode='track',
                  track_dir_is_arrival=True, **kwargs):
         # track_dir_is_arrival defaults to True here (unlike the light-yield model):
@@ -417,7 +421,11 @@ class FlowMatchATime(FlowMatchLY):
         # time is badly wrong under the other convention -- measured median residual
         # 6.9 ns with -direction versus 2769 ns with +direction.
         super().__init__(*args, track_dir_is_arrival=track_dir_is_arrival, **kwargs)
+        # refractive_index (phase) sets the Cherenkov angle, group_index the light's speed
+        # (None = the same). The muon parquets' prompt edge drifts 0.27 ns/m with d_perp
+        # under 1.33/1.33, as expected for seawater's ~1.35/1.38.
         self.refractive_index = float(refractive_index)
+        self.group_index = float(refractive_index if group_index is None else group_index)
         self.time_scale = float(time_scale)
         self.time_transform = time_transform
         if time_transform not in ('asinh', 'symlog'):
@@ -432,9 +440,10 @@ class FlowMatchATime(FlowMatchLY):
                        directions=None):
         """Earliest direct-light arrival time at each point, in ns.
 
-        track:   t_geom = [ d_along + d_perp * (n - cos_c) / sin_c ] / c,  cos_c = 1/n
-                 with d_along/d_perp along the muon TRAVEL direction from the vertex.
-        cascade: t_geom = n * |x - vertex| / c, light straight from the vertex; the
+        track:   t_geom = [ d_along + d_perp * (n_g - cos_c) / sin_c ] / c,  cos_c = 1/n
+                 with d_along/d_perp along the muon TRAVEL direction from the vertex,
+                 n = refractive_index (phase) and n_g = group_index.
+        cascade: t_geom = n_g * |x - vertex| / c, light straight from the vertex; the
                  direction is not used.
         Differentiable in the event parameters.
         """
@@ -445,7 +454,7 @@ class FlowMatchATime(FlowMatchLY):
         dev, dt = pts.device, pts.dtype
         vert = vertices.reshape(-1, 3).to(device=dev, dtype=dt)
         if self.particle_mode == 'cascade':
-            return self.refractive_index * torch.linalg.norm(pts - vert, dim=1) / C_VAC
+            return self.group_index * torch.linalg.norm(pts - vert, dim=1) / C_VAC
         if directions is not None:
             u = directions.reshape(-1, 3).to(device=dev, dtype=dt)
         else:
@@ -459,10 +468,9 @@ class FlowMatchATime(FlowMatchLY):
         d_along = (rel * travel).sum(1)
         d_perp = torch.linalg.norm(rel - d_along.unsqueeze(1) * travel, dim=1)
 
-        n = self.refractive_index
-        cos_c = 1.0 / n
+        cos_c = 1.0 / self.refractive_index
         sin_c = math.sqrt(max(1.0 - cos_c ** 2, 1e-12))
-        return (d_along + d_perp * (n - cos_c) / sin_c) / C_VAC
+        return (d_along + d_perp * (self.group_index - cos_c) / sin_c) / C_VAC
 
     def time_residual(self, t_hit, points, vertices, zeniths=None, azimuths=None,
                       directions=None):
@@ -599,6 +607,7 @@ class FlowMatchATime(FlowMatchLY):
         super().save_model(filepath, state=state)
         ck = torch.load(filepath, map_location='cpu', weights_only=False)
         ck.update({'refractive_index': self.refractive_index,
+                   'group_index': self.group_index,
                    'time_scale': self.time_scale,
                    'time_transform': self.time_transform,
                    'particle_mode': self.particle_mode,
@@ -614,6 +623,8 @@ class FlowMatchATime(FlowMatchLY):
             else:
                 print(f"load_model: {k} not found in checkpoint; using default")
                 setattr(self, k, getattr(self, k))
+        # checkpoints from before group_index used one index for angle and speed
+        self.group_index = float(ck.get('group_index', self.refractive_index))
         return super().load_model(filepath)
 
     # ---------------- dataloaders ----------------
@@ -644,10 +655,7 @@ class FlowMatchATime(FlowMatchLY):
             max_photons_per_row=max_photons_per_row,
             event_filter=train_filter)
 
-        if pin_memory is None:
-            # pinning targets the current CUDA device (cuda:0 unless set), so only
-            # pin when the model is on a GPU
-            pin_memory = torch.device(self.device).type == 'cuda'
+        pin_memory = _resolve_pin_memory(self.device, pin_memory)
         base = RandomSampler(ds) if shuffle else SequentialSampler(ds)
         kw = dict(dataset=ds, batch_size=None,
                   sampler=BatchSampler(base, batch_size=batch_size, drop_last=False),

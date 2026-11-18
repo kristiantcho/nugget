@@ -132,10 +132,10 @@ class FlavorDataset(Dataset):
         return self.num_samples_per_epoch
 
     def get_batch(self, indices, masked=True):
-        """(feats, mask, glob, label, source index, log10 E)."""
+        """(feats, mask, glob, label, source index, log10 E, event index within the source)."""
         n = len(np.asarray(indices).reshape(-1))
         labels, src = self._sample_sources(n)
-        out, le = [], np.empty(n, dtype=np.float32)
+        out, le, ev = [], np.empty(n, dtype=np.float32), np.empty(n, dtype=np.int64)
         for i, s in enumerate(src):
             ds = self.sources[s]
             # an event that loses every pulse or fails the trigger would not have been
@@ -150,9 +150,10 @@ class FlavorDataset(Dataset):
                                    f"{self.max_redraws} draws; use more strings")
             out.append(tok)
             le[i] = ds._log10e[e]
+            ev[i] = e
         feats, mask, glob = pad_events(out)
         return (feats, mask, glob, torch.from_numpy(labels.astype(np.float32)),
-                torch.from_numpy(src), torch.from_numpy(le))
+                torch.from_numpy(src), torch.from_numpy(le), torch.from_numpy(ev))
 
     def __getitem__(self, idx):
         if isinstance(idx, slice):
@@ -314,16 +315,19 @@ class FlavorClassifier:
 
     @torch.no_grad()
     def predict_dataloader(self, dataloader, max_batches=None):
-        """Numpy logit, label, source index and log10 E over (up to max_batches of) a loader."""
+        """Numpy logit, label, source index, log10 E, event index within the source and number
+        of hit PMTs over (up to max_batches of) a loader."""
         self.net.eval()
-        out = {k: [] for k in ('logit', 'label', 'source', 'log10_energy')}
-        for i, (feats, mask, glob, y, s, le) in enumerate(dataloader):
+        out = {k: [] for k in ('logit', 'label', 'source', 'log10_energy', 'event', 'n_pmt')}
+        for i, (feats, mask, glob, y, s, le, ev) in enumerate(dataloader):
             if max_batches is not None and i >= max_batches:
                 break
             out['logit'].append(self.logits(feats, mask, glob).float().cpu())
             out['label'].append(y)
             out['source'].append(s)
             out['log10_energy'].append(le)
+            out['event'].append(ev)
+            out['n_pmt'].append(glob[:, 0].long())
         return {k: torch.cat(v).numpy() for k, v in out.items()}
 
     def evaluate(self, dataloader, max_batches=None):

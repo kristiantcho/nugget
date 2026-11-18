@@ -984,10 +984,31 @@ class ROVPenalty(LossFunction):
                  'rov_least_blocked_angle_per_string' (N,).
 
         """
-        points = geom_dict.get('string_xy', None)
+        string_points = geom_dict.get('string_xy', None)
+        cjb_points = geom_dict.get('cjb_xy', None)
+        cjb_probs = geom_dict.get('cjb_weights', None)
         num_angles = kwargs.get('num_angles', 6)
         string_weights = geom_dict.get('string_weights', None)
         string_probs = torch.sigmoid(string_weights) if string_weights is not None else None
+
+        # --- Optional CJBs: treated exactly like (weighted) strings. ---
+        # Strings and CJBs are stacked into one point set so that each one's ROV
+        # corridor is blocked by both strings and CJBs. The combined loss is
+        # reported in 'rov_penalty'; per-object outputs are split back apart.
+        N_strings = string_points.shape[0]
+        has_cjbs = cjb_points is not None and cjb_points.numel() > 0
+        if has_cjbs:
+            cjb_points = cjb_points.to(device=string_points.device, dtype=string_points.dtype)
+            N_cjbs = cjb_points.shape[0]
+            if cjb_probs is None:
+                cjb_probs = torch.ones(N_cjbs, device=string_points.device, dtype=string_points.dtype)
+            if string_probs is None:
+                string_probs = torch.ones(N_strings, device=string_points.device, dtype=string_points.dtype)
+            points = torch.cat([string_points, cjb_points], dim=0)
+            string_probs = torch.cat([string_probs.to(dtype=string_points.dtype), cjb_probs], dim=0)
+        else:
+            N_cjbs = 0
+            points = string_points
 
         # - soft_inside=False: use hard boolean masks for corridor membership (non-differentiable w.r.t. positions)
         # - angle_softmin_tau=0.0: use hard min over angles (non-differentiable at argmin switches)
@@ -1102,11 +1123,16 @@ class ROVPenalty(LossFunction):
 
         # least_blocked_angle_deg_per_string = least_blocked_angle_per_string * (180.0 / torch.pi)
         penalty_per_string = torch.clamp(penalty_per_string, min=0.0)  # Ensure non-negative for reporting
-        return {
-            'rov_penalty': loss / N,
-            'rov_penalty_per_string': penalty_per_string / N,
-            'rov_least_blocked_angle_per_string': least_blocked_angle_per_string,
+        penalty_per_string = penalty_per_string / N
+        out = {
+            'rov_penalty': loss / N,  # combined over strings + CJBs
+            'rov_penalty_per_string': penalty_per_string[:N_strings],
+            'rov_least_blocked_angle_per_string': least_blocked_angle_per_string[:N_strings],
         }
+        if has_cjbs:
+            out['cjb_rov_penalty_per_string'] = penalty_per_string[N_strings:]
+            out['cjb_rov_least_blocked_angle_per_string'] = least_blocked_angle_per_string[N_strings:]
+        return out
 
 class DiversityPenalty(LossFunction):
     """Loss function for diversity penalty to encourage diversity among optimal geometries."""

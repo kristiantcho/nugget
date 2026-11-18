@@ -29,7 +29,7 @@ clf = nugget.losses.flavor_classifier.FlavorClassifier(
     # --- classifier head ---
     head_width=256,
     head_depth=2,
-    head_dropout=0.1,
+    head_dropout=0.0,
 
     # --- token transforms (thesis Eq. 8.2) ---
     length_scale=500.0,
@@ -61,13 +61,13 @@ data_kw = dict(
     pulse_params=None,
     require_trigger=False,
     # every event in its own random sub-geometry, as for the reco flow
-    n_strings_range=(10, 300),
-    om_drop_prob=0.5,
+    n_strings_range=(50, 300),
+    om_drop_prob=0.2,
     om_drop_range=(0.0, 0.5),
-    silent_tokens='oms',
+    silent_tokens='strings',
     max_tokens=20000,
     batch_size=64,
-    num_workers=8,
+    num_workers=4,
 )
 
 train_dataloader = clf.create_flavor_dataloader(
@@ -90,7 +90,7 @@ history = clf.train_with_dataloader(
     val_dataloader=val_dataloader,
     epochs=EPOCHS,
     grad_clip=3.0,
-    early_stopping_patience=30,
+    early_stopping_patience=50,
     save_every_n_epochs=5,
     checkpoint_path=CHECKPOINT,
 )

@@ -16,7 +16,7 @@ from torch.utils.data import Dataset, DataLoader, BatchSampler, RandomSampler, S
 
 from nugget.surrogates.base_surrogate import Surrogate
 from nugget.surrogates.FlowMatchLY import (
-    TimeEmbedding, _reseed_dataset_rng_in_worker, _event_split,
+    TimeEmbedding, _reseed_dataset_rng_in_worker, _event_split, _resolve_pin_memory,
 )
 from nugget.surrogates.FlowMatchATime import _ragged_indices
 
@@ -747,7 +747,7 @@ class RecoFlowDataset(Dataset):
                  n_strings_range=(10, 150), om_drop_prob=0.5, om_drop_range=(0.0, 0.5),
                  max_tokens=None, feature_set='essential', silent_tokens=False,
                  uniform_energy_zenith=False, n_energy_bins=20, n_coszen_bins=20,
-                 event_filter=None, max_redraws=1000, verbose=True):
+                 event_filter=None, max_redraws=1000, event_columns=(), verbose=True):
         import pandas as pd
         import pyarrow.compute as pc
         from nugget.utils.parquet_io import (
@@ -789,13 +789,17 @@ class RecoFlowDataset(Dataset):
         else:
             raise ValueError(f"{parquet_path} has neither a 'times' (list mode) nor a "
                              "'time' (photon mode) column; light-yield files carry no times")
-        cols = ['run_id', 'event_id', 'string', 'om', 'pmt', tcol, ecol, 'zenith', 'azimuth']
+        # extra per-event columns (self.event_columns), taken from each event's first row
+        extra = {c: c if c in names else LEPTON_ALIASES.get(c, c) for c in event_columns}
+        cols = list(dict.fromkeys(['run_id', 'event_id', 'string', 'om', 'pmt', tcol, ecol,
+                                   'zenith', 'azimuth', *extra.values()]))
         batches = (_iter_batches(parquet_path, cols) if event_filter is None
                    else _filtered_batches(parquet_path, cols, event_filter))
 
         int_cols = {'run': 'run_id', 'event': 'event_id', 'string': 'string', 'om': 'om',
                     'pmt': 'pmt'}
-        flt_cols = {'E': ecol, 'zen': 'zenith', 'azi': 'azimuth'}
+        flt_cols = {'E': ecol, 'zen': 'zenith', 'azi': 'azimuth',
+                    **{f'event:{c}': col for c, col in extra.items()}}
         parts = {k: [] for k in [*int_cols, *flt_cols, 'n']}
         flat = []
         for b in batches:
@@ -849,6 +853,7 @@ class RecoFlowDataset(Dataset):
                              axis=1).astype(np.float32)
         self._zenith = zen.astype(np.float32)
         self._azimuth = azi.astype(np.float32)
+        self.event_columns = {c: r[f'event:{c}'][first] for c in extra}
         self._n_events = len(first)
         self.num_samples_per_epoch = (int(num_events_per_epoch) if num_events_per_epoch
                                       else self._n_events)
@@ -902,17 +907,18 @@ class RecoFlowDataset(Dataset):
         """(mu, sigma) of log10 E over the events."""
         return float(self._log10e.mean()), float(self._log10e.std())
 
-    def tokens(self, e, masked=True):
+    def tokens(self, e, masked=True, om_active=None):
         """Tokens of event e in a freshly sampled sub-geometry (masked=False: the whole
-        geometry), after pulses and trigger; None if no hit survives."""
+        geometry; om_active: this bool mask over OMs instead), after pulses and trigger; None
+        if no hit survives."""
         rng, geo = self._rng, self.geometry
         rows = np.arange(self._ev_start[e], self._ev_end[e])
         g = self._row_geo[rows].astype(np.int64)
-        om_active = None
-        if masked:
+        if om_active is None and masked:
             # drawn independently of the event, so given the geometry the events keep their
             # true (triggered) distribution; only how often each geometry is seen changes
             om_active = geo.sample_active(rng, **self.masking)
+        if om_active is not None:
             keep = om_active[geo.pmt_om[g]]
             rows, g = rows[keep], g[keep]
             if len(rows) == 0:
@@ -1477,8 +1483,7 @@ class FlowMatchReco(Surrogate):
             uniform_energy_zenith=uniform_energy_zenith, n_energy_bins=n_energy_bins,
             n_coszen_bins=n_coszen_bins, event_filter=train_filter)
 
-        if pin_memory is None:
-            pin_memory = torch.device(self.device).type == 'cuda'
+        pin_memory = _resolve_pin_memory(self.device, pin_memory)
         base = RandomSampler(ds) if shuffle else SequentialSampler(ds)
         kw = dict(dataset=ds, batch_size=None,
                   sampler=BatchSampler(base, batch_size=batch_size, drop_last=False),
