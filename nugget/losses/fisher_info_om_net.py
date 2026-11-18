@@ -8,6 +8,11 @@ import numpy as np
 import torch
 
 from nugget.losses.base_loss import LossFunction
+from nugget.losses.fisher_info_flow import _VERTEX
+
+# default param_scales of the vertex components: the Fisher of x / 1000 m, whose per-OM
+# entries sit level with the angular ones and far above eps_floor
+VERTEX_SCALE = 1000.0
 
 
 def _as_t(x, device, dtype=torch.float64):
@@ -65,7 +70,11 @@ def resolution_from_fisher(F, fisher_params, energy, zenith, resolution_type='an
 
 def resolution_from_covariance(cov, fisher_params, energy, zenith, resolution_type='angular',
                                use_relative_energy=False):
-    """Per-event angular (rad) or energy (GeV, or relative) resolution from (n, P, P) covariances."""
+    """Per-event angular (rad), energy (GeV, or relative) or vertex (m, over the scanned
+    components) resolution from (n, P, P) covariances."""
+    if resolution_type == 'vertex':
+        iv = [fisher_params.index(c) for c in _VERTEX if c in fisher_params]
+        return torch.sqrt(cov[:, iv, iv].sum(1).clamp_min(0.0))
     if resolution_type == 'angular':
         iz, ia = fisher_params.index('zenith'), fisher_params.index('azimuth')
         s = torch.sin(zenith)
@@ -90,11 +99,18 @@ class OMFisherTargets:
     in d_long_range (from the vertex, along the travel direction), uniform azimuth.
     A fraction uniform_frac is uniform in a cube of half-size uniform_half_size about
     the vertex, so far regions are covered too.
+
+    region (dict: center, radius, height of the cylinder the detector can occupy) places
+    the OMs around the detector instead, for samplers whose vertices lie far from it
+    (RangeSampler): d_long uniform over the track's passage through the cylinder, extended
+    by d_perp_range[1] on each side (around its closest approach to the centre if it
+    misses), and the uniform fraction inside the cylinder. d_long_range and
+    uniform_half_size are then unused.
     """
 
     def __init__(self, fisher_loss, sampler, oms_per_event=64, d_perp_range=(1.0, 400.0),
                  d_long_range=(-200.0, 1500.0), uniform_frac=0.1, uniform_half_size=600.0,
-                 chunk=8192, seed=None):
+                 region=None, chunk=8192, seed=None):
         if fisher_loss.sample_hits:
             print("OMFisherTargets: fisher_loss.sample_hits=True samples the hit "
                   "selection; use sample_hits=False for exact targets.")
@@ -102,11 +118,39 @@ class OMFisherTargets:
         self.oms_per_event, self.chunk = int(oms_per_event), int(chunk)
         self.d_perp_range, self.d_long_range = tuple(d_perp_range), tuple(d_long_range)
         self.uniform_frac, self.uniform_half_size = float(uniform_frac), float(uniform_half_size)
+        self.region = None if region is None else dict(
+            center=np.asarray(region.get('center', (0.0, 0.0, 0.0)), float).reshape(3),
+            radius=float(region['radius']), height=float(region['height']))
         self.rng = np.random.default_rng(seed)
 
     @property
     def fisher_params(self):
-        return list(self.fisher_loss.fisher_info_params)
+        # one name per Fisher row ('position' expanded to 'x', 'y', 'z')
+        return list(self.fisher_loss.theta_names)
+
+    def _passage(self, v, u):
+        """(s0, s1) along the track v + s u: its passage through the region's cylinder,
+        extended by d_perp_range[1]; around its closest approach to the centre if it misses."""
+        c, R, h = self.region['center'], self.region['radius'], 0.5 * self.region['height']
+        w = v - c
+        lo, hi = -np.inf, np.inf
+        a = u[0] ** 2 + u[1] ** 2
+        if a > 1e-12:                                  # |w_xy + s u_xy| <= R
+            b = w[0] * u[0] + w[1] * u[1]
+            disc = b * b - a * (w[0] ** 2 + w[1] ** 2 - R * R)
+            lo, hi = ((np.inf, -np.inf) if disc < 0 else
+                      ((-b - math.sqrt(disc)) / a, (-b + math.sqrt(disc)) / a))
+        elif w[0] ** 2 + w[1] ** 2 > R * R:            # vertical, outside the radius
+            lo, hi = np.inf, -np.inf
+        if abs(u[2]) > 1e-12:                          # |w_z + s u_z| <= h
+            z0, z1 = sorted(((-h - w[2]) / u[2], (h - w[2]) / u[2]))
+            lo, hi = max(lo, z0), min(hi, z1)
+        elif abs(w[2]) > h:                            # horizontal, above or below
+            lo, hi = np.inf, -np.inf
+        if lo > hi:
+            lo = hi = float(-(w @ u))
+        m = self.d_perp_range[1]
+        return lo - m, hi + m
 
     def _place(self, ev):
         """OM positions (oms_per_event, 3) around one event's track."""
@@ -122,12 +166,19 @@ class OMFisherTargets:
         e2 = np.cross(u, e1)
         lo, hi = math.log(self.d_perp_range[0]), math.log(self.d_perp_range[1])
         dp = np.exp(self.rng.uniform(lo, hi, n_t))
-        dl = self.rng.uniform(self.d_long_range[0], self.d_long_range[1], n_t)
+        dl = self.rng.uniform(*(self.d_long_range if self.region is None
+                                else self._passage(v, u)), n_t)
         ph = self.rng.uniform(0.0, 2.0 * math.pi, n_t)
         p_track = (v + dl[:, None] * u
                    + dp[:, None] * (np.cos(ph)[:, None] * e1 + np.sin(ph)[:, None] * e2))
-        p_unif = v + self.rng.uniform(-self.uniform_half_size, self.uniform_half_size,
-                                      (n_u, 3))
+        if self.region is None:
+            p_unif = v + self.rng.uniform(-self.uniform_half_size, self.uniform_half_size,
+                                          (n_u, 3))
+        else:
+            R, H = self.region['radius'], self.region['height']
+            r, phi = R * np.sqrt(self.rng.random(n_u)), self.rng.uniform(0.0, 2.0 * math.pi, n_u)
+            p_unif = self.region['center'] + np.column_stack(
+                [r * np.cos(phi), r * np.sin(phi), self.rng.uniform(-0.5 * H, 0.5 * H, n_u)])
         return np.concatenate([p_track, p_unif]), v
 
     def __call__(self, n_events):
@@ -185,7 +236,8 @@ class _ResMLP(torch.nn.Module):
 # --------------------------------------------------------------------------- #
 
 class OMFisherNetLoss(LossFunction):
-    """Angular / energy resolution from an MLP's per-OM Fisher (16-PMT template summed).
+    """Angular / energy / vertex resolution from an MLP's per-OM Fisher (16-PMT template
+    summed).
 
     Same call contract as FlowFisherResolutionLoss: per-string Fisher summed over OMs,
     optional sigmoid(string_weights), resolution per event, one metric. Positions are
@@ -193,8 +245,9 @@ class OMFisherNetLoss(LossFunction):
 
     The net predicts the Cholesky factor of F' = D F D + eps_floor I, with D the event
     energy for 'energy' (so that entry is the Fisher of ln E) and param_scales[p]
-    otherwise (default 1): log of its diagonal and the off-diagonals over their
-    column's diagonal. F = L L^T is PSD by construction.
+    otherwise (default VERTEX_SCALE = 100 m for 'x', 'y', 'z', 1 for the angles): log of
+    its diagonal and the off-diagonals over their column's diagonal. F = L L^T is PSD by
+    construction.
 
     Parameters
     ----------
@@ -211,7 +264,11 @@ class OMFisherNetLoss(LossFunction):
         by orders of magnitude over 1-400 m, which linear distances standardised over
         a km-wide spread barely resolve.
     fisher_params : sequence of str
-        Must match the targets it is trained on (OMFisherTargets).
+        From {'energy', 'zenith', 'azimuth', 'position', 'x', 'y', 'z'}; 'position' (the
+        vertex) stands for 'x', 'y', 'z'. Must match the targets it is trained on
+        (OMFisherTargets of a FlowFisherResolutionLoss scanning the same parameters).
+    resolution_type : {'angular', 'energy', 'vertex'}
+        'vertex': sqrt of the summed variances of the vertex components, in m.
     target_mode : 'exact' or 'mc'
         'exact': targets are exact Fishers; MSE on their log-Cholesky factors.
         'mc': targets are single-draw MC Fishers (unbiased, noisy); the loss is the
@@ -242,16 +299,26 @@ class OMFisherNetLoss(LossFunction):
                  eps_floor=1e-6, weight_tau='median', target_mode='exact',
                  geometry_grads='chunked', net_dtype=None, print_loss=False):
         super().__init__(device=device)
-        if resolution_type not in ('angular', 'energy'):
-            raise ValueError("resolution_type must be 'angular' or 'energy'")
+        if resolution_type not in ('angular', 'energy', 'vertex'):
+            raise ValueError("resolution_type must be 'angular', 'energy' or 'vertex'")
         if target_mode not in ('exact', 'mc'):
             raise ValueError("target_mode must be 'exact' or 'mc'")
         self.target_mode = target_mode
         if geometry_grads not in ('chunked', 'direct', False):
             raise ValueError("geometry_grads must be 'chunked', 'direct' or False")
-        self.fisher_params = list(fisher_params)
+        # one name per Fisher row, as FlowFisherResolutionLoss.theta_names
+        self.fisher_params = [c for p in fisher_params
+                              for c in (_VERTEX if p == 'position' else (p,))]
+        if (set(self.fisher_params) - {'energy', 'zenith', 'azimuth', *_VERTEX}
+                or len(set(self.fisher_params)) != len(self.fisher_params)):
+            raise ValueError("fisher_params must be distinct entries of 'energy', 'zenith', "
+                             f"'azimuth', 'position', 'x', 'y', 'z'; got {list(fisher_params)}")
+        if resolution_type == 'vertex' and not set(_VERTEX) & set(self.fisher_params):
+            raise ValueError("resolution_type='vertex' needs 'position' in fisher_params")
         self.resolution_type = resolution_type
-        self.param_scales = dict(param_scales or {})
+        # the vertex defaults are stored, so a checkpoint keeps the scale it was trained in
+        self.param_scales = {**{c: VERTEX_SCALE for c in _VERTEX if c in self.fisher_params},
+                             **dict(param_scales or {})}
         self.domain_size = domain_size
         self.rich_rel_pos_mode = bool(rich_rel_pos_mode)
         self.include_vertex_position = bool(include_vertex_position)
@@ -718,7 +785,7 @@ class OMFisherNetLoss(LossFunction):
                 corr = (pts3 * G).sum()          # value 0, gradient G w.r.t. points_3d
                 total = total + (corr - corr.detach())
 
-        key = 'angular_resolution' if self.resolution_type == 'angular' else 'energy_resolution'
+        key = f'{self.resolution_type}_resolution'
         return {f'{key}_loss': total, f'{key}_per_event': res,
                 'resolution_params': params,
                 'fisher_info_per_string_per_event': F_str.detach()}

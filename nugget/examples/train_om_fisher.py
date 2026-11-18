@@ -10,16 +10,17 @@ from nugget.losses.fisher_info_flow_mc import FlowFisherMCResolutionLoss
 from nugget.losses.fisher_info_om_net import (OMFisherNetLoss, OMFisherTargets,
                                               resolution_from_fisher)
 
-DEVICE = 'cuda:3'
-HIT_CKPT = './flow_models/best_mc_hit_model_v1r.pt'
-LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1r.pt'
-ATIME_CKPT = './flow_models/best_mc_atime_muon_flow_model_v1r.pt'
+DEVICE = 'cuda:0'
+HIT_CKPT = './flow_models/best_mc_muon_hit_model_v1rl.pt'
+LY_CKPT = './flow_models/best_mc_ly_muon_flow_model_v1rl.pt'
+ATIME_CKPT = './flow_models/best_mc_atime_muon_flow_model_v1rlg.pt'
 
-CHECKPOINT = './fisher_models/best_om_muon_fisher_net_v3mc.pt'
-HISTORY = './fisher_models/om_muon_fisher_net_v3mc_training_history.pkl'
+CHECKPOINT = './fisher_models/best_om_muon_fisher_net_v1mciv.pt'
+HISTORY = './fisher_models/om_muon_fisher_net_v1mcivx_training_history.pkl'
 
-# Parameters of the Fisher matrix. Any set FlowFisherResolutionLoss can scan works.
-FISHER_PARAMS = ('energy', 'zenith', 'azimuth')
+# Parameters of the Fisher matrix. Any set FlowFisherResolutionLoss can scan works;
+# add 'position' for the vertex ('x', 'y', 'z', learned in units of 1000 m).
+FISHER_PARAMS = ('energy', 'zenith', 'azimuth', 'position')
 
 # 'exact': train on quadrature Fishers.  'mc': train on single-draw MC Fishers
 # (unbiased, noisy, far cheaper); the net learns their expectation. Validation and
@@ -36,20 +37,29 @@ MC_SAMPLES = 1
 
 N_STEPS = 2_000            # each step draws EVENTS_PER_STEP fresh events
 EVENTS_PER_STEP = 16 if TARGET_MODE == 'exact' else 128   # MC draws are ~20-40x cheaper
-OMS_PER_EVENT = 64          # 90% around the track, 10% uniform in a cube
+OMS_PER_EVENT = 64          # 90% around the track, 10% uniform in the region
 
-sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+# sampler = nugget.samplers.cyl_sampler.CylinderSampler(
+#     device=DEVICE,
+#     event_type='signal',
+#     domain_size=1200,
+#     E_min=1e2, E_max=1e6,
+#     energy_dist='log_uniform',
+#     uniform_zenith_sampling=True,
+#     random_position_along_ray=True,
+#     find_exact_intersection=False,
+#     cylinder_radius=600,
+#     cylinder_height=1000,
+#     cylinder_center=[0, 0, 0],
+# )
+
+sampler = nugget.samplers.range_sampler.RangeSampler(
     device=DEVICE,
-    event_type='signal',
-    domain_size=1200,
-    E_min=1e2, E_max=1e6,
+    E_min=1e2,
+    E_max=1e6,
     energy_dist='log_uniform',
-    uniform_zenith_sampling=True,
-    random_position_along_ray=True,
-    find_exact_intersection=False,
-    cylinder_radius=600,
-    cylinder_height=1000,
-    cylinder_center=[0, 0, 0],
+    injection_radius=1100,
+    chunk_size=10000,
 )
 
 ns = NuSmoothie(device=DEVICE, domain_size=10000, hit_checkpoint=HIT_CKPT,
@@ -68,9 +78,12 @@ mc = FlowFisherMCResolutionLoss(
 placement = dict(
     oms_per_event=OMS_PER_EVENT,
     d_perp_range=(1.0, 400.0),      # log-uniform distance from the track [m]
-    d_long_range=(-200.0, 1500.0),  # along the track from the vertex [m]
-    uniform_frac=0.1,
-    uniform_half_size=2000,
+    # OMs around the cylinder the strings can occupy, not around the vertex: ranged
+    # vertices lie up to ~10 km from the detector. None: anchored at the vertex instead
+    region=dict(center=(0.0, 0.0, 0.0), radius=1000.0, height=1300.0),
+    d_long_range=(-200.0, 1500.0),  # along the track from the vertex [m] (no region)
+    uniform_frac=0.1,               # uniform in the region (no region: in a cube about the vertex)
+    uniform_half_size=2000,         # that cube's half-size (no region)
     chunk=FISHER_CHUNK,
 )
 exact_targets = OMFisherTargets(exact, sampler, seed=0, **placement)
@@ -133,8 +146,11 @@ pickle.dump(history, open(HISTORY, 'wb'))
 # Check 1: per-event resolution on fresh events. Sum each event's OMs (exact vs
 # predicted Fisher) and compare the resolutions.
 # ---------------------------------------------------------------------------
-if 'zenith' in FISHER_PARAMS and 'azimuth' in FISHER_PARAMS:
-    P = len(FISHER_PARAMS)
+names = om_loss.fisher_params          # one per Fisher row ('position' -> x, y, z)
+checks = [r for r, need in (('angular', {'zenith', 'azimuth'}), ('energy', {'energy'}),
+                            ('vertex', {'x', 'y', 'z'})) if need <= set(names)]
+if checks:
+    P = len(names)
     test = exact_targets(512)
     zen, azi = test['zenith'], test['azimuth']
     u = torch.stack([torch.sin(zen) * torch.cos(azi), torch.sin(zen) * torch.sin(azi),
@@ -145,13 +161,14 @@ if 'zenith' in FISHER_PARAMS and 'azimuth' in FISHER_PARAMS:
     F_pred_ev = F_pred.reshape(-1, OMS_PER_EVENT, P, P).sum(1)
     E_ev = test['energy'].reshape(-1, OMS_PER_EVENT)[:, 0]
     z_ev = zen.reshape(-1, OMS_PER_EVENT)[:, 0]
-    r_true = resolution_from_fisher(F_true_ev, list(FISHER_PARAMS), E_ev, z_ev)
-    r_pred = resolution_from_fisher(F_pred_ev, list(FISHER_PARAMS), E_ev, z_ev)
-    ok = torch.isfinite(r_true) & torch.isfinite(r_pred) & (r_true > 0)
-    ratio = (r_pred[ok] / r_true[ok]).cpu().numpy()
-    print(f'\nper-event angular resolution, net / exact ({int(ok.sum())} events):')
-    print(f'  p16 / p50 / p84 = {np.percentile(ratio, [16, 50, 84]).round(3)}   '
-          f'mean |log ratio| = {np.mean(np.abs(np.log(ratio))):.3f}')
+    for rtype in checks:
+        r_true = resolution_from_fisher(F_true_ev, names, E_ev, z_ev, rtype)
+        r_pred = resolution_from_fisher(F_pred_ev, names, E_ev, z_ev, rtype)
+        ok = torch.isfinite(r_true) & torch.isfinite(r_pred) & (r_true > 0)
+        ratio = (r_pred[ok] / r_true[ok]).cpu().numpy()
+        print(f'\nper-event {rtype} resolution, net / exact ({int(ok.sum())} events):')
+        print(f'  p16 / p50 / p84 = {np.percentile(ratio, [16, 50, 84]).round(3)}   '
+              f'mean |log ratio| = {np.mean(np.abs(np.log(ratio))):.3f}')
 
 
 # ---------------------------------------------------------------------------

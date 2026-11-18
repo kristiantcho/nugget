@@ -12,6 +12,34 @@ from nugget.surrogates.base_surrogate import Surrogate
 LN10 = math.log(10.0)
 
 
+def through_going_mask(points, vertices, zeniths, azimuths, arrival, min_upstream,
+                       refractive_index=1.33):
+    """(N,) bool: the PMT's direct-light emission point lies at least min_upstream [m]
+    downstream of the vertex, so up to there the track looks infinite upstream."""
+    st = np.sin(zeniths)
+    u = np.stack([st * np.cos(azimuths), st * np.sin(azimuths), np.cos(zeniths)], 1)
+    if arrival:
+        u = -u
+    rel = np.asarray(points, np.float64) - np.asarray(vertices, np.float64)
+    d_long = (rel * u).sum(1)
+    d_perp = np.linalg.norm(rel - d_long[:, None] * u, axis=1)
+    cos_c = 1.0 / refractive_index
+    return d_long - d_perp * cos_c / math.sqrt(1.0 - cos_c ** 2) >= min_upstream
+
+
+def _through_cut(model, df, verbose, name):
+    """Rows of df (parquet rows joined to the geometry) that pass through_going_mask."""
+    keep = through_going_mask(
+        df[['om_x', 'om_y', 'om_z']].to_numpy(), df[['muon_x', 'muon_y', 'muon_z']].to_numpy(),
+        df.zenith.to_numpy(np.float64), df.azimuth.to_numpy(np.float64),
+        model.track_dir_is_arrival, model.through_min_upstream,
+        getattr(model, 'refractive_index', 1.33))
+    if verbose:
+        print(f"{name}: through-going cut kept {keep.sum():,}/{len(keep):,} rows "
+              f"(emission point >= {model.through_min_upstream:g} m past the vertex)")
+    return df[keep]
+
+
 def _reseed_dataset_rng_in_worker(worker_id):
     """Give each DataLoader worker an independent numpy RNG stream."""
     info = torch.utils.data.get_worker_info()
@@ -138,6 +166,18 @@ def _times_row_lengths(series):
 #  Dataset                                                                     #
 # --------------------------------------------------------------------------- #
 
+def _resolve_pin_memory(device, pin_memory):
+    """pin_memory for a DataLoader feeding a model on `device`; off unless asked for."""
+    # Every host->GPU copy here is blocking, so pinning gains nothing; it only opens a CUDA
+    # context on the *current* device (cuda:0 unless set; torch ignores pin_memory_device).
+    if not pin_memory:
+        return False
+    dev = torch.device(device)
+    if dev.type == 'cuda':
+        torch.cuda.set_device(dev)      # so the pinning context lands on the model's GPU
+    return True
+
+
 def _event_split(parquet_path, event_frac, test_save_path, test_frac, seed):
     """Event filter for the training set (None = every event); writes the test set."""
     from nugget.utils.parquet_io import split_events, write_event_subset
@@ -172,9 +212,9 @@ class LightYieldFlowDataset(Dataset):
         geo = pd.read_csv(geometry_csv_path,
                           usecols=['string', 'om', 'pmt', 'om_x', 'om_y', 'om_z',
                                    'pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z'])
+        ecol = model.energy_column
         base_cols = ['run_id', 'event_id', 'string', 'om', 'pmt',
-                     'muon_x', 'muon_y', 'muon_z', 'neutrino_energy',
-                     'zenith', 'azimuth']
+                     'muon_x', 'muon_y', 'muon_z', ecol, 'zenith', 'azimuth']
         # Prefer an explicit 'count' column; otherwise derive the light yield from
         # the length of each row's 'times' list, which is the same quantity. Both
         # parquet engines validate column names before reading, so the failed
@@ -194,7 +234,8 @@ class LightYieldFlowDataset(Dataset):
             src = 'len(times)'
         df = df.assign(_ly=counts)
         if verbose:
-            print(f"LightYieldFlowDataset: light yield taken from '{src}'")
+            print(f"LightYieldFlowDataset: light yield taken from '{src}', energy from "
+                  f"'{ecol}'")
 
         half = self._domain_half_extent()
         if filter_vertex_in_domain:
@@ -206,6 +247,8 @@ class LightYieldFlowDataset(Dataset):
                       f"muon vertex outside {half.tolist()}")
 
         df = df.merge(geo, on=['string', 'om', 'pmt'], how='inner', copy=False)
+        if getattr(model, 'through_going', False):
+            df = _through_cut(model, df, verbose, 'LightYieldFlowDataset')
         # The flow models q >= 1; a zero-photon row would give log10(0 + u) -> -inf.
         n_zero = int((df['_ly'] < 1).sum())
         if n_zero:
@@ -224,7 +267,7 @@ class LightYieldFlowDataset(Dataset):
             df[['pmt_dir_x', 'pmt_dir_y', 'pmt_dir_z']].to_numpy(np.float32))
         self._muon_pos = np.ascontiguousarray(
             df[['muon_x', 'muon_y', 'muon_z']].to_numpy(np.float32))
-        self._energy = df.neutrino_energy.to_numpy(np.float32)
+        self._energy = df[ecol].to_numpy(np.float32)
         self._zenith = df.zenith.to_numpy(np.float32)
         self._azimuth = df.azimuth.to_numpy(np.float32)
         self._count = df['_ly'].to_numpy(np.float32)
@@ -360,10 +403,12 @@ class FlowMatchLY(Surrogate):
                  add_vertex_distance=False, add_distance_from_beam=False,
                  add_dist_long=False, track_dir_is_arrival=False,
                  add_pmt_direction=True, add_pmt_cosangle=False,
-                 include_direction=True,
-                 standardize_context=True, ly_eps=1e-6,
+                 include_direction=True, through_going=False, through_min_upstream=50.0,
+                 energy_type='neutrino', standardize_context=True, ly_eps=1e-6,
                  **kwargs):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
+        if energy_type not in self.ENERGY_COLUMNS:
+            raise ValueError(f"energy_type must be one of {sorted(self.ENERGY_COLUMNS)}")
 
         self.width, self.depth = width, depth
         self.time_dim, self.cond_width, self.dropout = time_dim, cond_width, dropout
@@ -388,6 +433,13 @@ class FlowMatchLY(Surrogate):
         # then only enters through relative quantities (cos_angle, d_perp/d_long, and
         # the PMT cosine with add_pmt_cosangle)
         self.include_direction = include_direction
+        # True: an infinite track, no vertex in the features (see _through_context). The
+        # datasets then keep only samples whose direct-light emission point is
+        # through_min_upstream [m] past the vertex.
+        self.through_going = through_going
+        self.through_min_upstream = through_min_upstream
+        # which parquet energy the energy feature is trained on (see ENERGY_COLUMNS)
+        self.energy_type = energy_type
         self.ly_eps = ly_eps
     
 
@@ -405,6 +457,15 @@ class FlowMatchLY(Surrogate):
         self.best_state_dict = None
         self.is_trained = False
 
+    # energy_type -> parquet column; read_parquet_columns reads muon_energy as lepton_energy
+    # in the e/tau files
+    ENERGY_COLUMNS = {'neutrino': 'neutrino_energy', 'lepton': 'muon_energy'}
+
+    @property
+    def energy_column(self):
+        """Parquet column the energy feature is trained on."""
+        return self.ENERGY_COLUMNS[getattr(self, 'energy_type', 'neutrino')]
+
     # ---------------- dtype / device plumbing ----------------
 
     @property
@@ -421,6 +482,11 @@ class FlowMatchLY(Surrogate):
 
     @property
     def context_dim(self):
+        if getattr(self, 'through_going', False):       # mirrors _through_context
+            d = 2 + (3 if getattr(self, 'include_direction', True) else 0)
+            if self.add_pmt_direction:
+                d += 2 if self.add_pmt_cosangle else 6
+            return d
         d = 3 + 1                                       # rel, log10 E
         d += 3 if getattr(self, 'include_direction', True) else 0   # direction
         if not self.rich_rel_pos_mode:
@@ -472,6 +538,9 @@ class FlowMatchLY(Surrogate):
             st, ct = torch.sin(zen), torch.cos(zen)
             direction = torch.stack([st * torch.cos(azi), st * torch.sin(azi), ct], dim=1)
         log_e = torch.log10(E + self.ly_eps) / 8.0
+        if getattr(self, 'through_going', False):
+            return self._through_context(pts, vert_raw, direction, log_e, pmt_directions,
+                                         norm)
         rel = det - vert
         vert_dist = torch.linalg.norm(rel, dim=1)
         dir_norm = torch.linalg.norm(direction, dim=1)
@@ -509,6 +578,32 @@ class FlowMatchLY(Surrogate):
                              / (dir_norm * pn + 1e-8)).unsqueeze(1))
             else:
                 cols.append(pdv)
+        return torch.cat(cols, dim=1)
+
+    def _through_context(self, pts, ref, direction, log_e, pmt_directions, norm):
+        """Infinite-track features: distance from the track, log10 E, [direction], and the
+        PMT orientation in the (track, radial) frame. ref is any point on the track, so
+        the features do not change as it slides along."""
+        u = direction / torch.linalg.norm(direction, dim=1, keepdim=True).clamp_min(1e-12)
+        if self.track_dir_is_arrival:
+            u = -u
+        rel = pts - ref
+        perp = rel - (rel * u).sum(1, keepdim=True) * u
+        # +1 mm^2 keeps the gradient finite for a PMT on the track axis
+        d_perp = torch.sqrt((perp ** 2).sum(1) + 1e-6)
+        e_perp = perp / d_perp.unsqueeze(1)
+        cols = [(d_perp / norm).unsqueeze(1), log_e.unsqueeze(1)]
+        if getattr(self, 'include_direction', True):
+            cols.append(direction)
+        if self.add_pmt_direction:
+            if pmt_directions is None:
+                raise ValueError("pmt_directions required when add_pmt_direction=True")
+            pdv = pmt_directions.reshape(-1, 3).to(pts.dtype)
+            if self.add_pmt_cosangle:
+                pdv = pdv / torch.linalg.norm(pdv, dim=1, keepdim=True).clamp_min(1e-12)
+                cols += [(u * pdv).sum(1, keepdim=True), (e_perp * pdv).sum(1, keepdim=True)]
+            else:
+                cols += [pdv, e_perp]
         return torch.cat(cols, dim=1)
 
     def _apply_context_norm(self, c):
@@ -835,6 +930,9 @@ class FlowMatchLY(Surrogate):
             'add_pmt_direction': self.add_pmt_direction,
             'add_pmt_cosangle': self.add_pmt_cosangle,
             'include_direction': self.include_direction,
+            'through_going': self.through_going,
+            'through_min_upstream': self.through_min_upstream,
+            'energy_type': self.energy_type,
             'standardize_context': self.standardize_context,
             'context_mean': None if self.context_mean is None else self.context_mean.cpu(),
             'context_std': None if self.context_std is None else self.context_std.cpu(),
@@ -846,6 +944,11 @@ class FlowMatchLY(Surrogate):
         ck = torch.load(filepath, map_location=self.device, weights_only=False)
         # every checkpoint from before this flag existed was trained with the direction
         self.include_direction = bool(ck.get('include_direction', True))
+        # ... and with a vertex
+        self.through_going = bool(ck.get('through_going', False))
+        self.through_min_upstream = float(ck.get('through_min_upstream', 50.0))
+        # ... and on the neutrino energy
+        self.energy_type = ck.get('energy_type', 'neutrino')
         for k in ['width', 'depth', 'time_dim', 'cond_width', 'dropout', 'domain_size',
                   'dim', 'sigma_min', 'ly_eps', 'rich_rel_pos_mode',
                   'include_vertex_position', 'add_vertex_distance',
@@ -889,10 +992,7 @@ class FlowMatchLY(Surrogate):
             filter_vertex_in_domain=filter_vertex_in_domain,
             event_filter=train_filter)
 
-        if pin_memory is None:
-            # pinning targets the current CUDA device (cuda:0 unless set), so only
-            # pin when the model is on a GPU
-            pin_memory = torch.device(self.device).type == 'cuda'
+        pin_memory = _resolve_pin_memory(self.device, pin_memory)
         base = RandomSampler(ds) if shuffle else SequentialSampler(ds)
         kw = dict(dataset=ds, batch_size=None,
                   sampler=BatchSampler(base, batch_size=batch_size, drop_last=False),

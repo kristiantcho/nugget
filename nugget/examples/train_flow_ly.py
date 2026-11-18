@@ -8,13 +8,13 @@ GEOM = '../other/800_40_40_geom.csv'
 # CHECKPOINT = './flow_models/best_mc_ly_e_flow_model_v1R.pt'
 
 TRAIN_PARQUET = 'big_mu_accepted.parquet'
-TEST_PARQUET = './flow_models/mc_ly_muon_flow_v1R_test_samples.parquet'
-CHECKPOINT = './flow_models/best_mc_ly_muon_flow_model_v1R.pt'
+TEST_PARQUET = './flow_models/mc_ly_muon_flow_v1rl_test_samples.parquet'
+CHECKPOINT = './flow_models/best_mc_ly_muon_flow_model_v1rl.pt'
 
 EPOCHS = 500
 
 flow = nugget.surrogates.FlowMatchLY.FlowMatchLY(
-    device="cuda:0",
+    device="cuda:3",
     domain_size=20000,
     dim=3,
 
@@ -45,7 +45,12 @@ flow = nugget.surrogates.FlowMatchLY.FlowMatchLY(
     add_pmt_direction=True,
     add_pmt_cosangle=True,
     standardize_context=True,
-    include_direction=False,
+    include_direction=True,
+    # True: infinite-track features (no vertex) and only samples whose emission point
+    # is through_min_upstream m past the vertex; set it the same in all three scripts
+    through_going=False,
+    through_min_upstream=50.0,
+    energy_type='lepton',     # 'neutrino' or 'lepton' energy feature; same in all three
     ly_eps=1e-6,
 )
 
@@ -87,7 +92,7 @@ history = flow.train_with_dataloader(
     checkpoint_path=CHECKPOINT,
 )
 
-pickle.dump(history, open('./flow_models/mc_ly_muon_flow_v1R_training_history.pkl', 'wb'))
+pickle.dump(history, open('./flow_models/mc_ly_muon_flow_v1rl_training_history.pkl', 'wb'))
 
 
 # ---------------------------------------------------------------------------

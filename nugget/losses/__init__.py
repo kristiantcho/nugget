@@ -15,3 +15,6 @@ from . import effective_area
 from . import pointsource_fom
 from . import fisher_info_helpers
 from . import analysis_loss
+from . import flavor_classifier
+from . import flavor_surrogate
+from . import reco_gd

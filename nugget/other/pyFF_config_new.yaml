@@ -1,0 +1,62 @@
+---
+factors:
+  - name: "powerlaw"
+    type: "PowerLawFlux"
+    pivot_energy: 1.0E+5
+    baseline_norm: 1.0E-18
+    param_mapping:
+      flux_norm: "astro_norm"
+      spectral_index: "astro_index"
+  - name: "atmo_powerlaw"
+    type: "PowerLawFlux"
+    pivot_energy: 1.0
+    baseline_norm: 0.000014
+    param_mapping:
+      flux_norm: "atmo_norm" #rename parameter
+      spectral_index: 2.7 #fix parameter
+  - name: "atmo_zenith"
+    type: "GaisserZenithFactor"
+    pivot_energy: 1.0E+5
+    baseline_norm: 1.0E-18
+    param_mapping:
+      kaon_pion_ratio: 0.213  
+  
+
+components:
+  - name: "astro"
+    factors: ["powerlaw"]
+  - name: "atmo"
+    factors: ["atmo_powerlaw","atmo_zenith"]
+
+models:
+  - name: "model"
+    components:
+    - name: "astro"
+      baseline_weight: "baseline_weight"
+    - name: "atmo"
+      baseline_weight: "baseline_weight"
+
+histograms:
+  - name: det1
+    binning:
+      type: RectangularBinning
+      bin_vars_edges:
+        - ["log10_reco_energy", "linear", [2, 7, 31]]
+        - ["cos_reco_zenith", "linear", [-1, 0, 25]]
+    lifetime: 315600000 #10 years
+    models: [["model","dataset"]]
+  
+model_parameters:
+  astro_norm: 1.44
+  astro_index: 2.0
+  atmo_norm: 1.0
+
+prior_bounds:
+  astro_norm: [0.0,.inf]
+  astro_index: [-.inf,.inf]
+  atmo_norm: [0.0,.inf] 
+
+prior_seeds:
+  astro_norm: 1.44
+  astro_index: 2.0
+  atmo_norm: 1.0
