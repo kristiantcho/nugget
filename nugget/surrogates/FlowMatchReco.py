@@ -747,7 +747,8 @@ class RecoFlowDataset(Dataset):
                  n_strings_range=(10, 150), om_drop_prob=0.5, om_drop_range=(0.0, 0.5),
                  max_tokens=None, feature_set='essential', silent_tokens=False,
                  uniform_energy_zenith=False, n_energy_bins=20, n_coszen_bins=20,
-                 event_filter=None, max_redraws=1000, event_columns=(), verbose=True):
+                 event_filter=None, max_redraws=1000, event_columns=(), fixed_strings=None,
+                 verbose=True):
         import pandas as pd
         import pyarrow.compute as pc
         from nugget.utils.parquet_io import (
@@ -778,6 +779,16 @@ class RecoFlowDataset(Dataset):
         # a DetectorGeometry may stand in for the path, so several datasets can share one
         self.geometry = (geometry_csv_path if isinstance(geometry_csv_path, DetectorGeometry)
                          else DetectorGeometry.from_csv(geometry_csv_path))
+        # fixed_strings (indices of the geometry's strings, all their OMs): one sub-geometry
+        # for every event instead of a random one each
+        self.fixed_om_active = None
+        if fixed_strings is not None:
+            fixed = np.unique(np.asarray(fixed_strings, dtype=np.int64))
+            if fixed.min() < 0 or fixed.max() >= self.geometry.n_strings:
+                raise ValueError(f"fixed_strings must index the geometry's "
+                                 f"{self.geometry.n_strings} strings")
+            self.fixed_om_active = np.isin(self.geometry.om_string, fixed)
+        self.config['fixed_strings'] = None if fixed_strings is None else fixed.tolist()
 
         names = _schema(parquet_path).names
         ecol = (energy_column if energy_column in names
@@ -875,9 +886,13 @@ class RecoFlowDataset(Dataset):
                   f"features={self.feature_set}, "
                   f"silent tokens={self.silent_tokens or 'off'}, "
                   f"max_tokens={self.max_tokens}")
-            print(f"  geometry: {self.geometry.n_strings} strings; per event "
-                  f"{self.masking['n_strings_range'] or 'all'} random strings, OM dropout "
-                  f"{self.masking['om_drop_range']} with prob {self.masking['om_drop_prob']}")
+            if self.fixed_om_active is not None:
+                print(f"  geometry: {self.geometry.n_strings} strings; every event in one fixed "
+                      f"sub-geometry of {len(self.config['fixed_strings'])} strings")
+            else:
+                print(f"  geometry: {self.geometry.n_strings} strings; per event "
+                      f"{self.masking['n_strings_range'] or 'all'} random strings, OM dropout "
+                      f"{self.masking['om_drop_range']} with prob {self.masking['om_drop_prob']}")
 
     def _build_bins(self, n_e, n_c):
         def edges(v, nb):
@@ -908,16 +923,17 @@ class RecoFlowDataset(Dataset):
         return float(self._log10e.mean()), float(self._log10e.std())
 
     def tokens(self, e, masked=True, om_active=None):
-        """Tokens of event e in a freshly sampled sub-geometry (masked=False: the whole
-        geometry; om_active: this bool mask over OMs instead), after pulses and trigger; None
-        if no hit survives."""
+        """Tokens of event e in a freshly sampled sub-geometry, or the fixed one if set
+        (masked=False: the whole geometry; om_active: this bool mask over OMs instead), after
+        pulses and trigger; None if no hit survives."""
         rng, geo = self._rng, self.geometry
         rows = np.arange(self._ev_start[e], self._ev_end[e])
         g = self._row_geo[rows].astype(np.int64)
         if om_active is None and masked:
             # drawn independently of the event, so given the geometry the events keep their
             # true (triggered) distribution; only how often each geometry is seen changes
-            om_active = geo.sample_active(rng, **self.masking)
+            om_active = (self.fixed_om_active if self.fixed_om_active is not None
+                         else geo.sample_active(rng, **self.masking))
         if om_active is not None:
             keep = om_active[geo.pmt_om[g]]
             rows, g = rows[keep], g[keep]

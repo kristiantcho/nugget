@@ -459,17 +459,24 @@ class FlavorClassifier:
                                  num_workers=0, seed=None, signal_frac=0.5, source_weights=None,
                                  uniform_energy_zenith=False, n_energy_bins=20,
                                  n_coszen_bins=20, test_save_paths=None, test_frac=0.1,
-                                 split_seed=None, event_frac=None, pin_memory=None, **reco_kw):
+                                 split_seed=None, event_frac=None, exclude_parquets=None,
+                                 pin_memory=None, **reco_kw):
         """Event-level loader over {name: parquet}; `signal` names the signal source(s), the
         rest are background. test_save_paths {name: path} holds out test_frac of each
-        source's events; event_frac (scalar or {name: frac}) subsamples the files. Remaining
-        keywords go to RecoFlowDataset (pulses, trigger, sub-geometry masking, tokens)."""
+        source's events; exclude_parquets {name: path} leaves out the events of those files
+        (another run's test set, so two runs share one split); event_frac (scalar or
+        {name: frac}) subsamples the files. Remaining keywords go to RecoFlowDataset (pulses,
+        trigger, sub-geometry masking or fixed_strings, tokens)."""
         filters = {}
         for n, path in parquets.items():
             frac = event_frac.get(n) if isinstance(event_frac, dict) else event_frac
             filters[n] = _event_split(
                 path, frac, None if test_save_paths is None else test_save_paths[n], test_frac,
                 split_seed if split_seed is not None else seed)
+            if exclude_parquets is not None and exclude_parquets.get(n) is not None:
+                from nugget.utils.parquet_io import list_events
+                keep = set(list_events(path)) if filters[n] is None else filters[n]
+                filters[n] = keep - set(list_events(exclude_parquets[n]))
         ds = FlavorDataset(
             parquets, signal, geometry_csv_path, num_events_per_epoch=num_events_per_epoch,
             seed=seed, signal_frac=signal_frac, source_weights=source_weights,

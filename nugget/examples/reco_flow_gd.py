@@ -20,7 +20,7 @@ from nugget.losses.reco_gd import (RecoGDLoss, energy_table, event_table, half_e
                                    resolution_summary, save_table)
 
 # one worker process per entry; repeat a device to run several processes on it
-DEVICES = ['cuda:7'] if torch.cuda.is_available() else ['cpu']
+DEVICES = ['cuda:1'] if torch.cuda.is_available() else ['cpu']
 PARQUET = './big_mu_accepted.parquet'
 GEOM = '../other/800_40_40_geom.csv'
 HIT_CKPT = './flow_models/best_mc_muon_hit_model_v1rl.pt'
@@ -61,8 +61,8 @@ RECO = dict(
     scale=(20.0, 20.0, 20.0, np.radians(5), np.radians(5), 0.3),
     lr=0.05, max_iter=1000, patience=200, min_delta=1e-2, lr_factor=0.5, lr_patience=20,
     min_lr=1e-4, log10e_bounds=(2.0, 6.0), bound_vertex=True,
-    events_per_batch=32, flow_chunk_rows=15000, hit_chunk_rows=100_000,
-    response_n_steps=32, response_events_per_batch=32)
+    events_per_batch=16, flow_chunk_rows=15000, hit_chunk_rows=100_000,
+    response_n_steps=32, response_events_per_batch=16)
 SAVE_EVERY = 100                 # finished events between saves of a worker's file
 ENERGY_BIN = 0.5                 # log10 E bin width of the summary table
 

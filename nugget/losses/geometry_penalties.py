@@ -57,6 +57,44 @@ class StringConnectionPenalty(LossFunction):
         return {"string_connection_penalty": string_connection_penalty,
                 "string_connection_penalty_per_string": string_connection_penalty_per_string}
 
+class CJBConnectionBinarizationPenalty(LossFunction):
+    """Loss function for weight binarization penalty to encourage binarization."""
+    def __init__(self, device=None):
+        """
+        Initialize the weight binarization penalty loss function.
+        
+        Parameters:
+        -----------
+        device : torch.device or None
+            Device to use for computations. If None, uses cuda if available, else cpu.
+        """
+        super().__init__(device)
+
+    def __call__(self, geom_dict, **kwargs):
+        """
+        Compute penalty for CJB-String connection weights to encourage binarization.
+        
+        Parameters:
+        -----------
+        geom_dict : dict
+            Geometry dictionary containing 'assignment_logits' key.
+        **kwargs
+            Additional keyword arguments (currently unused).
+            
+        Returns:
+        --------
+        torch.Tensor
+            The binarization penalty value (weighted).
+        """
+        assignment_logits = geom_dict.get('assignment_logits', None)
+        assignment_weights = torch.sigmoid(assignment_logits) if assignment_logits is not None else None
+        # string_probs_cut = torch.clamp(string_probs, min=0.0, max=1.0)
+        
+        if assignment_weights is not None:
+            return {'cjb_connection_binarization_penalty': torch.sum(-assignment_weights * torch.log(assignment_weights + 1e-6) - (1 - assignment_weights) * torch.log(1 - assignment_weights + 1e-6)) / len(assignment_weights)}
+        else:
+            return {'cjb_connection_binarization_penalty': torch.tensor(0.0)}
+
 
 class BoundaryPenalty(LossFunction):
     """Loss function for boundary penalties."""
