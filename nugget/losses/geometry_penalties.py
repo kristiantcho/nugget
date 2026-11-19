@@ -52,7 +52,7 @@ class StringConnectionPenalty(LossFunction):
         weights=torch.sigmoid(assignment_logits)
         string_usage=torch.sum(weights, dim=1)
         # string_connections=torch.softplus((string_usage-0.9)*60)
-        string_connection_penalty_per_string = F.softplus((1 - string_usage), beta=2.0)
+        string_connection_penalty_per_string = F.softplus((0.99 - string_usage), beta=2.0) + F.softplus((string_usage - 1.01), beta=2.0)
         string_connection_penalty=torch.sum(string_connection_penalty_per_string)
         return {"string_connection_penalty": string_connection_penalty,
                 "string_connection_penalty_per_string": string_connection_penalty_per_string}
