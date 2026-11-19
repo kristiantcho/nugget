@@ -7,6 +7,16 @@ from torch.nn import functional as F
 from nugget.losses.base_loss import LossFunction
 
 
+def get_assignment_weights(geom_dict):
+    """String-CJB connection weights: the geometry's `assignment_weights` (sigmoid or softmax
+    already applied), else sigmoid(`assignment_logits`) for older geom_dicts, else None."""
+    weights = geom_dict.get('assignment_weights', None)
+    if weights is not None:
+        return weights
+    logits = geom_dict.get('assignment_logits', None)
+    return torch.sigmoid(logits) if logits is not None else None
+
+
 class CJBCapacityPenalty(LossFunction):
     """Penalize cable junction box capacity overuse."""
 
@@ -27,13 +37,12 @@ class CJBCapacityPenalty(LossFunction):
 
     def __call__(self, geom_dict, **kwargs):
         parameters = {**self.parameters, **kwargs}
-        assignment_logits = geom_dict.get("assignment_logits", None)
-        weights = torch.sigmoid(assignment_logits)
+        weights = get_assignment_weights(geom_dict)
         cjb_usage = torch.sum(weights, dim=0)
         excess_usage = F.softplus(
             cjb_usage - parameters["cjb_capacity"], beta=parameters["beta"]
         )
-        penalty = torch.sum(excess_usage)
+        penalty = torch.sum(excess_usage**2)/len(excess_usage)
         return {"cjb_capacity_penalty": penalty,
                 "cjb_capacity_penalty_per_cjb": excess_usage}
 
@@ -47,12 +56,11 @@ class StringConnectionPenalty(LossFunction):
         
     def __call__(self, geom_dict, **kwargs):
     
-        assignment_logits=geom_dict.get("assignment_logits", None)
-        weights=torch.sigmoid(assignment_logits)
+        weights=get_assignment_weights(geom_dict)
         string_usage=torch.sum(weights, dim=1)
         # string_connections=torch.softplus((string_usage-0.9)*60)
         string_connection_penalty_per_string = F.softplus((0.95 - string_usage), beta=2.0) + F.softplus((string_usage - 1.05), beta=2.0)
-        string_connection_penalty=torch.sum(string_connection_penalty_per_string)
+        string_connection_penalty=torch.sum(string_connection_penalty_per_string**2)/len(string_connection_penalty_per_string)
         return {"string_connection_penalty": string_connection_penalty,
                 "string_connection_penalty_per_string": string_connection_penalty_per_string}
 
@@ -76,17 +84,16 @@ class CJBConnectionBinarizationPenalty(LossFunction):
         Parameters:
         -----------
         geom_dict : dict
-            Geometry dictionary containing 'assignment_logits' key.
+            Geometry dictionary containing 'assignment_weights' (or 'assignment_logits').
         **kwargs
             Additional keyword arguments (currently unused).
-            
+
         Returns:
         --------
         torch.Tensor
             The binarization penalty value (weighted).
         """
-        assignment_logits = geom_dict.get('assignment_logits', None)
-        assignment_weights = torch.sigmoid(assignment_logits) if assignment_logits is not None else None
+        assignment_weights = get_assignment_weights(geom_dict)
         # string_probs_cut = torch.clamp(string_probs, min=0.0, max=1.0)
         
         if assignment_weights is not None:

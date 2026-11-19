@@ -1,14 +1,16 @@
 """Cable and junction-box cost penalty."""
 
 from nugget.losses.base_loss import LossFunction
+from nugget.losses.geometry_penalties import get_assignment_weights
 import torch
+from torch.nn import functional as F
 
 
 class CostLoss(LossFunction):
 	"""Penalize cable length, junction-box count, and capacity overuse.
 
 	``geom_dict`` is expected to contain fixed string coordinates, CJB
-	coordinates, and string-to-CJB assignment logits. Cost coefficients can be set at
+	coordinates, and string-to-CJB `assignment_weights`. Cost coefficients can be set at
 	construction or overridden for an individual call.
 
 	The returned ``estimated_total_cost`` is the unnormalized cable and CJB cost;
@@ -37,10 +39,9 @@ class CostLoss(LossFunction):
 		parameters = {**self.parameters, **kwargs}
 		strings = geom_dict.get("string_xy", None)
 		cjbs = geom_dict.get("cjb_xy", None)
-		assignment_logits = geom_dict.get("assignment_logits", None)
 		cjb_weights= geom_dict.get("cjb_weights", None)
 
-		assignment_weights = torch.sigmoid(assignment_logits)
+		assignment_weights = get_assignment_weights(geom_dict)
 		distances = torch.cdist(strings, cjbs)
 		expected_cable_lengths = torch.sum(assignment_weights * distances, dim=1)
 		cable_cost = parameters["C_cable"] * torch.sum(expected_cable_lengths)

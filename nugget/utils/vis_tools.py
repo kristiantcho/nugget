@@ -788,7 +788,14 @@ class Visualizer:
 
     @classmethod
     def _cjb_connection_probs(cls, kwargs, n_strings, n_cjbs):
-        """sigmoid(assignment_logits) as an (n_strings, n_cjbs) array, or None."""
+        """(n_strings, n_cjbs) connection weights, or None.
+
+        Uses the geometry's `assignment_weights` (sigmoid or softmax already applied),
+        else sigmoid(`assignment_logits`) for older geom_dicts.
+        """
+        weights = cls._to_numpy_or_none(kwargs.get('assignment_weights', None))
+        if weights is not None and weights.shape == (n_strings, n_cjbs):
+            return weights.astype(float)
         logits = cls._to_numpy_or_none(kwargs.get('assignment_logits', None))
         if logits is None or logits.shape != (n_strings, n_cjbs):
             return None
@@ -1431,7 +1438,7 @@ class Visualizer:
               local repulsion plots when 'cjb_xy' is present. 'string_xy_cjb_penalty' ignores it.
             - string_xy_show_cjbs: bool, default False. Also draw CJBs in the 'string_xy' plot
               (color 'cjb_color', default 'tab:red').
-            - show_cjb_connections: bool, default True. String-CJB lines, alpha = sigmoid(assignment_logits);
+            - show_cjb_connections: bool, default True. String-CJB lines, alpha = assignment_weights;
               'cjb_connection_min_alpha' (default 0.01) hides weaker ones, 'cjb_connection_color' (default black).
             - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range]
               instead of the default domain boundaries [-half_domain, half_domain]

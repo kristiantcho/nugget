@@ -1,5 +1,6 @@
 from nugget.geometries.base_geometry import Geometry
 import torch
+from torch.nn import functional as F
 import numpy as np
 
 class DynamicString(Geometry):
@@ -11,10 +12,21 @@ class DynamicString(Geometry):
                 random_xy = False,
                 custom_z_spacing = None, points_per_string = None,
                 custom_string_spacing = None, hex_type='hexagonal', hybrid_mix_init=0.5,
-                random_assignment_logits = False, assignment_logits_init = 1.0, assignment_logits_std = 1.0):
+                random_assignment_logits = False, assignment_logits_init = 1.0, assignment_logits_std = 1.0,
+                assignment_activation = 'sigmoid', cjb_weight_gate = 'sigmoid'):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         self.n_strings = n_strings
         self.n_cjbs = n_cjbs
+        # 'sigmoid': independent per-connection probabilities; 'softmax': each string's
+        # weights over the CJBs sum to 1 (exactly one connection per string).
+        if assignment_activation not in ('sigmoid', 'softmax'):
+            raise ValueError(f"assignment_activation must be 'sigmoid' or 'softmax', got {assignment_activation!r}")
+        self.assignment_activation = assignment_activation
+        # cjb_weights from the assignment weights p: 'sigmoid' = sigmoid(6 (sum_i p_ij - 0.9));
+        # 'probability' = 1 - prod_i (1 - p_ij), the chance that at least one string uses CJB j.
+        if cjb_weight_gate not in ('sigmoid', 'probability'):
+            raise ValueError(f"cjb_weight_gate must be 'sigmoid' or 'probability', got {cjb_weight_gate!r}")
+        self.cjb_weight_gate = cjb_weight_gate
         # Initial string-CJB assignment logits: constant `assignment_logits_init`, or, with
         # `random_assignment_logits`, drawn from N(assignment_logits_init, assignment_logits_std^2).
         self.random_assignment_logits = random_assignment_logits
@@ -70,9 +82,18 @@ class DynamicString(Geometry):
             logits = logits + float(self.assignment_logits_std) * torch.randn_like(logits)
         return logits.requires_grad_()
 
-    def _calculate_cjb_weights(self, cjb_xy, assignment_logits):
-        weights = torch.sigmoid(assignment_logits)
-        cjb_usage = torch.sum(weights, dim=0)
+    def _calculate_assignment_weights(self, assignment_logits):
+        """(n_strings, n_cjbs) connection weights from the raw logits."""
+        if self.assignment_activation == 'softmax':
+            return F.softmax(assignment_logits, dim=1)  # over CJBs, per string
+        return torch.sigmoid(assignment_logits)
+
+    def _calculate_cjb_weights(self, cjb_xy, assignment_weights):
+        if self.cjb_weight_gate == 'probability':
+            # In log space; the clamp keeps log1p finite (and its gradient non-NaN) at p = 1.
+            log_unused = torch.log1p(-assignment_weights.clamp(max=1 - 1e-12)).sum(dim=0)
+            return (1 - torch.exp(log_unused)).to(dtype=cjb_xy.dtype)
+        cjb_usage = torch.sum(assignment_weights, dim=0)
         return (
             torch.sigmoid((cjb_usage-0.9)*6).to(dtype=cjb_xy.dtype)
         )
@@ -174,12 +195,10 @@ class DynamicString(Geometry):
                 assignment_logits = self._init_assignment_logits(
                     result['string_xy'].shape[0], result['cjb_xy'].shape[0]
                 )
-            cjb_weights = self._calculate_cjb_weights(
-                result['cjb_xy'], assignment_logits
-            )
+            assignment_weights = self._calculate_assignment_weights(assignment_logits)
             result['assignment_logits'] = assignment_logits
-           
-            result['cjb_weights'] = cjb_weights
+            result['assignment_weights'] = assignment_weights
+            result['cjb_weights'] = self._calculate_cjb_weights(result['cjb_xy'], assignment_weights)
             
             # Process z_values if available
             if 'z_values' in initial_geometry:
@@ -504,9 +523,8 @@ class DynamicString(Geometry):
             string_xy = torch.rand(self.n_strings, 2, device=self.device) * self.domain_size - self.half_domain
         cjb_xy = self.cjb_hex_grid.clone()
         assignment_logits = self._init_assignment_logits(string_xy.shape[0], cjb_xy.shape[0])
-        cjb_weights = self._calculate_cjb_weights(
-            cjb_xy, assignment_logits
-        )
+        assignment_weights = self._calculate_assignment_weights(assignment_logits)
+        cjb_weights = self._calculate_cjb_weights(cjb_xy, assignment_weights)
 
         points_3d = torch.zeros(self.total_points, 3, device=self.device)
         z_values_final = None
@@ -543,6 +561,7 @@ class DynamicString(Geometry):
             "string_xy": string_xy,
             "cjb_xy": cjb_xy,
             "assignment_logits": assignment_logits,
+            "assignment_weights": assignment_weights,
             "cjb_weights": cjb_weights,
             "string_indices": string_indices_final,
             "points_per_string_list": points_per_string_list_final,
@@ -616,9 +635,8 @@ class DynamicString(Geometry):
         # z comes straight from z_values. This replaces the old per-string Python
         # loop (which called int(points_per_string_list[s]) every string, forcing
         # a device sync per string per step on GPU) -- see _point_to_string_index.
-        cjb_weights = self._calculate_cjb_weights(
-            cjb_xy, assignment_logits
-        )
+        assignment_weights = self._calculate_assignment_weights(assignment_logits)
+        cjb_weights = self._calculate_cjb_weights(cjb_xy, assignment_weights)
 
         if z_values.shape[0] > 0:
             p2s = self._point_to_string_index(points_per_string_list)  # (n_points,)
@@ -634,7 +652,8 @@ class DynamicString(Geometry):
             "string_xy": string_xy,
             "cjb_xy": cjb_xy,
             "assignment_logits": assignment_logits,
+            "assignment_weights": assignment_weights,
             "cjb_weights": cjb_weights,
-            "string_indices": string_indices, 
+            "string_indices": string_indices,
             "points_per_string_list": points_per_string_list,
         }
