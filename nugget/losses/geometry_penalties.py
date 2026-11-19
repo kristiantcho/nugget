@@ -33,10 +33,9 @@ class CJBCapacityPenalty(LossFunction):
         excess_usage = F.softplus(
             cjb_usage - parameters["cjb_capacity"], beta=parameters["beta"]
         )
-        penalty_per_cjb = excess_usage.square()
-        penalty = torch.sum(penalty_per_cjb)
-        return {"cjb_capacity_penalty": penalty, "cjb_capacity_excess_usage": excess_usage,
-                "cjb_capacity_penalty_per_cjb": penalty_per_cjb}
+        penalty = torch.sum(excess_usage)
+        return {"cjb_capacity_penalty": penalty,
+                "cjb_capacity_penalty_per_cjb": excess_usage}
 
 class StringConnectionPenalty(LossFunction):
     """Loss function for string connection penalties."""
@@ -52,7 +51,7 @@ class StringConnectionPenalty(LossFunction):
         weights=torch.sigmoid(assignment_logits)
         string_usage=torch.sum(weights, dim=1)
         # string_connections=torch.softplus((string_usage-0.9)*60)
-        string_connection_penalty_per_string = F.softplus((0.99 - string_usage), beta=2.0) + F.softplus((string_usage - 1.01), beta=2.0)
+        string_connection_penalty_per_string = F.softplus((0.95 - string_usage), beta=2.0) + F.softplus((string_usage - 1.05), beta=2.0)
         string_connection_penalty=torch.sum(string_connection_penalty_per_string)
         return {"string_connection_penalty": string_connection_penalty,
                 "string_connection_penalty_per_string": string_connection_penalty_per_string}
