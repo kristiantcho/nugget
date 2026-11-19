@@ -146,6 +146,8 @@ class Visualizer:
     PLOT_FLUX_VARIANCE_HISTORY = "flux_variance_history"
     PLOT_FLUX_LIKELIHOOD_SCAN = "flux_likelihood_scan"
     PLOT_NN_DISTANCE_HISTORY = "nn_distance_history"
+    PLOT_STRING_XY_CJB_PENALTY = "string_xy_cjb_penalty"
+    PLOT_COST_HISTORY = "cost_history"
 
 
     def __init__(self, device=None, dim=3, domain_size=2.0, gif_temp_dir=None):
@@ -193,6 +195,8 @@ class Visualizer:
         # History of the global (weighted-softmin, if string_weights given) minimum
         # pairwise string-string distance, also shown on the 'nn_distance_history' plot.
         self._min_pairwise_distance_history = {}
+        # CostLoss outputs per iteration: {iteration: {'total', 'cable', 'cjb_count', 'connection'}}.
+        self._cost_history = {}
 
         # Cache of string XY positions (and weights) snapshotted once per unique
         # iteration whenever a 'string_history' plot is requested, so the full
@@ -760,12 +764,7 @@ class Visualizer:
 
     @classmethod
     def _get_cjb_plot_data(cls, kwargs):
-        """Return `(cjb_xy_np, cjb_probs_np)` from the plot kwargs, or `(None, None)`.
-
-        `cjb_weights` is expected to already be a probability in [0, 1] (sigmoided
-        in the geometry), matching ROVPenalty, so no sigmoid is applied here. If CJB
-        positions are given without weights, every CJB gets probability 1.
-        """
+        """`(cjb_xy, cjb_probs)` as numpy, or `(None, None)`. `cjb_weights` are already probabilities."""
         cjb_xy_np = cls._to_numpy_or_none(kwargs.get('cjb_xy', None))
         if cjb_xy_np is None or cjb_xy_np.size == 0:
             return None, None
@@ -777,17 +776,61 @@ class Visualizer:
             cjb_probs_np = np.ones(cjb_xy_np.shape[0], dtype=float)
         return cjb_xy_np, cjb_probs_np
 
-    @staticmethod
-    def _add_string_cjb_legend(ax, loc='upper right'):
-        """Legend distinguishing strings (circles) from CJBs (squares)."""
+    def _cjbs_shown(self, plot_type, kwargs):
+        """Whether CJBs (if present) are drawn in this plot type."""
+        if plot_type == self.PLOT_STRING_XY_CJB_PENALTY:
+            return True
+        if not kwargs.get('show_cjbs', True):
+            return False
+        if plot_type == self.PLOT_STRING_XY:
+            return bool(kwargs.get('string_xy_show_cjbs', False))
+        return plot_type in (self.PLOT_STRING_XY_ROV_PENALTY, self.PLOT_STRING_XY_LOCAL_STRING_REPULSION)
+
+    @classmethod
+    def _cjb_connection_probs(cls, kwargs, n_strings, n_cjbs):
+        """sigmoid(assignment_logits) as an (n_strings, n_cjbs) array, or None."""
+        logits = cls._to_numpy_or_none(kwargs.get('assignment_logits', None))
+        if logits is None or logits.shape != (n_strings, n_cjbs):
+            return None
+        return 1.0 / (1.0 + np.exp(-logits.astype(float)))
+
+    def _draw_cjbs(self, ax, kwargs, xy_np, cjb_xy_np, cjb_probs_np, marker_size,
+                   values=None, cmap=None, norm=None, color='lightgray'):
+        """Draw string-CJB connections, CJB squares and the strings/CJBs legend."""
+        from matplotlib.collections import LineCollection
+        from matplotlib.colors import to_rgba
         from matplotlib.lines import Line2D
+
+        drew_connections = False
+        if kwargs.get('show_cjb_connections', True):
+            conn = self._cjb_connection_probs(kwargs, len(xy_np), len(cjb_xy_np))
+            if conn is not None:
+                i_idx, j_idx = np.nonzero(conn >= float(kwargs.get('cjb_connection_min_alpha', 0.01)))
+                if i_idx.size > 0:
+                    segments = np.stack([xy_np[i_idx], cjb_xy_np[j_idx]], axis=1)  # (n_seg, 2, 2)
+                    rgba = np.tile(to_rgba(kwargs.get('cjb_connection_color', 'black')), (i_idx.size, 1))
+                    rgba[:, 3] = np.clip(conn[i_idx, j_idx], 0.0, 1.0)
+                    ax.add_collection(LineCollection(segments, colors=rgba, linewidths=0.7, zorder=0.9))
+                    drew_connections = True
+
+        scatter_kwargs = dict(s=1.5 * marker_size, marker='s', alpha=np.clip(cjb_probs_np, 0.05, 1.0),
+                              edgecolors='black', linewidths=0.4, zorder=3)
+        if values is not None:
+            sc = ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c=values, cmap=cmap, norm=norm, **scatter_kwargs)
+        else:
+            sc = ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c=color, **scatter_kwargs)
+
         handles = [
             Line2D([], [], marker='o', linestyle='None', markerfacecolor='lightgray',
                    markeredgecolor='black', markersize=6, label='Strings'),
             Line2D([], [], marker='s', linestyle='None', markerfacecolor='lightgray',
                    markeredgecolor='black', markersize=7, label='CJBs'),
         ]
-        ax.legend(handles=handles, loc=loc, fontsize=8, framealpha=0.8)
+        if drew_connections:
+            handles.append(Line2D([], [], color=kwargs.get('cjb_connection_color', 'black'),
+                                  linewidth=0.7, label='Connections'))
+        ax.legend(handles=handles, loc='upper right', fontsize=8, framealpha=0.8)
+        return sc
 
     @staticmethod
     def _weighted_mean_nn_distance(string_xy, string_weights=None, num_neighbours=5, nn_tau=None):
@@ -1263,6 +1306,9 @@ class Visualizer:
             - 'llr_histogram_points': LLR density histogram comparing signal and background distributions per point
             - 'snr_contour': SNR contour plot based on per-string values
             - 'string_xy_local_string_repulsion_penalty': String XY scatter colored by per-string local string repulsion penalty
+            - 'string_xy_cjb_penalty': Strings colored by StringConnectionPenalty and CJBs (squares) by
+              CJBCapacityPenalty (gray when that loss is absent), with string-CJB connections.
+            - 'cost_history': CostLoss total / cable / CJB / connection cost per visualized iteration.
             - 'string_history': Traced path of each string's XY position across every recorded
               iteration, from its start-of-optimization position (red) to its current/final
               position (green)
@@ -1381,6 +1427,12 @@ class Visualizer:
                 which puts `fold_indices`/`n_folds`/`fold_angle` in the geometry dict), restricts the
                 `rov_draw_safe_space_on_violations` / `rov_draw_safe_space_union` corridors to fold 0's strings
                 only, then reuses that fold's corridors
+            - show_cjbs: bool, default True. Draw CJBs (squares) and their connections in the ROV and
+              local repulsion plots when 'cjb_xy' is present. 'string_xy_cjb_penalty' ignores it.
+            - string_xy_show_cjbs: bool, default False. Also draw CJBs in the 'string_xy' plot
+              (color 'cjb_color', default 'tab:red').
+            - show_cjb_connections: bool, default True. String-CJB lines, alpha = sigmoid(assignment_logits);
+              'cjb_connection_min_alpha' (default 0.01) hides weaker ones, 'cjb_connection_color' (default black).
             - zoom_range: float, optional. If provided, sets axis limits for 2D contour plots to [-zoom_range, zoom_range]
               instead of the default domain boundaries [-half_domain, half_domain]
             - plot_with_surrogate: bool, optional. If True and 'light_surrogate_func' and 'surrogate_event_params' 
@@ -3398,7 +3450,7 @@ class Visualizer:
         effective_half_domain = self.half_domain
         if zoom_range is None and string_xy is not None:
             string_xy_np = string_xy.detach().cpu().numpy() if torch.is_tensor(string_xy) else np.asarray(string_xy)
-            cjb_xy_for_domain, _ = self._get_cjb_plot_data(kwargs)
+            cjb_xy_for_domain = self._get_cjb_plot_data(kwargs)[0] if self._cjbs_shown(plot_type, kwargs) else None
             if cjb_xy_for_domain is not None:
                 string_xy_np = np.concatenate([string_xy_np.reshape(-1, 2), cjb_xy_for_domain], axis=0)
             if string_xy_np.size > 0:
@@ -3653,8 +3705,17 @@ class Visualizer:
                         alpha_vals = np.full(len(xy_np), 0.8, dtype=float)
                         weight_mask = np.array([True]*len(xy_np))
 
-                    if np.any(weight_mask):    
+                    if np.any(weight_mask):
                         ax.scatter(xy_np[:, 0][weight_mask], xy_np[:, 1][weight_mask], s=min([40,30*200/len(xy_np[weight_mask])]) * string_size_scale, alpha=alpha_vals[weight_mask])
+
+                # Opt-in CJBs (`string_xy_show_cjbs=True`), in a fixed color since the
+                # string colormap here encodes points per string.
+                if self._cjbs_shown(plot_type, kwargs):
+                    cjb_xy_np, cjb_probs_np = self._get_cjb_plot_data(kwargs)
+                    if cjb_xy_np is not None:
+                        self._draw_cjbs(ax, kwargs, xy_np, cjb_xy_np, cjb_probs_np,
+                                        min([40, 30 * 200 / len(xy_np)]) * string_size_scale,
+                                        color=kwargs.get('cjb_color', 'tab:red'))
 
                 set_axis_limits(ax)
                 ax.set_title('String Positions in XY Plane')
@@ -3739,9 +3800,11 @@ class Visualizer:
                     # normalises per-object values by the TOTAL count (strings + CJBs),
                     # so undo that normalisation with the same total here.
                     cjb_xy_np, cjb_probs_np = self._get_cjb_plot_data(kwargs)
-                    n_cjbs = 0 if cjb_xy_np is None else cjb_xy_np.shape[0]
-                    n_total = len(xy_np) + n_cjbs
+                    n_total = len(xy_np) + (0 if cjb_xy_np is None else cjb_xy_np.shape[0])
                     rov_penalty_np = np.asarray(rov_penalty_np, dtype=float) * n_total
+                    if not self._cjbs_shown(plot_type, kwargs):
+                        cjb_xy_np, cjb_probs_np = None, None  # hidden, but still counted in n_total above
+                    n_cjbs = 0 if cjb_xy_np is None else cjb_xy_np.shape[0]
 
                     cjb_rov_penalty_np = None
                     cjb_rov_angles_np = None
@@ -3885,22 +3948,9 @@ class Visualizer:
                         linewidths=0.1
                     )
 
-                    # CJBs as squares, same colormap/norm; alpha from CJB probabilities.
                     if n_cjbs > 0:
-                        cjb_scatter_kwargs = dict(
-                            s=1.5 * string_marker_size,
-                            marker='s',
-                            alpha=np.clip(cjb_probs_np, 0.05, 1.0),
-                            edgecolors='black',
-                            linewidths=0.4,
-                            zorder=3,
-                        )
-                        if cjb_rov_penalty_np is not None:
-                            ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c=cjb_rov_penalty_np,
-                                       cmap=cmap, norm=norm, **cjb_scatter_kwargs)
-                        else:
-                            ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c='lightgray', **cjb_scatter_kwargs)
-                        self._add_string_cjb_legend(ax)
+                        self._draw_cjbs(ax, kwargs, xy_np, cjb_xy_np, cjb_probs_np, string_marker_size,
+                                        values=cjb_rov_penalty_np, cmap=cmap, norm=norm)
 
                     # Add colorbar
                     cbar = fig.colorbar(sc, ax=ax)
@@ -3946,7 +3996,8 @@ class Visualizer:
                             alpha_vals = 0.8
 
                         # Optional CJBs (squares), colored by their own per-CJB repulsion.
-                        cjb_xy_np, cjb_probs_np = self._get_cjb_plot_data(kwargs)
+                        cjb_xy_np, cjb_probs_np = (self._get_cjb_plot_data(kwargs)
+                                                   if self._cjbs_shown(plot_type, kwargs) else (None, None))
                         n_cjbs = 0 if cjb_xy_np is None else cjb_xy_np.shape[0]
                         cjb_repulsion_np = None
                         if n_cjbs > 0:
@@ -3979,20 +4030,8 @@ class Visualizer:
                         )
 
                         if n_cjbs > 0:
-                            cjb_scatter_kwargs = dict(
-                                s=1.5 * string_marker_size,
-                                marker='s',
-                                alpha=np.clip(cjb_probs_np, 0.05, 1.0),
-                                edgecolors='black',
-                                linewidths=0.4,
-                                zorder=3,
-                            )
-                            if cjb_repulsion_np is not None:
-                                ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c=cjb_repulsion_np,
-                                           cmap=cmap, norm=norm, **cjb_scatter_kwargs)
-                            else:
-                                ax.scatter(cjb_xy_np[:, 0], cjb_xy_np[:, 1], c='lightgray', **cjb_scatter_kwargs)
-                            self._add_string_cjb_legend(ax)
+                            self._draw_cjbs(ax, kwargs, xy_np, cjb_xy_np, cjb_probs_np, string_marker_size,
+                                            values=cjb_repulsion_np, cmap=cmap, norm=norm)
 
                         cbar = fig.colorbar(sc, ax=ax)
                         cbar.set_label('Local String Repulsion Penalty')
@@ -4004,8 +4043,62 @@ class Visualizer:
                         ax.set_ylabel('Y')
                         self._draw_slice_lines(ax, xy_np, **kwargs)
                 else:
-                    ax.text(0.5, 0.5, "Local string repulsion per string data not available", 
+                    ax.text(0.5, 0.5, "Local string repulsion per string data not available",
                           ha='center', va='center', transform=ax.transAxes)
+            else:
+                ax.text(0.5, 0.5, "String XY data not available",
+                      ha='center', va='center', transform=ax.transAxes)
+
+        elif plot_type == self.PLOT_STRING_XY_CJB_PENALTY:
+            # Strings colored by StringConnectionPenalty, CJBs by CJBCapacityPenalty (gray if
+            # that loss was not used). Always shows CJBs, regardless of `show_cjbs`.
+            if string_xy is not None:
+                xy_np = self._to_numpy_or_none(string_xy).reshape(-1, 2).astype(float)
+                cjb_xy_np, cjb_probs_np = self._get_cjb_plot_data(kwargs)
+                n_cjbs = 0 if cjb_xy_np is None else cjb_xy_np.shape[0]
+
+                def _per_entity(key, n):
+                    vals = self._to_numpy_or_none(kwargs.get(key, None))
+                    if vals is None or n == 0 or vals.size != n:
+                        return None
+                    return vals.reshape(-1).astype(float)
+
+                string_pen_np = _per_entity('string_connection_penalty_per_string', len(xy_np))
+                cjb_pen_np = _per_entity('cjb_capacity_penalty_per_cjb', n_cjbs)
+
+                string_probs_np = _per_entity('string_weights', len(xy_np))  # already sigmoided above
+                alpha_vals = np.clip(string_probs_np, 0.05, 1.0) if string_probs_np is not None else 0.8
+
+                cmap = plt.cm.RdYlGn_r  # Red for high penalty, green for low penalty
+                # One colour scale shared by strings and CJBs.
+                pen_parts = [p for p in (string_pen_np, cjb_pen_np) if p is not None]
+                norm = None
+                if pen_parts:
+                    norm = Normalize(vmin=0.0, vmax=max(float(np.max(np.concatenate(pen_parts))), 1.0))
+                string_marker_size = min([30, 50 * 200 / len(xy_np)]) * string_size_scale
+                if string_pen_np is not None:
+                    ax.scatter(xy_np[:, 0], xy_np[:, 1], s=string_marker_size, c=string_pen_np,
+                               cmap=cmap, norm=norm, alpha=alpha_vals, edgecolors='black', linewidths=0.1)
+                else:
+                    ax.scatter(xy_np[:, 0], xy_np[:, 1], s=string_marker_size, c='lightgray', alpha=alpha_vals,
+                               edgecolors='black', linewidths=0.1)
+
+                if n_cjbs > 0:
+                    self._draw_cjbs(ax, kwargs, xy_np, cjb_xy_np, cjb_probs_np, string_marker_size,
+                                    values=cjb_pen_np, cmap=cmap, norm=norm)
+
+                if norm is not None:
+                    fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax).set_label('Connection Penalty')
+
+                if string_pen_np is None and cjb_pen_np is None:
+                    ax.text(0.5, 0.02, "No StringConnectionPenalty / CJBCapacityPenalty outputs",
+                            ha='center', va='bottom', transform=ax.transAxes, fontsize=8)
+
+                set_axis_limits(ax)
+                ax.set_title('String Connection / CJB Capacity Penalty')
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                self._draw_slice_lines(ax, xy_np, **kwargs)
             else:
                 ax.text(0.5, 0.5, "String XY data not available",
                       ha='center', va='center', transform=ax.transAxes)
@@ -6360,6 +6453,44 @@ class Visualizer:
                 ax.text(0.5, 0.5, "Nearest-neighbour distance history not available\n(Pass 'string_xy')",
                       ha='center', va='center', transform=ax.transAxes)
 
+        elif plot_type == self.PLOT_COST_HISTORY:
+            # CostLoss outputs, recorded once per visualized iteration (keyed by iteration,
+            # like the other *_history plots).
+            cost_keys = {'cable': 'cable_cost', 'cjb_count': 'cjb_count_cost', 'connection': 'connection_cost'}
+            if iteration is not None:
+                entry = {}
+                for name, key in cost_keys.items():
+                    val = self._to_numpy_or_none(kwargs.get(key, None))
+                    if val is not None:
+                        entry[name] = float(np.sum(val))  # sum in case a component is per-CJB
+                if len(entry) == len(cost_keys):
+                    entry['total'] = sum(entry.values())
+                elif kwargs.get('estimated_total_cost', None) is not None:
+                    entry['total'] = float(np.sum(self._to_numpy_or_none(kwargs['estimated_total_cost'])))
+                if entry:
+                    self._cost_history[int(iteration)] = entry
+
+            if self._cost_history:
+                iters = sorted(self._cost_history)
+                for name, label, color, lw in (('total', 'Total', 'black', 2.0),
+                                               ('cable', 'Cables', 'tab:blue', 1.5),
+                                               ('cjb_count', 'CJBs', 'tab:red', 1.5),
+                                               ('connection', 'Connections', 'tab:green', 1.5)):
+                    pts = [(i, self._cost_history[i][name]) for i in iters if name in self._cost_history[i]]
+                    if pts:
+                        x_vals, y_vals = zip(*pts)
+                        ax.plot(x_vals, y_vals, color=color, linewidth=lw, label=label)
+                ax.set_title('Cost History')
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Estimated Cost')
+                ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+                ax.legend(fontsize=8)
+                ax.grid(True, alpha=0.3)
+                ax.set_yscale('log')
+            else:
+                ax.text(0.5, 0.5, "Cost history not available\n(needs 'cost_loss' (CostLoss) outputs)",
+                      ha='center', va='center', transform=ax.transAxes)
+
         elif isinstance(plot_type, str) and plot_type.split(':', 1)[0] == self.PLOT_FLUX_LIKELIHOOD_SCAN:
             scan = self._likelihood_scan_inputs(kwargs, plot_type.split(':', 1)[1] if ':' in plot_type else None)
             if scan is None or not np.isfinite(scan[4]) or scan[4] <= 0:
@@ -8629,7 +8760,7 @@ class Visualizer:
     def clear_string_history(self) -> None:
         """
         Clear the cached string XY position/weight history used by the
-        'string_history' plot type (and the 'nn_distance_history' plot). Call
+        'string_history' plot type (and the 'nn_distance_history' and 'cost_history' plots). Call
         this before starting a fresh optimization run if you want the traced
         path / metric history to restart from that run's initial geometry
         rather than continuing from a previous run.
@@ -8640,6 +8771,7 @@ class Visualizer:
         self._last_recorded_iteration_string_history = None
         self._nn_distance_history = {}
         self._min_pairwise_distance_history = {}
+        self._cost_history = {}
 
 def plot_nll_landscape(llrnet, signal_sampler, signal_surrogate_func,
                        param_names=None, param_ranges=None, n_points=50,

@@ -1,7 +1,6 @@
 """Cable and junction-box cost penalty."""
 
 from nugget.losses.base_loss import LossFunction
-from nugget.losses.geometry_penalties import CapacityPenalty
 import torch
 
 
@@ -26,7 +25,6 @@ class CostLoss(LossFunction):
 		**kwargs,
 	):
 		super().__init__(device)
-		self.capacity_penalty = CapacityPenalty(device=device)
 		self.parameters = {
 			"C_cable": C_cable,
 			"C_cjb": C_cjb,
@@ -50,9 +48,11 @@ class CostLoss(LossFunction):
 		cjb_usage = torch.sum(assignment_weights, dim=0)
 		connection_cost= torch.sum(cjb_usage) * parameters["C_connection"]
 
-		cjb_count_cost = parameters["C_cjb"] * cjb_weights #<-- soft_active_cjbs
+		cjb_count_cost = parameters["C_cjb"] * torch.sum(cjb_weights) #<-- soft_active_cjbs
 		estimated_total_cost = cable_cost + cjb_count_cost + connection_cost
 
 		loss = estimated_total_cost
 		loss = loss / parameters["normalization"]
-		return {"cost_loss": loss, "estimated_total_cost": estimated_total_cost}
+		return {"cost_loss": loss, "estimated_total_cost": estimated_total_cost,
+		   		"cable_cost": cable_cost, "cjb_count_cost": cjb_count_cost,
+				"connection_cost": connection_cost}	

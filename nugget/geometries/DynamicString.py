@@ -7,13 +7,19 @@ class DynamicString(Geometry):
     
     def __init__(self, device=None, dim=3, domain_size=2,
                 total_points = 150, n_strings = 30,
-                n_cjbs = 10,
+                n_cjbs = 0,
                 random_xy = False,
                 custom_z_spacing = None, points_per_string = None,
-                custom_string_spacing = None, hex_type='hexagonal', hybrid_mix_init=0.5):
+                custom_string_spacing = None, hex_type='hexagonal', hybrid_mix_init=0.5,
+                random_assignment_logits = False, assignment_logits_init = 1.0, assignment_logits_std = 1.0):
         super().__init__(device=device, dim=dim, domain_size=domain_size)
         self.n_strings = n_strings
         self.n_cjbs = n_cjbs
+        # Initial string-CJB assignment logits: constant `assignment_logits_init`, or, with
+        # `random_assignment_logits`, drawn from N(assignment_logits_init, assignment_logits_std^2).
+        self.random_assignment_logits = random_assignment_logits
+        self.assignment_logits_init = assignment_logits_init
+        self.assignment_logits_std = assignment_logits_std
         self.points_per_string = points_per_string
         self.total_points = int(self.n_strings * self.points_per_string) if self.points_per_string is not None else total_points
         self.random_xy = random_xy
@@ -56,11 +62,19 @@ class DynamicString(Geometry):
         if self.points_per_string is not None:
             self.total_points = int(self.n_strings * self.points_per_string)
             
+    def _init_assignment_logits(self, n_strings, n_cjbs):
+        """Fresh (n_strings, n_cjbs) leaf of assignment logits."""
+        logits = torch.full((n_strings, n_cjbs), float(self.assignment_logits_init),
+                            device=self.device, dtype=torch.float64)
+        if self.random_assignment_logits:
+            logits = logits + float(self.assignment_logits_std) * torch.randn_like(logits)
+        return logits.requires_grad_()
+
     def _calculate_cjb_weights(self, cjb_xy, assignment_logits):
         weights = torch.sigmoid(assignment_logits)
         cjb_usage = torch.sum(weights, dim=0)
         return (
-            torch.sigmoid((cjb_usage-0.9)*6).to(dtype=cjb_xy.dtype),
+            torch.sigmoid((cjb_usage-0.9)*6).to(dtype=cjb_xy.dtype)
         )
 
     def initialize_points(self, initial_geometry=None, **kwargs):
@@ -157,12 +171,8 @@ class DynamicString(Geometry):
                     dtype=torch.float64,
                 ).detach().clone().requires_grad_()
             else:
-                assignment_logits = torch.full(
-                    (result['string_xy'].shape[0], result['cjb_xy'].shape[0]),
-                    1.0,
-                    device=self.device,
-                    dtype=torch.float64,
-                    requires_grad=True,
+                assignment_logits = self._init_assignment_logits(
+                    result['string_xy'].shape[0], result['cjb_xy'].shape[0]
                 )
             cjb_weights = self._calculate_cjb_weights(
                 result['cjb_xy'], assignment_logits
@@ -493,11 +503,7 @@ class DynamicString(Geometry):
         if self.random_xy:
             string_xy = torch.rand(self.n_strings, 2, device=self.device) * self.domain_size - self.half_domain
         cjb_xy = self.cjb_hex_grid.clone()
-        assignment_logits = torch.empty(
-            (string_xy.shape[0], cjb_xy.shape[0]),
-            device=self.device,
-            dtype=torch.float64,
-        ).fill_(1.0).requires_grad_()
+        assignment_logits = self._init_assignment_logits(string_xy.shape[0], cjb_xy.shape[0])
         cjb_weights = self._calculate_cjb_weights(
             cjb_xy, assignment_logits
         )
@@ -537,7 +543,6 @@ class DynamicString(Geometry):
             "string_xy": string_xy,
             "cjb_xy": cjb_xy,
             "assignment_logits": assignment_logits,
-            "cjbs_string_connections": cjbs_string_connections,
             "cjb_weights": cjb_weights,
             "string_indices": string_indices_final,
             "points_per_string_list": points_per_string_list_final,

@@ -18,3 +18,4 @@ from . import analysis_loss
 from . import flavor_classifier
 from . import flavor_surrogate
 from . import reco_gd
+from . import cost_loss

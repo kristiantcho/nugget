@@ -4,28 +4,22 @@ import torch
 from scipy.optimize import linear_sum_assignment
 from torch.nn import functional as F
 
-try:
-    from geomloss import SamplesLoss
-except ImportError:
-    SamplesLoss = None
-
 from nugget.losses.base_loss import LossFunction
 
 
-class CapacityPenalty(LossFunction):
+class CJBCapacityPenalty(LossFunction):
     """Penalize cable junction box capacity overuse."""
 
     def __init__(
         self,
-        C_capacity_penalty=50,
         cjb_capacity=10,
-        beta=5,
+        beta=2,
         device=None,
         **kwargs,
     ):
         super().__init__(device)
         self.parameters = {
-            "C_capacity_penalty": C_capacity_penalty,
+           
             "cjb_capacity": cjb_capacity,
             "beta": beta,
         }
@@ -39,27 +33,29 @@ class CapacityPenalty(LossFunction):
         excess_usage = F.softplus(
             cjb_usage - parameters["cjb_capacity"], beta=parameters["beta"]
         )
-        penalty = parameters["C_capacity_penalty"] * torch.sum(excess_usage.square())
-        return {"capacity_penalty": penalty, "capacity_excess_usage": excess_usage}
+        penalty_per_cjb = excess_usage.square()
+        penalty = torch.sum(penalty_per_cjb)
+        return {"cjb_capacity_penalty": penalty, "cjb_capacity_excess_usage": excess_usage,
+                "cjb_capacity_penalty_per_cjb": penalty_per_cjb}
 
 class StringConnectionPenalty(LossFunction):
-
+    """Loss function for string connection penalties."""
     def __init__(
         self,
         device=None,
-        **kwargs,
     ):
         super().__init__(device)
         
-
     def __call__(self, geom_dict, **kwargs):
     
         assignment_logits=geom_dict.get("assignment_logits", None)
         weights=torch.sigmoid(assignment_logits)
         string_usage=torch.sum(weights, dim=1)
-        string_connections=torch.sigmoid((string_usage-0.9)*60)
-        string_connection_penalty=torch.sum(1-string_connections)
-        return {"string_connection_penalty": string_connection_penalty, "string_connections": string_connections}
+        # string_connections=torch.softplus((string_usage-0.9)*60)
+        string_connection_penalty_per_string = F.softplus((1 - string_usage), beta=2.0)
+        string_connection_penalty=torch.sum(string_connection_penalty_per_string)
+        return {"string_connection_penalty": string_connection_penalty,
+                "string_connection_penalty_per_string": string_connection_penalty_per_string}
 
 
 class BoundaryPenalty(LossFunction):
