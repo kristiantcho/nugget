@@ -348,6 +348,9 @@ class Optimizer():
         # Optional: detect when the geometry becomes NaN and revert to the last good checkpoint.
         self.revert_on_nan = kwargs.get('revert_on_nan', False)
         self.max_nan_retries = kwargs.get('max_nan_retries', 5)
+
+        stop_condition = kwargs.get('stop_condition')
+        
         # Optional: only apply sigmoid to a subset of losses.
         # - If provided (list/tuple/set of strings), sigmoid is applied only to those loss names.
         # - If not provided, preserves legacy behavior (sigmoid applied to all losses when enabled).
@@ -430,8 +433,9 @@ class Optimizer():
             + [0]
         )
         self._stopped_early_on_nan = False
+        stop_requested = False
         for it in range(max_iter, max_iter+n_iter):
-            if self._stopped_early_on_nan:
+            if self._stopped_early_on_nan or stop_requested:
                 break
             nan_retries = 0
             while True:
@@ -599,6 +603,9 @@ class Optimizer():
                     loss_str = ' | '.join([f'{key}: {loss_hist[-1]:.4f}' if self.loss_weights_dict.get(key) != 0.0 and len(loss_hist) > 0 else '' for key, loss_hist in self.loss_dict.items()])
                     print(f'Iter {it+1}/{n_iter}, Total Loss: {self.total_loss[-1]:.4f} | {loss_str}', flush=True)
                 
+                if stop_condition is not None and stop_condition(self.geom_dict):
+                    stop_requested = True
+                    print(f"Stop condition met after iteration {it+1}; stopping optimization.", flush=True)
                 
                 break
 
