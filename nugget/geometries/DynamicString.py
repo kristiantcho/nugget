@@ -91,7 +91,7 @@ class DynamicString(Geometry):
     def _calculate_cjb_weights(self, cjb_xy, assignment_weights):
         if self.cjb_weight_gate == 'probability':
             # In log space; the clamp keeps log1p finite (and its gradient non-NaN) at p = 1.
-            log_unused = torch.log1p(-assignment_weights.clamp(max=1 - 1e-12)).sum(dim=0)
+            log_unused = torch.log1p(-assignment_weights).sum(dim=0)
             return (1 - torch.exp(log_unused)).to(dtype=cjb_xy.dtype)
         cjb_usage = torch.sum(assignment_weights, dim=0)
         return (
