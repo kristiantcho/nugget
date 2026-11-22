@@ -42,7 +42,7 @@ class CJBCapacityPenalty(LossFunction):
         excess_usage = F.softplus(
             cjb_usage - parameters["cjb_capacity"], beta=parameters["beta"]
         )
-        penalty = torch.sum(excess_usage**2)
+        penalty = torch.sum(excess_usage)/len(excess_usage)
         return {"cjb_capacity_penalty": penalty,
                 "cjb_capacity_penalty_per_cjb": excess_usage}
 
